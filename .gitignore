@@ -1,14 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+*.egg
 
-# package stuff
-build/*
-dist/*
-*.egg-info/*
+# Virtual environments
+.venv/
+venv/
 
-# misc
-*.pyc
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
 
-# ply generated stuff
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Type checking
+.mypy_cache/
+
+# PLY legacy (remove these files from repo)
 parser.out
 parsetab.py
 
-
+# Lock files
+uv.lock
