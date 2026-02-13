@@ -92,7 +92,8 @@ def _generate_las_content(las_file: LASFile) -> str:
             format_str += "}"
             desc = f"{desc}  {format_str}"
 
-        lines.append(f" {curve.mnemonic}.{unit}  : {desc}")
+        api = f"  {curve.api_code}" if curve.api_code else ""
+        lines.append(f" {curve.mnemonic}.{unit}{api}  : {desc}")
     lines.append("")
 
     # ~P Parameter section

@@ -108,6 +108,10 @@ def _read_normal(
             except (ValueError, IndexError):
                 las_file.logs[las_file.curves_order[i]][current_line] = null_value
 
+        # Fill remaining curves with null_value when line has fewer values
+        for i in range(len(values), curve_count):
+            las_file.logs[las_file.curves_order[i]][current_line] = null_value
+
         current_line += 1
 
 

@@ -208,8 +208,86 @@ class TestReadLASFileAsObject:
         assert yme_curve.data_format == "E"
 
 
+class TestAPICodeParsing:
+    """Tests for API code extraction from curve definitions."""
+
+    def test_api_codes_parsed_from_las12(self, test_data_dir: Path) -> None:
+        """Test API codes are extracted from LAS 1.2 curve_api file."""
+        api_file = test_data_dir / "sample_curve_api.las"
+        if not api_file.exists():
+            pytest.skip("sample_curve_api.las not found")
+        las = read_las_file_as_object(api_file)
+        rhob = las.get_curve_by_mnemonic("RHOB")
+        assert rhob is not None
+        assert rhob.api_code == "7 350 02 00"
+
+    def test_api_codes_parsed_from_las20(self, test_data_dir: Path) -> None:
+        """Test API codes are extracted from LAS 2.0 file."""
+        las20 = test_data_dir / "sample_2.0.las"
+        if not las20.exists():
+            pytest.skip("sample_2.0.las not found")
+        las = read_las_file_as_object(las20)
+        dt = las.get_curve_by_mnemonic("DT")
+        assert dt is not None
+        assert dt.api_code == "60 520 32 00"
+
+    def test_empty_api_code_for_curves_without_it(self, test_data_dir: Path) -> None:
+        """Test that curves without API codes have empty api_code."""
+        sample = test_data_dir / "sample.las"
+        if not sample.exists():
+            pytest.skip("sample.las not found")
+        las = read_las_file_as_object(sample)
+        dept = las.get_curve_by_mnemonic("DEPT")
+        assert dept is not None
+        assert dept.api_code == ""
+
+    def test_api_code_roundtrip(self, test_data_dir: Path, tmp_path: Path) -> None:
+        """Test API codes survive a write-then-read roundtrip."""
+        from pylasdev import write_las_file
+
+        api_file = test_data_dir / "sample_curve_api.las"
+        if not api_file.exists():
+            pytest.skip("sample_curve_api.las not found")
+        las = read_las_file_as_object(api_file)
+        temp_file = tmp_path / "api_roundtrip.las"
+        write_las_file(temp_file, las)
+        las2 = read_las_file_as_object(temp_file)
+        rhob = las2.get_curve_by_mnemonic("RHOB")
+        assert rhob is not None
+        assert rhob.api_code == "7 350 02 00"
+
+
 class TestDataReaderEdgeCases:
     """Tests for data reader edge cases and boundary conditions."""
+
+    def test_missing_values_filled_with_null(self, tmp_path: Path) -> None:
+        """Test that short data lines fill remaining curves with null_value."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            " GR.GAPI  :  Gamma Ray\n"
+            "~A  DEPT  DT  GR\n"
+            "100.0  50.0  75.0\n"
+            "101.0  51.0\n"
+            "102.0\n"
+        )
+        test_file = tmp_path / "short_lines.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_las_file(test_file)
+        # Line 1: all values present
+        assert data["logs"]["GR"][0] == 75.0
+        # Line 2: GR missing -> should be null_value, NOT 0.0
+        assert data["logs"]["GR"][1] == -999.25
+        # Line 3: DT and GR missing -> both should be null_value
+        assert data["logs"]["DT"][2] == -999.25
+        assert data["logs"]["GR"][2] == -999.25
 
     def test_section_after_ascii_not_parsed_as_data(self, tmp_path: Path) -> None:
         """Test that sections appearing after ~A don't corrupt data."""

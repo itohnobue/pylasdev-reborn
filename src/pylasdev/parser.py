@@ -206,6 +206,7 @@ class LASParser:
 
         raw_mnemonic = match.group("mnemonic").upper().strip()
         unit = match.group("unit") or ""
+        api_code = match.group("value").strip() if match.group("value") else ""
         description = (
             match.group("description").strip()
             if "description" in match.groupdict() and match.group("description")
@@ -241,6 +242,7 @@ class LASParser:
         curve = CurveDefinition(
             mnemonic=normalized,
             unit=unit,
+            api_code=api_code,
             description=description,
             original_mnemonic=raw_mnemonic if raw_mnemonic != normalized else "",
             data_format=data_format,
