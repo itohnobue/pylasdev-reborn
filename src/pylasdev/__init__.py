@@ -11,6 +11,15 @@ Public API:
 
 from .compare import compare_las_dicts
 from .dev_reader import read_dev_file
+from .exceptions import (
+    DEVReadError,
+    LASEncodingError,
+    LASParseError,
+    LASReadError,
+    LASVersionError,
+    LASWriteError,
+    PylasdevError,
+)
 from .models import CurveDefinition, DevFile, LASFile, ParameterEntry, VersionSection, WellSection
 from .reader import read_las_file, read_las_file_as_object
 from .writer import write_las_file
@@ -30,4 +39,12 @@ __all__ = [
     "WellSection",
     "CurveDefinition",
     "ParameterEntry",
+    # Exceptions
+    "PylasdevError",
+    "LASReadError",
+    "LASWriteError",
+    "LASParseError",
+    "LASVersionError",
+    "LASEncodingError",
+    "DEVReadError",
 ]

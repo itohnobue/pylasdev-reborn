@@ -39,6 +39,9 @@ def read_dev_file(
     if not file_path.exists():
         raise DEVReadError(f"File not found: {file_path}")
 
+    if not file_path.is_file():
+        raise DEVReadError(f"Not a file: {file_path}")
+
     _detected_encoding, content = read_with_encoding(file_path, encoding)
 
     lines = content.splitlines()
@@ -80,7 +83,7 @@ def read_dev_file(
                 try:
                     dev_dict[names[k]][current_line] = float(values[k])
                 except (ValueError, IndexError):
-                    dev_dict[names[k]][current_line] = 0.0
+                    dev_dict[names[k]][current_line] = np.nan
             current_line += 1
 
     return dev_dict

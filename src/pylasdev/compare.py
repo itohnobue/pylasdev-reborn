@@ -31,6 +31,12 @@ def compare_las_dicts(
     Returns:
         True if the dictionaries are equivalent, False otherwise.
     """
+    # Check for keys in dict1 not present in dict2
+    for key in dict1:
+        if key not in dict2:
+            logger.warning("Key '%s' not found in second dict", key)
+            return False
+
     for key in dict2:
         if key not in dict1:
             logger.warning("Key '%s' not found in first dict", key)
@@ -39,6 +45,13 @@ def compare_las_dicts(
         val1, val2 = dict1[key], dict2[key]
 
         if isinstance(val2, dict):
+            # Check for keys in val1 not present in val2
+            if isinstance(val1, dict):
+                for in_key in val1:
+                    if in_key not in val2:
+                        logger.warning("Key '%s.%s' not found in second dict", key, in_key)
+                        return False
+
             for in_key in val2:
                 if in_key not in val1:
                     logger.warning("Key '%s.%s' not found in first dict", key, in_key)
