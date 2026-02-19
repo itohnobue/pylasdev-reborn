@@ -129,7 +129,10 @@ def _generate_las_content(las_file: LASFile) -> str:
             curve_names = section.curves_order
             if curve_names and curve_names[0] in section.data:
                 num_rows = len(section.data[curve_names[0]])
-                null_value = float(las_file.well.get("NULL", "-999.25"))
+                try:
+                    null_value = float(las_file.well.get("NULL", "-999.25"))
+                except (ValueError, TypeError):
+                    null_value = -999.25
                 delimiter = las_file.version.delimiter_char
 
                 for i in range(num_rows):
@@ -138,9 +141,9 @@ def _generate_las_content(las_file: LASFile) -> str:
                         if name in las_file.string_data and i < len(las_file.string_data[name]):
                             row_values.append(str(las_file.string_data[name][i]))
                         elif name in section.data and i < len(section.data[name]):
-                            row_values.append(f"{section.data[name][i]:.4f}")
+                            row_values.append(f"{section.data[name][i]:.8g}")
                         else:
-                            row_values.append(f"{null_value:.4f}")
+                            row_values.append(f"{null_value:.8g}")
                     lines.append(delimiter.join(row_values))
     else:
         # Legacy single data section
@@ -148,7 +151,10 @@ def _generate_las_content(las_file: LASFile) -> str:
         if curve_names and curve_names[0] in las_file.logs:
             lines.append("~A  " + "  ".join(curve_names))
             num_rows = len(las_file.logs[curve_names[0]])
-            null_value = float(las_file.well.get("NULL", "-999.25"))
+            try:
+                null_value = float(las_file.well.get("NULL", "-999.25"))
+            except (ValueError, TypeError):
+                null_value = -999.25
             delimiter = las_file.version.delimiter_char
 
             for i in range(num_rows):
@@ -157,9 +163,9 @@ def _generate_las_content(las_file: LASFile) -> str:
                     if name in las_file.string_data and i < len(las_file.string_data[name]):
                         vals.append(str(las_file.string_data[name][i]))
                     elif name in las_file.logs and i < len(las_file.logs[name]):
-                        vals.append(f"{las_file.logs[name][i]:.4f}")
+                        vals.append(f"{las_file.logs[name][i]:.8g}")
                     else:
-                        vals.append(f"{null_value:.4f}")
+                        vals.append(f"{null_value:.8g}")
                 lines.append(delimiter.join(vals))
 
     return "\n".join(lines) + "\n"

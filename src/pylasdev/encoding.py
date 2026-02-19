@@ -44,19 +44,31 @@ def detect_encoding(file_path: Path) -> str:
 def read_with_encoding(
     file_path: Path,
     encoding: str | None = None,
+    max_file_size: int | None = None,
 ) -> tuple[str, str]:
     """Read file content with encoding detection and fallback chain.
 
     Args:
         file_path: Path to the file.
         encoding: Explicit encoding override. If None, auto-detected.
+        max_file_size: Optional maximum file size in bytes. If the file
+            exceeds this limit, a ValueError is raised.
 
     Returns:
         Tuple of (detected_encoding, file_content).
 
     Raises:
         UnicodeDecodeError: If no encoding in the fallback chain works.
+        ValueError: If file exceeds max_file_size.
     """
+    if max_file_size is not None:
+        file_size = file_path.stat().st_size
+        if file_size > max_file_size:
+            raise ValueError(
+                f"File size ({file_size} bytes) exceeds maximum allowed "
+                f"({max_file_size} bytes): {file_path}"
+            )
+
     if encoding is not None:
         content = file_path.read_text(encoding=encoding)
         return encoding, content

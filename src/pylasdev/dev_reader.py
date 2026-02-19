@@ -6,7 +6,6 @@ and proper encoding handling.
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 
@@ -69,13 +68,13 @@ def read_dev_file(
         if not stripped or stripped.startswith("#"):
             continue
 
-        values = re.split(r"[\s\t]+", stripped)
+        values = stripped.split()
 
         if not header_found:
             # First non-comment line = column names
             names = values
             for name in names:
-                dev_dict[name] = np.zeros(data_lines, dtype=np.float64)
+                dev_dict[name] = np.full(data_lines, np.nan, dtype=np.float64)
             header_found = True
         else:
             # Data lines

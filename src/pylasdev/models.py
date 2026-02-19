@@ -253,6 +253,7 @@ class LASFile:
             "parameters": params_dict,
             "logs": {k: v.copy() for k, v in self.logs.items()},
             "curves_order": list(self.curves_order),
+            "curves": [c.to_dict() for c in self.curves],
         }
 
     @classmethod
@@ -273,8 +274,31 @@ class LASFile:
 
         curves_order = data.get("curves_order", [])
         las_file.curves_order = list(curves_order)
-        for curve_name in curves_order:
-            las_file.curves.append(CurveDefinition(mnemonic=curve_name))
+
+        # Restore curve metadata if available (new format), otherwise create minimal CurveDefinition
+        curves_data = data.get("curves", [])
+        if curves_data and isinstance(curves_data, list) and isinstance(curves_data[0], dict):
+            for curve_dict in curves_data:
+                array_info = None
+                if "array_info" in curve_dict:
+                    ai = curve_dict["array_info"]
+                    array_info = ArrayElementInfo(
+                        base_name=ai.get("base_name", ""),
+                        index=ai.get("index", 0),
+                        time_offset=ai.get("time_offset"),
+                    )
+                las_file.curves.append(CurveDefinition(
+                    mnemonic=curve_dict.get("mnemonic", ""),
+                    unit=curve_dict.get("unit", ""),
+                    api_code=curve_dict.get("api_code", ""),
+                    description=curve_dict.get("description", ""),
+                    data_format=curve_dict.get("data_format", ""),
+                    array_info=array_info,
+                ))
+        else:
+            # Legacy format: only curve names available
+            for curve_name in curves_order:
+                las_file.curves.append(CurveDefinition(mnemonic=curve_name))
 
         params = data.get("parameters", {})
         for mnemonic, value in params.items():

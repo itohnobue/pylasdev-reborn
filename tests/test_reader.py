@@ -314,3 +314,152 @@ class TestDataReaderEdgeCases:
         assert len(data["logs"]["DEPT"]) == 2
         np.testing.assert_array_almost_equal(data["logs"]["DEPT"], [100.0, 101.0])
         np.testing.assert_array_almost_equal(data["logs"]["DT"], [50.0, 51.0])
+
+    def test_duplicate_curve_names_renamed_with_warning(self, tmp_path: Path) -> None:
+        """Test that duplicate curve mnemonics are renamed with a warning."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma Ray 1\n"
+            " GR.GAPI  :  Gamma Ray 2\n"
+            "~A  DEPT  GR  GR\n"
+            "100.0  10.0  20.0\n"
+            "101.0  11.0  21.0\n"
+        )
+        test_file = tmp_path / "dup_curves.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            data = read_las_file(test_file)
+            assert any("Duplicate curve mnemonic" in str(x.message) for x in w)
+
+        # Second GR should be renamed to GR_2
+        assert "GR" in data["logs"]
+        assert "GR_2" in data["logs"]
+        np.testing.assert_array_equal(data["logs"]["GR"], [10.0, 11.0])
+        np.testing.assert_array_equal(data["logs"]["GR_2"], [20.0, 21.0])
+
+    def test_duplicate_curves_metadata_synced(self, tmp_path: Path) -> None:
+        """Test that CurveDefinition objects are synced with renamed curves_order."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma Ray 1\n"
+            " GR.GAPI  :  Gamma Ray 2\n"
+            "~A  DEPT  GR  GR\n"
+            "100.0  10.0  20.0\n"
+            "101.0  11.0  21.0\n"
+        )
+        test_file = tmp_path / "dup_meta.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True):
+            _warnings.simplefilter("always")
+            las = read_las_file_as_object(test_file)
+
+        # curves_order and curves mnemonics must match
+        assert las.curves_order == ["DEPT", "GR", "GR_2"]
+        assert [c.mnemonic for c in las.curves] == ["DEPT", "GR", "GR_2"]
+
+        # get_curve_by_mnemonic must find renamed curve
+        gr2 = las.get_curve_by_mnemonic("GR_2")
+        assert gr2 is not None
+        assert gr2.unit == "GAPI"
+        assert gr2.original_mnemonic == "GR"
+
+        # to_dict should have consistent curves and curves_order
+        d = las.to_dict()
+        dict_mnemonics = [c["mnemonic"] for c in d["curves"]]
+        assert dict_mnemonics == d["curves_order"]
+
+    def test_unsupported_version_warns_but_reads(self, tmp_path: Path) -> None:
+        """Test that unsupported LAS version emits warning but still reads."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   4.0  : FUTURE VERSION\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~A  DEPT\n"
+            "100.0\n"
+        )
+        test_file = tmp_path / "v4.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            data = read_las_file(test_file)
+            assert any("not officially supported" in str(x.message) for x in w)
+
+        # Data should still be read successfully
+        assert "DEPT" in data["logs"]
+        assert data["logs"]["DEPT"][0] == 100.0
+
+    def test_unsupported_version_warns_as_object(self, tmp_path: Path) -> None:
+        """Test warning from read_las_file_as_object for unsupported version."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   5.0  : FUTURE VERSION\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~A  DEPT\n"
+            "100.0\n"
+        )
+        test_file = tmp_path / "v5.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            las = read_las_file_as_object(test_file)
+            assert any("not officially supported" in str(x.message) for x in w)
+
+        # Data should still be read
+        assert "DEPT" in las.logs
+
+    def test_max_file_size_limit(self, tmp_path: Path) -> None:
+        """Test that max_file_size parameter rejects oversized files."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~A  DEPT\n"
+            "100.0\n"
+        )
+        test_file = tmp_path / "size_test.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Should succeed with generous limit
+        data = read_las_file(test_file, max_file_size=10_000_000)
+        assert "DEPT" in data["logs"]
+
+        # Should fail with tiny limit
+        with pytest.raises(ValueError, match="exceeds maximum"):
+            read_las_file(test_file, max_file_size=10)

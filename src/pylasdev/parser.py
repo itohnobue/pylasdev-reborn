@@ -90,6 +90,8 @@ class LASParser:
     def __init__(self, mnem_base: dict[str, str] | None = None) -> None:
         """Initialize parser with optional mnemonic base."""
         self.mnem_base = mnem_base or {}
+        # Build uppercased lookup for case-insensitive matching
+        self._mnem_base_upper = {k.upper(): v for k, v in self.mnem_base.items()}
         self._reset()
 
     def _reset(self) -> None:
@@ -237,7 +239,7 @@ class LASParser:
             )
 
         # Apply mnemonic normalization from mnem_base
-        normalized = self.mnem_base.get(raw_mnemonic, raw_mnemonic)
+        normalized = self._mnem_base_upper.get(raw_mnemonic, raw_mnemonic)
 
         curve = CurveDefinition(
             mnemonic=normalized,

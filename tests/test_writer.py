@@ -55,7 +55,7 @@ class TestWriteLASFile:
         assert "VERS" in content
         assert "DEPT" in content
         assert "DT" in content
-        assert "100.0000" in content
+        assert "100" in content
 
     def test_write_preserves_version(self, sample_las_data: dict, tmp_path: Path) -> None:
         """Test that version info is preserved in output."""
@@ -119,7 +119,7 @@ class TestWriteLASFile:
         content = temp_file.read_text()
         assert "~A" in content
         # Check numeric data is written
-        assert "1670.0000" in content
+        assert "1670" in content
 
     def test_write_read_roundtrip(self, sample_las_data: dict, tmp_path: Path) -> None:
         """Test that write then read produces equivalent data."""
@@ -133,7 +133,7 @@ class TestWriteLASFile:
             np.testing.assert_array_almost_equal(
                 reread["logs"][curve],
                 sample_las_data["logs"][curve],
-                decimal=3,
+                decimal=6,
             )
 
     def test_write_empty_data(self, tmp_path: Path) -> None:
@@ -330,8 +330,8 @@ class TestWriteLASFile:
 
         content = temp_file.read_text()
         assert "~A CURVE" in content
-        assert "100.0000" in content
-        assert "50.0000" in content
+        assert "100" in content
+        assert "50" in content
 
     def test_write_las30_string_data(self, tmp_path: Path) -> None:
         """Test writing LAS 3.0 string data in data_sections."""
@@ -359,3 +359,18 @@ class TestWriteLASFile:
         content = temp_file.read_text()
         assert "LIMESTONE" in content
         assert "DOLOMITE" in content
+
+    def test_write_non_numeric_null(self, tmp_path: Path) -> None:
+        """Test that non-numeric NULL value falls back to -999.25."""
+        las = LASFile()
+        las.version = VersionSection(vers="2.0")
+        las.well["NULL"] = "NONE"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        temp_file = tmp_path / "null_test.las"
+        write_las_file(temp_file, las)  # Should not crash
+
+        content = temp_file.read_text()
+        assert "100" in content

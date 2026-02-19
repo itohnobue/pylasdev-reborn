@@ -26,7 +26,7 @@ class TestRoundTrip:
             np.testing.assert_array_almost_equal(
                 sample_las_data["logs"][curve],
                 roundtrip["logs"][curve],
-                decimal=4,
+                decimal=6,
             )
 
     def test_roundtrip_all_files(self, all_las_files: list[Path], tmp_path: Path) -> None:
@@ -48,3 +48,26 @@ class TestRoundTrip:
                         f"Shape mismatch for {curve} in {las_path.name}: "
                         f"{original['logs'][curve].shape} vs {roundtrip['logs'][curve].shape}"
                     )
+
+    def test_roundtrip_preserves_curve_metadata(self) -> None:
+        """Test that to_dict/from_dict round-trip preserves curve metadata."""
+        from pylasdev.models import CurveDefinition, LASFile, VersionSection
+
+        las = LASFile()
+        las.version = VersionSection(vers="2.0")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "DT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", description="DEPTH"))
+        las.curves.append(CurveDefinition(mnemonic="DT", unit="US/M", api_code="123", description="SONIC"))
+        las.logs["DEPT"] = np.array([100.0])
+        las.logs["DT"] = np.array([50.0])
+
+        d = las.to_dict()
+        restored = LASFile.from_dict(d)
+
+        assert len(restored.curves) == 2
+        assert restored.curves[0].unit == "M"
+        assert restored.curves[0].description == "DEPTH"
+        assert restored.curves[1].unit == "US/M"
+        assert restored.curves[1].api_code == "123"
+        assert restored.curves[1].description == "SONIC"

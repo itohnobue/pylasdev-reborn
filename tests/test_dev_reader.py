@@ -84,6 +84,28 @@ class TestReadDEVFile:
         data = read_dev_file(sample_dev, encoding="utf-8")
         assert len(data) > 0
 
+    def test_ragged_columns_fill_nan(self, tmp_path: Path) -> None:
+        """Test that missing values in ragged DEV data become NaN, not 0.0."""
+        content = (
+            "# DEV file with ragged data\n"
+            "MD TVD X Y\n"
+            "0.0 0.0 100.0 200.0\n"
+            "100.0 99.0 101.0\n"
+            "200.0 198.0\n"
+        )
+        test_file = tmp_path / "ragged.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Row 1 (index 1): Y is missing → should be NaN
+        assert np.isnan(data["Y"][1])
+        # Row 2 (index 2): X and Y are missing → both NaN
+        assert np.isnan(data["X"][2])
+        assert np.isnan(data["Y"][2])
+        # Filled values should be correct
+        assert data["MD"][1] == 100.0
+        assert data["TVD"][2] == 198.0
+
     def test_dev_file_model(self) -> None:
         """Test DevFile model to_dict."""
         dev = DevFile()
