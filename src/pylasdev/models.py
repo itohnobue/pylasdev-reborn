@@ -6,34 +6,10 @@ Supports LAS 1.2, 2.0, and 3.0 formats.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
-
-
-class DelimiterType(Enum):
-    """Delimiter types for LAS 3.0 data sections."""
-
-    SPACE = "SPACE"
-    TAB = "TAB"
-    COMMA = "COMMA"
-
-
-class DataFormatType(Enum):
-    """Data format types for LAS 3.0 curve definitions.
-
-    F: Float
-    E: Scientific notation (0.00E00)
-    S: String
-    A: Array (with time offset)
-    """
-
-    FLOAT = "F"
-    SCIENTIFIC = "E"
-    STRING = "S"
-    ARRAY = "A"
 
 
 @dataclass
@@ -326,10 +302,6 @@ class LASFile:
             if curve.mnemonic == mnemonic or curve.base_mnemonic == mnemonic:
                 return curve
         return None
-
-    def get_parameters_by_zone(self, zone_name: str) -> list[ParameterEntry]:
-        """Get all parameters associated with a zone (LAS 3.0)."""
-        return [p for p in self.parameters if p.zone and p.zone.zone_name == zone_name]
 
     def get_array_curves(self, base_name: str) -> list[CurveDefinition]:
         """Get all array elements for a base curve name (LAS 3.0)."""

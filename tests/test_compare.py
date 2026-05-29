@@ -44,6 +44,12 @@ class TestCompareLasDicts:
         d2 = {"well": {"STRT": "100", "STOP": "200"}}
         assert compare_las_dicts(d1, d2) is False
 
+    def test_extra_nested_key(self) -> None:
+        """Test comparing dicts where first has extra nested key."""
+        d1 = {"well": {"STRT": "100", "STOP": "200"}}
+        d2 = {"well": {"STRT": "100"}}
+        assert compare_las_dicts(d1, d2) is False
+
     def test_array_size_mismatch(self) -> None:
         """Test comparing dicts with different array sizes."""
         d1 = {"logs": {"DEPT": np.array([1.0, 2.0])}}
@@ -90,3 +96,9 @@ class TestCompareLasDicts:
     def test_empty_dicts(self) -> None:
         """Test comparing empty dicts."""
         assert compare_las_dicts({}, {}) is True
+
+    def test_key_in_first_not_in_second(self) -> None:
+        """Test comparing dicts where dict1 has key not in dict2."""
+        d1 = {"version": {"VERS": "2.0"}, "extra": "value"}
+        d2 = {"version": {"VERS": "2.0"}}
+        assert compare_las_dicts(d1, d2) is False

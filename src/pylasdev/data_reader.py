@@ -119,7 +119,10 @@ def _read_normal(
 
     in_ascii = False
     current_line = 0
-    null_value = float(las_file.well.get("NULL", "-999.25"))
+    try:
+        null_value = float(las_file.well.get("NULL", "-999.25"))
+    except (ValueError, TypeError):
+        null_value = -999.25
 
     for line in lines:
         stripped = line.strip()
@@ -141,11 +144,17 @@ def _read_normal(
             try:
                 las_file.logs[las_file.curves_order[i]][current_line] = float(values[i])
             except (ValueError, IndexError):
-                las_file.logs[las_file.curves_order[i]][current_line] = null_value
+                # IndexError can occur when curve_count was reduced after deduplication
+                # (the pre-allocated arrays are sized for the deduplicated curve_count
+                # which may be smaller than the original data column count)
+                # ValueError covers non-numeric values — fill with null_value
+                if i < curve_count:
+                    las_file.logs[las_file.curves_order[i]][current_line] = null_value
 
         # Fill remaining curves with null_value when line has fewer values
         for i in range(len(values), curve_count):
-            las_file.logs[las_file.curves_order[i]][current_line] = null_value
+            if current_line < len(las_file.logs[las_file.curves_order[i]]):
+                las_file.logs[las_file.curves_order[i]][current_line] = null_value
 
         current_line += 1
 
@@ -175,7 +184,10 @@ def _read_wrapped(
     in_ascii = False
     depth_line = True  # First data line is always a depth line
     counter = 0  # Tracks position within non-depth curves
-    null_value = float(las_file.well.get("NULL", "-999.25"))
+    try:
+        null_value = float(las_file.well.get("NULL", "-999.25"))
+    except (ValueError, TypeError):
+        null_value = -999.25
 
     for line in lines:
         stripped = line.strip()

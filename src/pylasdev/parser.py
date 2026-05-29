@@ -100,10 +100,14 @@ class LASParser:
         self._current_section: str | None = None
         self._current_section_name: str = ""
         self._line_number = 0
-        self._wrap_mode = False
         self._data_line_count = 0
         self._ascii_data_lines: list[str] = []
         self._current_data_section_idx: int = 0
+
+    @property
+    def data_line_count(self) -> int:
+        """Public accessor for pre-scanned data line count."""
+        return self._data_line_count
 
     def parse(self, content: str) -> LASFile:
         """Parse LAS file content string."""
@@ -180,7 +184,6 @@ class LASParser:
             self.las_file.version.vers = value
         elif mnemonic == "WRAP":
             self.las_file.version.wrap = value.upper()
-            self._wrap_mode = value.upper() == "YES"
         elif mnemonic == "DLM":
             self.las_file.version.dlm = value
 
@@ -331,8 +334,11 @@ class LASParser:
         # Determine which curves are string type
         string_curves = {i: c.data_format == "S" for i, c in enumerate(curves)}
 
-        # Get null value
-        null_value = float(self.las_file.well.get("NULL", "-999.25"))
+        # Get null value (with try/except for non-numeric null strings, matching writer.py)
+        try:
+            null_value = float(self.las_file.well.get("NULL", "-999.25"))
+        except (ValueError, TypeError):
+            null_value = -999.25
 
         # Create data section
         data_section = DataSection(

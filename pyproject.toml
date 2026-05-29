@@ -39,7 +39,7 @@ pandas = ["pandas>=2.0"]
 all = ["pylasdev[dev,pandas]"]
 
 [project.urls]
-Homepage = "https://github.com/user/pylasdev"
+Homepage = "https://github.com/username/pylasdev"
 
 # UV configuration
 [tool.uv]

@@ -264,3 +264,116 @@ Line two of free text.
         assert las2.version.vers == "1.20"
         assert len(las2.curves) == 1
         assert las2.curves_order == ["DEPTH"]
+
+    # --- TEST-05: Multiple ~A section handling for LAS 3.0 ---
+    def test_las30_multiple_data_sections(self) -> None:
+        """Test LAS 3.0 with multiple ~A data sections."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+~A FirstSection
+100.0,50.0
+101.0,51.0
+~A SecondSection
+200.0,60.0
+201.0,61.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.data_sections) == 2
+        assert las.data_sections[0].name == "FirstSection"
+        assert las.data_sections[1].name == "SecondSection"
+        # First section data
+        assert len(las.data_sections[0].data["DEPT"]) == 2
+        assert las.data_sections[0].data["DEPT"][0] == 100.0
+        # Second section data
+        assert len(las.data_sections[1].data["DEPT"]) == 2
+        assert las.data_sections[1].data["DEPT"][0] == 200.0
+
+    # --- TEST-15: _parse_version/_parse_well return on non-matching line ---
+    def test_version_non_matching_line(self) -> None:
+        """Test that _parse_version ignores lines that don't match data pattern."""
+        content = """~VERSION INFORMATION
+ This line has no dot separator
+ VERS.   3.0  : CWLS LOG ASCII STANDARD
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        # Should still parse VERS line, ignoring the bad line
+        assert las.version.vers == "3.0"
+
+    def test_well_non_matching_line(self) -> None:
+        """Test that _parse_well ignores non-matching lines."""
+        content = """~VERSION INFORMATION
+ VERS.   2.0  : CWLS LOG ASCII STANDARD
+ WRAP.   NO   : ONE LINE PER DEPTH STEP
+~WELL INFORMATION
+ Not a valid well line
+ STRT.M   1670.0 : START DEPTH
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert las.well["STRT"] == "1670.0"
+
+    # --- TEST-16: Comment skip / space delimiter / string-curve fallback in ASCII data ---
+    def test_las30_ascii_comment_skip(self) -> None:
+        """Test that comments in LAS 3.0 ASCII data are skipped."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+~A
+# This is a comment in data
+100.0,50.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.data_sections) == 1
+        # Should only have 1 data row, comment skipped
+        assert len(las.data_sections[0].data["DEPT"]) == 1
+
+    def test_las30_space_delimiter(self) -> None:
+        """Test LAS 3.0 with SPACE delimiter (default split behavior)."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   SPACE :
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+~A
+100.0  50.0
+101.0  51.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert las.data_sections[0].data["DEPT"][0] == 100.0
+        assert las.data_sections[0].data["DT"][0] == 50.0
+
+    def test_las30_string_curve_fallback(self) -> None:
+        """Test that non-numeric values in non-string curves fallback to null_value."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ CDES.        : CORE DESC {S}
+~A
+100.0,BAD_STRING
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        # CDES is string type, so BAD_STRING should be stored as string
+        assert "CDES" in las.string_data
+        assert las.string_data["CDES"][0] == "BAD_STRING"
+

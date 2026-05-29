@@ -115,3 +115,27 @@ class TestReadDEVFile:
         assert "MD" in d
         assert "TVD" in d
         np.testing.assert_array_equal(d["MD"], np.array([0.0, 100.0, 200.0]))
+
+    def test_directory_input_raises_error(self, tmp_path: Path) -> None:
+        """Test that passing a directory path raises DEVReadError."""
+        with pytest.raises(DEVReadError, match="Not a file"):
+            read_dev_file(tmp_path)
+
+    def test_non_numeric_values(self, tmp_path: Path) -> None:
+        """Test DEV file with non-numeric values gets substituted with NaN."""
+        content = (
+            "MD TVD X Y\n"
+            "0.0 0.0 100.0 200.0\n"
+            "100.0 BAD 101.0 201.0\n"
+            "200.0 198.0 102.0 ERR\n"
+        )
+        test_file = tmp_path / "nonnum.dev"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_dev_file(test_file)
+        # BAD in TVD column -> NaN
+        assert np.isnan(data["TVD"][1])
+        # ERR in Y column -> NaN
+        assert np.isnan(data["Y"][2])
+        # Other values should parse correctly
+        assert data["MD"][1] == 100.0
+        assert data["X"][2] == 102.0

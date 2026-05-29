@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest import mock
 
 from pylasdev.encoding import FALLBACK_ENCODINGS, detect_encoding, read_with_encoding
 
@@ -23,6 +24,18 @@ class TestDetectEncoding:
         test_file.write_text("Simple ASCII text\n", encoding="utf-8")
         result = detect_encoding(test_file)
         assert isinstance(result, str)
+
+    # --- TEST-14: HAS_CHARDET=False path ---
+    def test_detect_without_chardet(self, tmp_path: Path) -> None:
+        """Test detect_encoding when chardet is not available."""
+        test_file = tmp_path / "test.las"
+        test_file.write_text("Simple text", encoding="utf-8")
+
+        # Mock HAS_CHARDET to False to exercise the fallback path
+        with mock.patch("pylasdev.encoding.HAS_CHARDET", False):
+            enc = detect_encoding(test_file)
+            # Without chardet, should return utf-8 (fallback)
+            assert enc == "utf-8"
 
 
 class TestReadWithEncoding:

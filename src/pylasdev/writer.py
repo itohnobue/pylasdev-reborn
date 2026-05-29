@@ -12,6 +12,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+from numpy.typing import NDArray
+
 from .exceptions import LASWriteError
 from .models import LASFile
 
@@ -47,44 +50,52 @@ def write_las_file(
 
 
 def _generate_las_content(las_file: LASFile) -> str:
-    """Generate LAS file content string with metadata preservation.
+    """Generate LAS file content string with metadata preservation."""
+    lines: list[str] = []
+    lines.extend(_write_version_section(las_file))
+    lines.extend(_write_well_section(las_file))
+    lines.extend(_write_curve_section(las_file))
+    lines.extend(_write_parameter_section(las_file))
+    lines.extend(_write_other_section(las_file))
+    lines.extend(_write_ascii_sections(las_file))
+    return "\n".join(lines) + "\n"
 
-    Supports LAS 3.0 features including:
-    - DLM field in version section
-    - Array notation in curves
-    - Format specifiers ({F}, {E}, {S}, {A:x})
-    - Zone associations in parameters
-    """
+
+def _write_version_section(las_file: LASFile) -> list[str]:
+    """Write ~V Version section."""
     lines: list[str] = []
     is_las30 = las_file.is_las30
-
-    # ~V Version section
     lines.append("~VERSION INFORMATION")
     vers_desc = "CWLS LOG ASCII STANDARD -VERSION 3.0" if is_las30 else "CWLS LOG ASCII STANDARD"
     lines.append(f" VERS.   {las_file.version.vers}  : {vers_desc}")
     # Always write WRAP=NO since we write one line per depth step (non-wrapped)
-    # Even if the original file had WRAP=YES, our output is always non-wrapped
     lines.append(" WRAP.   NO  : ONE LINE PER DEPTH STEP")
-
-    # LAS 3.0: Add DLM field
     if is_las30:
         dlm_desc = "DELIMITING CHARACTER BETWEEN DATA COLUMNS"
         lines.append(f" DLM .                        {las_file.version.dlm} : {dlm_desc}")
     lines.append("")
+    return lines
 
-    # ~W Well section
+
+def _write_well_section(las_file: LASFile) -> list[str]:
+    """Write ~W Well section."""
+    lines: list[str] = []
     lines.append("~WELL INFORMATION")
     for key, value in las_file.well.entries.items():
         lines.append(f" {key}.   {value}  :")
     lines.append("")
+    return lines
 
-    # ~C Curve section — preserve units and descriptions
+
+def _write_curve_section(las_file: LASFile) -> list[str]:
+    """Write ~C Curve section — preserve units and descriptions."""
+    lines: list[str] = []
+    is_las30 = las_file.is_las30
     lines.append("~CURVE INFORMATION")
     for curve in las_file.curves:
         unit = curve.unit if curve.unit else ""
         desc = curve.description if curve.description else ""
 
-        # LAS 3.0: Add format specifier
         if is_las30 and curve.data_format:
             format_str = f"{{{curve.data_format}"
             if curve.array_info and curve.array_info.time_offset is not None:
@@ -95,77 +106,106 @@ def _generate_las_content(las_file: LASFile) -> str:
         api = f"  {curve.api_code}" if curve.api_code else ""
         lines.append(f" {curve.mnemonic}.{unit}{api}  : {desc}")
     lines.append("")
+    return lines
 
-    # ~P Parameter section
-    if las_file.parameters:
-        lines.append("~PARAMETER INFORMATION")
-        for param in las_file.parameters:
-            unit = param.unit if param.unit else ""
-            desc = param.description if param.description else ""
 
-            # LAS 3.0: Add zone association
-            if is_las30 and param.zone:
-                zone_str = f" | {param.zone.zone_name}"
-                if param.zone.zone_index is not None:
-                    zone_str += f"[{param.zone.zone_index}]"
-                desc = f"{desc}{zone_str}"
+def _write_parameter_section(las_file: LASFile) -> list[str]:
+    """Write ~P Parameter section."""
+    lines: list[str] = []
+    if not las_file.parameters:
+        return lines
+    is_las30 = las_file.is_las30
+    lines.append("~PARAMETER INFORMATION")
+    for param in las_file.parameters:
+        unit = param.unit if param.unit else ""
+        desc = param.description if param.description else ""
 
-            lines.append(f" {param.mnemonic}.{unit}  {param.value}  : {desc}")
-        lines.append("")
+        if is_las30 and param.zone:
+            zone_str = f" | {param.zone.zone_name}"
+            if param.zone.zone_index is not None:
+                zone_str += f"[{param.zone.zone_index}]"
+            desc = f"{desc}{zone_str}"
 
-    # ~O Other section
+        lines.append(f" {param.mnemonic}.{unit}  {param.value}  : {desc}")
+    lines.append("")
+    return lines
+
+
+def _write_other_section(las_file: LASFile) -> list[str]:
+    """Write ~O Other section."""
+    lines: list[str] = []
     if las_file.other and las_file.other.strip():
         lines.append("~OTHER")
         lines.append(las_file.other.rstrip())
         lines.append("")
+    return lines
 
-    # ~A ASCII data section(s)
+
+def _write_ascii_sections(las_file: LASFile) -> list[str]:
+    """Write ~A ASCII data section(s)."""
+    lines: list[str] = []
+    try:
+        null_value = float(las_file.well.get("NULL", "-999.25"))
+    except (ValueError, TypeError):
+        null_value = -999.25
+    delimiter = las_file.version.delimiter_char
+
     if las_file.data_sections:
         # LAS 3.0: Multiple data sections
         for section in las_file.data_sections:
             section_name = f" {section.name}" if section.name else ""
             lines.append(f"~A{section_name}")
-
-            curve_names = section.curves_order
-            if curve_names and curve_names[0] in section.data:
-                num_rows = len(section.data[curve_names[0]])
-                try:
-                    null_value = float(las_file.well.get("NULL", "-999.25"))
-                except (ValueError, TypeError):
-                    null_value = -999.25
-                delimiter = las_file.version.delimiter_char
-
-                for i in range(num_rows):
-                    row_values: list[str] = []
-                    for name in curve_names:
-                        if name in las_file.string_data and i < len(las_file.string_data[name]):
-                            row_values.append(str(las_file.string_data[name][i]))
-                        elif name in section.data and i < len(section.data[name]):
-                            row_values.append(f"{section.data[name][i]:.8g}")
-                        else:
-                            row_values.append(f"{null_value:.8g}")
-                    lines.append(delimiter.join(row_values))
+            lines.extend(
+                _format_data_rows(
+                    section.curves_order,
+                    section.data,
+                    las_file.string_data,
+                    null_value,
+                    delimiter,
+                )
+            )
     else:
         # Legacy single data section
         curve_names = las_file.curves_order
         if curve_names and curve_names[0] in las_file.logs:
             lines.append("~A  " + "  ".join(curve_names))
-            num_rows = len(las_file.logs[curve_names[0]])
-            try:
-                null_value = float(las_file.well.get("NULL", "-999.25"))
-            except (ValueError, TypeError):
-                null_value = -999.25
-            delimiter = las_file.version.delimiter_char
+            lines.extend(
+                _format_data_rows(
+                    curve_names,
+                    las_file.logs,
+                    las_file.string_data,
+                    null_value,
+                    delimiter,
+                )
+            )
+    return lines
 
-            for i in range(num_rows):
-                vals: list[str] = []
-                for name in curve_names:
-                    if name in las_file.string_data and i < len(las_file.string_data[name]):
-                        vals.append(str(las_file.string_data[name][i]))
-                    elif name in las_file.logs and i < len(las_file.logs[name]):
-                        vals.append(f"{las_file.logs[name][i]:.8g}")
-                    else:
-                        vals.append(f"{null_value:.8g}")
-                lines.append(delimiter.join(vals))
 
-    return "\n".join(lines) + "\n"
+def _format_data_rows(
+    curve_names: list[str],
+    data: dict[str, NDArray[np.float64]],
+    string_data: dict[str, NDArray[np.str_]],
+    null_value: float,
+    delimiter: str,
+) -> list[str]:
+    """Format data rows for a section — handles both legacy and LAS 3.0 sections.
+
+    Builds one line per depth step with delimiter-separated values.
+    String curves are emitted as-is; numeric curves use :.8g formatting.
+    Missing values are filled with the null_value.
+    """
+    lines: list[str] = []
+    if not curve_names or curve_names[0] not in data:
+        return lines
+    num_rows = len(data[curve_names[0]])
+    for i in range(num_rows):
+        row_values: list[str] = []
+        for name in curve_names:
+            if name in string_data and i < len(string_data[name]):
+                row_values.append(str(string_data[name][i]))
+            elif name in data and i < len(data[name]):
+                row_values.append(f"{data[name][i]:.8g}")
+            else:
+                row_values.append(f"{null_value:.8g}")
+        lines.append(delimiter.join(row_values))
+    return lines

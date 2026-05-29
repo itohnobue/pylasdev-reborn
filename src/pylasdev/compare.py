@@ -31,35 +31,47 @@ def compare_las_dicts(
     Returns:
         True if the dictionaries are equivalent, False otherwise.
     """
-    # Check for keys in dict1 not present in dict2
-    for key in dict1:
-        if key not in dict2:
-            logger.warning("Key '%s' not found in second dict", key)
-            return False
+    # Check for key equality using set operations
+    if set(dict1.keys()) != set(dict2.keys()):
+        only_in_first = set(dict1.keys()) - set(dict2.keys())
+        only_in_second = set(dict2.keys()) - set(dict1.keys())
+        if only_in_first:
+            logger.warning("Keys only in first dict: %s", only_in_first)
+        if only_in_second:
+            logger.warning("Keys only in second dict: %s", only_in_second)
+        return False
 
     for key in dict2:
-        if key not in dict1:
-            logger.warning("Key '%s' not found in first dict", key)
-            return False
-
         val1, val2 = dict1[key], dict2[key]
 
         if isinstance(val2, dict):
-            # Check for keys in val1 not present in val2
+            # Check for key equality in nested dicts using set operations
             if isinstance(val1, dict):
-                for in_key in val1:
-                    if in_key not in val2:
-                        logger.warning("Key '%s.%s' not found in second dict", key, in_key)
-                        return False
+                if set(val1.keys()) != set(val2.keys()):
+                    only_in_first = set(val1.keys()) - set(val2.keys())
+                    only_in_second = set(val2.keys()) - set(val1.keys())
+                    if only_in_first:
+                        logger.warning("Keys '%s'.%s only in first dict", key, only_in_first)
+                    if only_in_second:
+                        logger.warning("Keys '%s'.%s only in second dict", key, only_in_second)
+                    return False
 
             for in_key in val2:
-                if in_key not in val1:
+                if isinstance(val1, dict) and in_key not in val1:
                     logger.warning("Key '%s.%s' not found in first dict", key, in_key)
                     return False
 
                 if isinstance(val2[in_key], np.ndarray):
                     if not _compare_arrays(val1[in_key], val2[in_key], key, in_key, rtol, atol):
                         return False
+                elif isinstance(val1[in_key], np.ndarray):
+                    # val1 has array but val2 doesn't — type mismatch
+                    logger.warning(
+                        "Type mismatch at '%s.%s': %s vs %s",
+                        key, in_key,
+                        type(val1[in_key]).__name__, type(val2[in_key]).__name__,
+                    )
+                    return False
                 elif val1[in_key] != val2[in_key]:
                     logger.warning(
                         "Mismatch at '%s.%s': %r vs %r", key, in_key, val1[in_key], val2[in_key]

@@ -76,7 +76,7 @@ if las.version.is_las30:
 
 ```bash
 # Clone and install dev dependencies
-git clone https://github.com/user/pylasdev.git
+git clone https://github.com/username/pylasdev.git
 cd pylasdev
 uv sync --extra dev
 
@@ -101,7 +101,7 @@ Complete rewrite from Python 2 to Python 3.12+.
 - Object-oriented API: `read_las_file_as_object()` returns typed `LASFile`
 - Encoding detection with chardet + fallback chain (cp1251, cp1252, cp866, latin-1)
 - Custom exception hierarchy: `LASReadError`, `LASWriteError`, `LASParseError`, `LASVersionError`, `LASEncodingError`, `DEVReadError`
-- Comprehensive pytest suite (112 tests, 92% coverage)
+- Comprehensive pytest suite (148 tests, 92% coverage)
 
 #### Performance Improvements
 - Wrapped mode: O(n²) → O(n) (fixed `numpy.append()` bug)

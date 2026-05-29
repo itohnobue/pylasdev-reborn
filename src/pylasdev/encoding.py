@@ -89,6 +89,7 @@ def read_with_encoding(
         except UnicodeDecodeError:
             continue
 
-    # Last resort
+    # The fallback chain always succeeds because latin-1 decodes any byte sequence.
+    # This point is unreachable but kept as a safety guard.
     content = file_path.read_text(encoding="utf-8", errors="replace")
     return "utf-8", content

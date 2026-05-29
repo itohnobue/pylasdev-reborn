@@ -148,6 +148,11 @@ class TestReadLASFileAsObject:
         with pytest.raises(LASReadError):
             read_las_file_as_object(tmp_path / "missing.las")
 
+    def test_not_a_file(self, tmp_path: Path) -> None:
+        """Test error for directory path."""
+        with pytest.raises(LASReadError, match="Not a file"):
+            read_las_file_as_object(tmp_path)
+
     def test_las30_object_has_version(self, test_data_dir: Path) -> None:
         """Test LAS 3.0 file parsed as object has correct version."""
         las30 = test_data_dir / "sample_3.0.las"
@@ -463,3 +468,177 @@ class TestDataReaderEdgeCases:
         # Should fail with tiny limit
         with pytest.raises(ValueError, match="exceeds maximum"):
             read_las_file(test_file, max_file_size=10)
+
+    # --- TEST-02: Non-numeric data triggers ValueError handler in _read_normal ---
+    def test_non_numeric_data_normal_mode(self, tmp_path: Path) -> None:
+        """Test that non-numeric values in normal mode trigger null_value substitution."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A  DEPT  DT\n"
+            "100.0  BAD\n"
+            "101.0  51.0\n"
+        )
+        test_file = tmp_path / "bad_data.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_las_file(test_file)
+        # BAD should be replaced with null_value (-999.25)
+        assert data["logs"]["DT"][0] == -999.25
+        # DEPT is fine
+        assert data["logs"]["DEPT"][0] == 100.0
+        # Next row should be fine
+        assert data["logs"]["DT"][1] == 51.0
+
+    # --- TEST-03: Wrapped-mode incomplete depth step padding ---
+    def test_wrapped_incomplete_step_padding(self, tmp_path: Path) -> None:
+        """Test wrapped mode padding when curves have unequal lengths."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            " GR.GAPI  :  Gamma Ray\n"
+            "~A\n"
+            "100.0\n"
+            "50.0\n"
+            "75.0\n"
+            "101.0\n"
+            "51.0\n"
+            # Missing GR for second depth step (incomplete)
+        )
+        test_file = tmp_path / "wrapped_short.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            data = read_las_file(test_file)
+            # Should have padding warning
+            assert any("Padding" in str(x.message) for x in w)
+
+        # All arrays should be same length after padding
+        sizes = [len(data["logs"][c]) for c in data["curves_order"]]
+        assert len(set(sizes)) == 1
+        # GR should have null_value for the last step
+        assert data["logs"]["GR"][-1] == -999.25
+
+    # --- TEST-04: Wrapped-mode depth line has >1 value ---
+    def test_wrapped_depth_line_extra_values(self, tmp_path: Path) -> None:
+        """Test wrapped mode warns when depth line has multiple values."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A\n"
+            # First depth line: 1 value (< curve_count) -> _detect_actual_wrap returns True
+            "100.0\n"
+            # DT for first step
+            "50.0\n"
+            # Second depth line: 2 values -> > 1, triggers warning
+            "101.0  99.0\n"
+            # DT for second step
+            "51.0\n"
+        )
+        test_file = tmp_path / "wrapped_extra_depth.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            data = read_las_file(test_file)
+            assert any("depth line has 2 values" in str(x.message) for x in w)
+
+        # DEPT should only have the correct depth values (100.0, 101.0)
+        assert data["logs"]["DEPT"][0] == 100.0
+        assert data["logs"]["DEPT"][1] == 101.0
+        # DT should have correct values
+        assert data["logs"]["DT"][0] == 50.0
+        assert data["logs"]["DT"][1] == 51.0
+
+    # --- TEST-11: Zero-curve early return ---
+    def test_zero_curves_early_return(self, tmp_path: Path) -> None:
+        """Test reading LAS file with empty curve section returns empty logs."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            "~A\n"
+            "100.0\n"
+        )
+        test_file = tmp_path / "no_curves.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_las_file(test_file)
+        assert data["logs"] == {}
+        assert data["curves_order"] == []
+
+    # --- TEST-12: _detect_actual_wrap with no data after ~A ---
+    def test_detect_wrap_no_data(self, tmp_path: Path) -> None:
+        """Test _detect_actual_wrap returns True when no data lines exist."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~A\n"
+            "# Just a comment, no data\n"
+        )
+        test_file = tmp_path / "wrap_no_data.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Should not crash — _detect_actual_wrap defaults to True
+        data = read_las_file(test_file)
+        assert isinstance(data, dict)
+
+    # --- TEST-13: Wrapped-mode ValueError/IndexError handlers ---
+    def test_wrapped_malformed_data_handlers(self, tmp_path: Path) -> None:
+        """Test wrapped mode ValueError/IndexError handlers substitute null_value."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            " GR.GAPI  :  Gamma Ray\n"
+            "~A\n"
+            # Depth line with non-numeric value (ValueError)
+            "BAD\n"
+            "50.0\n"
+            "75.0\n"
+        )
+        test_file = tmp_path / "wrapped_bad.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_las_file(test_file)
+        # BAD in depth should become null_value
+        assert data["logs"]["DEPT"][0] == -999.25
+        # DT and GR should be fine
+        assert data["logs"]["DT"][0] == 50.0
+        assert data["logs"]["GR"][0] == 75.0

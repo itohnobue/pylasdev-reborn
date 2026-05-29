@@ -110,6 +110,40 @@ class TestParameterEntry:
         assert d["mnemonic"] == "BS"
         assert d["value"] == "200"
 
+    def test_with_array_index(self) -> None:
+        """Test ParameterEntry with array_index set."""
+        p = ParameterEntry(mnemonic="RUN[1]", value="1.0", array_index=1)
+        assert p.array_index == 1
+        assert p.base_mnemonic == "RUN"
+        d = p.to_dict()
+        assert d["array_index"] == 1
+
+    def test_with_zone(self) -> None:
+        """Test ParameterEntry with zone association."""
+        from pylasdev.models import ParameterZone
+
+        p = ParameterEntry(
+            mnemonic="MATR", value="SAND", description="Matrix",
+            zone=ParameterZone(zone_name="RUN", zone_index=1),
+        )
+        assert p.zone is not None
+        assert p.zone.zone_name == "RUN"
+        assert p.zone.zone_index == 1
+        d = p.to_dict()
+        assert d["zone"]["zone_name"] == "RUN"
+        assert d["zone"]["zone_index"] == 1
+
+    def test_base_mnemonic_without_array_index(self) -> None:
+        """Test base_mnemonic for parameter without array index."""
+        p = ParameterEntry(mnemonic="BHT", value="35")
+        assert p.base_mnemonic == "BHT"
+
+    def test_base_mnemonic_without_bracket(self) -> None:
+        """Test base_mnemonic when array_index is set but no bracket in mnemonic."""
+        p = ParameterEntry(mnemonic="RUN", value="1", array_index=1)
+        # array_index is set but mnemonic has no '[' -> returns mnemonic
+        assert p.base_mnemonic == "RUN"
+
 
 class TestLASFile:
     """Tests for LASFile dataclass."""
@@ -174,6 +208,32 @@ class TestLASFile:
         las.curves.append(CurveDefinition(mnemonic="DT"))
         assert las.get_curve_by_mnemonic("DT") is not None
         assert las.get_curve_by_mnemonic("MISSING") is None
+
+    def test_get_array_curves(self) -> None:
+        """Test get_array_curves filters curves by base array name."""
+        from pylasdev.models import ArrayElementInfo
+
+        las = LASFile()
+        las.curves.append(CurveDefinition(mnemonic="DEPT"))
+        las.curves.append(CurveDefinition(
+            mnemonic="NMR[1]",
+            array_info=ArrayElementInfo(base_name="NMR", index=1),
+        ))
+        las.curves.append(CurveDefinition(
+            mnemonic="NMR[2]",
+            array_info=ArrayElementInfo(base_name="NMR", index=2),
+        ))
+        las.curves.append(CurveDefinition(
+            mnemonic="T1[1]",
+            array_info=ArrayElementInfo(base_name="T1", index=1),
+        ))
+
+        nmr_curves = las.get_array_curves("NMR")
+        assert len(nmr_curves) == 2
+        assert nmr_curves[0].mnemonic == "NMR[1]"
+        assert nmr_curves[1].mnemonic == "NMR[2]"
+
+        assert las.get_array_curves("NONEXIST") == []
 
 
 class TestDevFile:

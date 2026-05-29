@@ -7,10 +7,11 @@ Public API:
     compare_las_dicts() — Compare two LAS data dictionaries
     LASFile             — Dataclass for rich LAS file access
     DevFile             — Dataclass for DEV file access
+    MNEM_BASE           — Mnemonic alias database for curve name normalization
 """
 
 from .compare import compare_las_dicts
-from .dev_reader import read_dev_file
+from .dev_reader import read_dev_file, read_dev_file_as_object
 from .exceptions import (
     DEVReadError,
     LASEncodingError,
@@ -20,6 +21,7 @@ from .exceptions import (
     LASWriteError,
     PylasdevError,
 )
+from .mnem_base import MNEM_BASE
 from .models import CurveDefinition, DevFile, LASFile, ParameterEntry, VersionSection, WellSection
 from .reader import read_las_file, read_las_file_as_object
 from .writer import write_las_file
@@ -32,6 +34,7 @@ __all__ = [
     "compare_las_dicts",
     # New object API
     "read_las_file_as_object",
+    "read_dev_file_as_object",
     # Data models
     "LASFile",
     "DevFile",
@@ -39,6 +42,8 @@ __all__ = [
     "WellSection",
     "CurveDefinition",
     "ParameterEntry",
+    # Mnemonic base
+    "MNEM_BASE",
     # Exceptions
     "PylasdevError",
     "LASReadError",

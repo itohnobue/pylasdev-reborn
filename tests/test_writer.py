@@ -374,3 +374,26 @@ class TestWriteLASFile:
 
         content = temp_file.read_text()
         assert "100" in content
+
+    # --- TEST-17: LAS 3.0 data_sections with non-numeric NULL value ---
+    def test_write_las30_non_numeric_null_in_data_sections(self, tmp_path: Path) -> None:
+        """Test LAS 3.0 data_sections path with non-numeric NULL value fallback."""
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "NOT A NUMBER"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+
+        section = DataSection(
+            name="CURVE",
+            curves_order=["DEPT"],
+            data={"DEPT": np.array([100.0, 101.0])},
+        )
+        las.data_sections.append(section)
+
+        temp_file = tmp_path / "las30_null.las"
+        write_las_file(temp_file, las)  # Should not crash
+
+        content = temp_file.read_text()
+        assert "100" in content
+        assert "101" in content
