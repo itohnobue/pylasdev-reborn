@@ -9,7 +9,10 @@ Geoscience files commonly use:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+
+from .exceptions import LASEncodingError
 
 try:
     import chardet
@@ -18,7 +21,14 @@ try:
 except ImportError:
     HAS_CHARDET = False
 
-# Ordered by likelihood in Russian geoscience context
+logger = logging.getLogger(__name__)
+
+# Ordered by likelihood in Russian geoscience context.
+# latin-1 is used as the terminal fallback because it can decode any byte
+# sequence (every byte 0x00-0xFF maps to a valid character), guaranteeing
+# that read_with_encoding() always returns content even for files with
+# unknown or corrupted encodings. This design choice prioritizes data
+# recovery over strictness — geoscience files often have mixed encodings.
 FALLBACK_ENCODINGS = ["utf-8", "cp1251", "cp1252", "cp866", "latin-1"]
 
 
@@ -58,7 +68,8 @@ def read_with_encoding(
         Tuple of (detected_encoding, file_content).
 
     Raises:
-        UnicodeDecodeError: If no encoding in the fallback chain works.
+        UnicodeDecodeError: If the explicit encoding parameter fails to decode the file.
+        LASEncodingError: If no encoding in the fallback chain works.
         ValueError: If file exceeds max_file_size.
     """
     if max_file_size is not None:
@@ -79,7 +90,10 @@ def read_with_encoding(
         content = file_path.read_text(encoding=detected)
         return detected, content
     except UnicodeDecodeError:
-        pass
+        logger.debug(
+            "Failed to decode %s with detected encoding %s, trying fallback chain",
+            file_path, detected,
+        )
 
     # Fallback chain
     for enc in FALLBACK_ENCODINGS:
@@ -90,6 +104,9 @@ def read_with_encoding(
             continue
 
     # The fallback chain always succeeds because latin-1 decodes any byte sequence.
-    # This point is unreachable but kept as a safety guard.
-    content = file_path.read_text(encoding="utf-8", errors="replace")
-    return "utf-8", content
+    # This point should be unreachable, but if it is reached (e.g. because someone
+    # removed latin-1 from the fallback chain), raise a proper error instead of
+    # silently substituting replacement characters.
+    raise LASEncodingError(
+        f"Failed to decode {file_path} with any encoding in the fallback chain."
+    )

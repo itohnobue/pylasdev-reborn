@@ -277,7 +277,8 @@ class TestWriteLASFile:
         write_las_file(temp_file, las)
 
         content = temp_file.read_text()
-        assert "{A:0.0}" in content
+        # Time offset 0.0 is formatted as int 0 when it's a whole number
+        assert "{A:0}" in content
         assert "NMR[1]" in content
 
     def test_write_las30_zone_association(self, tmp_path: Path) -> None:
@@ -397,3 +398,66 @@ class TestWriteLASFile:
         content = temp_file.read_text()
         assert "100" in content
         assert "101" in content
+
+    # --- TEST-06: zone_index=None branch (line 125->127) ---
+    def test_write_zone_without_index(self, tmp_path: Path) -> None:
+        """Test writing LAS 3.0 parameter with zone but no zone_index.
+
+        When zone_index is None, the zone is written as "| ZONENAME"
+        without the [N] suffix (exercises writer.py line 125->127).
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+        las.parameters.append(
+            ParameterEntry(
+                mnemonic="TEMP",
+                unit="DEGC",
+                value="75.0",
+                description="Temperature",
+                zone=ParameterZone(zone_name="RUN", zone_index=None),
+            )
+        )
+
+        temp_file = tmp_path / "zone_no_index.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        assert "TEMP" in content
+        # Zone should be written without index: | RUN (not | RUN[1])
+        assert "| RUN" in content
+        assert "RUN[" not in content
+
+    # --- TEST-06: curve_names[0] not in data (line 199/198 guard) ---
+    def test_write_curve_names_not_in_data(self, tmp_path: Path) -> None:
+        """Test that _format_data_rows returns early when curve_names[0]
+        is not present in the data dict.
+
+        This guards against misconfigured data sections where curves_order
+        contains names that are not keys in the data dictionary.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "DT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.curves.append(CurveDefinition(mnemonic="DT", unit="US/M"))
+
+        # DataSection has curves_order but no data for DEPT
+        section = DataSection(
+            name="BROKEN",
+            curves_order=["DEPT", "DT"],
+            data={},  # Empty data — curve_names[0] not in data
+        )
+        las.data_sections.append(section)
+
+        temp_file = tmp_path / "no_data_keys.las"
+        write_las_file(temp_file, las)  # Should not crash
+
+        content = temp_file.read_text()
+        assert "~A BROKEN" in content
+        # No data rows should be written (guard at line 198 returns [])
+        # Content after ~A BROKEN should be empty or next section

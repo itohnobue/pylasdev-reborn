@@ -5,7 +5,6 @@ Example: {"AK": "DT", "APTS": "SP", ...}
 """
 
 MNEM_BASE: dict[str, str] = {
-    '"NKTDue;"': "NKT",
     "AHF30": "AHF20",
     "AHF60": "AHF20",
     "AHF90": "AHF20",

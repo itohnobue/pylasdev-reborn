@@ -11,11 +11,14 @@ Supports LAS 1.2, 2.0, and 3.0 formats.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import ClassVar
 
 import numpy as np
 
+from .data_reader import _deduplicate_curves
+from .exceptions import LASParseError
 from .models import (
     ArrayElementInfo,
     CurveDefinition,
@@ -24,6 +27,8 @@ from .models import (
     ParameterEntry,
     ParameterZone,
 )
+
+logger = logging.getLogger(__name__)
 
 # Section header: line starting with ~, followed by section letter or name
 SECTION_PATTERN = re.compile(r"^~([A-Za-z])(.*)")
@@ -99,26 +104,41 @@ class LASParser:
         self.las_file = LASFile()
         self._current_section: str | None = None
         self._current_section_name: str = ""
-        self._line_number = 0
         self._data_line_count = 0
         self._ascii_data_lines: list[str] = []
         self._current_data_section_idx: int = 0
+        self._version_found = False  # flag for required ~V section validation
 
     @property
     def data_line_count(self) -> int:
         """Public accessor for pre-scanned data line count."""
         return self._data_line_count
 
-    def parse(self, content: str) -> LASFile:
-        """Parse LAS file content string."""
+    def parse(self, content: str, lines: list[str] | None = None) -> LASFile:
+        """Parse LAS file content string.
+
+        Args:
+            content: Raw file content string. Used only if `lines` is not
+                provided, for backward compatibility.
+            lines: Pre-split lines list (PERF-01 optimization). When
+                provided, content is not split again, eliminating the
+                double splitlines() between parser and data_reader.
+        """
         self._reset()
 
-        lines = content.splitlines()
+        if lines is None:
+            lines = content.splitlines()
         self._pre_scan(lines)
 
-        for i, line in enumerate(lines, 1):
-            self._line_number = i
+        for line in lines:
             self._parse_line(line)
+
+        # Validation: a valid LAS file must have a ~V section
+        if not self._version_found and content.strip():
+            raise LASParseError(
+                "Content does not appear to be a valid LAS file: "
+                "missing required ~V (Version Information) section."
+            )
 
         # Process collected ASCII data only for LAS 3.0
         # For LAS 1.2/2.0, data_reader handles ASCII data with proper wrap mode support
@@ -173,6 +193,7 @@ class LASParser:
 
     def _parse_version(self, line: str) -> None:
         """Parse ~V (version) section line."""
+        self._version_found = True
         match = self._match_data_line(line)
         if not match:
             return
@@ -188,7 +209,14 @@ class LASParser:
             self.las_file.version.dlm = value
 
     def _parse_well(self, line: str) -> None:
-        """Parse ~W (well information) section line."""
+        """Parse ~W (well information) section line.
+
+        Note: Only the value portion of each well entry is preserved.
+        The unit field (e.g. 'M' in 'STRT.M') is discarded because
+        WellSection stores values as plain strings. This matches the
+        original pylasdev behavior where well values are simple strings
+        without unit metadata.
+        """
         match = self._match_data_line(line)
         if not match:
             return
@@ -312,7 +340,12 @@ class LASParser:
 
         In LAS 3.0, data can be delimited by SPACE, TAB, or COMMA.
         Data is collected and processed after all lines are parsed.
+
+        For LAS 1.2/2.0, ASCII data is handled by data_reader, so no
+        collection is needed here.
         """
+        if not self.las_file.version.is_las30:
+            return
         self._ascii_data_lines.append(line)
 
     def _process_ascii_data(self) -> None:
@@ -331,6 +364,11 @@ class LASParser:
         if not curves:
             return
 
+        # GD-05: Deduplicate curve names for LAS 3.0 path (same logic as
+        # data_reader._deduplicate_curves used for LAS 1.2/2.0).
+        _deduplicate_curves(self.las_file)
+        curves = self.las_file.curves  # refresh reference after dedup
+
         # Determine which curves are string type
         string_curves = {i: c.data_format == "S" for i, c in enumerate(curves)}
 
@@ -340,16 +378,46 @@ class LASParser:
         except (ValueError, TypeError):
             null_value = -999.25
 
-        # Create data section
+        # Create data section.
+        # NOTE (GD-11): LAS 3.0 _process_ascii_data currently uses the global
+        # curve set (self.las_file.curves) for all data sections. Per-section
+        # curve subsets (where different ~A sections define different curves)
+        # are not yet supported. If a LAS 3.0 file uses different curves per
+        # section, only the globally declared curves will be populated and
+        # extra columns in per-section data may be silently dropped.
         data_section = DataSection(
             name=self._current_section_name or f"Section_{self._current_data_section_idx}",
             curves_order=[c.mnemonic for c in curves],
         )
 
-        # Parse data lines
         num_curves = len(curves)
-        data_arrays: list[list[float | str]] = [[] for _ in range(num_curves)]
 
+        # PERF-03: Pre-allocate numpy arrays for numeric curves.
+        # String curves use list accumulation because np.empty(dtype=np.str_)
+        # would truncate variable-length strings (numpy infers a fixed
+        # max string length at creation time). Numeric curves get the full
+        # pre-allocation benefit.
+        # Count actual data lines (excluding comments) for array sizing.
+        actual_count = sum(
+            1 for line in self._ascii_data_lines if not COMMENT_PATTERN.match(line)
+        )
+
+        # Pre-allocate numeric arrays; defer string arrays
+        string_data_lists: dict[int, list[str]] = {}
+        for i, curve in enumerate(curves):
+            if string_curves.get(i, False):
+                # String curves: accumulate as list, convert at end
+                string_data_lists[i] = []
+                data_section.data[curve.mnemonic] = np.zeros(
+                    actual_count, dtype=np.float64
+                )
+            else:
+                arr = np.zeros(actual_count, dtype=np.float64)
+                self.las_file.logs[curve.mnemonic] = arr
+                data_section.data[curve.mnemonic] = arr
+
+        # Fill arrays by index (no list accumulation overhead for numerics)
+        idx = 0
         for line in self._ascii_data_lines:
             # Skip comment lines
             if COMMENT_PATTERN.match(line):
@@ -367,30 +435,34 @@ class LASParser:
                 values.append(str(null_value))
 
             for i in range(num_curves):
-                val_str = values[i].strip() if i < len(values) else str(null_value)
+                # After the while loop above, len(values) >= num_curves is guaranteed,
+                # so values[i] is always valid for i in range(num_curves).
+                val_str = values[i].strip()
                 try:
                     if string_curves.get(i, False):
-                        data_arrays[i].append(val_str)
+                        string_data_lists[i].append(val_str)
                     else:
+                        # Empty-string values (e.g. whitespace-only columns from
+                        # space-delimited files) are treated as null to match the
+                        # behavior of most LAS processing tools.
                         val = float(val_str) if val_str else null_value
-                        data_arrays[i].append(val)
+                        self.las_file.logs[curves[i].mnemonic][idx] = val
                 except ValueError:
                     if string_curves.get(i, False):
-                        data_arrays[i].append(val_str)
+                        string_data_lists[i].append(val_str)
                     else:
-                        data_arrays[i].append(null_value)
+                        self.las_file.logs[curves[i].mnemonic][idx] = null_value
 
-        # Convert to numpy arrays
+            idx += 1
+
+        # Convert string data lists to numpy arrays
+        # Using np.array(list, dtype=np.str_) infers the correct max string
+        # length, preserving the full string values (unlike np.empty).
         for i, curve in enumerate(curves):
-            if string_curves.get(i, False):
-                self.las_file.string_data[curve.mnemonic] = np.array(data_arrays[i], dtype=np.str_)
-                data_section.data[curve.mnemonic] = np.array(
-                    [0.0] * len(data_arrays[i]), dtype=np.float64
+            if i in string_data_lists:
+                self.las_file.string_data[curve.mnemonic] = np.array(
+                    string_data_lists[i], dtype=np.str_
                 )
-            else:
-                arr = np.array(data_arrays[i], dtype=np.float64)
-                self.las_file.logs[curve.mnemonic] = arr
-                data_section.data[curve.mnemonic] = arr
 
         # Store data section (LAS 3.0)
         self.las_file.data_sections.append(data_section)

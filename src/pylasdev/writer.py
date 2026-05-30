@@ -23,13 +23,19 @@ def write_las_file(
     file_path: str | Path,
     las_data: dict[str, Any] | LASFile,
     encoding: str = "utf-8",
+    precision: str = ".8g",
 ) -> None:
     """Write LAS data to file.
 
     Args:
         file_path: Output file path.
         las_data: LAS data as dict (legacy format) or LASFile object.
-        encoding: Output file encoding (default: utf-8).
+        encoding: Output file encoding (default: utf-8). If las_data is a
+            dict, this parameter is used directly (dicts from to_dict()
+            do not carry an encoding key). If las_data is a LASFile object,
+            the object's .encoding attribute is used instead of this default.
+        precision: Format specifier for numeric data values (default: '.8g').
+            Pass a Python format spec like '.6g' or '.10e' for more precision.
 
     Raises:
         LASWriteError: If file cannot be written.
@@ -38,18 +44,22 @@ def write_las_file(
 
     if isinstance(las_data, dict):
         las_file = LASFile.from_dict(las_data)
+        # Use detected encoding from the data dict if available,
+        # otherwise fall back to the explicit parameter.
+        file_encoding = las_data.get("encoding", encoding)
     else:
         las_file = las_data
+        file_encoding = las_file.encoding or encoding
 
-    content = _generate_las_content(las_file)
+    content = _generate_las_content(las_file, precision)
 
     try:
-        file_path.write_text(content, encoding=encoding)
+        file_path.write_text(content, encoding=file_encoding)
     except OSError as e:
         raise LASWriteError(f"Cannot write to {file_path}: {e}") from e
 
 
-def _generate_las_content(las_file: LASFile) -> str:
+def _generate_las_content(las_file: LASFile, precision: str = ".8g") -> str:
     """Generate LAS file content string with metadata preservation."""
     lines: list[str] = []
     lines.extend(_write_version_section(las_file))
@@ -57,7 +67,7 @@ def _generate_las_content(las_file: LASFile) -> str:
     lines.extend(_write_curve_section(las_file))
     lines.extend(_write_parameter_section(las_file))
     lines.extend(_write_other_section(las_file))
-    lines.extend(_write_ascii_sections(las_file))
+    lines.extend(_write_ascii_sections(las_file, precision))
     return "\n".join(lines) + "\n"
 
 
@@ -99,7 +109,12 @@ def _write_curve_section(las_file: LASFile) -> list[str]:
         if is_las30 and curve.data_format:
             format_str = f"{{{curve.data_format}"
             if curve.array_info and curve.array_info.time_offset is not None:
-                format_str += f":{curve.array_info.time_offset}"
+                # Format time_offset as int if it's a whole number, float otherwise
+                offset = curve.array_info.time_offset
+                if offset == int(offset):
+                    format_str += f":{int(offset)}"
+                else:
+                    format_str += f":{offset}"
             format_str += "}"
             desc = f"{desc}  {format_str}"
 
@@ -141,7 +156,7 @@ def _write_other_section(las_file: LASFile) -> list[str]:
     return lines
 
 
-def _write_ascii_sections(las_file: LASFile) -> list[str]:
+def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str]:
     """Write ~A ASCII data section(s)."""
     lines: list[str] = []
     try:
@@ -162,6 +177,7 @@ def _write_ascii_sections(las_file: LASFile) -> list[str]:
                     las_file.string_data,
                     null_value,
                     delimiter,
+                    precision,
                 )
             )
     else:
@@ -176,6 +192,7 @@ def _write_ascii_sections(las_file: LASFile) -> list[str]:
                     las_file.string_data,
                     null_value,
                     delimiter,
+                    precision,
                 )
             )
     return lines
@@ -187,12 +204,13 @@ def _format_data_rows(
     string_data: dict[str, NDArray[np.str_]],
     null_value: float,
     delimiter: str,
+    precision: str = ".8g",
 ) -> list[str]:
     """Format data rows for a section — handles both legacy and LAS 3.0 sections.
 
     Builds one line per depth step with delimiter-separated values.
-    String curves are emitted as-is; numeric curves use :.8g formatting.
-    Missing values are filled with the null_value.
+    String curves are emitted as-is; numeric curves use configurable formatting.
+    Missing values are filled with the null_value. NaN values are output as null.
     """
     lines: list[str] = []
     if not curve_names or curve_names[0] not in data:
@@ -204,8 +222,24 @@ def _format_data_rows(
             if name in string_data and i < len(string_data[name]):
                 row_values.append(str(string_data[name][i]))
             elif name in data and i < len(data[name]):
-                row_values.append(f"{data[name][i]:.8g}")
+                val = data[name][i]
+                if np.isnan(val):
+                    row_values.append(_format_number(null_value, precision))
+                else:
+                    row_values.append(_format_number(val, precision))
             else:
-                row_values.append(f"{null_value:.8g}")
+                row_values.append(_format_number(null_value, precision))
         lines.append(delimiter.join(row_values))
     return lines
+
+
+def _format_number(value: float, precision: str = ".8g") -> str:
+    """Format a numeric value with configurable precision.
+
+    Handles whole numbers as integers to avoid unnecessary decimal noise.
+    """
+    if np.isinf(value):
+        return format(float(value), precision)
+    if value == int(value):
+        return format(int(value), precision)
+    return format(float(value), precision)

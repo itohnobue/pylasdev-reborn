@@ -33,7 +33,13 @@ class VersionSection:
 
     @property
     def is_las30(self) -> bool:
-        """Check if this is a LAS 3.0 file."""
+        """Check if this is a LAS 3.0 file.
+
+        Uses string prefix matching ('3' prefix on the version string).
+        This is a deliberate design choice: LAS 3.x versions (3.0, 3.1,
+        etc.) all share the same structural features. A version string
+        like '3.1beta' or '3.0-draft' will match.
+        """
         return self.vers.startswith("3")
 
     @property
@@ -109,6 +115,8 @@ class CurveDefinition:
             "api_code": self.api_code,
             "description": self.description,
         }
+        if self.original_mnemonic:
+            result["original_mnemonic"] = self.original_mnemonic
         if self.data_format:
             result["data_format"] = self.data_format
         if self.array_info:
@@ -268,6 +276,7 @@ class LASFile:
                     unit=curve_dict.get("unit", ""),
                     api_code=curve_dict.get("api_code", ""),
                     description=curve_dict.get("description", ""),
+                    original_mnemonic=curve_dict.get("original_mnemonic", ""),
                     data_format=curve_dict.get("data_format", ""),
                     array_info=array_info,
                 ))

@@ -102,3 +102,44 @@ class TestCompareLasDicts:
         d1 = {"version": {"VERS": "2.0"}, "extra": "value"}
         d2 = {"version": {"VERS": "2.0"}}
         assert compare_las_dicts(d1, d2) is False
+
+    # --- TEST-01: val2 is dict, val1 is NOT dict (line 49 uncovered branch) ---
+    def test_val2_dict_val1_not_dict(self) -> None:
+        """Test comparison when val2 is a dict but val1 is not (e.g., list).
+
+        Exercises the branch where isinstance(val2, dict) is True but
+        isinstance(val1, dict) is False at line 49 of compare.py.
+        A list supports integer subscripting so the iteration works.
+        """
+        d1 = {"data": ["A", "B"]}
+        d2 = {"data": {0: "A", 1: "B"}}
+        assert compare_las_dicts(d1, d2) is True
+
+        # Different values should return False
+        d1["data"] = ["A", "C"]
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_val2_dict_val1_not_dict_mismatch(self) -> None:
+        """Test val2-dict vs val1-non-dict mismatch detected as inequality."""
+        d1 = {"data": ["A"]}
+        d2 = {"data": {0: "B"}}
+        assert compare_las_dicts(d1, d2) is False
+
+    # --- TEST-01: nested type mismatch (line 67-74) ---
+    def test_nested_type_mismatch_array_vs_scalar(self) -> None:
+        """Test detecting type mismatch in nested dict where val1 is ndarray
+        but val2 is a scalar (line 67-74 of compare.py)."""
+        d1 = {"logs": {"DEPT": np.array([1.0, 2.0])}}
+        d2 = {"logs": {"DEPT": 5}}
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_nested_type_mismatch_scalar_vs_array(self) -> None:
+        """Test detecting type mismatch where val2 value is ndarray
+        but val1 value is not (line 64-65 of compare.py).
+
+        The _compare_arrays guard now handles non-ndarray arguments
+        gracefully by logging a type mismatch and returning False.
+        """
+        d1 = {"logs": {"DEPT": 5}}
+        d2 = {"logs": {"DEPT": np.array([1.0, 2.0])}}
+        assert compare_las_dicts(d1, d2) is False

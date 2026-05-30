@@ -377,3 +377,110 @@ Line two of free text.
         assert "CDES" in las.string_data
         assert las.string_data["CDES"][0] == "BAD_STRING"
 
+    # --- TEST-05: Empty curves in LAS 3.0 data section (line 332 early return) ---
+    def test_las30_empty_curves_with_data(self) -> None:
+        """Test LAS 3.0 parser with ~A data section but no curves defined.
+
+        When there are no curves (curves_order is empty), _process_ascii_data
+        should return early without error (line 332 of parser.py).
+        """
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+~A
+100.0,50.0
+101.0,51.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        # No curves, so data_sections should be empty
+        assert len(las.curves) == 0
+        assert len(las.curves_order) == 0
+        # Parser should not crash even with ASCII data but no curves
+        assert isinstance(las.data_sections, list)
+
+    # --- TEST-05: Non-numeric NULL value in LAS 3.0 data (line 340-341) ---
+    def test_las30_non_numeric_null(self) -> None:
+        """Test LAS 3.0 processing with non-numeric NULL value.
+
+        When NULL field cannot be converted to float, it should fall back
+        to -999.25 (lines 338-341 of parser.py).
+        """
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.   NOT_A_NUMBER  : NON-NUMERIC NULL
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+~A
+100.0,50.0
+101.0,51.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        # Data sections should be populated despite non-numeric NULL
+        assert len(las.data_sections) == 1
+        assert "DEPT" in las.data_sections[0].data
+        assert las.data_sections[0].data["DEPT"][0] == 100.0
+        assert las.data_sections[0].data["DT"][0] == 50.0
+
+    # --- TEST-05: ValueError handler for non-string curves with bad data (lines 377-381) ---
+    def test_las30_valueerror_non_string_curve(self) -> None:
+        """Test ValueError fallback for non-string curve with non-numeric data.
+
+        When a non-string {F} curve gets a non-numeric value, the ValueError
+        handler at line 380-381 should substitute null_value (-999.25).
+        """
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+~A
+100.0,BAD_VALUE
+101.0,51.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        # DT[0] has "BAD_VALUE" which cannot be converted to float
+        # Should fall back to null_value (-999.25)
+        assert las.data_sections[0].data["DT"][0] == -999.25
+        # DEPT should still be fine
+        assert las.data_sections[0].data["DEPT"][0] == 100.0
+        # DT[1] should be fine
+        assert las.data_sections[0].data["DT"][1] == 51.0
+
+    # --- TEST-05: Empty string value for numeric curve (line 375) ---
+    def test_las30_empty_value_numeric_curve(self) -> None:
+        """Test LAS 3.0 empty string value for numeric curve uses null_value.
+
+        When val_str is empty, the float conversion at line 375 falls back
+        to null_value before a ValueError is even attempted.
+        """
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+~A
+100.0,
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        # Empty value for DT should become null_value
+        assert las.data_sections[0].data["DT"][0] == -999.25
+        assert las.data_sections[0].data["DEPT"][0] == 100.0
+

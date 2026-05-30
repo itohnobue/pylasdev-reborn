@@ -105,6 +105,15 @@ def _compare_arrays(
     """Compare two numpy arrays with tolerance."""
     label = f"{key}.{in_key}" if in_key else key
 
+    if not isinstance(arr1, np.ndarray) or not isinstance(arr2, np.ndarray):
+        logger.warning(
+            "Type mismatch at '%s': %s vs %s",
+            label,
+            type(arr1).__name__,
+            type(arr2).__name__,
+        )
+        return False
+
     if arr1.size != arr2.size:
         logger.warning("Array size mismatch at '%s': %d vs %d", label, arr1.size, arr2.size)
         return False

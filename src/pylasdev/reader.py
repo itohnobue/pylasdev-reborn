@@ -6,6 +6,7 @@ context managers, and no global state.
 
 from __future__ import annotations
 
+import logging
 import warnings
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,8 @@ from .encoding import read_with_encoding
 from .exceptions import LASReadError
 from .models import LASFile
 from .parser import LASParser
+
+logger = logging.getLogger(__name__)
 
 
 def read_las_file(
@@ -40,8 +43,10 @@ def read_las_file(
         Well values are strings. Log values are numpy arrays.
 
     Raises:
-        LASReadError: If file cannot be read.
-        LASParseError: If file content cannot be parsed.
+        LASReadError: If file cannot be found or is not a regular file.
+        LASEncodingError: If file encoding cannot be determined.
+        LASParseError: If file content cannot be parsed (e.g. missing
+            required ~V section).
         ValueError: If file exceeds max_file_size.
 
     Warns:
@@ -83,7 +88,10 @@ def read_las_file_as_object(
         LASFile dataclass with full parsed data.
 
     Raises:
-        LASReadError: If file cannot be read.
+        LASReadError: If file cannot be found or is not a regular file.
+        LASEncodingError: If file encoding cannot be determined.
+        LASParseError: If file content cannot be parsed (e.g. missing
+            required ~V section).
         ValueError: If file exceeds max_file_size.
 
     Warns:
@@ -100,7 +108,11 @@ def read_las_file_as_object(
     detected_encoding, content = read_with_encoding(file_path, encoding, max_file_size)
 
     parser = LASParser(mnem_base)
-    las_file = parser.parse(content)
+    # PERF-01: Split content once, pass lines list to both parser and
+    # data_reader to eliminate redundant content.splitlines() calls
+    # (double splitlines doubles peak memory for large files).
+    lines = content.splitlines()
+    las_file = parser.parse(content, lines=lines)
     las_file.source_file = str(file_path)
     las_file.encoding = detected_encoding
 
@@ -115,12 +127,16 @@ def read_las_file_as_object(
                 stacklevel=2,
             )
     except ValueError:
-        pass  # Non-numeric version string — let it through
+        # Non-numeric version string (e.g. "CWLS LOG ASCII STANDARD").
+        # This is common in LAS 1.2 files and files with plain-text version
+        # identifiers. Silently accept these — they cannot be compared via
+        # float() but the file is still parseable.
+        logger.debug("Non-numeric version string encountered: %s", las_file.version.vers)
 
     # Read ASCII data section
     # For LAS 3.0, the parser already handles this
     # For LAS 1.2/2.0, use the dedicated data reader
     if not las_file.is_las30:
-        read_ascii_data(content, las_file, parser.data_line_count)
+        read_ascii_data(lines, las_file, parser.data_line_count)
 
     return las_file

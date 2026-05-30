@@ -14,11 +14,12 @@ import numpy as np
 from .models import LASFile
 
 
-def read_ascii_data(content: str, las_file: LASFile, data_line_count: int) -> None:
+def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int) -> None:
     """Read the ~A (ASCII data) section and populate las_file.logs.
 
     Args:
-        content: Full file content string.
+        lines: File content split into lines (pre-split by reader.py
+            for efficiency — eliminates redundant content.splitlines()).
         las_file: LASFile object with curves_order already populated.
         data_line_count: Number of data lines (from pre-scan).
     """
@@ -26,7 +27,6 @@ def read_ascii_data(content: str, las_file: LASFile, data_line_count: int) -> No
     if curve_count == 0:
         return
 
-    lines = content.splitlines()
     wrap_mode = las_file.version.wrap.upper() == "YES"
 
     if wrap_mode:
@@ -230,9 +230,13 @@ def _read_wrapped(
                         data_lists[counter].append(null_value)
 
                 if counter >= curve_count - 1:
-                    # All curves for this depth step are complete
+                    # All curves for this depth step are complete.
+                    # Break to discard any extra values on this line
+                    # (prevents silent misalignment if a line has
+                    # more values than expected).
                     counter = 0
                     depth_line = True
+                    break
 
     # Validate array lengths — pad incomplete last depth step
     max_len = max((len(dl) for dl in data_lists), default=0)

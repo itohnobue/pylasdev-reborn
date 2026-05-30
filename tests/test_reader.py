@@ -642,3 +642,95 @@ class TestDataReaderEdgeCases:
         # DT and GR should be fine
         assert data["logs"]["DT"][0] == 50.0
         assert data["logs"]["GR"][0] == 75.0
+
+    # --- TEST-03: Non-numeric NULL value fallback in data_reader.py (lines 124-125, 189-190) ---
+    def test_non_numeric_null_fallback_normal(self, tmp_path: Path) -> None:
+        """Test that non-numeric NULL field falls back to -999.25 in normal mode.
+
+        The NULL value in a LAS file should be numeric, but when it's not
+        (e.g., "NONE"), the reader should fall back to -999.25.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.   NONE  : NON-NUMERIC NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~A  DEPT\n"
+            "100.0\n"
+        )
+        test_file = tmp_path / "non_numeric_null.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_las_file(test_file)
+        assert data["logs"]["DEPT"][0] == 100.0
+        # NULL value itself should be in the well section as string "NONE"
+        assert data["well"]["NULL"] == "NONE"
+
+    def test_non_numeric_null_fallback_wrapped(self, tmp_path: Path) -> None:
+        """Test that non-numeric NULL field falls back to -999.25 in wrapped mode."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.   BADNULL  : NON-NUMERIC NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A\n"
+            "100.0\n"
+            "50.0\n"
+            "101.0\n"
+            "51.0\n"
+        )
+        test_file = tmp_path / "wrapped_non_numeric_null.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_las_file(test_file)
+        # Data should be read correctly despite bad NULL value
+        assert data["logs"]["DEPT"][0] == 100.0
+        assert data["logs"]["DEPT"][1] == 101.0
+        assert data["logs"]["DT"][0] == 50.0
+        assert data["logs"]["DT"][1] == 51.0
+        assert data["well"]["NULL"] == "BADNULL"
+
+    # --- TEST-04: IndexError branch in normal mode (line 151->143) ---
+    def test_index_error_branch_normal(self, tmp_path: Path) -> None:
+        """Test the IndexError handler in _read_normal mode.
+
+        The IndexError can occur when curve_count was reduced after
+        deduplication and arrays are sized for the reduced count.
+        With a duplicate curve that forces dedup, and data values that
+        fit within the original curve_count but the deduplication reduces
+        it, some values should be handled gracefully.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DUP.API  :  Duplicate 1\n"
+            " DUP.API  :  Duplicate 2\n"
+            "~A  DEPT  DUP  DUP\n"
+            "100.0  10.0  20.0\n"
+            "101.0  11.0  21.0\n"
+        )
+        test_file = tmp_path / "dup_index_error.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            data = read_las_file(test_file)
+            assert any("Duplicate curve mnemonic" in str(x.message) for x in w)
+
+        # After dedup, DUP becomes DUP and DUP_2, arrays sized for 2 curves
+        assert "DUP" in data["logs"]
+        assert "DUP_2" in data["logs"]
