@@ -22,7 +22,17 @@ from .exceptions import (
     PylasdevError,
 )
 from .mnem_base import MNEM_BASE
-from .models import CurveDefinition, DevFile, LASFile, ParameterEntry, VersionSection, WellSection
+from .models import (
+    ArrayElementInfo,
+    CurveDefinition,
+    DataSection,
+    DevFile,
+    LASFile,
+    ParameterEntry,
+    ParameterZone,
+    VersionSection,
+    WellSection,
+)
 from .reader import read_las_file, read_las_file_as_object
 from .writer import write_las_file
 
@@ -42,6 +52,9 @@ __all__ = [
     "WellSection",
     "CurveDefinition",
     "ParameterEntry",
+    "ParameterZone",
+    "ArrayElementInfo",
+    "DataSection",
     # Mnemonic base
     "MNEM_BASE",
     # Exceptions

@@ -17,7 +17,7 @@ from typing import ClassVar
 
 import numpy as np
 
-from .data_reader import _deduplicate_curves
+from .data_reader import _deduplicate_curves, _get_null_value
 from .exceptions import LASParseError
 from .models import (
     ArrayElementInfo,
@@ -36,6 +36,13 @@ SECTION_PATTERN = re.compile(r"^~([A-Za-z])(.*)")
 # Data line pattern: MNEMONIC.UNIT  VALUE : DESCRIPTION
 # Uses \w which matches Unicode (including Cyrillic) in Python 3
 # Note: LAS files commonly have spaces between mnemonic and dot (e.g., "DT  .US/M")
+#
+# The colon separator uses (\s+:\s*|\s*:\s+) which requires whitespace on
+# at least one side of the colon.  This prevents false matches on bare
+# colons in values (timestamps like "12:34:56") and LAS 3.0 format
+# specifiers ({A:0}), while still correctly separating value from
+# description in standard "VALUE : DESCRIPTION" lines and handling
+# empty-value lines like "MNEM.UNIT       : DESCRIPTION".
 DATA_LINE_PATTERN = re.compile(
     r"^\s*"
     r"(?P<mnemonic>[\w\-]+(?:\[\d+\])?)"  # mnemonic: word chars + hyphen + optional [N] array index
@@ -43,8 +50,8 @@ DATA_LINE_PATTERN = re.compile(
     r"\."  # literal dot separator
     r"(?P<unit>[\w\-/]*)"  # unit: optional, can include /
     r"\s+"  # whitespace separator
-    r"(?P<value>[^:]*?)"  # value: everything up to colon
-    r"\s*:\s*"  # colon separator
+    r"(?P<value>.*?)"  # value: everything up to the colon separator
+    r"(\s+:\s*|\s*:\s+|:\s*$)"  # colon separator (see detailed comment above)
     r"(?P<description>.*?)"  # description: rest of line
     r"\s*$"
 )
@@ -95,7 +102,13 @@ class LASParser:
     def __init__(self, mnem_base: dict[str, str] | None = None) -> None:
         """Initialize parser with optional mnemonic base."""
         self.mnem_base = mnem_base or {}
-        # Build uppercased lookup for case-insensitive matching
+        # Build uppercased lookup for case-insensitive matching.
+        # NOTE: This is rebuilt per instance (not at module level) for thread
+        # safety.  When reusing a single LASParser instance across multiple
+        # parse() calls, _reset() preserves this cache — only parse()
+        # re-entrant callers creating many short-lived instances with the
+        # same mnem_base will pay the rebuild cost.  For those workloads,
+        # reuse the parser instance instead.
         self._mnem_base_upper = {k.upper(): v for k, v in self.mnem_base.items()}
         self._reset()
 
@@ -108,6 +121,9 @@ class LASParser:
         self._ascii_data_lines: list[str] = []
         self._current_data_section_idx: int = 0
         self._version_found = False  # flag for required ~V section validation
+        # F-3: Accumulate other-section lines in a list to avoid O(n^2)
+        # string concatenation (self.las_file.other += ... per line).
+        self._other_lines: list[str] = []
 
     @property
     def data_line_count(self) -> int:
@@ -139,6 +155,10 @@ class LASParser:
                 "Content does not appear to be a valid LAS file: "
                 "missing required ~V (Version Information) section."
             )
+
+        # Finalize accumulated ~O section text (F-3: O(n) join vs O(n^2) concat)
+        if self._other_lines:
+            self.las_file.other = "\n".join(self._other_lines) + "\n"
 
         # Process collected ASCII data only for LAS 3.0
         # For LAS 1.2/2.0, data_reader handles ASCII data with proper wrap mode support
@@ -183,6 +203,14 @@ class LASParser:
             handler_name = self.SECTION_HANDLERS.get(self._current_section)
             if handler_name:
                 getattr(self, handler_name)(line)
+            else:
+                # F-2: Unknown section type (e.g., custom-named LAS 3.0 sections).
+                # Log a warning and accumulate as free-form text (like ~O).
+                logger.warning(
+                    "Unknown section type '~%s' at line: %s",
+                    self._current_section,
+                    line[:80],
+                )
 
     def _match_data_line(self, line: str) -> re.Match[str] | None:
         """Try to match a header data line with colon, then without."""
@@ -333,7 +361,7 @@ class LASParser:
 
     def _parse_other(self, line: str) -> None:
         """Parse ~O (other) section — free-form text, accumulated."""
-        self.las_file.other += line + "\n"
+        self._other_lines.append(line)
 
     def _parse_ascii_data(self, line: str) -> None:
         """Collect ASCII data lines for later processing.
@@ -372,11 +400,8 @@ class LASParser:
         # Determine which curves are string type
         string_curves = {i: c.data_format == "S" for i, c in enumerate(curves)}
 
-        # Get null value (with try/except for non-numeric null strings, matching writer.py)
-        try:
-            null_value = float(self.las_file.well.get("NULL", "-999.25"))
-        except (ValueError, TypeError):
-            null_value = -999.25
+        # Get null value (shared utility, used by parser, data_reader, writer)
+        null_value = _get_null_value(self.las_file.well)
 
         # Create data section.
         # NOTE (GD-11): LAS 3.0 _process_ascii_data currently uses the global
@@ -404,6 +429,11 @@ class LASParser:
 
         # Pre-allocate numeric arrays; defer string arrays
         string_data_lists: dict[int, list[str]] = {}
+        # F-9: Only populate las_file.logs from the first data section
+        # to preserve backward compatibility (to_dict() reads from logs).
+        # Subsequent sections only write to data_section.data — their
+        # data is still accessible via las_file.data_sections[N].data.
+        is_first_section = not self.las_file.data_sections
         for i, curve in enumerate(curves):
             if string_curves.get(i, False):
                 # String curves: accumulate as list, convert at end
@@ -413,7 +443,8 @@ class LASParser:
                 )
             else:
                 arr = np.zeros(actual_count, dtype=np.float64)
-                self.las_file.logs[curve.mnemonic] = arr
+                if is_first_section:
+                    self.las_file.logs[curve.mnemonic] = arr
                 data_section.data[curve.mnemonic] = arr
 
         # Fill arrays by index (no list accumulation overhead for numerics)
@@ -446,12 +477,12 @@ class LASParser:
                         # space-delimited files) are treated as null to match the
                         # behavior of most LAS processing tools.
                         val = float(val_str) if val_str else null_value
-                        self.las_file.logs[curves[i].mnemonic][idx] = val
+                        data_section.data[curves[i].mnemonic][idx] = val
                 except ValueError:
                     if string_curves.get(i, False):
                         string_data_lists[i].append(val_str)
                     else:
-                        self.las_file.logs[curves[i].mnemonic][idx] = null_value
+                        data_section.data[curves[i].mnemonic][idx] = null_value
 
             idx += 1
 

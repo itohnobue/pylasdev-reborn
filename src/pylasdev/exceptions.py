@@ -20,7 +20,12 @@ class LASParseError(PylasdevError):
 
 
 class LASVersionError(PylasdevError):
-    """Raised when an unsupported LAS version is encountered."""
+    """Raised when an unsupported LAS version is encountered.
+
+    Note: the library itself issues ``warnings.warn()`` for LAS versions
+    beyond 3.0 and continues processing.  This exception is provided so
+    that user code can enforce a strict version policy when needed.
+    """
 
 
 class LASEncodingError(PylasdevError):

@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from .data_reader import _get_null_value
 from .exceptions import LASWriteError
 from .models import LASFile
 
@@ -30,10 +31,11 @@ def write_las_file(
     Args:
         file_path: Output file path.
         las_data: LAS data as dict (legacy format) or LASFile object.
-        encoding: Output file encoding (default: utf-8). If las_data is a
-            dict, this parameter is used directly (dicts from to_dict()
-            do not carry an encoding key). If las_data is a LASFile object,
-            the object's .encoding attribute is used instead of this default.
+        encoding: Output file encoding (default: utf-8). Always writes
+            using this encoding regardless of the input's original encoding.
+            UTF-8 is recommended for maximum compatibility and reliable
+            re-reading of files containing non-ASCII characters (e.g.
+            Cyrillic curve mnemonics in Russian LAS files).
         precision: Format specifier for numeric data values (default: '.8g').
             Pass a Python format spec like '.6g' or '.10e' for more precision.
 
@@ -44,17 +46,19 @@ def write_las_file(
 
     if isinstance(las_data, dict):
         las_file = LASFile.from_dict(las_data)
-        # Use detected encoding from the data dict if available,
-        # otherwise fall back to the explicit parameter.
-        file_encoding = las_data.get("encoding", encoding)
     else:
         las_file = las_data
-        file_encoding = las_file.encoding or encoding
 
+    # Always write with the specified encoding (default: utf-8).
+    # The original file's encoding (e.g. cp866) is detected by the reader
+    # for correct input parsing, but output should use a modern encoding
+    # that chardet can unambiguously detect. Legacy single-byte Cyrillic
+    # encodings (cp866, cp1251) are too similar for chardet to distinguish
+    # reliably in re-read scenarios, causing roundtrip failures.
     content = _generate_las_content(las_file, precision)
 
     try:
-        file_path.write_text(content, encoding=file_encoding)
+        file_path.write_text(content, encoding=encoding)
     except OSError as e:
         raise LASWriteError(f"Cannot write to {file_path}: {e}") from e
 
@@ -159,10 +163,7 @@ def _write_other_section(las_file: LASFile) -> list[str]:
 def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str]:
     """Write ~A ASCII data section(s)."""
     lines: list[str] = []
-    try:
-        null_value = float(las_file.well.get("NULL", "-999.25"))
-    except (ValueError, TypeError):
-        null_value = -999.25
+    null_value = _get_null_value(las_file.well)
     delimiter = las_file.version.delimiter_char
 
     if las_file.data_sections:
@@ -216,19 +217,31 @@ def _format_data_rows(
     if not curve_names or curve_names[0] not in data:
         return lines
     num_rows = len(data[curve_names[0]])
+
+    # Pre-extract curve data arrays to avoid O(rows x curves) dict lookups
+    # inside the inner loop (F-23 performance optimization).
+    curve_arrays: list[tuple[NDArray[np.float64] | NDArray[np.str_] | None, bool]] = []
+    for name in curve_names:
+        if name in string_data:
+            curve_arrays.append((string_data[name], True))
+        elif name in data:
+            curve_arrays.append((data[name], False))
+        else:
+            curve_arrays.append((None, False))
+
     for i in range(num_rows):
         row_values: list[str] = []
-        for name in curve_names:
-            if name in string_data and i < len(string_data[name]):
-                row_values.append(str(string_data[name][i]))
-            elif name in data and i < len(data[name]):
-                val = data[name][i]
-                if np.isnan(val):
+        for arr, is_string in curve_arrays:
+            if arr is None or i >= len(arr):
+                row_values.append(_format_number(null_value, precision))
+            elif is_string:
+                row_values.append(str(arr[i]))
+            else:
+                val = arr[i]  # type: ignore[index]
+                if np.isnan(val):  # type: ignore[arg-type]
                     row_values.append(_format_number(null_value, precision))
                 else:
-                    row_values.append(_format_number(val, precision))
-            else:
-                row_values.append(_format_number(null_value, precision))
+                    row_values.append(_format_number(val, precision))  # type: ignore[arg-type]
         lines.append(delimiter.join(row_values))
     return lines
 

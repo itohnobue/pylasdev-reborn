@@ -64,6 +64,16 @@ def read_dev_file_as_object(
     Raises:
         DEVReadError: If file cannot be read or parsed.
         ValueError: If file exceeds max_file_size.
+
+    Example:
+        >>> from pylasdev import read_dev_file_as_object
+        >>> dev = read_dev_file_as_object("survey.dev")
+        >>> dev.column_order
+        ['MD', 'TVD', 'X', 'Y']
+        >>> dev.columns["MD"][:3]
+        array([0., 100., 200.])
+        >>> dev.to_dict()["MD"][:3]
+        array([0., 100., 200.])
     """
     file_path = Path(file_path)
 

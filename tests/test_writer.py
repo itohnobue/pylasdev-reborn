@@ -461,3 +461,98 @@ class TestWriteLASFile:
         assert "~A BROKEN" in content
         # No data rows should be written (guard at line 198 returns [])
         # Content after ~A BROKEN should be empty or next section
+
+    # --- F-24: NaN values in _format_data_rows ---
+    def test_write_nan_values(self, tmp_path: Path) -> None:
+        """Test that NaN values in data are written as null_value.
+
+        Exercises writer.py:226-227 — the np.isnan check in _format_data_rows.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="2.0")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "DT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.curves.append(CurveDefinition(mnemonic="DT", unit="US/M"))
+        las.logs["DEPT"] = np.array([100.0, 101.0])
+        las.logs["DT"] = np.array([50.0, np.nan])
+
+        temp_file = tmp_path / "nan_test.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        # The NaN value should be output as null_value (-999.25)
+        assert "-999.25" in content
+        # Verify roundtrip: re-read and check the NaN position is null_value
+        reread = read_las_file(temp_file)
+        assert reread["logs"]["DT"][1] == -999.25
+
+    # --- F-25: Inf values in _format_data_rows ---
+    def test_write_inf_values(self, tmp_path: Path) -> None:
+        """Test that Inf/-Inf values are written as formatted strings.
+
+        Exercises writer.py:241-242 — the np.isinf check in _format_number.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="2.0")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "DT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.curves.append(CurveDefinition(mnemonic="DT", unit="US/M"))
+        las.logs["DEPT"] = np.array([100.0, 101.0, 102.0])
+        # Use float dtype explicitly so inf can be stored
+        dt_vals = np.array([50.0, np.inf, -np.inf], dtype=np.float64)
+        las.logs["DT"] = dt_vals
+
+        temp_file = tmp_path / "inf_test.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        # Verify both +inf and -inf are present in the output
+        assert "inf" in content.lower()
+        assert "-inf" in content.lower()
+        # Verify roundtrip: re-read and check the inf values are preserved
+        reread = read_las_file(temp_file)
+        assert np.isposinf(reread["logs"]["DT"][1])
+        assert np.isneginf(reread["logs"]["DT"][2])
+
+    # --- F-26: Custom precision parameter ---
+    def test_write_custom_precision(self, tmp_path: Path) -> None:
+        """Test writing with a custom precision format specifier.
+
+        Exercises writer.py:27 — the precision parameter.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="2.0")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([1234.56789])
+
+        temp_file = tmp_path / "prec.las"
+        write_las_file(temp_file, las, precision=".4g")
+
+        content = temp_file.read_text()
+        # With .4g format, format(1234.56789, '.4g') == '1235'
+        assert "1235" in content
+
+    # --- F-29: Dict encoding key ---
+    def test_write_dict_with_encoding_key(self, tmp_path: Path) -> None:
+        """Test writing from dict with an 'encoding' key.
+
+        The encoding key is processed by LASFile.from_dict() at models.py:333.
+        """
+        data = {
+            "encoding": "ascii",
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"NULL": "-999.25"},
+            "parameters": {},
+            "logs": {"DEPT": np.array([1.0, 2.0])},
+            "curves_order": ["DEPT"],
+        }
+        temp_file = tmp_path / "enc_key.las"
+        write_las_file(temp_file, data)
+
+        assert temp_file.exists()
+        content = temp_file.read_text()
+        assert "~VERSION" in content

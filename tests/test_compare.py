@@ -143,3 +143,61 @@ class TestCompareLasDicts:
         d1 = {"logs": {"DEPT": 5}}
         d2 = {"logs": {"DEPT": np.array([1.0, 2.0])}}
         assert compare_las_dicts(d1, d2) is False
+
+    # --- F-52: Top-level ndarray comparison ---
+    def test_top_level_ndarray_comparison(self) -> None:
+        """Test comparing dicts containing ndarray values at the top level.
+
+        Exercises compare.py:81-83 — the isinstance(val2, np.ndarray) branch
+        for top-level (non-nested) ndarray values.
+        """
+        d1 = {"data": np.array([1.0, 2.0, 3.0])}
+        d2 = {"data": np.array([1.0, 2.0, 3.0])}
+        assert compare_las_dicts(d1, d2) is True
+
+    def test_top_level_ndarray_different_values(self) -> None:
+        """Test top-level ndarray comparison detects different values."""
+        d1 = {"data": np.array([1.0, 2.0, 3.0])}
+        d2 = {"data": np.array([1.0, 2.0, 4.0])}
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_top_level_ndarray_size_mismatch(self) -> None:
+        """Test top-level ndarray comparison detects size mismatch."""
+        d1 = {"data": np.array([1.0, 2.0])}
+        d2 = {"data": np.array([1.0, 2.0, 3.0])}
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_top_level_ndarray_type_mismatch(self) -> None:
+        """Test top-level ndarray vs scalar type mismatch."""
+        d1 = {"data": np.array([1.0])}
+        d2 = {"data": 5}
+        assert compare_las_dicts(d1, d2) is False
+
+    # --- F-53: Non-standard value types at top level ---
+    def test_scalar_values_comparison(self) -> None:
+        """Test comparing dicts with scalar (int/float/str) top-level values.
+
+        Exercises compare.py:89-92 — the else branch for values that are
+        not dicts, ndarrays, or lists (scalar types).
+        """
+        d1 = {"a": 1, "b": 2.0, "c": "hello"}
+        d2 = {"a": 1, "b": 2.0, "c": "hello"}
+        assert compare_las_dicts(d1, d2) is True
+
+    def test_scalar_values_mismatch(self) -> None:
+        """Test scalar top-level value mismatch detected."""
+        d1 = {"a": 1, "b": 2.0}
+        d2 = {"a": 1, "b": 3.0}
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_scalar_string_mismatch(self) -> None:
+        """Test scalar string value mismatch detected."""
+        d1 = {"name": "hello"}
+        d2 = {"name": "world"}
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_scalar_missing_key_in_first(self) -> None:
+        """Test missing key when comparing scalar-valued dicts."""
+        d1 = {"a": 1}
+        d2 = {"a": 1, "b": 2}
+        assert compare_las_dicts(d1, d2) is False

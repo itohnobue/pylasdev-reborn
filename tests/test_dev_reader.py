@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from pylasdev import read_dev_file
+from pylasdev import read_dev_file, read_dev_file_as_object
 from pylasdev.exceptions import DEVReadError
 from pylasdev.models import DevFile
 
@@ -139,3 +139,102 @@ class TestReadDEVFile:
         # Other values should parse correctly
         assert data["MD"][1] == 100.0
         assert data["X"][2] == 102.0
+
+    # --- F-47: Direct test of read_dev_file_as_object ---
+    def test_read_dev_file_as_object_direct(self, tmp_path: Path) -> None:
+        """Test read_dev_file_as_object directly with a simple DEV file.
+
+        Exercises dev_reader.py:45-67 — the read_dev_file_as_object function.
+        """
+        content = (
+            "MD TVD X Y\n"
+            "0.0 0.0 100.0 200.0\n"
+            "100.0 99.0 101.0 201.0\n"
+            "200.0 198.0 102.0 202.0\n"
+        )
+        test_file = tmp_path / "direct.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        dev = read_dev_file_as_object(test_file)
+        assert isinstance(dev, DevFile)
+        assert dev.source_file != ""
+        assert dev.encoding != ""
+        assert "MD" in dev.columns
+        assert "TVD" in dev.columns
+        assert len(dev.columns["MD"]) == 3
+        np.testing.assert_array_equal(dev.columns["MD"], np.array([0.0, 100.0, 200.0]))
+
+    # --- F-48: max_file_size for DEV ---
+    def test_max_file_size_rejects_oversized_dev(self, tmp_path: Path) -> None:
+        """Test that max_file_size parameter rejects oversized DEV files.
+
+        Exercises dev_reader.py:69-76 — the max_file_size guard via
+        read_with_encoding.
+        """
+        content = (
+            "MD TVD\n"
+            "0.0 0.0\n"
+            "100.0 99.0\n"
+        )
+        test_file = tmp_path / "size.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Should succeed with generous limit
+        data = read_dev_file(test_file, max_file_size=10_000_000)
+        assert "MD" in data
+
+        # Should fail with tiny limit
+        with pytest.raises(ValueError, match="exceeds maximum"):
+            read_dev_file(test_file, max_file_size=10)
+
+        # Also test read_dev_file_as_object with max_file_size
+        dev = read_dev_file_as_object(test_file, max_file_size=10_000_000)
+        assert isinstance(dev, DevFile)
+
+        with pytest.raises(ValueError, match="exceeds maximum"):
+            read_dev_file_as_object(test_file, max_file_size=10)
+
+    # --- F-49: Header-only DEV file ---
+    def test_header_only_dev_file(self, tmp_path: Path) -> None:
+        """Test reading a DEV file with only a header line, no data.
+
+        Exercises dev_reader.py:86-96 — the header-only path where
+        data_lines is 0.
+        """
+        content = "MD TVD X Y\n"
+        test_file = tmp_path / "header_only.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert isinstance(data, dict)
+        assert "MD" in data
+        assert "TVD" in data
+        assert "X" in data
+        assert "Y" in data
+        # All columns should be empty (0-length)
+        assert len(data["MD"]) == 0
+        assert len(data["TVD"]) == 0
+        assert len(data["X"]) == 0
+        assert len(data["Y"]) == 0
+
+    # --- F-50: Extra columns in data row vs header ---
+    def test_extra_columns_in_data_row(self, tmp_path: Path) -> None:
+        """Test DEV file with data row having more values than header columns.
+
+        Exercises dev_reader.py:119-126 — the min(len(values), len(names))
+        guard that prevents IndexError on extra columns.
+        """
+        content = (
+            "MD TVD\n"
+            "0.0 0.0 100.0 200.0\n"
+            "100.0 99.0\n"
+        )
+        test_file = tmp_path / "extra_cols.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Extra values in first row should be silently ignored
+        assert len(data["MD"]) == 2
+        assert data["MD"][0] == 0.0
+        assert data["TVD"][0] == 0.0
+        assert data["MD"][1] == 100.0

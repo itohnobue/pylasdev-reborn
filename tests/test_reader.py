@@ -734,3 +734,71 @@ class TestDataReaderEdgeCases:
         # After dedup, DUP becomes DUP and DUP_2, arrays sized for 2 curves
         assert "DUP" in data["logs"]
         assert "DUP_2" in data["logs"]
+
+    # --- F-19: Wrapped-mode section transition break ---
+    def test_wrapped_section_after_ascii_stops_data(self, tmp_path: Path) -> None:
+        """Test that a new section after ~A in wrapped mode stops data collection.
+
+        Exercises data_reader.py:200 — the break in _read_wrapped when a section
+        other than ~A is encountered during ASCII data reading.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A\n"
+            "100.0\n"
+            "50.0\n"
+            "101.0\n"
+            "51.0\n"
+            "~OTHER\n"
+            "Some free text after data.\n"
+        )
+        test_file = tmp_path / "wrapped_section_break.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_las_file(test_file)
+        # Should have 2 data points per curve (stopped before ~OTHER)
+        assert len(data["logs"]["DEPT"]) == 2
+        np.testing.assert_array_almost_equal(data["logs"]["DEPT"], [100.0, 101.0])
+        np.testing.assert_array_almost_equal(data["logs"]["DT"], [50.0, 51.0])
+
+    # --- F-22: Curve deduplication name collision ---
+    def test_curve_dedup_already_has_suffix(self, tmp_path: Path) -> None:
+        """Test curve deduplication when curves already have _N suffix.
+
+        Exercises data_reader.py:86 — name collision edge case where
+        curves already use _2 suffix notation.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " GR_2.API  :  Pre-existing suffix 1\n"
+            " GR_2.API  :  Pre-existing suffix 2\n"
+            "~A  GR_2  GR_2\n"
+            "100.0  10.0\n"
+        )
+        test_file = tmp_path / "already_suffixed.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            data = read_las_file(test_file)
+            assert any("Duplicate curve mnemonic" in str(x.message) for x in w)
+
+        # First GR_2 keeps its name, second becomes GR_2_2
+        assert "GR_2" in data["logs"]
+        assert "GR_2_2" in data["logs"]
+        np.testing.assert_array_equal(data["logs"]["GR_2"], [100.0])
+        np.testing.assert_array_equal(data["logs"]["GR_2_2"], [10.0])

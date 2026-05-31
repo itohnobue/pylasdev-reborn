@@ -38,7 +38,7 @@ print(dev_data["TVD"])  # True vertical depth array
 ### Object-oriented API (new)
 
 ```python
-from pylasdev import read_las_file_as_object, LASFile
+from pylasdev import read_las_file_as_object, LASFile, read_dev_file_as_object, DevFile
 
 # Read as typed object for richer access
 las: LASFile = read_las_file_as_object("well_log.las")
@@ -52,6 +52,21 @@ for curve in las.curves:
 if las.version.is_las30:
     print(las.data_sections)    # Multiple data sections
     print(las.string_data)      # String-format curve data
+
+# DEV file reading (new object API)
+dev: DevFile = read_dev_file_as_object("deviation.dev")
+print(dev.column_order)     # ['MD', 'TVD', 'X', 'Y']
+print(dev.columns["MD"])    # numpy array of measured depth values
+```
+
+### Key Methods
+
+```python
+# Key LASFile methods:
+curve = las.get_curve_by_mnemonic("GR")   # Find curve by mnemonic
+arrays = las.get_array_curves("NMR")      # Get array-type curves (LAS 3.0)
+d = las.to_dict()                          # Convert to dict format
+las2 = LASFile.from_dict(d)               # Create from dict
 ```
 
 ## Features
@@ -62,7 +77,7 @@ if las.version.is_las30:
 - Automatic encoding detection with chardet (supports Cyrillic: cp1251, cp866)
 - Auto-detection of mislabeled WRAP headers (WRAP=YES with non-wrapped data)
 - Type-safe API with full type hints and dataclass models
-- Mnemonic database (2,090 entries) for curve name normalization
+- Mnemonic database (2,020 entries) for curve name normalization
 - Compare LAS files for equality with configurable tolerance
 - Wrapped and non-wrapped data mode support
 
@@ -72,11 +87,19 @@ if las.version.is_las30:
 - NumPy >= 1.24
 - chardet >= 5.0 (optional, for encoding detection)
 
+```bash
+# Install with encoding support
+pip install pylasdev[encoding]
+
+# Install with all extras (dev tools + encoding)
+pip install pylasdev[all]
+```
+
 ## Development
 
 ```bash
 # Clone and install dev dependencies
-git clone https://github.com/username/pylasdev.git
+git clone https://github.com/muharlyamovar/pylasdev.git
 cd pylasdev
 uv sync --extra dev
 
@@ -101,7 +124,7 @@ Complete rewrite from Python 2 to Python 3.12+.
 - Object-oriented API: `read_las_file_as_object()` returns typed `LASFile`
 - Encoding detection with chardet + fallback chain (cp1251, cp1252, cp866, latin-1)
 - Custom exception hierarchy: `LASReadError`, `LASWriteError`, `LASParseError`, `LASVersionError`, `LASEncodingError`, `DEVReadError`
-- Comprehensive pytest suite (148 tests, 92% coverage)
+- Comprehensive pytest suite (184 tests)
 
 #### Performance Improvements
 - Wrapped mode: O(n²) → O(n) (fixed `numpy.append()` bug)
@@ -120,7 +143,7 @@ Complete rewrite from Python 2 to Python 3.12+.
 - Data reader stops at section boundaries (prevents reading garbage after `~A` section)
 
 #### Mnemonic Database Cleanup
-- Deduplicated: 5,577 → 2,090 unique entries
+- Deduplicated: 5,577 → 2,020 unique entries
 
 ## License
 

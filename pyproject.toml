@@ -33,13 +33,13 @@ dev = [
     "pytest-cov>=5.0",
     "mypy>=1.10",
     "ruff>=0.5.0",
-    "chardet>=5.0",
 ]
-pandas = ["pandas>=2.0"]
-all = ["pylasdev[dev,pandas]"]
+encoding = ["chardet>=5.0"]
+all = ["pylasdev[dev,encoding]"]
 
 [project.urls]
-Homepage = "https://github.com/username/pylasdev"
+Homepage = "https://github.com/muharlyamovar/pylasdev"
+Repository = "https://github.com/muharlyamovar/pylasdev"
 
 # UV configuration
 [tool.uv]

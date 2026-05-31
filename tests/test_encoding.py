@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from pylasdev.encoding import FALLBACK_ENCODINGS, detect_encoding, read_with_encoding
 
 
@@ -96,3 +98,21 @@ class TestReadWithEncoding:
             enc, content = read_with_encoding(las_file)
             assert len(content) > 0
             assert isinstance(enc, str)
+
+    # --- F-40: Explicit encoding failure ---
+    def test_explicit_encoding_fails_with_unicode_decode_error(self, tmp_path: Path) -> None:
+        """Test that explicit encoding parameter raises UnicodeDecodeError on mismatch.
+
+        Exercises encoding.py:83-85 — the direct read_text(encoding=encoding) path
+        that occurs when an explicit encoding is provided.
+        When the file content cannot be decoded with the given encoding,
+        UnicodeDecodeError should propagate.
+        """
+        test_file = tmp_path / "cp1251.las"
+        # Write Russian text in CP1251 (Windows Cyrillic)
+        russian_text = "\u041f\u0440\u0438\u0432\u0435\u0442"  # "Привет"
+        test_file.write_bytes(russian_text.encode("cp1251"))
+
+        # Trying to decode CP1251 as ASCII should fail
+        with pytest.raises(UnicodeDecodeError):
+            read_with_encoding(test_file, encoding="ascii")

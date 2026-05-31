@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from pylasdev.exceptions import LASParseError
 from pylasdev.parser import LASParser
 
 
@@ -483,4 +486,40 @@ Line two of free text.
         # Empty value for DT should become null_value
         assert las.data_sections[0].data["DT"][0] == -999.25
         assert las.data_sections[0].data["DEPT"][0] == 100.0
+
+    # --- F-10: LASParseError for non-empty content without ~V section ---
+    def test_parse_non_empty_no_version_raises_error(self) -> None:
+        """Test that non-empty content without ~V section raises LASParseError.
+
+        Exercises parser.py:137-141 — the validation that a valid LAS file
+        must contain a ~Version section.
+        """
+        content = "This is not a LAS file.\nJust some random text.\n"
+        parser = LASParser()
+        with pytest.raises(LASParseError, match="missing required ~V"):
+            parser.parse(content)
+
+    def test_parse_empty_content_no_version_error(self) -> None:
+        """Test that empty content does NOT raise LASParseError.
+
+        Blank files should not trigger the ~V validation since content.strip() is falsy.
+        """
+        parser = LASParser()
+        result = parser.parse("")
+        assert result.version.vers == "2.0"
+
+    # --- F-11: TAB delimiter end-to-end in LAS 3.0 ---
+    def test_las30_tab_delimiter(self) -> None:
+        """Test LAS 3.0 with TAB delimiter end-to-end.
+
+        Exercises parser.py:342-348 — TAB delimiter path in _process_ascii_data.
+        """
+        content = "~VERSION INFORMATION\n VERS.   3.0  :\n WRAP.   NO   :\n DLM .   TAB  :\n~CURVE INFORMATION\n DEPT.M      :  DEPTH {F}\n DT.US/M     :  SONIC {F}\n~A\n100.0\t50.0\n101.0\t51.0\n"
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.data_sections) == 1
+        assert las.data_sections[0].data["DEPT"][0] == 100.0
+        assert las.data_sections[0].data["DT"][0] == 50.0
+        assert las.data_sections[0].data["DEPT"][1] == 101.0
+        assert las.data_sections[0].data["DT"][1] == 51.0
 

@@ -83,7 +83,12 @@ def compare_las_dicts(
                 return False
 
         elif isinstance(val2, list):
-            if val1 != val2:
+            # F-10: data_sections contains numpy arrays that can't
+            # be compared with generic list equality (ambiguity error).
+            if key == "data_sections":
+                if not _compare_data_sections(val1, val2, rtol, atol):
+                    return False
+            elif val1 != val2:
                 logger.warning("List mismatch at '%s': %r vs %r", key, val1, val2)
                 return False
         else:
@@ -118,8 +123,72 @@ def _compare_arrays(
         logger.warning("Array size mismatch at '%s': %d vs %d", label, arr1.size, arr2.size)
         return False
 
-    if not np.allclose(arr1, arr2, rtol=rtol, atol=atol, equal_nan=True):
+    # F-4: np.allclose() fails on string/object arrays (e.g. string_data).
+    # Use np.array_equal for non-numeric dtypes.
+    if arr1.dtype.kind in ("U", "S", "O") or arr2.dtype.kind in ("U", "S", "O"):
+        if not np.array_equal(arr1, arr2):
+            logger.warning("Array values mismatch at '%s'", label)
+            return False
+    elif not np.allclose(arr1, arr2, rtol=rtol, atol=atol, equal_nan=True):
         logger.warning("Array values mismatch at '%s'", label)
         return False
+
+    return True
+
+
+def _compare_data_sections(
+    sections1: list[dict[str, Any]],
+    sections2: list[dict[str, Any]],
+    rtol: float,
+    atol: float,
+) -> bool:
+    """Compare data_sections lists element-wise.
+
+    Handles numpy arrays inside nested dicts where generic list
+    equality (val1 != val2) would raise "truth value of an array
+    is ambiguous" (F-10).
+    """
+    if len(sections1) != len(sections2):
+        logger.warning(
+            "data_sections length mismatch: %d vs %d",
+            len(sections1), len(sections2),
+        )
+        return False
+
+    for i, (ds1, ds2) in enumerate(zip(sections1, sections2, strict=False)):
+        if set(ds1.keys()) != set(ds2.keys()):
+            only_in_first = set(ds1.keys()) - set(ds2.keys())
+            only_in_second = set(ds2.keys()) - set(ds1.keys())
+            if only_in_first:
+                logger.warning(
+                    "Keys 'data_sections[%d]' only in first: %s", i, only_in_first,
+                )
+            if only_in_second:
+                logger.warning(
+                    "Keys 'data_sections[%d]' only in second: %s", i, only_in_second,
+                )
+            return False
+
+        for k in ds2:
+            v1, v2 = ds1[k], ds2[k]
+            if isinstance(v2, np.ndarray):
+                if not _compare_arrays(
+                    v1, v2, f"data_sections[{i}].{k}", None, rtol, atol,
+                ):
+                    return False
+            elif isinstance(v2, list):
+                if v1 != v2:
+                    logger.warning(
+                        "List mismatch at 'data_sections[%d].%s': %r vs %r",
+                        i, k, v1, v2,
+                    )
+                    return False
+            else:
+                if v1 != v2:
+                    logger.warning(
+                        "Mismatch at 'data_sections[%d].%s': %r vs %r",
+                        i, k, v1, v2,
+                    )
+                    return False
 
     return True

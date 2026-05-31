@@ -203,6 +203,14 @@ class DataSection:
     curves_order: list[str] = field(default_factory=list)
     data: dict[str, NDArray[np.float64]] = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, Any]:
+        """Convert DataSection to dict for serialization."""
+        return {
+            "name": self.name,
+            "curves_order": list(self.curves_order),
+            "data": {k: v.copy() for k, v in self.data.items()},
+        }
+
 
 @dataclass
 class LASFile:
@@ -226,7 +234,13 @@ class LASFile:
     string_data: dict[str, NDArray[np.str_]] = field(default_factory=dict)  # For {S} format curves
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to legacy dict format for backward compatibility."""
+        """Convert to legacy dict format for backward compatibility.
+
+        Returns a dict with both legacy ``parameters`` (``{mnemonic: value}``
+        dict) and ``parameter_details`` (list of full ParameterEntry dicts)
+        to preserve backward compatibility while exposing LAS 3.0 metadata.
+        ``logs`` arrays are defensively copied.
+        """
         params_dict: dict[str, str] = {}
         for p in self.parameters:
             params_dict[p.mnemonic] = p.value
@@ -235,9 +249,14 @@ class LASFile:
             "version": self.version.to_dict(),
             "well": self.well.to_dict(),
             "parameters": params_dict,
+            "parameter_details": [p.to_dict() for p in self.parameters],
+            "curves": [c.to_dict() for c in self.curves],
             "logs": {k: v.copy() for k, v in self.logs.items()},
             "curves_order": list(self.curves_order),
-            "curves": [c.to_dict() for c in self.curves],
+            "other": self.other,
+            "data_sections": [ds.to_dict() for ds in self.data_sections],
+            "string_data": {k: v.copy() for k, v in self.string_data.items()},
+            "encoding": self.encoding,
         }
 
     @classmethod
@@ -285,14 +304,73 @@ class LASFile:
             for curve_name in curves_order:
                 las_file.curves.append(CurveDefinition(mnemonic=curve_name))
 
-        params = data.get("parameters", {})
-        for mnemonic, value in params.items():
-            las_file.parameters.append(
-                ParameterEntry(
-                    mnemonic=mnemonic,
-                    value=str(value),
-                )
+        params = data.get("parameters", [])
+        if isinstance(params, dict):
+            # Legacy format: {mnemonic: value}
+            # Check for parameter_details first to preserve full metadata
+            # on roundtrip (e.g. array_index, zone, unit, description).
+            param_details = data.get("parameter_details")
+            if param_details and isinstance(param_details, list):
+                for param_dict in param_details:
+                    zone = None
+                    if "zone" in param_dict:
+                        zone = ParameterZone(
+                            zone_name=param_dict["zone"].get("zone_name", ""),
+                            zone_index=param_dict["zone"].get("zone_index"),
+                        )
+                    las_file.parameters.append(ParameterEntry(
+                        mnemonic=str(param_dict.get("mnemonic", "")),
+                        unit=str(param_dict.get("unit", "")),
+                        value=str(param_dict.get("value", "")),
+                        description=str(param_dict.get("description", "")),
+                        array_index=param_dict.get("array_index"),
+                        zone=zone,
+                    ))
+            else:
+                # Pure legacy: only params dict, no details available
+                for mnemonic, value in params.items():
+                    las_file.parameters.append(
+                        ParameterEntry(mnemonic=mnemonic, value=str(value))
+                    )
+        elif isinstance(params, list):
+            # New format: [{"mnemonic": ..., "value": ..., ...}, ...]
+            for param_dict in params:
+                zone = None
+                if "zone" in param_dict:
+                    zone = ParameterZone(
+                        zone_name=param_dict["zone"].get("zone_name", ""),
+                        zone_index=param_dict["zone"].get("zone_index"),
+                    )
+                las_file.parameters.append(ParameterEntry(
+                    mnemonic=str(param_dict.get("mnemonic", "")),
+                    unit=str(param_dict.get("unit", "")),
+                    value=str(param_dict.get("value", "")),
+                    description=str(param_dict.get("description", "")),
+                    array_index=param_dict.get("array_index"),
+                    zone=zone,
+                ))
+
+        las_file.other = str(data.get("other", ""))
+        las_file.encoding = str(data.get("encoding", "utf-8"))
+        las_file.source_file = str(data.get("source_file", ""))
+
+        # Restore LAS 3.0 data sections
+        ds_data = data.get("data_sections", [])
+        for ds_dict in ds_data:
+            ds = DataSection(
+                name=ds_dict.get("name", ""),
+                curves_order=list(ds_dict.get("curves_order", [])),
+                data={
+                    k: np.array(v, dtype=np.float64)
+                    for k, v in ds_dict.get("data", {}).items()
+                },
             )
+            las_file.data_sections.append(ds)
+
+        # Restore LAS 3.0 string data
+        sd = data.get("string_data", {})
+        for name, arr in sd.items():
+            las_file.string_data[name] = np.array(arr, dtype=np.str_)
 
         logs = data.get("logs", {})
         for name, arr in logs.items():
@@ -329,3 +407,31 @@ class DevFile:
     def to_dict(self) -> dict[str, NDArray[np.float64]]:
         """Convert to legacy dict format."""
         return {k: v.copy() for k, v in self.columns.items()}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DevFile:
+        """Create DevFile from dict (reverse of to_dict).
+
+        Args:
+            data: Flat dict mapping column names to array-like values.
+
+        Returns:
+            DevFile with columns populated from the dict.
+        """
+        dev = cls()
+        # Separate column arrays from metadata keys
+        metadata_keys = {"encoding", "source_file", "column_order"}
+        for key, value in data.items():
+            if key in metadata_keys:
+                if key == "encoding":
+                    dev.encoding = str(value)
+                elif key == "source_file":
+                    dev.source_file = str(value)
+                elif key == "column_order":
+                    dev.column_order = list(value)
+            else:
+                dev.columns[key] = np.array(value, dtype=np.float64)
+        # If column_order wasn't in the dict, infer from Python 3.7+ dict order
+        if not dev.column_order:
+            dev.column_order = list(dev.columns.keys())
+        return dev
