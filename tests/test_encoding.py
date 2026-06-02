@@ -116,3 +116,23 @@ class TestReadWithEncoding:
         # Trying to decode CP1251 as ASCII should fail
         with pytest.raises(UnicodeDecodeError):
             read_with_encoding(test_file, encoding="ascii")
+
+    # --- T5: LASEncodingError unreachable path (encoding.py:110) ---
+    def test_fallback_chain_empty_raises_encoding_error(self, tmp_path: Path) -> None:
+        """Test LASEncodingError when fallback chain is exhausted.
+
+        Exercises encoding.py:110-112 — the LASEncodingError raise at the end
+        of read_with_encoding when all fallback encodings fail.
+        This path is normally unreachable because latin-1 can decode any byte,
+        but it guards against the case where FALLBACK_ENCODINGS is modified.
+        """
+        test_file = tmp_path / "bad.las"
+        # Write bytes that are invalid UTF-8 and will fail with standard encodings
+        test_file.write_bytes(b"\xff\xfe\x00\x01")
+
+        # Mock fallback chain to be empty so we hit the error path
+        with mock.patch("pylasdev.encoding.FALLBACK_ENCODINGS", []):
+            with mock.patch("pylasdev.encoding.HAS_CHARDET", False):
+                from pylasdev.exceptions import LASEncodingError
+                with pytest.raises(LASEncodingError, match="Failed to decode"):
+                    read_with_encoding(test_file)

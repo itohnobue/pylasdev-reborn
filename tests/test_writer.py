@@ -281,6 +281,40 @@ class TestWriteLASFile:
         assert "{A:0}" in content
         assert "NMR[1]" in content
 
+    # --- T9: Fractional time_offset (writer.py:121) ---
+    def test_write_las30_fractional_time_offset(self, tmp_path: Path) -> None:
+        """Test writing LAS 3.0 array curve with fractional time_offset.
+
+        Exercises writer.py:120-121 — the format string path for non-integer
+        time_offset values (e.g., 5.5).
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "NMR[1]"]
+        las.curves.append(
+            CurveDefinition(mnemonic="DEPT", unit="M", description="DEPTH", data_format="F")
+        )
+        las.curves.append(
+            CurveDefinition(
+                mnemonic="NMR[1]",
+                unit="ms",
+                description="NMR Echo",
+                data_format="A",
+                array_info=ArrayElementInfo(base_name="NMR", index=1, time_offset=5.5),
+            )
+        )
+        las.logs["DEPT"] = np.array([100.0])
+        las.logs["NMR[1]"] = np.array([10.0])
+
+        temp_file = tmp_path / "las30_frac_offset.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        # Fractional time_offset 5.5 should appear as float in format
+        assert "{A:5.5}" in content
+        assert "NMR[1]" in content
+
     def test_write_las30_zone_association(self, tmp_path: Path) -> None:
         """Test writing LAS 3.0 parameter zone associations."""
         las = LASFile()
@@ -489,9 +523,11 @@ class TestWriteLASFile:
 
     # --- F-25: Inf values in _format_data_rows ---
     def test_write_inf_values(self, tmp_path: Path) -> None:
-        """Test that Inf/-Inf values are written as formatted strings.
+        """Test that Inf/-Inf values are replaced with null_value in output.
 
-        Exercises writer.py:241-242 — the np.isinf check in _format_number.
+        Inf values are not valid LAS data; they are serialized as the
+        null value (like NaN) to avoid producing "inf" or "-inf" strings
+        that parsers cannot handle.
         """
         las = LASFile()
         las.version = VersionSection(vers="2.0")
@@ -508,13 +544,18 @@ class TestWriteLASFile:
         write_las_file(temp_file, las)
 
         content = temp_file.read_text()
-        # Verify both +inf and -inf are present in the output
-        assert "inf" in content.lower()
-        assert "-inf" in content.lower()
-        # Verify roundtrip: re-read and check the inf values are preserved
+        # Extract data lines (after ~A header)
+        data_lines = content.split("~A")[-1].splitlines()
+        # Verify inf values are NOT present in data — replaced with null_value
+        assert not any("inf" in line.lower() for line in data_lines)
+        # Verify the null value appears in data lines where inf was
+        assert any("-999.25" in line for line in data_lines[1:])  # skip header line
+        # Verify the normal value (50) still appears
+        assert "50" in data_lines[1]
+        # Verify roundtrip: re-read and check inf values became null_value
         reread = read_las_file(temp_file)
-        assert np.isposinf(reread["logs"]["DT"][1])
-        assert np.isneginf(reread["logs"]["DT"][2])
+        assert reread["logs"]["DT"][1] == pytest.approx(-999.25)
+        assert reread["logs"]["DT"][2] == pytest.approx(-999.25)
 
     # --- F-26: Custom precision parameter ---
     def test_write_custom_precision(self, tmp_path: Path) -> None:

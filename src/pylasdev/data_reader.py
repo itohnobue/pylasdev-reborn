@@ -8,15 +8,30 @@ and O(n) performance (vs O(n^2) numpy.append bug in original).
 from __future__ import annotations
 
 import warnings
-from typing import Any
 
 import numpy as np
 
-from .models import LASFile
+from .models import LASFile, WellSection
+
+
+def _is_section_header(stripped: str) -> bool:
+    """Check if a stripped line is a section header (~[A-Za-z]).
+
+    Uses ASCII-only character check to match the parser's SECTION_PATTERN,
+    which is limited to [A-Za-z].  The parser upper-cases section letters,
+    so matching must stay within ASCII.
+    """
+    return (
+        stripped.startswith("~")
+        and len(stripped) > 1
+        and stripped[1] in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    )
 
 
 def _get_null_value(
-    well: Any, default: str = "-999.25", default_float: float = -999.25
+    well: WellSection | dict[str, str],
+    default: str = "-999.25",
+    default_float: float = -999.25,
 ) -> float:
     """Extract null value from well section or return default.
 
@@ -78,8 +93,8 @@ def _detect_actual_wrap(lines: list[str], curve_count: int) -> bool:
     for line in lines:
         stripped = line.strip()
 
-        if stripped.startswith("~") and len(stripped) > 1 and stripped[1].isalpha():
-            if stripped[1].lower() == "a":
+        if _is_section_header(stripped):
+            if stripped[1].upper() == "A":
                 in_ascii = True
             continue
 
@@ -127,18 +142,9 @@ def _deduplicate_curves(
                 new_name = f"{name}_{suffix}"
             # Update the seen counter to match the actual suffix used
             seen[name] = suffix
-            warnings.warn(
-                f"Duplicate curve mnemonic '{name}' renamed to '{new_name}'. "
-                "Data may come from a file with repeated curve names.",
-                stacklevel=_stacklevel,
+            _rename_duplicate_curve(
+                las_file, idx, name, new_name, new_order, output_names, _stacklevel,
             )
-            new_order.append(new_name)
-            output_names.add(new_name)
-            # Keep CurveDefinition in sync with renamed curves_order
-            if idx < len(las_file.curves):
-                if not las_file.curves[idx].original_mnemonic:
-                    las_file.curves[idx].original_mnemonic = name
-                las_file.curves[idx].mnemonic = new_name
         else:
             # F-22: Check for cross-base collisions where an
             # original name matches a previously generated _N suffix.
@@ -152,23 +158,38 @@ def _deduplicate_curves(
                     suffix += 1
                     new_name = f"{name}_{suffix}"
                 seen[name] = suffix
-                warnings.warn(
-                    f"Duplicate curve mnemonic '{name}' renamed to '{new_name}'. "
-                    "Data may come from a file with repeated curve names.",
-                    stacklevel=_stacklevel,
+                _rename_duplicate_curve(
+                    las_file, idx, name, new_name, new_order, output_names, _stacklevel,
                 )
-                new_order.append(new_name)
-                output_names.add(new_name)
-                if idx < len(las_file.curves):
-                    if not las_file.curves[idx].original_mnemonic:
-                        las_file.curves[idx].original_mnemonic = name
-                    las_file.curves[idx].mnemonic = new_name
             else:
                 seen[name] = 1
                 new_order.append(name)
                 output_names.add(name)
     if new_order != las_file.curves_order:
         las_file.curves_order = new_order
+
+
+def _rename_duplicate_curve(
+    las_file: LASFile,
+    idx: int,
+    name: str,
+    new_name: str,
+    new_order: list[str],
+    output_names: set[str],
+    _stacklevel: int = 2,
+) -> None:
+    """Rename a duplicate curve with warning and keep CurveDefinition in sync."""
+    warnings.warn(
+        f"Duplicate curve mnemonic '{name}' renamed to '{new_name}'. "
+        "Data may come from a file with repeated curve names.",
+        stacklevel=_stacklevel,
+    )
+    new_order.append(new_name)
+    output_names.add(new_name)
+    if idx < len(las_file.curves):
+        if not las_file.curves[idx].original_mnemonic:
+            las_file.curves[idx].original_mnemonic = name
+        las_file.curves[idx].mnemonic = new_name
 
 
 def _read_normal(
@@ -197,8 +218,8 @@ def _read_normal(
         # F-20: Align section detection with parser.py's SECTION_PATTERN
         # (~[A-Za-z]).  Lines starting with ~ but without an alphabetic
         # section letter (e.g. bare ~, ~~~, etc.) are ignored.
-        if stripped.startswith("~") and len(stripped) > 1 and stripped[1].isalpha():
-            if stripped.startswith("~A"):
+        if _is_section_header(stripped):
+            if stripped[1].upper() == "A":
                 in_ascii = True
             else:
                 if in_ascii:
@@ -218,7 +239,7 @@ def _read_normal(
                 # (the pre-allocated arrays are sized for the deduplicated curve_count
                 # which may be smaller than the original data column count)
                 # ValueError covers non-numeric values — fill with null_value
-                if i < curve_count:
+                if i < curve_count and current_line < las_file.logs[las_file.curves_order[i]].shape[0]:
                     las_file.logs[las_file.curves_order[i]][current_line] = null_value
 
         # Fill remaining curves with null_value when line has fewer values
@@ -263,8 +284,8 @@ def _read_wrapped(
         # F-20: Align section detection with parser.py's SECTION_PATTERN
         # (~[A-Za-z]).  Only treat lines as section headers when the
         # character after ~ is alphabetic.
-        if stripped.startswith("~") and len(stripped) > 1 and stripped[1].isalpha():
-            if stripped.startswith("~A"):
+        if _is_section_header(stripped):
+            if stripped[1].upper() == "A":
                 in_ascii = True
             else:
                 if in_ascii:

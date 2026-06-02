@@ -22,6 +22,14 @@ def compare_las_dicts(
 ) -> bool:
     """Compare two LAS data dictionaries for equality.
 
+    The high branch count (23) is inherent to the function's purpose:
+    it must handle every type that appears in LAS dicts — numpy arrays
+    (with tolerance comparison), nested dicts, lists (with special
+    handling for data_sections containing numpy arrays), and scalars —
+    each requiring distinct comparison logic.  Breaking this into
+    separate functions for each type would scatter the comparison
+    protocol and make it harder to follow the control flow.
+
     Args:
         dict1: First LAS data dictionary.
         dict2: Second LAS data dictionary.

@@ -12,6 +12,28 @@ import numpy as np
 from numpy.typing import NDArray
 
 
+def _create_parameter_entry(param_dict: dict[str, Any]) -> ParameterEntry:
+    """Create a ParameterEntry from a dictionary, handling optional zone info.
+
+    Extracted from LASFile.from_dict to avoid duplicated construction logic
+    across the parameter_details and params list branches.
+    """
+    zone = None
+    if "zone" in param_dict:
+        zone = ParameterZone(
+            zone_name=param_dict["zone"].get("zone_name", ""),
+            zone_index=param_dict["zone"].get("zone_index"),
+        )
+    return ParameterEntry(
+        mnemonic=str(param_dict.get("mnemonic", "")),
+        unit=str(param_dict.get("unit", "")),
+        value=str(param_dict.get("value", "")),
+        description=str(param_dict.get("description", "")),
+        array_index=param_dict.get("array_index"),
+        zone=zone,
+    )
+
+
 @dataclass
 class VersionSection:
     """LAS Version Information section (~V).
@@ -251,17 +273,29 @@ class LASFile:
             "parameters": params_dict,
             "parameter_details": [p.to_dict() for p in self.parameters],
             "curves": [c.to_dict() for c in self.curves],
+            # Defensive copy prevents callers from mutating internal arrays
+            # through the returned dict (numpy arrays are mutable views).
             "logs": {k: v.copy() for k, v in self.logs.items()},
             "curves_order": list(self.curves_order),
             "other": self.other,
             "data_sections": [ds.to_dict() for ds in self.data_sections],
-            "string_data": {k: v.copy() for k, v in self.string_data.items()},
+            "string_data": {k: v.copy() for k, v in self.string_data.items()},  # same defensive copy as logs above
             "encoding": self.encoding,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LASFile:
-        """Create LASFile from legacy dict format."""
+        """Create LASFile from dict format.
+
+        Handles multiple format variants inherently:
+        - Legacy flat dict (curves as string lists, params as {name: value} dict)
+        - Detailed dict with CurveDefinition metadata (unit, api_code, description)
+        - LAS 3.0 dict with array_info, data_format, data_sections, string_data
+        - Mixed formats from roundtrip serialization
+
+        The method is naturally long due to covering all these variants in a
+        single backwards-compatible code path.
+        """
         las_file = cls()
 
         version = data.get("version", {})
@@ -312,20 +346,7 @@ class LASFile:
             param_details = data.get("parameter_details")
             if param_details and isinstance(param_details, list):
                 for param_dict in param_details:
-                    zone = None
-                    if "zone" in param_dict:
-                        zone = ParameterZone(
-                            zone_name=param_dict["zone"].get("zone_name", ""),
-                            zone_index=param_dict["zone"].get("zone_index"),
-                        )
-                    las_file.parameters.append(ParameterEntry(
-                        mnemonic=str(param_dict.get("mnemonic", "")),
-                        unit=str(param_dict.get("unit", "")),
-                        value=str(param_dict.get("value", "")),
-                        description=str(param_dict.get("description", "")),
-                        array_index=param_dict.get("array_index"),
-                        zone=zone,
-                    ))
+                    las_file.parameters.append(_create_parameter_entry(param_dict))
             else:
                 # Pure legacy: only params dict, no details available
                 for mnemonic, value in params.items():
@@ -335,20 +356,7 @@ class LASFile:
         elif isinstance(params, list):
             # New format: [{"mnemonic": ..., "value": ..., ...}, ...]
             for param_dict in params:
-                zone = None
-                if "zone" in param_dict:
-                    zone = ParameterZone(
-                        zone_name=param_dict["zone"].get("zone_name", ""),
-                        zone_index=param_dict["zone"].get("zone_index"),
-                    )
-                las_file.parameters.append(ParameterEntry(
-                    mnemonic=str(param_dict.get("mnemonic", "")),
-                    unit=str(param_dict.get("unit", "")),
-                    value=str(param_dict.get("value", "")),
-                    description=str(param_dict.get("description", "")),
-                    array_index=param_dict.get("array_index"),
-                    zone=zone,
-                ))
+                las_file.parameters.append(_create_parameter_entry(param_dict))
 
         las_file.other = str(data.get("other", ""))
         las_file.encoding = str(data.get("encoding", "utf-8"))

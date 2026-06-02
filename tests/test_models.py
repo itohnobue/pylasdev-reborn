@@ -235,6 +235,99 @@ class TestLASFile:
 
         assert las.get_array_curves("NONEXIST") == []
 
+    # --- T3: from_dict() list-format parameters path (models.py:335-344) ---
+
+    def test_from_dict_list_parameters(self) -> None:
+        """Test LASFile.from_dict() with parameters as a list of dicts."""
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100"},
+            "curves_order": ["DEPT"],
+            "parameters": [
+                {"mnemonic": "BHT", "unit": "DEGC", "value": "35.5", "description": "Temp"},
+                {"mnemonic": "BS", "unit": "MM", "value": "200", "description": "Bit Size"},
+            ],
+            "logs": {"DEPT": np.array([100.0, 101.0])},
+        }
+        las = LASFile.from_dict(data)
+        assert len(las.parameters) == 2
+        assert las.parameters[0].mnemonic == "BHT"
+        assert las.parameters[0].unit == "DEGC"
+        assert las.parameters[0].value == "35.5"
+        assert las.parameters[0].description == "Temp"
+        assert las.parameters[1].mnemonic == "BS"
+        assert las.parameters[1].value == "200"
+
+    def test_from_dict_list_parameters_with_zone(self) -> None:
+        """Test LASFile.from_dict() with list-format params including zone."""
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {},
+            "curves_order": ["DEPT"],
+            "parameters": [
+                {
+                    "mnemonic": "MATR",
+                    "unit": "",
+                    "value": "SAND",
+                    "description": "Neutron Matrix",
+                    "zone": {"zone_name": "RUN", "zone_index": 1},
+                },
+            ],
+            "logs": {"DEPT": np.array([100.0])},
+        }
+        las = LASFile.from_dict(data)
+        assert len(las.parameters) == 1
+        assert las.parameters[0].zone is not None
+        assert las.parameters[0].zone.zone_name == "RUN"
+        assert las.parameters[0].zone.zone_index == 1
+
+    def test_from_dict_list_parameters_with_array_index(self) -> None:
+        """Test LASFile.from_dict() with list-format params including array_index."""
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {},
+            "curves_order": ["DEPT"],
+            "parameters": [
+                {
+                    "mnemonic": "RUN[1]",
+                    "unit": "",
+                    "value": "1.0",
+                    "description": "Run Number",
+                    "array_index": 1,
+                },
+            ],
+            "logs": {"DEPT": np.array([100.0])},
+        }
+        las = LASFile.from_dict(data)
+        assert len(las.parameters) == 1
+        assert las.parameters[0].array_index == 1
+        assert las.parameters[0].base_mnemonic == "RUN"
+
+    def test_from_dict_list_parameters_roundtrip(self) -> None:
+        """Test roundtrip with list-format parameters preserves metadata."""
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT"))
+        las.logs["DEPT"] = np.array([100.0])
+        from pylasdev.models import ParameterZone
+        las.parameters.append(ParameterEntry(
+            mnemonic="MATR", value="SAND", description="Matrix",
+            zone=ParameterZone(zone_name="RUN", zone_index=1),
+        ))
+        las.parameters.append(ParameterEntry(
+            mnemonic="RUN[1]", value="1.0", array_index=1,
+        ))
+
+        d = las.to_dict()
+        las2 = LASFile.from_dict(d)
+        d2 = las2.to_dict()
+
+        assert len(d2["parameter_details"]) == 2
+        assert d2["parameter_details"][0]["mnemonic"] == "MATR"
+        assert d2["parameter_details"][0]["zone"]["zone_name"] == "RUN"
+        assert d2["parameter_details"][1]["array_index"] == 1
+
 
 class TestDevFile:
     """Tests for DevFile dataclass."""
@@ -249,3 +342,64 @@ class TestDevFile:
         # Verify it's a copy
         d["MD"][0] = 999.0
         assert dev.columns["MD"][0] == 0.0
+
+    # --- T2: DevFile.from_dict() coverage (models.py:421-437) ---
+
+    def test_dev_file_from_dict(self) -> None:
+        """Test DevFile.from_dict() creates DevFile from column dict."""
+        data: dict[str, Any] = {
+            "MD": np.array([0.0, 100.0, 200.0]),
+            "TVD": np.array([0.0, 99.0, 198.0]),
+            "X": np.array([100.0, 101.0, 102.0]),
+        }
+        dev = DevFile.from_dict(data)
+        assert "MD" in dev.columns
+        assert "TVD" in dev.columns
+        assert "X" in dev.columns
+        np.testing.assert_array_equal(dev.columns["MD"], np.array([0.0, 100.0, 200.0]))
+        np.testing.assert_array_equal(dev.columns["TVD"], np.array([0.0, 99.0, 198.0]))
+        # column_order should be inferred from insertion order
+        assert dev.column_order == ["MD", "TVD", "X"]
+
+    def test_dev_file_from_dict_with_metadata(self) -> None:
+        """Test DevFile.from_dict() with encoding, source_file, column_order."""
+        data: dict[str, Any] = {
+            "MD": np.array([0.0, 100.0]),
+            "TVD": np.array([0.0, 99.0]),
+            "encoding": "cp1251",
+            "source_file": "/path/to/data.dev",
+            "column_order": ["TVD", "MD"],
+        }
+        dev = DevFile.from_dict(data)
+        assert dev.encoding == "cp1251"
+        assert dev.source_file == "/path/to/data.dev"
+        # Explicit column_order should be preserved
+        assert dev.column_order == ["TVD", "MD"]
+        np.testing.assert_array_equal(dev.columns["MD"], np.array([0.0, 100.0]))
+        np.testing.assert_array_equal(dev.columns["TVD"], np.array([0.0, 99.0]))
+
+    def test_dev_file_from_dict_roundtrip(self) -> None:
+        """Test DevFile.from_dict(to_dict()) preserves column data.
+
+        Note: to_dict() only returns column arrays (backward compat),
+        so metadata like source_file and encoding are NOT preserved
+        through a to_dict() → from_dict() roundtrip. Use a rich dict
+        with metadata keys to preserve those.
+        """
+        dev = DevFile()
+        dev.columns["MD"] = np.array([0.0, 100.0, 200.0])
+        dev.columns["TVD"] = np.array([0.0, 99.0, 198.0])
+        dev.encoding = "utf-8"
+        dev.source_file = "test.dev"
+
+        d = dev.to_dict()
+        dev2 = DevFile.from_dict(d)
+
+        # Column data is preserved
+        np.testing.assert_array_equal(dev2.columns["MD"], dev.columns["MD"])
+        np.testing.assert_array_equal(dev2.columns["TVD"], dev.columns["TVD"])
+        # Metadata from to_dict() is NOT in the output dict, so defaults apply
+        assert dev2.encoding == "utf-8"  # default, not from to_dict()
+        assert dev2.source_file == ""  # default
+        # column_order inferred from dict insertion order
+        assert dev2.column_order == ["MD", "TVD"]

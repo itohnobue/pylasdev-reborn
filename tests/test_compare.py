@@ -201,3 +201,77 @@ class TestCompareLasDicts:
         d1 = {"a": 1}
         d2 = {"a": 1, "b": 2}
         assert compare_las_dicts(d1, d2) is False
+
+    # --- T1: _compare_data_sections coverage (compare.py:151-194) ---
+
+    def test_compare_data_sections_match(self) -> None:
+        """Test _compare_data_sections returns True for matching sections."""
+        d1 = {
+            "data_sections": [
+                {"DEPT": np.array([1000.0, 1001.0]), "DT": np.array([50.0, 51.0])},
+                {"GR": np.array([75.0, 76.0])},
+            ],
+        }
+        d2 = {
+            "data_sections": [
+                {"DEPT": np.array([1000.0, 1001.0]), "DT": np.array([50.0, 51.0])},
+                {"GR": np.array([75.0, 76.0])},
+            ],
+        }
+        assert compare_las_dicts(d1, d2) is True
+
+    def test_compare_data_sections_length_mismatch(self) -> None:
+        """Test _compare_data_sections returns False when section counts differ."""
+        d1 = {"data_sections": [{"DEPT": np.array([1.0])}]}
+        d2 = {"data_sections": [{"DEPT": np.array([1.0])}, {"DT": np.array([2.0])}]}
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_compare_data_sections_key_mismatch(self) -> None:
+        """Test _compare_data_sections returns False when dict keys differ."""
+        d1 = {"data_sections": [{"DEPT": np.array([1.0]), "DT": np.array([2.0])}]}
+        d2 = {"data_sections": [{"DEPT": np.array([1.0]), "GR": np.array([3.0])}]}
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_compare_data_sections_ndarray_mismatch(self) -> None:
+        """Test _compare_data_sections returns False when ndarray values differ."""
+        d1 = {"data_sections": [{"DEPT": np.array([1.0, 2.0])}]}
+        d2 = {"data_sections": [{"DEPT": np.array([1.0, 3.0])}]}
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_compare_data_sections_list_mismatch(self) -> None:
+        """Test _compare_data_sections returns False when list values differ."""
+        d1 = {"data_sections": [{"order": ["A", "B"]}]}
+        d2 = {"data_sections": [{"order": ["A", "C"]}]}
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_compare_data_sections_scalar_mismatch(self) -> None:
+        """Test _compare_data_sections returns False when scalar values differ."""
+        d1 = {"data_sections": [{"name": "section_a"}]}
+        d2 = {"data_sections": [{"name": "section_b"}]}
+        assert compare_las_dicts(d1, d2) is False
+
+    # --- T4: String/object array comparison (compare.py:129-131) ---
+
+    def test_compare_string_arrays_match(self) -> None:
+        """Test _compare_arrays handles Unicode string arrays correctly."""
+        d1 = {"string_data": {"CDES": np.array(["SAND", "SHALE"], dtype="U")}}
+        d2 = {"string_data": {"CDES": np.array(["SAND", "SHALE"], dtype="U")}}
+        assert compare_las_dicts(d1, d2) is True
+
+    def test_compare_string_arrays_mismatch(self) -> None:
+        """Test _compare_arrays detects mismatch in string arrays."""
+        d1 = {"string_data": {"CDES": np.array(["SAND", "SHALE"], dtype="U")}}
+        d2 = {"string_data": {"CDES": np.array(["SAND", "LIMESTONE"], dtype="U")}}
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_compare_object_arrays_match(self) -> None:
+        """Test _compare_arrays handles object dtype arrays correctly."""
+        d1 = {"meta": {"tags": np.array(["A", "B"], dtype="O")}}
+        d2 = {"meta": {"tags": np.array(["A", "B"], dtype="O")}}
+        assert compare_las_dicts(d1, d2) is True
+
+    def test_compare_object_arrays_mismatch(self) -> None:
+        """Test _compare_arrays detects mismatch in object arrays."""
+        d1 = {"meta": {"tags": np.array(["A", "B"], dtype="O")}}
+        d2 = {"meta": {"tags": np.array(["A", "C"], dtype="O")}}
+        assert compare_las_dicts(d1, d2) is False

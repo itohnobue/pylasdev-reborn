@@ -142,6 +142,16 @@ class LASParser:
         """
         self._reset()
 
+        # Three-pass parsing design:
+        #   Pass 1 (_pre_scan): count ASCII data lines to enable pre-allocation
+        #     of numpy arrays at the exact size, avoiding O(n^2) incremental
+        #     reallocation during data fill.
+        #   Pass 2 (_parse_line looping): extract metadata (version, well, curve
+        #     definitions, parameters) and collect ASCII data lines.
+        #   Pass 3 (_process_ascii_data): fill pre-allocated numpy arrays with
+        #     parsed numeric/string values.
+        # Three separate passes are necessary because Pass 2 performs array
+        # pre-allocation (using the count from Pass 1) BEFORE Pass 3 fills them.
         if lines is None:
             lines = content.splitlines()
         self._pre_scan(lines)
@@ -436,11 +446,11 @@ class LASParser:
         is_first_section = not self.las_file.data_sections
         for i, curve in enumerate(curves):
             if string_curves.get(i, False):
-                # String curves: accumulate as list, convert at end
+                # String curves: accumulate as list, convert at end.
+                # PERF: No zeros allocation in data_section.data — the writer
+                # reads string curves from las_file.string_data, not from
+                # data_section.data, so the np.zeros allocation here was dead.
                 string_data_lists[i] = []
-                data_section.data[curve.mnemonic] = np.zeros(
-                    actual_count, dtype=np.float64
-                )
             else:
                 arr = np.zeros(actual_count, dtype=np.float64)
                 if is_first_section:

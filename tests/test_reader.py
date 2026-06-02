@@ -445,6 +445,53 @@ class TestDataReaderEdgeCases:
         # Data should still be read
         assert "DEPT" in las.logs
 
+    # --- T6: Non-numeric VERS branch (reader.py:129-134) ---
+    def test_non_numeric_vers(self, tmp_path: Path) -> None:
+        """Test that non-numeric VERS string (e.g. 'CWLS') reads without error.
+
+        Exercises reader.py:129-134 — the ValueError handler for non-numeric
+        version strings. Common in LAS 1.2 files with plain text identifiers.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   CWLS LOG ASCII STANDARD  : VERSION 1.2\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~A  DEPT\n"
+            "100.0\n"
+        )
+        test_file = tmp_path / "non_numeric_vers.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Should not crash — non-numeric VERS is logged and file reads anyway
+        data = read_las_file(test_file)
+        assert "DEPT" in data["logs"]
+        assert data["logs"]["DEPT"][0] == 100.0
+
+    def test_non_numeric_vers_as_object(self, tmp_path: Path) -> None:
+        """Test non-numeric VERS with read_las_file_as_object."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   CWLS LOG ASCII STANDARD  : VERSION 1.2\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~A  DEPT\n"
+            "100.0\n"
+        )
+        test_file = tmp_path / "non_numeric_vers_obj.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Should not crash — non-numeric VERS just gets logged at debug
+        las = read_las_file_as_object(test_file)
+        assert las.version.vers == "CWLS LOG ASCII STANDARD"
+        assert "DEPT" in las.logs
+
     def test_max_file_size_limit(self, tmp_path: Path) -> None:
         """Test that max_file_size parameter rejects oversized files."""
         content = (
@@ -802,3 +849,49 @@ class TestDataReaderEdgeCases:
         assert "GR_2_2" in data["logs"]
         np.testing.assert_array_equal(data["logs"]["GR_2"], [100.0])
         np.testing.assert_array_equal(data["logs"]["GR_2_2"], [10.0])
+
+    # --- T7: Cross-base collision while-loop (data_reader.py:149-165) ---
+    def test_cross_base_collision_dedup(self, tmp_path: Path) -> None:
+        """Test dedup when original name matches a previously generated suffix.
+
+        Input curves_order: ["DEPT", "DEPT", "DEPT_2"]
+        Expected: ["DEPT", "DEPT_2", "DEPT_2_2"] — the second DEPT becomes
+        DEPT_2 which collides with the third original name DEPT_2,
+        so the third gets renamed to DEPT_2_2.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth 1\n"
+            " DEPT.M   :  Depth 2\n"
+            " DEPT_2.M :  Pre-named curve\n"
+            "~A  DEPT  DEPT  DEPT_2\n"
+            "100.0  10.0  20.0\n"
+            "101.0  11.0  21.0\n"
+        )
+        test_file = tmp_path / "cross_base_collision.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            data = read_las_file(test_file)
+            # Should have 2 warnings: one for duplicate DEPT, one for cross-base
+            dup_warnings = [x for x in w if "Duplicate curve mnemonic" in str(x.message)]
+            assert len(dup_warnings) >= 2
+
+        # Expected order: DEPT, DEPT_2, DEPT_2_2
+        assert "DEPT" in data["logs"]
+        assert "DEPT_2" in data["logs"]
+        assert "DEPT_2_2" in data["logs"]
+        # All three must be distinct keys
+        assert len(data["logs"]) == 3
+        # Verify data values
+        np.testing.assert_array_equal(data["logs"]["DEPT"], [100.0, 101.0])
+        np.testing.assert_array_equal(data["logs"]["DEPT_2"], [10.0, 11.0])
+        np.testing.assert_array_equal(data["logs"]["DEPT_2_2"], [20.0, 21.0])
