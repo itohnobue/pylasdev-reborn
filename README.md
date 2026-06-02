@@ -89,10 +89,10 @@ las2 = LASFile.from_dict(d)               # Create from dict
 
 ```bash
 # Install with encoding support
-pip install "git+https://github.com/itohnobue/pylasdev-reborn.git#egg=pylasdev[encoding]"
+pip install "pylasdev[encoding] @ git+https://github.com/itohnobue/pylasdev-reborn.git"
 
 # Install with all extras (dev tools + encoding)
-pip install "git+https://github.com/itohnobue/pylasdev-reborn.git#egg=pylasdev[all]"
+pip install "pylasdev[all] @ git+https://github.com/itohnobue/pylasdev-reborn.git"
 ```
 
 ## Development
