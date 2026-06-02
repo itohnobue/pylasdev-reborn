@@ -7,13 +7,13 @@ It is "Reborn" because it was updated, fixed and refactored to work with modern 
 ## Installation
 
 ```bash
-pip install pylasdev
+pip install git+ssh://git@git.aoizora.ru:2222/nobu/pylasdev-reborn.git
 ```
 
 Or with uv:
 
 ```bash
-uv add pylasdev
+uv add git+ssh://git@git.aoizora.ru:2222/nobu/pylasdev-reborn.git
 ```
 
 ## Usage
