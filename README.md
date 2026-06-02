@@ -7,13 +7,13 @@ It is "Reborn" because it was updated, fixed and refactored to work with modern 
 ## Installation
 
 ```bash
-pip install git+https://github.com/muharlyamovar/pylasdev.git
+pip install git+https://github.com/itohnobue/pylasdev-reborn.git
 ```
 
 Or with uv:
 
 ```bash
-uv add git+https://github.com/muharlyamovar/pylasdev.git
+uv add git+https://github.com/itohnobue/pylasdev-reborn.git
 ```
 
 ## Usage
@@ -89,17 +89,17 @@ las2 = LASFile.from_dict(d)               # Create from dict
 
 ```bash
 # Install with encoding support
-pip install pylasdev[encoding]
+pip install "git+https://github.com/itohnobue/pylasdev-reborn.git#egg=pylasdev[encoding]"
 
 # Install with all extras (dev tools + encoding)
-pip install pylasdev[all]
+pip install "git+https://github.com/itohnobue/pylasdev-reborn.git#egg=pylasdev[all]"
 ```
 
 ## Development
 
 ```bash
 # Clone and install dev dependencies
-git clone https://github.com/muharlyamovar/pylasdev.git
+git clone https://github.com/itohnobue/pylasdev-reborn.git
 cd pylasdev
 uv sync --extra dev
 

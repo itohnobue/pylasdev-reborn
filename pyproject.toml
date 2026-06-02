@@ -38,8 +38,8 @@ encoding = ["chardet>=5.0"]
 all = ["pylasdev[dev,encoding]"]
 
 [project.urls]
-Homepage = "https://github.com/muharlyamovar/pylasdev"
-Repository = "https://github.com/muharlyamovar/pylasdev"
+Homepage = "https://github.com/itohnobue/pylasdev-reborn"
+Repository = "https://github.com/itohnobue/pylasdev-reborn"
 
 # UV configuration
 [tool.uv]
