@@ -114,6 +114,10 @@ uv run mypy src/
 
 ## Changelog
 
+### Version 1.5.0 (2026-06-02)
+
+Bug fixes, production hardening, and test coverage improvements.
+
 ### Version 1.0.0 (2026-02-12)
 
 Complete rewrite from Python 2 to Python 3.12+.
