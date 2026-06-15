@@ -58,6 +58,10 @@ def read_with_encoding(
 ) -> tuple[str, str]:
     """Read file content with encoding detection and fallback chain.
 
+    Reads raw bytes once via ``file_path.read_bytes()``, then decodes
+    in memory through the fallback chain. This avoids repeated full-file
+    I/O when encoding detection fails (was up to 7 reads; now always 1).
+
     Args:
         file_path: Path to the file.
         encoding: Explicit encoding override. If None, auto-detected.
@@ -69,9 +73,18 @@ def read_with_encoding(
 
     Raises:
         UnicodeDecodeError: If the explicit encoding parameter fails to decode the file.
-        LASEncodingError: If no encoding in the fallback chain works.
+        LASEncodingError: If the path is not a regular file or no encoding
+            in the fallback chain works.
         ValueError: If file exceeds max_file_size.
     """
+    # Guard against non-regular files (FIFOs, pipes, sockets, etc.).
+    # Public entry points (read_las_file_as_object) also check is_file(),
+    # but this module should be self-protecting when called directly.
+    if not file_path.is_file():
+        raise LASEncodingError(
+            f"Cannot read {file_path}: not a regular file."
+        )
+
     if max_file_size is not None:
         file_size = file_path.stat().st_size
         if file_size > max_file_size:
@@ -80,14 +93,17 @@ def read_with_encoding(
                 f"({max_file_size} bytes): {file_path}"
             )
 
+    # Read raw bytes once — all subsequent decoding happens in memory.
+    raw_bytes = file_path.read_bytes()
+
     if encoding is not None:
-        content = file_path.read_text(encoding=encoding)
+        content = raw_bytes.decode(encoding)
         return encoding, content
 
     # Try auto-detection first
     detected = detect_encoding(file_path)
     try:
-        content = file_path.read_text(encoding=detected)
+        content = raw_bytes.decode(detected)
         return detected, content
     except UnicodeDecodeError:
         logger.debug(
@@ -95,10 +111,10 @@ def read_with_encoding(
             file_path, detected,
         )
 
-    # Fallback chain
+    # Fallback chain — decode the same raw_bytes in memory.
     for enc in FALLBACK_ENCODINGS:
         try:
-            content = file_path.read_text(encoding=enc)
+            content = raw_bytes.decode(enc)
             return enc, content
         except UnicodeDecodeError:
             continue

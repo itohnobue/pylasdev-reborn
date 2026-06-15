@@ -104,7 +104,7 @@ pip install ".[all]"
 ```bash
 # Clone and install dev dependencies
 git clone https://github.com/itohnobue/pylasdev-reborn.git
-cd pylasdev
+cd pylasdev-reborn
 uv sync --extra dev
 
 # Run tests

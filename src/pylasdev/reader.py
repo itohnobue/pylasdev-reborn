@@ -105,7 +105,10 @@ def read_las_file_as_object(
     if not file_path.is_file():
         raise LASReadError(f"Not a file: {file_path}")
 
-    detected_encoding, content = read_with_encoding(file_path, encoding, max_file_size)
+    try:
+        detected_encoding, content = read_with_encoding(file_path, encoding, max_file_size)
+    except PermissionError as e:
+        raise LASReadError(f"Cannot read file (permission denied): {file_path}") from e
 
     parser = LASParser(mnem_base)
     # PERF-01: Split content once, pass lines list to both parser and

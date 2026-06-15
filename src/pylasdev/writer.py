@@ -250,8 +250,10 @@ def _format_number(value: float, precision: str = ".8g") -> str:
     """Format a numeric value with configurable precision.
 
     Handles whole numbers as integers to avoid unnecessary decimal noise.
+    Self-protecting against NaN and Inf — caller guards these already,
+    but a NaN slipping through would otherwise crash on ``int(np.nan)``.
     """
-    if np.isinf(value):
+    if np.isnan(value) or np.isinf(value):
         return format(float(value), precision)
     if value == int(value):
         return format(int(value), precision)

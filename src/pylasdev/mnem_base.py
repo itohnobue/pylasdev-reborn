@@ -2,6 +2,11 @@
 
 Maps alternate/vendor-specific curve mnemonics to canonical names.
 Example: {"AK": "DT", "APTS": "SP", ...}
+
+Some entries form alias chains (A → B → C) where B is itself a key.
+These chains are intentional — they represent nested aliasing where a
+variant normalizes to an intermediate name, which further normalizes to
+a canonical name.  Use :func:`resolve_mnemonic` to walk these chains.
 """
 
 MNEM_BASE: dict[str, str] = {
@@ -2026,3 +2031,44 @@ MNEM_BASE: dict[str, str] = {
     "бк": "BK",
     "юОЯ": "ALPS",
 }
+
+
+def resolve_mnemonic(
+    mnem_base: dict[str, str],
+    mnemonic: str,
+    max_depth: int = 10,
+) -> str:
+    """Resolve multi-step mnemonic alias chains iteratively.
+
+    A single ``.get(mnemonic)`` only resolves one hop.  When the
+    database contains chains like ``BK-3 → BK → BFV``, this helper
+    walks the chain until it reaches a terminal key (one that is not
+    itself a key in *mnem_base*).
+
+    Chains are intentional — they represent nested aliasing where a
+    variant (e.g. ``BK-3``) normalizes to an intermediate canonical name
+    (``BK``), which itself is an alias for the true canonical (``BFV``).
+
+    Cycle detection via *seen* set prevents infinite loops on malformed
+    data.
+
+    Args:
+        mnem_base: Uppercased mnemonic-to-canonical mapping.
+        mnemonic: Input mnemonic to resolve.
+        max_depth: Safety limit on chain length (default 10).
+
+    Returns:
+        Fully resolved canonical mnemonic.
+    """
+    current = mnemonic
+    seen: set[str] = set()
+    for _ in range(max_depth):
+        if current not in mnem_base:
+            return current
+        nxt = mnem_base[current]
+        if nxt in seen:
+            # Cycle detected — return current as-is
+            return current
+        seen.add(current)
+        current = nxt
+    return current

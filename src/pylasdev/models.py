@@ -12,6 +12,16 @@ import numpy as np
 from numpy.typing import NDArray
 
 
+def _safe_str(value: Any, default: str = "") -> str:
+    """Convert value to str, returning *default* when *value* is None.
+
+    Prevents ``str(None)`` → ``"None"`` in dict roundtrip paths.
+    """
+    if value is None:
+        return default
+    return str(value)
+
+
 def _create_parameter_entry(param_dict: dict[str, Any]) -> ParameterEntry:
     """Create a ParameterEntry from a dictionary, handling optional zone info.
 
@@ -25,10 +35,10 @@ def _create_parameter_entry(param_dict: dict[str, Any]) -> ParameterEntry:
             zone_index=param_dict["zone"].get("zone_index"),
         )
     return ParameterEntry(
-        mnemonic=str(param_dict.get("mnemonic", "")),
-        unit=str(param_dict.get("unit", "")),
-        value=str(param_dict.get("value", "")),
-        description=str(param_dict.get("description", "")),
+        mnemonic=_safe_str(param_dict.get("mnemonic", "")),
+        unit=_safe_str(param_dict.get("unit", "")),
+        value=_safe_str(param_dict.get("value", "")),
+        description=_safe_str(param_dict.get("description", "")),
         array_index=param_dict.get("array_index"),
         zone=zone,
     )
@@ -300,14 +310,14 @@ class LASFile:
 
         version = data.get("version", {})
         las_file.version = VersionSection(
-            vers=str(version.get("VERS", "2.0")),
-            wrap=str(version.get("WRAP", "NO")),
-            dlm=str(version.get("DLM", "SPACE")),
+            vers=_safe_str(version.get("VERS"), "2.0"),
+            wrap=_safe_str(version.get("WRAP"), "NO"),
+            dlm=_safe_str(version.get("DLM"), "SPACE"),
         )
 
         well = data.get("well", {})
         for key, value in well.items():
-            las_file.well[key] = str(value)
+            las_file.well[key] = _safe_str(value)
 
         curves_order = data.get("curves_order", [])
         las_file.curves_order = list(curves_order)
@@ -351,16 +361,16 @@ class LASFile:
                 # Pure legacy: only params dict, no details available
                 for mnemonic, value in params.items():
                     las_file.parameters.append(
-                        ParameterEntry(mnemonic=mnemonic, value=str(value))
+                        ParameterEntry(mnemonic=mnemonic, value=_safe_str(value))
                     )
         elif isinstance(params, list):
             # New format: [{"mnemonic": ..., "value": ..., ...}, ...]
             for param_dict in params:
                 las_file.parameters.append(_create_parameter_entry(param_dict))
 
-        las_file.other = str(data.get("other", ""))
-        las_file.encoding = str(data.get("encoding", "utf-8"))
-        las_file.source_file = str(data.get("source_file", ""))
+        las_file.other = _safe_str(data.get("other"), "")
+        las_file.encoding = _safe_str(data.get("encoding"), "utf-8")
+        las_file.source_file = _safe_str(data.get("source_file"), "")
 
         # Restore LAS 3.0 data sections
         ds_data = data.get("data_sections", [])
@@ -432,9 +442,9 @@ class DevFile:
         for key, value in data.items():
             if key in metadata_keys:
                 if key == "encoding":
-                    dev.encoding = str(value)
+                    dev.encoding = _safe_str(value, "utf-8")
                 elif key == "source_file":
-                    dev.source_file = str(value)
+                    dev.source_file = _safe_str(value)
                 elif key == "column_order":
                     dev.column_order = list(value)
             else:

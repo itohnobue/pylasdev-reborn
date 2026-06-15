@@ -19,6 +19,7 @@ import numpy as np
 
 from .data_reader import _deduplicate_curves, _get_null_value
 from .exceptions import LASParseError
+from .mnem_base import resolve_mnemonic
 from .models import (
     ArrayElementInfo,
     CurveDefinition,
@@ -102,14 +103,13 @@ class LASParser:
     def __init__(self, mnem_base: dict[str, str] | None = None) -> None:
         """Initialize parser with optional mnemonic base."""
         self.mnem_base = mnem_base or {}
-        # Build uppercased lookup for case-insensitive matching.
-        # NOTE: This is rebuilt per instance (not at module level) for thread
-        # safety.  When reusing a single LASParser instance across multiple
-        # parse() calls, _reset() preserves this cache — only parse()
-        # re-entrant callers creating many short-lived instances with the
-        # same mnem_base will pay the rebuild cost.  For those workloads,
-        # reuse the parser instance instead.
-        self._mnem_base_upper = {k.upper(): v for k, v in self.mnem_base.items()}
+        # Build uppercased lookup with multi-step chain resolution.
+        # resolve_mnemonic walks chains like BK-3 → BK → BFV to reach
+        # the terminal canonical name. Single .get() only resolves one hop.
+        _raw_upper = {k.upper(): v for k, v in self.mnem_base.items()}
+        self._mnem_base_upper: dict[str, str] = {}
+        for k in _raw_upper:
+            self._mnem_base_upper[k] = resolve_mnemonic(_raw_upper, k)
         self._reset()
 
     def _reset(self) -> None:
@@ -359,8 +359,11 @@ class LASParser:
         if array_match:
             array_index = int(array_match.group("index"))
 
+        # Apply mnemonic normalization from mnem_base (same as curve handling)
+        normalized = self._mnem_base_upper.get(raw_mnemonic, raw_mnemonic)
+
         param = ParameterEntry(
-            mnemonic=raw_mnemonic,
+            mnemonic=normalized,
             unit=unit,
             value=value,
             description=description,
