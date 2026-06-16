@@ -10,6 +10,8 @@ Public API:
     MNEM_BASE           — Mnemonic alias database for curve name normalization
 """
 
+__version__ = "1.6.0"
+
 from .compare import compare_las_dicts
 from .dev_reader import read_dev_file, read_dev_file_as_object
 from .exceptions import (

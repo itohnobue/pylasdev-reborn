@@ -118,7 +118,7 @@ uv run mypy src/
 
 ## Changelog
 
-### Version 1.5.0 (2026-06-02)
+### Version 1.6.0 (2026-06-16)
 
 Bug fixes, production hardening, and test coverage improvements.
 

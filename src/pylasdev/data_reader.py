@@ -296,6 +296,13 @@ def _read_normal(
 
         current_line += 1
 
+    # Trim arrays when ~A section ended early (fewer data lines than declared).
+    # Pre-allocated np.zeros tail would otherwise expose 0.0 values that differ
+    # from null_value, corrupting downstream analysis.
+    if current_line < data_line_count:
+        for curve_name in las_file.curves_order:
+            las_file.logs[curve_name] = las_file.logs[curve_name][:current_line]
+
 
 def _read_wrapped(
     lines: list[str],

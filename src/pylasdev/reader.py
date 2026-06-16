@@ -13,7 +13,7 @@ from typing import Any
 
 from .data_reader import read_ascii_data
 from .encoding import read_with_encoding
-from .exceptions import LASReadError
+from .exceptions import LASParseError, LASReadError
 from .models import LASFile
 from .parser import LASParser
 
@@ -115,7 +115,12 @@ def read_las_file_as_object(
     # data_reader to eliminate redundant content.splitlines() calls
     # (double splitlines doubles peak memory for large files).
     lines = content.splitlines()
-    las_file = parser.parse(content, lines=lines)
+    try:
+        las_file = parser.parse(content, lines=lines)
+    except LASParseError as e:
+        raise LASParseError(
+            f"Error reading {file_path}: {e}"
+        ) from e
     las_file.source_file = str(file_path)
     las_file.encoding = detected_encoding
 
