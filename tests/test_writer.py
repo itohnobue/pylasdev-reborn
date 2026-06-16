@@ -386,7 +386,7 @@ class TestWriteLASFile:
             },
         )
         las.data_sections.append(section)
-        las.string_data["CDES"] = np.array(["LIMESTONE", "DOLOMITE"], dtype=np.str_)
+        section.string_data["CDES"] = np.array(["LIMESTONE", "DOLOMITE"], dtype=np.str_)
 
         temp_file = tmp_path / "las30_str.las"
         write_las_file(temp_file, las)

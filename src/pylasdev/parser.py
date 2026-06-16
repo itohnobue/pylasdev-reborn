@@ -20,6 +20,7 @@ import numpy as np
 from .data_reader import (
     MAX_CURVES,
     MAX_DATA_LINES,
+    MAX_TOTAL_ELEMENTS,
     _deduplicate_curves,
     _get_null_value,
     _to_finite_float,
@@ -457,6 +458,15 @@ class LASParser:
                 f"({MAX_CURVES}). The file may be malformed or corrupt."
             )
 
+        # Combined bound: protect against combination attacks where individual
+        # curve_count and data_line_count checks pass but product exhausts memory.
+        if num_curves * actual_count > MAX_TOTAL_ELEMENTS:
+            raise LASParseError(
+                f"Total allocation ({num_curves} curves × {actual_count} lines = "
+                f"{num_curves * actual_count} elements) exceeds maximum allowed "
+                f"({MAX_TOTAL_ELEMENTS}). The file may be malformed or corrupt."
+            )
+
         # PERF-03: Pre-allocate numpy arrays for numeric curves.
         # String curves use list accumulation because np.empty(dtype=np.str_)
         # would truncate variable-length strings (numpy infers a fixed
@@ -527,9 +537,17 @@ class LASParser:
         # length, preserving the full string values (unlike np.empty).
         for i, curve in enumerate(curves):
             if i in string_data_lists:
-                self.las_file.string_data[curve.mnemonic] = np.array(
-                    string_data_lists[i], dtype=np.str_
-                )
+                string_arr = np.array(string_data_lists[i], dtype=np.str_)
+                # Per-section storage: prevents later sections from overwriting
+                # earlier sections' string data (same pattern as numeric data at
+                # lines 481-483 above).
+                data_section.string_data[curve.mnemonic] = string_arr
+                # Backward compat: only the first section writes to the global
+                # las_file.string_data dict, matching the numeric-data pattern
+                # (F-9 comment at lines 467-471). The writer.py module reads
+                # string curves from las_file.string_data.
+                if is_first_section:
+                    self.las_file.string_data[curve.mnemonic] = string_arr
 
         # Store data section (LAS 3.0)
         self.las_file.data_sections.append(data_section)

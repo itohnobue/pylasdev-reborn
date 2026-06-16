@@ -29,7 +29,7 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --all-extras
+        run: uv sync --all-extras --frozen
 
       - name: Lint
         run: uv run ruff check src/ tests/
@@ -41,7 +41,7 @@ jobs:
         run: uv run mypy src/
 
       - name: Test
-        run: uv run pytest -v --cov=src/pylasdev --cov-report=term-missing
+        run: uv run pytest -v --cov=src/pylasdev --cov-report=term-missing --cov-fail-under=85
 
       - name: Build package
         run: uv build

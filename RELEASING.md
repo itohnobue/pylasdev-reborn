@@ -8,6 +8,13 @@ This document describes how to create a new release of pylasdev.
 - Python 3.12+ with `uv` installed
 - A [PyPI](https://pypi.org) account with trusted publisher configured for this repository (or a PyPI API token)
 
+> **Note:** The package is **not** currently published on PyPI. The CI pipeline
+> (step 4) is designed for automated PyPI publishing via Trusted Publishing,
+> but this requires the Trusted Publisher to be configured in PyPI project
+> settings first (see [Trusted Publishing Setup](#trusted-publishing-setup-one-time)
+> below). Until that is done, `pip install pylasdev` will return a 404 error.
+> For now, install from source: `git clone` + `pip install .` or `uv sync`.
+
 ## Steps
 
 ### 1. Ensure CI is green

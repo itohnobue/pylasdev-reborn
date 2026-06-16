@@ -22,7 +22,7 @@ jobs:
         run: uv python install 3.12
 
       - name: Install dependencies
-        run: uv sync --all-extras
+        run: uv sync --all-extras --frozen
 
       - name: Build package
         run: uv build
@@ -31,6 +31,23 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+
+      - name: Smoke test published package
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"  # Strip leading 'v' from tag (e.g., v1.6.0 → 1.6.0)
+          echo "Waiting for PyPI propagation of pylasdev==${VERSION}..."
+          for i in $(seq 1 12); do
+            if uv pip install --dry-run "pylasdev==${VERSION}" --index-url https://pypi.org/simple/ 2>/dev/null; then
+              echo "Package available on PyPI"
+              break
+            fi
+            echo "Attempt $i/12: not yet available, waiting 10s..."
+            sleep 10
+          done
+          uv pip install "pylasdev==${VERSION}" --index-url https://pypi.org/simple/
+          python -c "import pylasdev; print(f'pylasdev {pylasdev.__version__} imported successfully')"
+          python -c "from pylasdev.reader import read_las; print('read_las imported successfully')"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

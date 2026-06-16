@@ -29,6 +29,7 @@ htmlcov/
 # PLY legacy (remove these files from repo)
 parser.out
 parsetab.py
+# Lock files tracked in VCS for supply chain security
 
-# Lock files
-uv.lock
+# Test artifacts
+coverage.json

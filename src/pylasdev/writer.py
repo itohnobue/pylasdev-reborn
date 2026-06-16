@@ -175,7 +175,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
                 _format_data_rows(
                     section.curves_order,
                     section.data,
-                    las_file.string_data,
+                    section.string_data,
                     null_value,
                     delimiter,
                     precision,

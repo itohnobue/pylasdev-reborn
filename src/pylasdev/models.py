@@ -234,6 +234,7 @@ class DataSection:
     name: str = ""  # Section name from ~A line (e.g., "ASCII" or custom name)
     curves_order: list[str] = field(default_factory=list)
     data: dict[str, NDArray[np.float64]] = field(default_factory=dict)
+    string_data: dict[str, NDArray[np.str_]] = field(default_factory=dict)  # For {S} format curves
 
     def to_dict(self) -> dict[str, Any]:
         """Convert DataSection to dict for serialization."""
@@ -241,6 +242,7 @@ class DataSection:
             "name": self.name,
             "curves_order": list(self.curves_order),
             "data": {k: v.copy() for k, v in self.data.items()},
+            "string_data": {k: v.copy() for k, v in self.string_data.items()},
         }
 
 
@@ -379,14 +381,20 @@ class LASFile:
         # Restore LAS 3.0 data sections
         ds_data = data.get("data_sections", [])
         for ds_dict in ds_data:
+            ds_string_data = {}
+            for name, arr in ds_dict.get("string_data", {}).items():
+                ds_string_data[name] = np.array(arr, dtype=np.str_)
             ds = DataSection(
                 name=ds_dict.get("name", ""),
                 curves_order=list(ds_dict.get("curves_order", [])),
                 data={k: np.array(v, dtype=np.float64) for k, v in ds_dict.get("data", {}).items()},
+                string_data=ds_string_data,
             )
             las_file.data_sections.append(ds)
 
-        # Restore LAS 3.0 string data
+        # Restore LAS 3.0 string data (top-level, backward compat
+        # with data serialized before string_data was moved to
+        # per-section DataSection objects).
         sd = data.get("string_data", {})
         for name, arr in sd.items():
             las_file.string_data[name] = np.array(arr, dtype=np.str_)

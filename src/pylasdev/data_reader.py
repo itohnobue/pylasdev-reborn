@@ -18,6 +18,11 @@ from .models import LASFile, WellSection
 # from malformed or malicious files. Overridable by setting the module constant.
 MAX_CURVES = 100_000
 MAX_DATA_LINES = 10_000_000
+# Combined allocation guard: curve_count × data_line_count must not exceed this.
+# Individual MAX_CURVES and MAX_DATA_LINES checks alone are insufficient — a file
+# with 1K curves × 1M lines (1B elements ≈ 8 GB) passes both guards independently
+# but OOMs during np.zeros pre-allocation. Overridable by setting module constant.
+MAX_TOTAL_ELEMENTS = 1_000_000_000
 
 
 def _is_section_header(stripped: str) -> bool:
@@ -105,6 +110,15 @@ def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int) -
         raise LASParseError(
             f"Curve count ({curve_count}) exceeds maximum allowed ({MAX_CURVES}). "
             f"The file may be malformed or corrupt."
+        )
+
+    # Combined bound: protect against combination attacks where individual
+    # curve_count and data_line_count checks pass but product exhausts memory.
+    if curve_count * data_line_count > MAX_TOTAL_ELEMENTS:
+        raise LASParseError(
+            f"Total allocation ({curve_count} curves × {data_line_count} lines = "
+            f"{curve_count * data_line_count} elements) exceeds maximum allowed "
+            f"({MAX_TOTAL_ELEMENTS}). The file may be malformed or corrupt."
         )
 
     wrap_mode = las_file.version.wrap.upper() == "YES"
@@ -261,6 +275,14 @@ def _read_normal(
             f"({MAX_DATA_LINES}). The file may be malformed or corrupt."
         )
 
+    # Combined bound: protect against combination attacks.
+    if curve_count * data_line_count > MAX_TOTAL_ELEMENTS:
+        raise LASParseError(
+            f"Total allocation ({curve_count} curves × {data_line_count} lines = "
+            f"{curve_count * data_line_count} elements) exceeds maximum allowed "
+            f"({MAX_TOTAL_ELEMENTS}). The file may be malformed or corrupt."
+        )
+
     # Pre-allocate arrays
     for curve_name in las_file.curves_order:
         las_file.logs[curve_name] = np.zeros(data_line_count, dtype=np.float64)
@@ -358,6 +380,14 @@ def _read_wrapped(
         raise LASParseError(
             f"Data line count ({_count}) exceeds maximum allowed "
             f"({MAX_DATA_LINES}). The file may be malformed or corrupt."
+        )
+
+    # Combined bound: protect against combination attacks.
+    if curve_count * _count > MAX_TOTAL_ELEMENTS:
+        raise LASParseError(
+            f"Total allocation ({curve_count} curves × {_count} lines = "
+            f"{curve_count * _count} elements) exceeds maximum allowed "
+            f"({MAX_TOTAL_ELEMENTS}). The file may be malformed or corrupt."
         )
 
     # Accumulate into lists, convert to numpy at end

@@ -10,7 +10,7 @@ It is "Reborn" because it was updated, fixed and refactored to work with modern 
 - [Usage](#usage)
   - [Basic API (dict-based)](#basic-api-dict-based)
   - [Object-oriented API (new)](#object-oriented-api-new)
-  - [Key Methods](#key-methods)
+    - [Key Methods](#key-methods)
 - [API Reference](#api-reference)
   - [Read Functions](#read-functions)
   - [Write Functions](#write-functions)
@@ -31,11 +31,20 @@ It is "Reborn" because it was updated, fixed and refactored to work with modern 
 
 ## Installation
 
+**Requirements:** Python >= 3.12, NumPy >= 1.24. See [Requirements](#requirements) for details.
+
+> **Note:** This package is **not** published on PyPI. `pip install pylasdev` will
+> fail with a 404 error. Install from source:
+
 ```bash
 git clone https://github.com/itohnobue/pylasdev-reborn.git
 cd pylasdev-reborn
 pip install .
 ```
+
+> `pip install .` uses the `hatchling` build backend (specified in `pyproject.toml`).
+> pip automatically installs build dependencies, but if you run `python -m build`
+> directly, install `hatchling>=1.21.0` first.
 
 Or with uv:
 
@@ -53,7 +62,8 @@ uv sync
 from pylasdev import read_las_file, write_las_file, read_dev_file
 
 # Read a LAS file (returns dict for backward compatibility)
-data = read_las_file("well_log.las")
+# Use a real test file from the test_data/ directory (27 sample LAS/DEV files)
+data = read_las_file("test_data/sample.las")
 print(data["well"]["WELL"])  # Print well name
 print(data["logs"]["DEPT"])  # Access depth curve as numpy array
 
@@ -61,7 +71,7 @@ print(data["logs"]["DEPT"])  # Access depth curve as numpy array
 write_las_file("output.las", data)
 
 # Read a DEV file (returns dict of column name → numpy array)
-dev_data = read_dev_file("deviation.dev")
+dev_data = read_dev_file("test_data/sample.dev")
 print(dev_data["MD"])   # Measured depth array
 print(dev_data["TVD"])  # True vertical depth array
 ```
@@ -72,7 +82,7 @@ print(dev_data["TVD"])  # True vertical depth array
 from pylasdev import read_las_file_as_object, LASFile, read_dev_file_as_object, DevFile
 
 # Read as typed object for richer access
-las: LASFile = read_las_file_as_object("well_log.las")
+las: LASFile = read_las_file_as_object("test_data/sample.las")
 print(las.well["WELL"])     # Dict-like access to well info
 print(las.version.vers)     # Version string ("1.2", "2.0", "3.0")
 print(las.encoding)         # Detected file encoding
@@ -85,12 +95,12 @@ if las.version.is_las30:
     print(las.string_data)      # String-format curve data
 
 # DEV file reading (new object API)
-dev: DevFile = read_dev_file_as_object("deviation.dev")
+dev: DevFile = read_dev_file_as_object("test_data/sample.dev")
 print(dev.column_order)     # ['MD', 'TVD', 'X', 'Y']
 print(dev.columns["MD"])    # numpy array of measured depth values
 ```
 
-### Key Methods
+#### Key Methods
 
 ```python
 # Key LASFile methods:
@@ -115,22 +125,36 @@ las2 = LASFile.from_dict(d)               # Create from dict
 
 | Function | Description |
 |----------|-------------|
-| `write_las_file(path, data)` | Write LAS data (dict or `LASFile`) to a `.las` file |
+| `write_las_file(path, data, encoding="utf-8", precision=".8g")` | Write LAS data (dict or `LASFile`) to a `.las` file with configurable encoding and numeric precision |
 
 ### Comparison
 
 ```python
 from pylasdev import compare_las_dicts
 
-# Compare two LAS data dictionaries for equality
-# with configurable relative and absolute tolerances
+# Compare two LAS data dictionaries for equality with tolerances.
+# rtol: Relative tolerance for numpy array comparison (default 1e-7).
+#       Values are considered equal if |a-b| <= atol + rtol*|b|
+# atol: Absolute tolerance for numpy array comparison (default 0.0).
+#       Allows small absolute differences (e.g. 1e-6).
 are_equal = compare_las_dicts(las_dict1, las_dict2, rtol=1e-7, atol=0.0)
 print(are_equal)  # True if equivalent, False otherwise
 ```
 
 `compare_las_dicts()` performs deep comparison of LAS data dictionaries,
 including numpy arrays (with tolerance), nested dicts, lists, and scalars.
-Mismatches are logged via Python's `logging` module at `WARNING` level.
+
+**Return value:** `True` if the dictionaries are structurally and numerically
+equivalent within tolerances; `False` otherwise.
+
+**Logging:** Mismatches are logged via Python's `logging` module at `WARNING`
+level. To see detailed comparison output (which keys differed, which arrays
+mismatched), configure logging before calling `compare_las_dicts()`:
+
+```python
+import logging
+logging.basicConfig(level=logging.WARNING, format="%(message)s")
+```
 
 ### Data Models
 
@@ -336,6 +360,22 @@ except PylasdevError:
     print("Other pylasdev error")
 ```
 
+> **Important:** The `max_file_size` parameter raises `ValueError`, which is **not** a
+> subclass of `PylasdevError`. A blanket `except PylasdevError` will silently miss
+> file-size-limit violations. Always catch `ValueError` separately when using
+> `max_file_size`:
+>
+> ```python
+> from pylasdev import read_las_file, PylasdevError
+>
+> try:
+>     data = read_las_file("large.las", max_file_size=10_000_000)
+> except ValueError as e:
+>     print(f"File exceeds size limit: {e}")
+> except PylasdevError as e:
+>     print(f"LAS error: {e}")
+> ```
+
 ## Features
 
 - Read and write LAS 1.2, 2.0, and 3.0 files
@@ -367,7 +407,8 @@ from pylasdev import read_las_file
 # Enforce a file size limit (10 MB)
 data = read_las_file("large.las", max_file_size=10 * 1024 * 1024)
 
-# The file will raise ValueError if it exceeds the limit
+# Raises ValueError (NOT a PylasdevError subclass) if the file exceeds the limit
+# Use `except ValueError` to catch this — `except PylasdevError` will miss it
 ```
 
 The `MAX_CURVES` and `MAX_DATA_LINES` module-level constants can be overridden
@@ -379,6 +420,11 @@ import pylasdev.data_reader as dr
 dr.MAX_CURVES = 200_000       # Allow more curves
 dr.MAX_DATA_LINES = 20_000_000  # Allow more data lines
 ```
+
+> **Note:** `pylasdev.data_reader` is an internal module. Its API is not covered
+> by the public backward-compatibility guarantee. Prefer the public API
+> (`read_las_file(..., max_file_size=N)`) for production code. Use internal
+> imports only when you need to override module-level constants directly.
 
 ## Troubleshooting
 
@@ -445,11 +491,11 @@ gr_clean = gr[valid]
 # Check Python version and pylasdev import
 python -c "import pylasdev; print(pylasdev.__version__)"
 
-# Check file encoding (requires chardet)
+# Check file encoding
 python -c "
-from pylasdev.encoding import detect_encoding
-enc = detect_encoding('well.las')
-print('Detected encoding:', enc)
+from pylasdev import read_las_file_as_object
+las = read_las_file_as_object('well.las')
+print('Detected encoding:', las.encoding)
 "
 ```
 
@@ -471,8 +517,8 @@ Python 3.12+. The dict-based API (`read_las_file()`, `read_dev_file()`,
 | Global `base_mnems` variable | Locally importable `MNEM_BASE` |
 
 To migrate:
-1. Replace `import pylasdev as pylasdev` with `import pylasdev` (no change for most users)
-2. Replace `pylasdev.las_compare.compare(a, b)` with `pylasdev.compare_las_dicts(a, b)`
+1. The import statement is the same: `import pylasdev` (no change for most users)
+2. Replace `pylasdev.las_compare.compare(a, b)` with `pylasdev.compare_las_dicts(a, b)` — the `las_compare` module has been removed; the function is now a top-level import
 3. Replace `pylasdev.base_mnems` with `pylasdev.MNEM_BASE`
 4. Existing `read_las_file()` and `read_dev_file()` calls work without changes
 
@@ -546,7 +592,7 @@ First production check passes:
 
 Installation and infrastructure fixes:
 - Installation section updated for local clone-and-install workflow
-- Package is not available on PyPI — clarified in README
+- Package is not published on PyPI (source install only) — clarified in README
 - Extras install syntax corrected to PEP 508 direct reference
 - All repository URLs fixed to github.com/itohnobue/pylasdev-reborn
 

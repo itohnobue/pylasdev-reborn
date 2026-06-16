@@ -143,6 +143,9 @@ def read_las_file_as_object(
     # For LAS 3.0, the parser already handles this
     # For LAS 1.2/2.0, use the dedicated data reader
     if not las_file.is_las30:
-        read_ascii_data(lines, las_file, parser.data_line_count)
+        try:
+            read_ascii_data(lines, las_file, parser.data_line_count)
+        except LASParseError as e:
+            raise LASParseError(f"Error reading {file_path}: {e}") from e
 
     return las_file
