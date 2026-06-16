@@ -48,6 +48,14 @@ class TestRoundTrip:
                         f"Shape mismatch for {curve} in {las_path.name}: "
                         f"{original['logs'][curve].shape} vs {roundtrip['logs'][curve].shape}"
                     )
+                    # F-041: Verify data values are preserved across write→read
+                    # Use rtol=1e-5 to account for precision formatting (~8 significant digits)
+                    np.testing.assert_allclose(
+                        original["logs"][curve],
+                        roundtrip["logs"][curve],
+                        rtol=1e-5,
+                        err_msg=(f"Data mismatch for {curve} in {las_path.name}"),
+                    )
 
     def test_roundtrip_preserves_curve_metadata(self) -> None:
         """Test that to_dict/from_dict round-trip preserves curve metadata."""

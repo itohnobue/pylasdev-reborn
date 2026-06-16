@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import threading
+
 import pytest
 
 from pylasdev.exceptions import LASParseError
@@ -193,6 +196,44 @@ Line two of free text.
         assert las.version.vers == "3.0"
         assert las.version.dlm == "COMMA"
         assert las.is_las30
+
+    # --- R-005: Parametrized version detection tests ---
+    @pytest.mark.parametrize(
+        "content,expected_vers,expected_wrap,is_las30",
+        [
+            (
+                "~VERSION INFORMATION\n VERS.   2.0  : CWLS LOG ASCII STANDARD\n WRAP.   NO   : ONE LINE PER DEPTH STEP\n",
+                "2.0",
+                "NO",
+                False,
+            ),
+            (
+                "~Version Information\n VERS.                1.20:   CWLS log ASCII Standard -VERSION 1.20\n WRAP.                 YES:   Multiple lines per depth step\n",
+                "1.20",
+                "YES",
+                False,
+            ),
+            (
+                "~VERSION INFORMATION\n VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n WRAP.   NO   :\n DLM.   COMMA :\n",
+                "3.0",
+                "NO",
+                True,
+            ),
+        ],
+    )
+    def test_version_detection_parametrized(
+        self,
+        content: str,
+        expected_vers: str,
+        expected_wrap: str,
+        is_las30: bool,
+    ) -> None:
+        """Parametrized test for LAS version detection across 1.2, 2.0, 3.0."""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert las.version.vers == expected_vers
+        assert las.version.wrap == expected_wrap
+        assert las.is_las30 == is_las30
 
     def test_las30_curve_format_specifiers(self) -> None:
         """Test parsing LAS 3.0 format specifiers {F}, {E}, {S}."""
@@ -522,3 +563,111 @@ Line two of free text.
         assert las.data_sections[0].data["DT"][0] == 50.0
         assert las.data_sections[0].data["DEPT"][1] == 101.0
         assert las.data_sections[0].data["DT"][1] == 51.0
+
+
+class TestUnknownSectionWarning:
+    """F-031: Unknown section handler warning test."""
+
+    def test_unknown_section_emits_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Test that a ~X section (unknown type) emits a warning via logger."""
+        content = """~VERSION INFORMATION
+ VERS.   2.0  : CWLS LOG ASCII STANDARD
+ WRAP.   NO   : ONE LINE PER DEPTH STEP
+~X CUSTOM
+ Some data in custom section.
+"""
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            parser = LASParser()
+            parser.parse(content)
+
+        assert "Unknown section type" in caplog.text
+        assert "~X" in caplog.text
+
+    def test_unknown_section_with_warnings_module(self) -> None:
+        """Test unknown section via pytest caplog (more portable)."""
+        content = """~VERSION INFORMATION
+ VERS.   2.0  : CWLS LOG ASCII STANDARD
+ WRAP.   NO   : ONE LINE PER DEPTH STEP
+~X CUSTOM
+ Some data in custom section.
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        # Should parse without error — unknown sections are logged, not fatal
+        assert las.version.vers == "2.0"
+
+
+class TestConcurrentParserAccess:
+    """CF-019: Concurrent parser access from multiple threads."""
+
+    def test_concurrent_parse_different_instances(self) -> None:
+        """Test that different parser instances work independently in threads."""
+        errors: list[Exception] = []
+        results: list[int] = []
+
+        def parse_las() -> None:
+            try:
+                content = """~VERSION INFORMATION
+ VERS.   2.0  : CWLS LOG ASCII STANDARD
+ WRAP.   NO   : ONE LINE PER DEPTH STEP
+~CURVE INFORMATION
+ DEPT.M  :
+ DT.US/M :
+~A  DEPT  DT
+100.0  50.0
+101.0  51.0
+"""
+                parser = LASParser()
+                las = parser.parse(content)
+                results.append(len(las.curves))
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=parse_las) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0, f"Errors in concurrent parse: {errors}"
+        assert len(results) == 8
+        # All parsers should produce 2 curves
+        assert all(r == 2 for r in results)
+
+    def test_concurrent_parse_same_instance(self) -> None:
+        """Test that a single parser instance works across threads.
+
+        Each call to parse() resets state, but concurrent access
+        without external synchronization may produce race conditions.
+        This test documents the behavior.
+        """
+        errors: list[Exception] = []
+
+        def parse_with_shared(parser: LASParser) -> None:
+            try:
+                content = """~VERSION INFORMATION
+ VERS.   2.0  : CWLS LOG ASCII STANDARD
+ WRAP.   NO   : ONE LINE PER DEPTH STEP
+~CURVE INFORMATION
+ DEPT.M  :
+ DT.US/M :
+~A  DEPT  DT
+100.0  50.0
+"""
+                las = parser.parse(content)
+                assert len(las.curves) == 2
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        parser = LASParser()
+        threads = [threading.Thread(target=parse_with_shared, args=(parser,)) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # If errors exist, the parser is not thread-safe for concurrent use
+        # with the same instance (expected — LASParser is designed with
+        # per-instance state that parse() resets)
+        if errors:
+            pytest.fail(f"LASParser is not thread-safe for shared-instance use (errors: {errors})")

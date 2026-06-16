@@ -91,9 +91,9 @@ def read_with_encoding(
         Tuple of (detected_encoding, file_content).
 
     Raises:
-        UnicodeDecodeError: If the explicit encoding parameter fails to decode the file.
-        LASEncodingError: If the path is not a regular file or no encoding
-            in the fallback chain works.
+        LASEncodingError: If the path is not a regular file, if the explicit
+            encoding parameter fails to decode the file, or if no encoding in
+            the fallback chain works.
         ValueError: If file exceeds max_file_size.
     """
     # Guard against non-regular files (FIFOs, pipes, sockets, etc.).
@@ -114,7 +114,12 @@ def read_with_encoding(
     raw_bytes = file_path.read_bytes()
 
     if encoding is not None:
-        content = raw_bytes.decode(encoding)
+        try:
+            content = raw_bytes.decode(encoding)
+        except UnicodeDecodeError as e:
+            raise LASEncodingError(
+                f"Failed to decode {file_path} with encoding '{encoding}': {e}"
+            ) from e
         return encoding, content
 
     # Try auto-detection from the already-read bytes

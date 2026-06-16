@@ -34,8 +34,7 @@ class TestReadDEVFile:
     def test_sample_dev_columns(self, test_data_dir: Path) -> None:
         """Test that sample.dev has expected columns."""
         sample_dev = test_data_dir / "sample.dev"
-        if not sample_dev.exists():
-            pytest.skip("sample.dev not found")
+        assert sample_dev.exists(), f"Required test data missing: {sample_dev}"
         data = read_dev_file(sample_dev)
         assert "MD" in data
         assert "TVD" in data
@@ -45,8 +44,7 @@ class TestReadDEVFile:
     def test_sample_dev_data_shape(self, test_data_dir: Path) -> None:
         """Test that all columns have the same length."""
         sample_dev = test_data_dir / "sample.dev"
-        if not sample_dev.exists():
-            pytest.skip("sample.dev not found")
+        assert sample_dev.exists(), f"Required test data missing: {sample_dev}"
         data = read_dev_file(sample_dev)
         sizes = [len(arr) for arr in data.values()]
         assert len(set(sizes)) == 1, f"Column sizes differ: {sizes}"
@@ -54,16 +52,14 @@ class TestReadDEVFile:
     def test_sample_dev_md_starts_at_zero(self, test_data_dir: Path) -> None:
         """Test that MD column starts at 0."""
         sample_dev = test_data_dir / "sample.dev"
-        if not sample_dev.exists():
-            pytest.skip("sample.dev not found")
+        assert sample_dev.exists(), f"Required test data missing: {sample_dev}"
         data = read_dev_file(sample_dev)
         assert data["MD"][0] == 0.0
 
     def test_sample_dev_has_multiple_rows(self, test_data_dir: Path) -> None:
         """Test that sample.dev has multiple data rows."""
         sample_dev = test_data_dir / "sample.dev"
-        if not sample_dev.exists():
-            pytest.skip("sample.dev not found")
+        assert sample_dev.exists(), f"Required test data missing: {sample_dev}"
         data = read_dev_file(sample_dev)
         assert len(data["MD"]) > 1
 
@@ -79,8 +75,7 @@ class TestReadDEVFile:
     def test_dev_encoding_parameter(self, test_data_dir: Path) -> None:
         """Test that explicit encoding parameter works."""
         sample_dev = test_data_dir / "sample.dev"
-        if not sample_dev.exists():
-            pytest.skip("sample.dev not found")
+        assert sample_dev.exists(), f"Required test data missing: {sample_dev}"
         data = read_dev_file(sample_dev, encoding="utf-8")
         assert len(data) > 0
 
@@ -222,3 +217,27 @@ class TestReadDEVFile:
         assert data["MD"][0] == 0.0
         assert data["TVD"][0] == 0.0
         assert data["MD"][1] == 100.0
+
+
+class TestDevIndexErrorHandler:
+    """CF-022: DEV reader IndexError handler tests."""
+
+    def test_normal_parsing_handled_gracefully(self, tmp_path: Path) -> None:
+        """Test DEV reader handles normal data without errors.
+
+        The IndexError handler (dev_reader.py:191-192) is a safety net for
+        pass-1/pass-2 data-line count inconsistency. In practice, both
+        passes count the same data, so the handler is unreachable under
+        normal conditions. This test verifies that normal parsing works
+        correctly.
+        """
+        content = "MD TVD X\n0.0 0.0 100.0\n100.0 99.0 101.0\n200.0 198.0 102.0\n"
+        test_file = tmp_path / "normal.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert len(data["MD"]) == 3
+        assert data["MD"][0] == 0.0
+        assert data["MD"][2] == 200.0
+        assert data["X"][0] == 100.0
+        assert data["X"][2] == 102.0

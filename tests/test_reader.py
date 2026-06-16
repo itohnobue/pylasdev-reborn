@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import os
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from pylasdev import read_las_file, read_las_file_as_object
-from pylasdev.exceptions import LASReadError
+from pylasdev.exceptions import LASParseError, LASReadError
 from pylasdev.models import LASFile
 
 
@@ -80,8 +82,7 @@ class TestReadLASFile:
     def test_sample_las_specific_values(self, test_data_dir: Path) -> None:
         """Test specific values from sample.las."""
         sample = test_data_dir / "sample.las"
-        if not sample.exists():
-            pytest.skip("sample.las not found")
+        assert sample.exists(), f"Required test data missing: {sample}"
         data = read_las_file(sample)
         assert "DEPT" in data["logs"]
         assert len(data["logs"]["DEPT"]) > 0
@@ -103,8 +104,7 @@ class TestReadLASFile:
     def test_mislabeled_wrap_handled(self, test_data_dir: Path) -> None:
         """Test that files with WRAP=YES but non-wrapped data are handled."""
         ct = test_data_dir / "comment_test.las"
-        if not ct.exists():
-            pytest.skip("comment_test.las not found")
+        assert ct.exists(), f"Required test data missing: {ct}"
         data = read_las_file(ct)
         # All arrays should have equal length
         if data["curves_order"]:
@@ -114,8 +114,7 @@ class TestReadLASFile:
     def test_encoding_parameter(self, test_data_dir: Path) -> None:
         """Test that explicit encoding parameter works."""
         sample = test_data_dir / "sample.las"
-        if not sample.exists():
-            pytest.skip("sample.las not found")
+        assert sample.exists(), f"Required test data missing: {sample}"
         data = read_las_file(sample, encoding="utf-8")
         assert "logs" in data
 
@@ -126,8 +125,7 @@ class TestReadLASFileAsObject:
     def test_returns_las_file_object(self, test_data_dir: Path) -> None:
         """Test that read_las_file_as_object returns LASFile."""
         sample = test_data_dir / "sample.las"
-        if not sample.exists():
-            pytest.skip("sample.las not found")
+        assert sample.exists(), f"Required test data missing: {sample}"
         las = read_las_file_as_object(sample)
         assert isinstance(las, LASFile)
         assert las.source_file != ""
@@ -136,8 +134,7 @@ class TestReadLASFileAsObject:
     def test_object_has_curves(self, test_data_dir: Path) -> None:
         """Test LASFile object has curve definitions."""
         sample = test_data_dir / "sample.las"
-        if not sample.exists():
-            pytest.skip("sample.las not found")
+        assert sample.exists(), f"Required test data missing: {sample}"
         las = read_las_file_as_object(sample)
         assert len(las.curves) > 0
         assert len(las.curves_order) > 0
@@ -156,8 +153,7 @@ class TestReadLASFileAsObject:
     def test_las30_object_has_version(self, test_data_dir: Path) -> None:
         """Test LAS 3.0 file parsed as object has correct version."""
         las30 = test_data_dir / "sample_3.0.las"
-        if not las30.exists():
-            pytest.skip("sample_3.0.las not found")
+        assert las30.exists(), f"Required test data missing: {las30}"
         las = read_las_file_as_object(las30)
         assert las.version.vers == "3.0"
         assert las.version.is_las30 is True
@@ -166,8 +162,7 @@ class TestReadLASFileAsObject:
     def test_las30_curves_with_formats(self, test_data_dir: Path) -> None:
         """Test LAS 3.0 curve format specifiers are parsed."""
         las30 = test_data_dir / "sample_3.0.las"
-        if not las30.exists():
-            pytest.skip("sample_3.0.las not found")
+        assert las30.exists(), f"Required test data missing: {las30}"
         las = read_las_file_as_object(las30)
         # Check that format specifiers were extracted
         dept_curve = las.get_curve_by_mnemonic("DEPT")
@@ -181,8 +176,7 @@ class TestReadLASFileAsObject:
     def test_las30_array_curves(self, test_data_dir: Path) -> None:
         """Test LAS 3.0 array notation curves are parsed."""
         las30 = test_data_dir / "sample_3.0.las"
-        if not las30.exists():
-            pytest.skip("sample_3.0.las not found")
+        assert las30.exists(), f"Required test data missing: {las30}"
         las = read_las_file_as_object(las30)
         nmr_curves = las.get_array_curves("NMR")
         assert len(nmr_curves) == 5
@@ -194,8 +188,7 @@ class TestReadLASFileAsObject:
     def test_las30_parameters_with_zones(self, test_data_dir: Path) -> None:
         """Test LAS 3.0 parameter zone associations."""
         las30 = test_data_dir / "sample_3.0.las"
-        if not las30.exists():
-            pytest.skip("sample_3.0.las not found")
+        assert las30.exists(), f"Required test data missing: {las30}"
         las = read_las_file_as_object(las30)
         # Check zone-associated parameters
         assert len(las.parameters) > 0
@@ -205,8 +198,7 @@ class TestReadLASFileAsObject:
     def test_las30_scientific_notation_format(self, test_data_dir: Path) -> None:
         """Test LAS 3.0 {E} (scientific notation) format specifier."""
         las30 = test_data_dir / "sample_3.0.las"
-        if not las30.exists():
-            pytest.skip("sample_3.0.las not found")
+        assert las30.exists(), f"Required test data missing: {las30}"
         las = read_las_file_as_object(las30)
         yme_curve = las.get_curve_by_mnemonic("YME")
         assert yme_curve is not None
@@ -219,8 +211,7 @@ class TestAPICodeParsing:
     def test_api_codes_parsed_from_las12(self, test_data_dir: Path) -> None:
         """Test API codes are extracted from LAS 1.2 curve_api file."""
         api_file = test_data_dir / "sample_curve_api.las"
-        if not api_file.exists():
-            pytest.skip("sample_curve_api.las not found")
+        assert api_file.exists(), f"Required test data missing: {api_file}"
         las = read_las_file_as_object(api_file)
         rhob = las.get_curve_by_mnemonic("RHOB")
         assert rhob is not None
@@ -229,8 +220,7 @@ class TestAPICodeParsing:
     def test_api_codes_parsed_from_las20(self, test_data_dir: Path) -> None:
         """Test API codes are extracted from LAS 2.0 file."""
         las20 = test_data_dir / "sample_2.0.las"
-        if not las20.exists():
-            pytest.skip("sample_2.0.las not found")
+        assert las20.exists(), f"Required test data missing: {las20}"
         las = read_las_file_as_object(las20)
         dt = las.get_curve_by_mnemonic("DT")
         assert dt is not None
@@ -239,8 +229,7 @@ class TestAPICodeParsing:
     def test_empty_api_code_for_curves_without_it(self, test_data_dir: Path) -> None:
         """Test that curves without API codes have empty api_code."""
         sample = test_data_dir / "sample.las"
-        if not sample.exists():
-            pytest.skip("sample.las not found")
+        assert sample.exists(), f"Required test data missing: {sample}"
         las = read_las_file_as_object(sample)
         dept = las.get_curve_by_mnemonic("DEPT")
         assert dept is not None
@@ -251,8 +240,7 @@ class TestAPICodeParsing:
         from pylasdev import write_las_file
 
         api_file = test_data_dir / "sample_curve_api.las"
-        if not api_file.exists():
-            pytest.skip("sample_curve_api.las not found")
+        assert api_file.exists(), f"Required test data missing: {api_file}"
         las = read_las_file_as_object(api_file)
         temp_file = tmp_path / "api_roundtrip.las"
         write_las_file(temp_file, las)
@@ -339,10 +327,8 @@ class TestDataReaderEdgeCases:
         test_file = tmp_path / "dup_curves.las"
         test_file.write_text(content, encoding="utf-8")
 
-        import warnings as _warnings
-
-        with _warnings.catch_warnings(record=True) as w:
-            _warnings.simplefilter("always")
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             data = read_las_file(test_file)
             assert any("Duplicate curve mnemonic" in str(x.message) for x in w)
 
@@ -371,10 +357,8 @@ class TestDataReaderEdgeCases:
         test_file = tmp_path / "dup_meta.las"
         test_file.write_text(content, encoding="utf-8")
 
-        import warnings as _warnings
-
-        with _warnings.catch_warnings(record=True):
-            _warnings.simplefilter("always")
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
             las = read_las_file_as_object(test_file)
 
         # curves_order and curves mnemonics must match
@@ -408,10 +392,8 @@ class TestDataReaderEdgeCases:
         test_file = tmp_path / "v4.las"
         test_file.write_text(content, encoding="utf-8")
 
-        import warnings as _warnings
-
-        with _warnings.catch_warnings(record=True) as w:
-            _warnings.simplefilter("always")
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             data = read_las_file(test_file)
             assert any("not officially supported" in str(x.message) for x in w)
 
@@ -435,10 +417,8 @@ class TestDataReaderEdgeCases:
         test_file = tmp_path / "v5.las"
         test_file.write_text(content, encoding="utf-8")
 
-        import warnings as _warnings
-
-        with _warnings.catch_warnings(record=True) as w:
-            _warnings.simplefilter("always")
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             las = read_las_file_as_object(test_file)
             assert any("not officially supported" in str(x.message) for x in w)
 
@@ -567,10 +547,8 @@ class TestDataReaderEdgeCases:
         test_file = tmp_path / "wrapped_short.las"
         test_file.write_text(content, encoding="utf-8")
 
-        import warnings as _warnings
-
-        with _warnings.catch_warnings(record=True) as w:
-            _warnings.simplefilter("always")
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             data = read_las_file(test_file)
             # Should have padding warning
             assert any("Padding" in str(x.message) for x in w)
@@ -606,10 +584,8 @@ class TestDataReaderEdgeCases:
         test_file = tmp_path / "wrapped_extra_depth.las"
         test_file.write_text(content, encoding="utf-8")
 
-        import warnings as _warnings
-
-        with _warnings.catch_warnings(record=True) as w:
-            _warnings.simplefilter("always")
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             data = read_las_file(test_file)
             assert any("depth line has 2 values" in str(x.message) for x in w)
 
@@ -771,10 +747,8 @@ class TestDataReaderEdgeCases:
         test_file = tmp_path / "dup_index_error.las"
         test_file.write_text(content, encoding="utf-8")
 
-        import warnings as _warnings
-
-        with _warnings.catch_warnings(record=True) as w:
-            _warnings.simplefilter("always")
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             data = read_las_file(test_file)
             assert any("Duplicate curve mnemonic" in str(x.message) for x in w)
 
@@ -837,10 +811,8 @@ class TestDataReaderEdgeCases:
         test_file = tmp_path / "already_suffixed.las"
         test_file.write_text(content, encoding="utf-8")
 
-        import warnings as _warnings
-
-        with _warnings.catch_warnings(record=True) as w:
-            _warnings.simplefilter("always")
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             data = read_las_file(test_file)
             assert any("Duplicate curve mnemonic" in str(x.message) for x in w)
 
@@ -876,10 +848,8 @@ class TestDataReaderEdgeCases:
         test_file = tmp_path / "cross_base_collision.las"
         test_file.write_text(content, encoding="utf-8")
 
-        import warnings as _warnings
-
-        with _warnings.catch_warnings(record=True) as w:
-            _warnings.simplefilter("always")
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             data = read_las_file(test_file)
             # Should have 2 warnings: one for duplicate DEPT, one for cross-base
             dup_warnings = [x for x in w if "Duplicate curve mnemonic" in str(x.message)]
@@ -895,3 +865,364 @@ class TestDataReaderEdgeCases:
         np.testing.assert_array_equal(data["logs"]["DEPT"], [100.0, 101.0])
         np.testing.assert_array_equal(data["logs"]["DEPT_2"], [10.0, 11.0])
         np.testing.assert_array_equal(data["logs"]["DEPT_2_2"], [20.0, 21.0])
+
+
+class TestMaxTotalElementsGuard:
+    """F-023: MAX_TOTAL_ELEMENTS allocation guard tests."""
+
+    def test_max_total_elements_normal_mode(self, tmp_path: Path) -> None:
+        """Test that curve_count * data_line_count > MAX_TOTAL_ELEMENTS raises error."""
+        from unittest import mock
+
+        # Build a file with 5 curves and 5 data lines
+        curves_block = "\n".join(f" C{i:02d}.UNIT  :  Curve {i}" for i in range(5))
+        # 5 data lines to get 5*5=25 elements
+        data_block = "\n".join(f"{100.0 + i}  1.0  2.0  3.0  4.0" for i in range(5))
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n" + curves_block + "\n~A" + "  C00" * 5 + "\n" + data_block + "\n"
+        )
+        test_file = tmp_path / "max_total.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Monkey-patch MAX_TOTAL_ELEMENTS to 20: 5 curves * 5 lines = 25 > 20
+        with mock.patch("pylasdev.data_reader.MAX_TOTAL_ELEMENTS", 20):
+            with pytest.raises(LASParseError, match="Total allocation"):
+                read_las_file(test_file)
+
+    def test_max_total_elements_wrapped_mode(self, tmp_path: Path) -> None:
+        """Test MAX_TOTAL_ELEMENTS in wrapped mode."""
+        from unittest import mock
+
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " C00.M  :  Curve 0\n"
+            " C01.M  :  Curve 1\n"
+            "~A\n"
+            "100.0\n"
+            "50.0\n"
+            "101.0\n"
+            "51.0\n"
+            "102.0\n"
+            "52.0\n"
+        )
+        test_file = tmp_path / "max_total_wrap.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Monkey-patch MAX_TOTAL_ELEMENTS to a low value
+        with mock.patch("pylasdev.data_reader.MAX_TOTAL_ELEMENTS", 5):
+            with pytest.raises(LASParseError, match="Total allocation"):
+                read_las_file(test_file)
+
+
+class TestPermissionErrorHandler:
+    """F-024: PermissionError handler tests."""
+
+    def test_unreadable_file_raises_las_read_error(self, tmp_path: Path) -> None:
+        """Test that an unreadable file raises LASReadError, not PermissionError."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~A  DEPT\n"
+            "100.0\n"
+        )
+        test_file = tmp_path / "noperm.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        try:
+            # Make file unreadable
+            os.chmod(test_file, 0o000)
+            with pytest.raises(LASReadError, match="Cannot read"):
+                read_las_file(test_file)
+        finally:
+            # Restore permissions so tmp_path cleanup works
+            os.chmod(test_file, 0o644)
+
+    def test_unreadable_file_as_object(self, tmp_path: Path) -> None:
+        """Test read_las_file_as_object with unreadable file."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~A  DEPT\n"
+            "100.0\n"
+        )
+        test_file = tmp_path / "noperm_obj.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        try:
+            os.chmod(test_file, 0o000)
+            with pytest.raises(LASReadError, match="Cannot read"):
+                read_las_file_as_object(test_file)
+        finally:
+            os.chmod(test_file, 0o644)
+
+
+class TestArrayTrimming:
+    """F-025: Array trimming when pre-scan over-counts."""
+
+    def test_early_ascii_termination_trims_arrays(self, tmp_path: Path) -> None:
+        """Test that when ~A ends before pre-scanned data_line_count, arrays trim.
+
+        The ~OTHER section header terminates ~A section data collection.
+        Pre-scan stops at the section header, and _read_normal breaks at it too,
+        so data_line_count matches current_line. No trimming occurs in this case
+        because current_line == data_line_count.
+
+        A true trimming scenario (current_line < data_line_count) requires the
+        pre-scan to over-count, which happens when new sections appear after ~A
+        data — the pre-scan `in_ascii` flag goes False on section headers, and
+        _read_normal breaks. This test verifies correct termination at section
+        boundaries and asserts data integrity (no 0.0 fill values)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A  DEPT  DT\n"
+            "100.0  50.0\n"
+            "101.0  51.0\n"
+            "~OTHER\n"
+            "Freeform text that section detection catches.\n"
+        )
+        test_file = tmp_path / "trim_section.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_las_file(test_file)
+        # Should have exactly 2 data points (stopped at ~OTHER)
+        assert len(data["logs"]["DEPT"]) == 2
+        assert len(data["logs"]["DT"]) == 2
+        np.testing.assert_array_almost_equal(data["logs"]["DEPT"], [100.0, 101.0])
+        np.testing.assert_array_almost_equal(data["logs"]["DT"], [50.0, 51.0])
+
+        # Verify no 0.0 fill values — all values should be actual data or null
+        assert not any(v == 0.0 for v in data["logs"]["DEPT"])
+        assert not any(v == 0.0 for v in data["logs"]["DT"])
+
+
+class TestMaxLimitsGuards:
+    """F-026: MAX_DATA_LINES / MAX_CURVES guard tests."""
+
+    def test_max_data_lines_normal_mode(self, tmp_path: Path) -> None:
+        """Test MAX_DATA_LINES guard raises error."""
+        from unittest import mock
+
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~A  DEPT\n"
+            "100.0\n"
+        )
+        test_file = tmp_path / "max_lines.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        with mock.patch("pylasdev.data_reader.MAX_DATA_LINES", 0):
+            with pytest.raises(LASParseError, match="Data line count"):
+                read_las_file(test_file)
+
+    def test_max_curves_normal_mode(self, tmp_path: Path) -> None:
+        """Test MAX_CURVES guard raises error."""
+        from unittest import mock
+
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A  DEPT  DT\n"
+            "100.0  50.0\n"
+        )
+        test_file = tmp_path / "max_curves.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        with mock.patch("pylasdev.data_reader.MAX_CURVES", 1):
+            with pytest.raises(LASParseError, match="Curve count"):
+                read_las_file(test_file)
+
+    def test_max_curves_wrapped_mode(self, tmp_path: Path) -> None:
+        """Test MAX_CURVES guard in wrapped mode."""
+        from unittest import mock
+
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A\n"
+            "100.0\n"
+            "50.0\n"
+        )
+        test_file = tmp_path / "max_curves_wrap.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        with mock.patch("pylasdev.data_reader.MAX_CURVES", 1):
+            with pytest.raises(LASParseError, match="Curve count"):
+                read_las_file(test_file)
+
+
+class TestToFiniteFloat:
+    """F-029: _to_finite_float non-finite value guard tests."""
+
+    def test_nan_value_returns_null(self, tmp_path: Path) -> None:
+        """Test that 'nan' in data returns null_value."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A  DEPT  DT\n"
+            "100.0  nan\n"
+        )
+        test_file = tmp_path / "nan_data.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_las_file(test_file)
+        assert data["logs"]["DT"][0] == -999.25
+
+    def test_inf_value_returns_null(self, tmp_path: Path) -> None:
+        """Test that 'inf' in data returns null_value."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A  DEPT  DT\n"
+            "100.0  inf\n"
+        )
+        test_file = tmp_path / "inf_data.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_las_file(test_file)
+        assert data["logs"]["DT"][0] == -999.25
+
+    def test_neg_inf_value_returns_null(self, tmp_path: Path) -> None:
+        """Test that '-inf' in data returns null_value."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A  DEPT  DT\n"
+            "100.0  -inf\n"
+        )
+        test_file = tmp_path / "neginf_data.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_las_file(test_file)
+        assert data["logs"]["DT"][0] == -999.25
+
+    def test_overflow_exponent_returns_null(self, tmp_path: Path) -> None:
+        """Test that large overflow exponent '1e309' returns null_value."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A  DEPT  DT\n"
+            "100.0  1e309\n"
+        )
+        test_file = tmp_path / "overflow_data.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_las_file(test_file)
+        assert data["logs"]["DT"][0] == -999.25
+
+
+class TestMetadataOnlyLas:
+    """CF-021: Metadata-only LAS file (no ~A section)."""
+
+    def test_las_without_ascii_section_parses(self, tmp_path: Path) -> None:
+        """Test that LAS file with ~V and ~C but no ~A parses correctly."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   100.0 : START DEPTH\n"
+            " STOP.M   200.0 : STOP DEPTH\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+        )
+        test_file = tmp_path / "no_ascii.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_las_file(test_file)
+        assert data["curves_order"] == ["DEPT", "DT"]
+        # logs contain zero-length arrays (pre-allocated with np.zeros(0))
+        assert len(data["logs"]) == 2
+        assert len(data["logs"]["DEPT"]) == 0
+        assert len(data["logs"]["DT"]) == 0
+
+    def test_las_without_ascii_section_as_object(self, tmp_path: Path) -> None:
+        """Test LASFile object from metadata-only file."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   100.0 : START DEPTH\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+        )
+        test_file = tmp_path / "no_ascii_obj.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        las = read_las_file_as_object(test_file)
+        assert las.curves_order == ["DEPT"]
+        # logs contains zero-length array (pre-allocated with np.zeros(0))
+        assert "DEPT" in las.logs
+        assert len(las.logs["DEPT"]) == 0
+        assert las.well["STRT"] == "100.0"

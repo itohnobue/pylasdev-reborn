@@ -6,15 +6,19 @@ and proper encoding handling.
 
 from __future__ import annotations
 
+import logging
+import warnings
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from .data_reader import MAX_DATA_LINES, _to_finite_float
+from .data_reader import MAX_CURVES, MAX_DATA_LINES, MAX_TOTAL_ELEMENTS, _to_finite_float
 from .encoding import read_with_encoding
-from .exceptions import DEVReadError
+from .exceptions import DEVReadError, LASEncodingError  # noqa: F401
 from .models import DevFile
+
+logger = logging.getLogger(__name__)
 
 
 def read_dev_file(
@@ -38,6 +42,8 @@ def read_dev_file(
     Raises:
         DEVReadError: If file cannot be read or parsed.
         ValueError: If file exceeds max_file_size.
+        LASEncodingError: If the explicit encoding parameter fails to decode
+            the file.
     """
     dev = read_dev_file_as_object(file_path, encoding=encoding, max_file_size=max_file_size)
     return dev.to_dict()
@@ -65,6 +71,8 @@ def read_dev_file_as_object(
     Raises:
         DEVReadError: If file cannot be read or parsed.
         ValueError: If file exceeds max_file_size.
+        LASEncodingError: If the explicit encoding parameter fails to decode
+            the file.
 
     Example:
         >>> from pylasdev import read_dev_file_as_object
@@ -86,8 +94,8 @@ def read_dev_file_as_object(
 
     try:
         detected_encoding, content = read_with_encoding(file_path, encoding, max_file_size)
-    except PermissionError as e:
-        raise DEVReadError(f"Cannot read file (permission denied): {file_path}") from e
+    except OSError as e:
+        raise DEVReadError(f"Cannot read file: {file_path}") from e
 
     lines = content.splitlines()
 
@@ -121,6 +129,7 @@ def read_dev_file_as_object(
     names: list[str] = []
     header_found = False
     current_line = 0
+    warned_extra = False  # Track extra-column warning per file
 
     for line in lines:
         stripped = line.strip()
@@ -132,12 +141,84 @@ def read_dev_file_as_object(
         if not header_found:
             # First non-comment line = column names
             names = values
+            # Deduplicate column names with cross-base collision detection.
+            # Ported from _deduplicate_curves in data_reader.py: uses an
+            # output_names set + while-loop to ensure generated _N suffixes
+            # don't collide with any name already in the output.
+            seen: dict[str, int] = {}
+            deduped_names: list[str] = []
+            output_names: set[str] = set()
+            for name in names:
+                if name in seen:
+                    seen[name] += 1
+                    # Ensure the generated name doesn't collide with
+                    # any name already in the output (including original names
+                    # that match the _N suffix pattern).
+                    suffix = seen[name]
+                    new_name = f"{name}_{suffix}"
+                    while new_name in output_names:
+                        suffix += 1
+                        new_name = f"{name}_{suffix}"
+                    seen[name] = suffix
+                    warnings.warn(
+                        f"Duplicate DEV column name '{name}' renamed to "
+                        f"'{new_name}'. Data may come from a file with "
+                        f"repeated column names.",
+                        stacklevel=2,
+                    )
+                    deduped_names.append(new_name)
+                    output_names.add(new_name)
+                else:
+                    # Check for cross-base collisions where an
+                    # original name matches a previously generated _N suffix.
+                    # Input ["A","A","A_2"] should produce
+                    # ["A","A_2","A_2_2"], not ["A","A_2","A_2"].
+                    if name in output_names:
+                        suffix = 2
+                        new_name = f"{name}_{suffix}"
+                        while new_name in output_names:
+                            suffix += 1
+                            new_name = f"{name}_{suffix}"
+                        seen[name] = suffix
+                        warnings.warn(
+                            f"Duplicate DEV column name '{name}' renamed to "
+                            f"'{new_name}'. Data may come from a file with "
+                            f"repeated column names.",
+                            stacklevel=2,
+                        )
+                        deduped_names.append(new_name)
+                        output_names.add(new_name)
+                    else:
+                        seen[name] = 1
+                        deduped_names.append(name)
+                        output_names.add(name)
+            names = deduped_names
+            if len(names) > MAX_CURVES:
+                raise DEVReadError(
+                    f"Column count ({len(names)}) exceeds maximum allowed "
+                    f"({MAX_CURVES}). The file may be malformed or corrupt."
+                )
+            if len(names) * data_lines > MAX_TOTAL_ELEMENTS:
+                raise DEVReadError(
+                    f"Total allocation ({len(names)} columns x {data_lines} lines = "
+                    f"{len(names) * data_lines} elements) exceeds maximum allowed "
+                    f"({MAX_TOTAL_ELEMENTS}). The file may be malformed or corrupt."
+                )
             for name in names:
                 dev.columns[name] = np.full(data_lines, np.nan, dtype=np.float64)
             dev.column_order = list(names)
             header_found = True
         else:
             # Data lines
+            # Warn about extra columns being silently discarded
+            if len(values) > len(names) and not warned_extra:
+                warned_extra = True
+                logger.warning(
+                    "Data line has %d values but only %d columns declared "
+                    "in the header. Extra columns are discarded.",
+                    len(values),
+                    len(names),
+                )
             for k in range(min(len(values), len(names))):
                 try:
                     dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)

@@ -101,12 +101,11 @@ class TestReadWithEncoding:
 
     # --- F-40: Explicit encoding failure ---
     def test_explicit_encoding_fails_with_unicode_decode_error(self, tmp_path: Path) -> None:
-        """Test that explicit encoding parameter raises UnicodeDecodeError on mismatch.
+        """Test that explicit encoding parameter raises LASEncodingError on mismatch.
 
-        Exercises encoding.py:83-85 — the direct read_text(encoding=encoding) path
-        that occurs when an explicit encoding is provided.
+        Exercises the explicit-encoding decode path in read_with_encoding.
         When the file content cannot be decoded with the given encoding,
-        UnicodeDecodeError should propagate.
+        LASEncodingError should be raised wrapping the UnicodeDecodeError.
         """
         test_file = tmp_path / "cp1251.las"
         # Write Russian text in CP1251 (Windows Cyrillic)
@@ -114,7 +113,9 @@ class TestReadWithEncoding:
         test_file.write_bytes(russian_text.encode("cp1251"))
 
         # Trying to decode CP1251 as ASCII should fail
-        with pytest.raises(UnicodeDecodeError):
+        from pylasdev.exceptions import LASEncodingError
+
+        with pytest.raises(LASEncodingError, match="Failed to decode"):
             read_with_encoding(test_file, encoding="ascii")
 
     # --- T5: LASEncodingError unreachable path (encoding.py:110) ---
@@ -137,3 +138,72 @@ class TestReadWithEncoding:
 
                 with pytest.raises(LASEncodingError, match="Failed to decode"):
                     read_with_encoding(test_file)
+
+
+class TestLowConfidenceChardetFallback:
+    """F-027: Low-confidence chardet fallback tests."""
+
+    def test_confidence_none_falls_back_to_utf8(self) -> None:
+        """Test that confidence=None falls back to utf-8."""
+        from pylasdev.encoding import _detect_encoding_from_bytes
+
+        with mock.patch("pylasdev.encoding.HAS_CHARDET", True):
+            with mock.patch("pylasdev.encoding.chardet") as mock_chardet:
+                mock_chardet.detect.return_value = {
+                    "encoding": "cp1251",
+                    "confidence": None,
+                }
+                result = _detect_encoding_from_bytes(b"hello")
+                assert result == "utf-8"
+
+    def test_confidence_falsy_falls_back_to_utf8(self) -> None:
+        """Test that confidence=0.0 (falsy) falls back to utf-8."""
+        from pylasdev.encoding import _detect_encoding_from_bytes
+
+        with mock.patch("pylasdev.encoding.HAS_CHARDET", True):
+            with mock.patch("pylasdev.encoding.chardet") as mock_chardet:
+                mock_chardet.detect.return_value = {
+                    "encoding": "cp1251",
+                    "confidence": 0.0,
+                }
+                result = _detect_encoding_from_bytes(b"hello")
+                assert result == "utf-8"
+
+    def test_confidence_below_threshold_falls_back_to_utf8(self) -> None:
+        """Test that confidence=0.7 falls back to utf-8 (not > 0.7)."""
+        from pylasdev.encoding import _detect_encoding_from_bytes
+
+        with mock.patch("pylasdev.encoding.HAS_CHARDET", True):
+            with mock.patch("pylasdev.encoding.chardet") as mock_chardet:
+                mock_chardet.detect.return_value = {
+                    "encoding": "cp1251",
+                    "confidence": 0.7,
+                }
+                result = _detect_encoding_from_bytes(b"hello")
+                assert result == "utf-8"
+
+    def test_confidence_above_threshold_uses_detected_encoding(self) -> None:
+        """Test that confidence=0.8 uses the detected encoding."""
+        from pylasdev.encoding import _detect_encoding_from_bytes
+
+        with mock.patch("pylasdev.encoding.HAS_CHARDET", True):
+            with mock.patch("pylasdev.encoding.chardet") as mock_chardet:
+                mock_chardet.detect.return_value = {
+                    "encoding": "cp1251",
+                    "confidence": 0.9,
+                }
+                result = _detect_encoding_from_bytes(b"hello")
+                assert result == "cp1251"
+
+    def test_confidence_above_threshold_encoding_none_falls_back(self) -> None:
+        """Test that high confidence but encoding=None falls back to utf-8."""
+        from pylasdev.encoding import _detect_encoding_from_bytes
+
+        with mock.patch("pylasdev.encoding.HAS_CHARDET", True):
+            with mock.patch("pylasdev.encoding.chardet") as mock_chardet:
+                mock_chardet.detect.return_value = {
+                    "encoding": None,
+                    "confidence": 0.9,
+                }
+                result = _detect_encoding_from_bytes(b"hello")
+                assert result == "utf-8"

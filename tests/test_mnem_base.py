@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pylasdev.mnem_base import MNEM_BASE
+import pytest
+
+from pylasdev.mnem_base import MNEM_BASE, resolve_mnemonic
 
 
 class TestMnemBase:
@@ -39,3 +41,99 @@ class TestMnemBase:
             # Just verify it doesn't crash with mnem_base
             data = read_las_file(las_files[0], mnem_base=MNEM_BASE)
             assert "logs" in data
+
+
+class TestResolveMnemonic:
+    """F-022+F-032: Direct tests for resolve_mnemonic function."""
+
+    def test_single_hop_resolution(self) -> None:
+        """Single-hop: AK → DT."""
+        mnem_base = {"AK": "DT"}
+        result = resolve_mnemonic(mnem_base, "AK")
+        assert result == "DT"
+
+    def test_non_existent_key_returns_self(self) -> None:
+        """Key not in base returns itself."""
+        mnem_base = {"AK": "DT"}
+        result = resolve_mnemonic(mnem_base, "ZZZ")
+        assert result == "ZZZ"
+
+    def test_multi_hop_chain_resolution(self) -> None:
+        """Multi-hop chain: BK-3 → BK → BFV."""
+        mnem_base = {"BK-3": "BK", "BK": "BFV"}
+        result = resolve_mnemonic(mnem_base, "BK-3")
+        assert result == "BFV"
+
+    def test_three_hop_chain_resolution(self) -> None:
+        """Three-hop chain: A → B → C → D."""
+        mnem_base = {"A": "B", "B": "C", "C": "D"}
+        result = resolve_mnemonic(mnem_base, "A")
+        assert result == "D"
+
+    def test_chain_terminates_at_terminal(self) -> None:
+        """Chain stops when a target is not itself a key."""
+        mnem_base = {"X": "Y"}  # Y is not a key
+        result = resolve_mnemonic(mnem_base, "X")
+        assert result == "Y"
+
+    def test_cycle_detection(self) -> None:
+        """Cycle A→B→A returns current value when cycle detected."""
+        mnem_base = {"A": "B", "B": "A"}
+        result = resolve_mnemonic(mnem_base, "A")
+        # Cycle detected: returns current when next is in seen
+        assert result in ("A", "B")
+
+    def test_self_loop_cycle_detection(self) -> None:
+        """Self-loop: A→A returns A."""
+        mnem_base = {"A": "A"}
+        result = resolve_mnemonic(mnem_base, "A")
+        assert result == "A"
+
+    def test_max_depth_limit(self) -> None:
+        """Long chain exceeding max_depth returns the current value."""
+        # Build a chain of max_depth+5 steps: 0→1→2→...→(max_depth+5)
+        chain_len = 15  # > default max_depth of 10
+        mnem_base = {str(i): str(i + 1) for i in range(chain_len)}
+        result = resolve_mnemonic(mnem_base, "0", max_depth=10)
+        # max_depth exhausted at the 10th hop, returns whatever current is
+        assert result in mnem_base.values() or result == "0"
+
+    def test_resolve_with_real_mnem_base_single_hop(self) -> None:
+        """Use real MNEM_BASE to verify single-hop resolution works."""
+        uppered = {k.upper(): v for k, v in MNEM_BASE.items()}
+        # AK → DT (single hop, works in uppercased dict)
+        result = resolve_mnemonic(uppered, "AK")
+        assert result == "DT"
+
+    def test_resolve_three_hop_real_chain(self) -> None:
+        """Real chain from MNEM_BASE: GZ3R1 → OGZ (resolved single-hop in uppercased)."""
+        uppered = {k.upper(): v for k, v in MNEM_BASE.items()}
+        result = resolve_mnemonic(uppered, "GZ3R1")
+        assert result == "OGZ"
+
+    def test_custom_max_depth(self) -> None:
+        """Custom max_depth limits chain walking."""
+        mnem_base = {"A": "B", "B": "C", "C": "D"}
+        result = resolve_mnemonic(mnem_base, "A", max_depth=1)
+        assert result == "B"  # Only one hop allowed, stops at B
+
+    # --- R-005: Parametrized mnemonic chain resolution ---
+    @pytest.mark.parametrize(
+        "mnem_base,key,expected",
+        [
+            ({"AK": "DT"}, "AK", "DT"),  # single-hop
+            ({"AK": "DT"}, "ZZZ", "ZZZ"),  # non-existent key
+            ({"BK-3": "BK", "BK": "BFV"}, "BK-3", "BFV"),  # two-hop chain
+            ({"A": "B", "B": "C", "C": "D"}, "A", "D"),  # three-hop chain
+            ({"X": "Y"}, "X", "Y"),  # terminal target
+        ],
+    )
+    def test_resolve_chain_parametrized(
+        self,
+        mnem_base: dict[str, str],
+        key: str,
+        expected: str,
+    ) -> None:
+        """Parametrized test for mnemonic chain resolution across multiple configurations."""
+        result = resolve_mnemonic(mnem_base, key)
+        assert result == expected

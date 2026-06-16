@@ -566,16 +566,45 @@ class TestWriteLASFile:
         las = LASFile()
         las.version = VersionSection(vers="2.0")
         las.well["NULL"] = "-999.25"
-        las.curves_order = ["DEPT"]
+        las.curves_order = ["DEPT", "DT"]
         las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
-        las.logs["DEPT"] = np.array([1234.56789])
+        las.curves.append(CurveDefinition(mnemonic="DT", unit="US/M"))
+        las.logs["DEPT"] = np.array([1234.56789, 1235.12345])
+        las.logs["DT"] = np.array([123.45, 123.55])
 
         temp_file = tmp_path / "prec.las"
         write_las_file(temp_file, las, precision=".4g")
 
         content = temp_file.read_text()
-        # With .4g format, format(1234.56789, '.4g') == '1235'
-        assert "1235" in content
+        # With .4g format: format(1234.56789, '.4g') == '1235'
+        # Extract data lines after ~A section
+        data_section = content.split("~A")[-1]
+        data_lines = [line for line in data_section.splitlines() if line.strip()]
+
+        # First line after ~A is the curve names header: "  DEPT  DT"
+        # Data lines follow after the header
+        assert len(data_lines) >= 2  # header + at least 1 data line
+        first_data_line = data_lines[1]  # skip header line
+
+        # Verify full formatted data line contains both values with correct precision
+        # For .4g: 1234.56789 → "1235", 123.45 → "123.5"
+        parts = first_data_line.split()
+        assert len(parts) == 2
+        assert parts[0] == "1235"  # 1234.56789 formatted as .4g
+        assert parts[1] == "123.5"  # 123.45 formatted as .4g
+
+        # Verify multiple data points
+        assert len(data_lines) >= 3
+        second_data_line = data_lines[2]
+        parts2 = second_data_line.split()
+        assert len(parts2) == 2
+
+        # Verify roundtrip preserves data values with the formatted precision
+        reread = read_las_file(temp_file)
+        assert reread["curves_order"] == ["DEPT", "DT"]
+        # Values should roundtrip approximately (precision loss from .4g)
+        np.testing.assert_allclose(reread["logs"]["DEPT"][0], 1235.0, rtol=1e-2)
+        np.testing.assert_allclose(reread["logs"]["DEPT"][1], 1235.0, rtol=1e-2)
 
     # --- F-29: Dict encoding key ---
     def test_write_dict_with_encoding_key(self, tmp_path: Path) -> None:

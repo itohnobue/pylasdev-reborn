@@ -12,6 +12,7 @@ tmp/
 # Virtual environments
 .venv/
 venv/
+ls/
 
 # Testing
 .pytest_cache/

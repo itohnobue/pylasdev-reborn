@@ -9,6 +9,7 @@ Supports LAS 1.2, 2.0, and 3.0 formats.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,38 @@ from numpy.typing import NDArray
 from .data_reader import _get_null_value
 from .exceptions import LASWriteError
 from .models import LASFile
+
+# Control characters except space and tab (which are valid LAS whitespace).
+# Matches \x00-\x08, \x0B, \x0C, \x0E-\x1F, and \x7F (DEL).
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+
+# Pattern to detect section-header-like leading content after sanitization.
+# A value starting with ~ followed by an alphabetic character mimics a
+# LAS section header and could split the file if injected verbatim.
+_LEADING_SECTION_RE = re.compile(r"^~([A-Za-z])")
+
+
+def _sanitize_las_value(value: str) -> str:
+    """Sanitize a string for safe inclusion in LAS output.
+
+    Removes newlines, control characters, and leading ~A-Z patterns
+    that could be interpreted as section headers when injected into
+    LAS output text.
+
+    Args:
+        value: Raw string value.
+
+    Returns:
+        Sanitized string safe for LAS output.
+    """
+    # Strip all newline characters (prevents section injection)
+    value = value.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    # Strip control characters
+    value = _CONTROL_CHARS_RE.sub("", value)
+    # If the value now starts with ~ followed by a letter, remove the leading ~
+    # to prevent it from being interpreted as a section header
+    value = _LEADING_SECTION_RE.sub(r"\1", value, count=1)
+    return value
 
 
 def write_las_file(
@@ -96,7 +129,7 @@ def _write_well_section(las_file: LASFile) -> list[str]:
     lines: list[str] = []
     lines.append("~WELL INFORMATION")
     for key, value in las_file.well.entries.items():
-        lines.append(f" {key}.   {value}  :")
+        lines.append(f" {key}.   {_sanitize_las_value(value)}  :")
     lines.append("")
     return lines
 
@@ -123,7 +156,7 @@ def _write_curve_section(las_file: LASFile) -> list[str]:
             desc = f"{desc}  {format_str}"
 
         api = f"  {curve.api_code}" if curve.api_code else ""
-        lines.append(f" {curve.mnemonic}.{unit}{api}  : {desc}")
+        lines.append(f" {_sanitize_las_value(curve.mnemonic)}.{unit}{api}  : {desc}")
     lines.append("")
     return lines
 
@@ -145,7 +178,7 @@ def _write_parameter_section(las_file: LASFile) -> list[str]:
                 zone_str += f"[{param.zone.zone_index}]"
             desc = f"{desc}{zone_str}"
 
-        lines.append(f" {param.mnemonic}.{unit}  {param.value}  : {desc}")
+        lines.append(f" {param.mnemonic}.{unit}  {_sanitize_las_value(param.value)}  : {desc}")
     lines.append("")
     return lines
 
@@ -155,7 +188,11 @@ def _write_other_section(las_file: LASFile) -> list[str]:
     lines: list[str] = []
     if las_file.other and las_file.other.strip():
         lines.append("~OTHER")
-        lines.append(las_file.other.rstrip())
+        # Sanitize each line of free-form other content against section injection
+        for line in las_file.other.splitlines():
+            sanitized = _sanitize_las_value(line)
+            if sanitized.strip():
+                lines.append(sanitized)
         lines.append("")
     return lines
 
@@ -184,7 +221,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
     else:
         # Legacy single data section
         curve_names = las_file.curves_order
-        if curve_names and curve_names[0] in las_file.logs:
+        if any(name in las_file.logs for name in curve_names):
             lines.append("~A  " + "  ".join(curve_names))
             lines.extend(
                 _format_data_rows(
@@ -214,9 +251,8 @@ def _format_data_rows(
     Missing values are filled with the null_value. NaN values are output as null.
     """
     lines: list[str] = []
-    if not curve_names or curve_names[0] not in data:
+    if not curve_names:
         return lines
-    num_rows = len(data[curve_names[0]])
 
     # Pre-extract curve data arrays to avoid O(rows x curves) dict lookups
     # inside the inner loop (F-23 performance optimization).
@@ -228,6 +264,17 @@ def _format_data_rows(
             curve_arrays.append((data[name], False))
         else:
             curve_arrays.append((None, False))
+
+    # Derive row count from max length across all curves, not just the first.
+    # This handles per-curve variable-length data (e.g. curves populated
+    # from different data sections in LAS 3.0).  Shorter curves are padded
+    # with null_value in the inner loop.
+    num_rows = max(
+        (len(arr) for arr, _ in curve_arrays if arr is not None),
+        default=0,
+    )
+    if num_rows == 0:
+        return lines
 
     for i in range(num_rows):
         row_values: list[str] = []

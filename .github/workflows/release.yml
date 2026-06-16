@@ -1,25 +1,84 @@
 name: Release
 
+# Rollback procedure (manual):
+# If a bad release is published to PyPI, yank it:
+#   1. PyPI Web UI: Project → Manage → Releases → Select version → Yank
+#   2. CLI: pip install twine && twine yank pylasdev==<VERSION> --reason "<REASON>"
+# Yanking marks the release as deprecated but does not remove files.
+# For complete removal, use PyPI web UI (irreversible admin action).
+# To re-release after yank: fix issues, bump version in pyproject.toml,
+# delete old tag, re-tag, push:
+#   git tag -d v<VERSION> && git push origin :refs/tags/v<VERSION>
+#   git tag -a v<VERSION_NEW> -m "v<VERSION_NEW>" && git push origin v<VERSION_NEW>
+
 on:
   push:
     tags: ["v*"]
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    concurrency:
+      group: release-check-${{ github.ref }}
+      cancel-in-progress: true
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081  # v5
+
+      - name: Set up Python
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --all-extras --frozen
+
+      - name: Test
+        run: uv run pytest -v --cov=src/pylasdev --cov-report=term-missing --cov-fail-under=85
+
+      - name: Security scan (bandit)
+        run: uv run bandit -r src/
+
+      - name: Dependency audit (pip-audit)
+        run: uv run pip-audit
+
   release:
+    needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    environment: pypi
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       id-token: write   # Required for trusted publishing to PyPI
       contents: write   # Required for GitHub release
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081  # v5
 
       - name: Set up Python
         run: uv python install 3.12
+
+      - name: Verify tag matches pyproject.toml version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          TOML_VERSION=$(grep '^version = ' pyproject.toml | head -1 | sed 's/version = "\([^"]*\)"/\1/')
+          if [ "$TAG_VERSION" != "$TOML_VERSION" ]; then
+            echo "ERROR: Tag version v${TAG_VERSION} != pyproject.toml version ${TOML_VERSION}"
+            exit 1
+          fi
+          echo "Version OK: tag v${TAG_VERSION} matches pyproject.toml ${TOML_VERSION}"
 
       - name: Install dependencies
         run: uv sync --all-extras --frozen
@@ -27,8 +86,13 @@ jobs:
       - name: Build package
         run: uv build
 
+      - name: Pre-publish wheel verification
+        run: |
+          uv pip install --no-deps "$(ls dist/pylasdev-*.whl | head -1)"
+          uv run python -c "import pylasdev; print(f'pylasdev {pylasdev.__version__} import OK')"
+
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # release/v1
         with:
           packages-dir: dist/
 
@@ -46,11 +110,11 @@ jobs:
             sleep 10
           done
           uv pip install "pylasdev==${VERSION}" --index-url https://pypi.org/simple/
-          python -c "import pylasdev; print(f'pylasdev {pylasdev.__version__} imported successfully')"
-          python -c "from pylasdev.reader import read_las; print('read_las imported successfully')"
+          uv run python -c "import pylasdev; print(f'pylasdev {pylasdev.__version__} imported successfully')"
+          uv run python -c "from pylasdev.reader import read_las; print('read_las imported successfully')"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           files: dist/*
           generate_release_notes: true

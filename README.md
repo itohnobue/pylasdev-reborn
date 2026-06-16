@@ -1,5 +1,9 @@
 # pylasdev Reborn
 
+[![CI](https://github.com/itohnobue/pylasdev-reborn/actions/workflows/ci.yml/badge.svg)](https://github.com/itohnobue/pylasdev-reborn/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-BSD--3--Clause-green.svg)](https://github.com/itohnobue/pylasdev-reborn/blob/main/LICENSE)
+
 Python library for reading and writing LAS (Log ASCII Standard) and DEV (deviation) well log files.
 
 It is "Reborn" because it was updated, fixed and refactored to work with modern tech along with fixing many bugs, adding support for LAS 3.0 files and much more (see full list at the end of this file).
@@ -19,7 +23,9 @@ It is "Reborn" because it was updated, fixed and refactored to work with modern 
   - [Mnemonic Database](#mnemonic-database)
   - [Exceptions](#exceptions)
 - [Common Use Cases](#common-use-cases)
-- [Error Handling](#error-handling)
+  - [Error Handling with try/except](#error-handling-with-tryexcept)
+  - [Encoding Override](#encoding-override)
+  - [Reading LAS 1.2 Files](#reading-las-12-files)
 - [Features](#features)
 - [Limits](#limits)
 - [Troubleshooting](#troubleshooting)
@@ -54,6 +60,19 @@ cd pylasdev-reborn
 uv sync
 ```
 
+## Quick Start
+
+```python
+from pylasdev import read_las_file
+
+# Read a LAS file — returns a dict
+data = read_las_file("test_data/sample.las")
+print(data["well"]["WELL"])    # Well name
+print(data["logs"]["DEPT"])    # Depth curve as numpy array
+```
+
+See [Usage](#usage) below for all read/write APIs, the object-oriented interface, and advanced features.
+
 ## Usage
 
 ### Basic API (dict-based)
@@ -62,7 +81,7 @@ uv sync
 from pylasdev import read_las_file, write_las_file, read_dev_file
 
 # Read a LAS file (returns dict for backward compatibility)
-# Use a real test file from the test_data/ directory (27 sample LAS/DEV files)
+# Use a real test file from the test_data/ directory (18 sample LAS/DEV files)
 data = read_las_file("test_data/sample.las")
 print(data["well"]["WELL"])  # Print well name
 print(data["logs"]["DEPT"])  # Access depth curve as numpy array
@@ -116,16 +135,16 @@ las2 = LASFile.from_dict(d)               # Create from dict
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `read_las_file(path, mnem_base=None, encoding=None, max_file_size=None)` | `dict` | Read LAS 1.2/2.0/3.0 file, returns legacy dict format |
-| `read_las_file_as_object(path, mnem_base=None, encoding=None, max_file_size=None)` | `LASFile` | Read LAS file, returns typed `LASFile` dataclass |
-| `read_dev_file(path, encoding=None, max_file_size=None)` | `dict` | Read DEV deviation file, returns `{column: ndarray}` dict |
-| `read_dev_file_as_object(path, encoding=None, max_file_size=None)` | `DevFile` | Read DEV file, returns typed `DevFile` dataclass |
+| `read_las_file(file_path, mnem_base=None, encoding=None, max_file_size=None)` | `dict` | Read LAS 1.2/2.0/3.0 file, returns legacy dict format |
+| `read_las_file_as_object(file_path, mnem_base=None, encoding=None, max_file_size=None)` | `LASFile` | Read LAS file, returns typed `LASFile` dataclass |
+| `read_dev_file(file_path, encoding=None, max_file_size=None)` | `dict` | Read DEV deviation file, returns `{column: ndarray}` dict |
+| `read_dev_file_as_object(file_path, encoding=None, max_file_size=None)` | `DevFile` | Read DEV file, returns typed `DevFile` dataclass |
 
 ### Write Functions
 
 | Function | Description |
 |----------|-------------|
-| `write_las_file(path, data, encoding="utf-8", precision=".8g")` | Write LAS data (dict or `LASFile`) to a `.las` file with configurable encoding and numeric precision |
+| `write_las_file(file_path, data, encoding="utf-8", precision=".8g")` | Write LAS data (dict or `LASFile`) to a `.las` file with configurable encoding and numeric precision |
 
 ### Comparison
 
@@ -256,7 +275,7 @@ All exceptions inherit from `PylasdevError`:
 | `PylasdevError` | Base exception for all pylasdev errors |
 | `LASReadError` | File not found, permission denied |
 | `LASParseError` | LAS file content cannot be parsed |
-| `LASVersionError` | Unsupported LAS version encountered |
+| `LASVersionError` | Provided for user code to enforce strict version policies. The library itself issues ``warnings.warn()`` for versions > 3.0 and continues processing. |
 | `LASEncodingError` | File encoding cannot be determined or decoded |
 | `LASWriteError` | LAS file cannot be written |
 | `DEVReadError` | DEV file cannot be read or parsed |
@@ -264,67 +283,6 @@ All exceptions inherit from `PylasdevError`:
 ## Common Use Cases
 
 ### Error Handling with try/except
-
-```python
-from pylasdev import (
-    read_las_file, read_las_file_as_object,
-    LASReadError, LASParseError, LASEncodingError,
-)
-
-# Example 1: Handle common read errors
-try:
-    data = read_las_file("well_log.las")
-except LASReadError as e:
-    print(f"File error: {e}")
-except LASEncodingError as e:
-    print(f"Encoding error: {e}")
-except LASParseError as e:
-    print(f"Parse error: {e}")
-
-# Example 2: Using the object API with error handling
-try:
-    las = read_las_file_as_object("survey.las")
-    print(f"Version: {las.version.vers}, Curves: {len(las.curves)}")
-except LASReadError:
-    print("Could not open file — check that the path exists")
-except LASParseError as e:
-    print(f"Malformed LAS file: {e}")
-```
-
-### Encoding Override
-
-```python
-from pylasdev import read_las_file, LASEncodingError
-
-# Auto-detection (default)
-data = read_las_file("well_log.las")
-print(data["encoding"])  # e.g., "cp1251"
-
-# Force specific encoding
-data = read_las_file("well_log.las", encoding="utf-8")
-
-# Handling encoding errors gracefully
-try:
-    data = read_las_file("unknown_encoding.las")
-except LASEncodingError:
-    # Fall back to latin-1 which never fails on bytes
-    data = read_las_file("unknown_encoding.las", encoding="latin-1")
-```
-
-### Reading LAS 1.2 Files
-
-```python
-from pylasdev import read_las_file_as_object
-
-# LAS 1.2 files work exactly the same as LAS 2.0
-las = read_las_file_as_object("legacy_v12.las")
-print(las.version.vers)          # "1.2"
-print(las.well["DATE"])         # Date field from ~W section
-for curve in las.curves:        # All curves from ~C section
-    print(f"{curve.mnemonic}: {curve.unit}")
-```
-
-## Error Handling
 
 pylasdev uses a custom exception hierarchy for all error conditions.
 All exceptions inherit from `PylasdevError`, making it easy to catch any
@@ -360,6 +318,34 @@ except PylasdevError:
     print("Other pylasdev error")
 ```
 
+Practical examples:
+
+```python
+from pylasdev import (
+    read_las_file, read_las_file_as_object,
+    LASReadError, LASParseError, LASEncodingError,
+)
+
+# Example 1: Handle common read errors
+try:
+    data = read_las_file("well_log.las")
+except LASReadError as e:
+    print(f"File error: {e}")
+except LASEncodingError as e:
+    print(f"Encoding error: {e}")
+except LASParseError as e:
+    print(f"Parse error: {e}")
+
+# Example 2: Using the object API with error handling
+try:
+    las = read_las_file_as_object("survey.las")
+    print(f"Version: {las.version.vers}, Curves: {len(las.curves)}")
+except LASReadError:
+    print("Could not open file — check that the path exists")
+except LASParseError as e:
+    print(f"Malformed LAS file: {e}")
+```
+
 > **Important:** The `max_file_size` parameter raises `ValueError`, which is **not** a
 > subclass of `PylasdevError`. A blanket `except PylasdevError` will silently miss
 > file-size-limit violations. Always catch `ValueError` separately when using
@@ -375,6 +361,39 @@ except PylasdevError:
 > except PylasdevError as e:
 >     print(f"LAS error: {e}")
 > ```
+
+### Encoding Override
+
+```python
+from pylasdev import read_las_file, LASEncodingError
+
+# Auto-detection (default)
+data = read_las_file("well_log.las")
+print(data["encoding"])  # e.g., "cp1251"
+
+# Force specific encoding
+data = read_las_file("well_log.las", encoding="utf-8")
+
+# Handling encoding errors gracefully
+try:
+    data = read_las_file("unknown_encoding.las")
+except LASEncodingError:
+    # Fall back to latin-1 which never fails on bytes
+    data = read_las_file("unknown_encoding.las", encoding="latin-1")
+```
+
+### Reading LAS 1.2 Files
+
+```python
+from pylasdev import read_las_file_as_object
+
+# LAS 1.2 files work exactly the same as LAS 2.0
+las = read_las_file_as_object("legacy_v12.las")
+print(las.version.vers)          # "1.2"
+print(las.well["DATE"])         # Date field from ~W section
+for curve in las.curves:        # All curves from ~C section
+    print(f"{curve.mnemonic}: {curve.unit}")
+```
 
 ## Features
 
@@ -425,6 +444,21 @@ dr.MAX_DATA_LINES = 20_000_000  # Allow more data lines
 > by the public backward-compatibility guarantee. Prefer the public API
 > (`read_las_file(..., max_file_size=N)`) for production code. Use internal
 > imports only when you need to override module-level constants directly.
+
+> **Warning (LAS 3.0):** Overriding `data_reader.MAX_CURVES` and
+> `data_reader.MAX_DATA_LINES` only affects LAS 1.2/2.0 files. For LAS 3.0
+> files, the parser imports these constants via ``from .data_reader import
+> MAX_CURVES``, which binds the integer value at import time. Reassigning
+> ``data_reader.MAX_CURVES`` after import does **not** update the parser's
+> copy. To override limits for LAS 3.0, also reassign ``pylasdev.parser.MAX_CURVES``:
+>
+> ```python
+> import pylasdev.data_reader as dr
+> import pylasdev.parser
+>
+> dr.MAX_CURVES = 200_000
+> pylasdev.parser.MAX_CURVES = 200_000
+> ```
 
 ## Troubleshooting
 
@@ -515,12 +549,14 @@ Python 3.12+. The dict-based API (`read_las_file()`, `read_dev_file()`,
 | No encoding detection | Auto-detection with chardet |
 | Thread-unsafe (global state) | Thread-safe |
 | Global `base_mnems` variable | Locally importable `MNEM_BASE` |
+| Writer destroys units/descriptions (hardcoded `.X`) | Writer preserves original units and descriptions |
 
 To migrate:
 1. The import statement is the same: `import pylasdev` (no change for most users)
 2. Replace `pylasdev.las_compare.compare(a, b)` with `pylasdev.compare_las_dicts(a, b)` — the `las_compare` module has been removed; the function is now a top-level import
 3. Replace `pylasdev.base_mnems` with `pylasdev.MNEM_BASE`
 4. Existing `read_las_file()` and `read_dev_file()` calls work without changes
+5. `write_las_file()` now preserves original curve units and descriptions from the `~C` section instead of writing hardcoded ``.X`` placeholders. If you were relying on the old destructive behavior, you may need to manually strip units/descriptions before writing.
 
 ## Requirements
 
@@ -639,6 +675,5 @@ Complete rewrite from Python 2 to Python 3.12+.
 
 BSD-3-Clause
 
-This repository does not yet include CONTRIBUTING.md, SECURITY.md, or a
-standalone CHANGELOG.md file. All version history and contributing guidelines
-are maintained in this README.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidelines and
+[SECURITY.md](SECURITY.md) for the security policy.

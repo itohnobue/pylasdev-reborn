@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from pylasdev.compare import compare_las_dicts
 
@@ -275,3 +276,110 @@ class TestCompareLasDicts:
         d1 = {"meta": {"tags": np.array(["A", "B"], dtype="O")}}
         d2 = {"meta": {"tags": np.array(["A", "C"], dtype="O")}}
         assert compare_las_dicts(d1, d2) is False
+
+    # --- CF-025: dtype "S" (byte strings) branch test ---
+    def test_compare_byte_string_arrays_match(self) -> None:
+        """Test _compare_arrays handles byte string arrays (dtype 'S')."""
+        d1 = {"logs": {"ID": np.array([b"DEPT", b"GR"], dtype="S")}}
+        d2 = {"logs": {"ID": np.array([b"DEPT", b"GR"], dtype="S")}}
+        assert compare_las_dicts(d1, d2) is True
+
+    def test_compare_byte_string_arrays_mismatch(self) -> None:
+        """Test _compare_arrays detects mismatch in byte string arrays."""
+        d1 = {"logs": {"ID": np.array([b"DEPT", b"GR"], dtype="S")}}
+        d2 = {"logs": {"ID": np.array([b"DEPT", b"DT"], dtype="S")}}
+        assert compare_las_dicts(d1, d2) is False
+
+    # --- CF-026: rtol parameter with custom value ---
+    def test_rtol_custom_tolerance(self) -> None:
+        """Test rtol parameter with a custom value different from atol."""
+        # Values with ~1% relative difference
+        d1 = {"logs": {"VAL": np.array([100.0, 200.0])}}
+        d2 = {"logs": {"VAL": np.array([101.0, 202.0])}}
+        # rtol=1e-7 (default) should fail — 1% difference > 1e-7
+        assert compare_las_dicts(d1, d2, rtol=1e-7) is False
+        # rtol=1e-3 should also fail — 101/100 - 1 = 0.01 > 1e-3
+        assert compare_las_dicts(d1, d2, rtol=1e-3) is False
+        # rtol=0.02 should pass — 0.01 < 0.02
+        assert compare_las_dicts(d1, d2, rtol=2e-2) is True
+
+    def test_rtol_interaction_with_atol(self) -> None:
+        """Test that rtol and atol work together correctly."""
+        d1 = {"logs": {"V": np.array([1.0, 10.0])}}
+        d2 = {"logs": {"V": np.array([1.01, 10.01])}}
+        # rtol=1e-7 too tight, atol=0.0 too tight
+        assert compare_las_dicts(d1, d2, rtol=1e-7, atol=0.0) is False
+        # rtol=1e-2 gives ~1% tolerance — 0.01/1.0=0.01 passes, 0.01/10.0=0.001 passes
+        assert compare_las_dicts(d1, d2, rtol=1e-2, atol=0.0) is True
+        # atol=0.02 alone passes since all absolute diffs are 0.01
+        assert compare_las_dicts(d1, d2, rtol=0.0, atol=0.02) is True
+
+    # --- R-005: Parametrized tolerance comparison ---
+    @pytest.mark.parametrize(
+        "d1,d2,atol,rtol,expected",
+        [
+            # Arrays within tolerance
+            (
+                {"logs": {"DEPT": np.array([1.0, 2.0])}},
+                {"logs": {"DEPT": np.array([1.0, 2.0 + 1e-8])}},
+                1e-7,
+                1e-7,
+                True,
+            ),
+            # Custom atol — passes with 0.02, fails with 0.001
+            (
+                {"logs": {"DEPT": np.array([1.0])}},
+                {"logs": {"DEPT": np.array([1.01])}},
+                0.02,
+                1e-7,
+                True,
+            ),
+            (
+                {"logs": {"DEPT": np.array([1.0])}},
+                {"logs": {"DEPT": np.array([1.01])}},
+                0.001,
+                1e-7,
+                False,
+            ),
+            # rtol-based: ~1% relative difference
+            (
+                {"logs": {"VAL": np.array([100.0, 200.0])}},
+                {"logs": {"VAL": np.array([101.0, 202.0])}},
+                0.0,
+                2e-2,
+                True,
+            ),
+            (
+                {"logs": {"VAL": np.array([100.0, 200.0])}},
+                {"logs": {"VAL": np.array([101.0, 202.0])}},
+                0.0,
+                1e-3,
+                False,
+            ),
+            # Both atol and rtol together
+            (
+                {"logs": {"V": np.array([1.0, 10.0])}},
+                {"logs": {"V": np.array([1.01, 10.01])}},
+                0.0,
+                1e-7,
+                False,
+            ),
+            (
+                {"logs": {"V": np.array([1.0, 10.0])}},
+                {"logs": {"V": np.array([1.01, 10.01])}},
+                0.02,
+                1e-7,
+                True,
+            ),
+        ],
+    )
+    def test_compare_tolerance_parametrized(
+        self,
+        d1: dict,
+        d2: dict,
+        atol: float,
+        rtol: float,
+        expected: bool,
+    ) -> None:
+        """Parametrized test for array comparison with tolerance values."""
+        assert compare_las_dicts(d1, d2, atol=atol, rtol=rtol) is expected

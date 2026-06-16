@@ -6,13 +6,14 @@ This document describes how to create a new release of pylasdev.
 
 - Push access to the repository
 - Python 3.12+ with `uv` installed
-- A [PyPI](https://pypi.org) account with trusted publisher configured for this repository (or a PyPI API token)
+- A [PyPI](https://pypi.org) account with Trusted Publishing configured for this repository (or a PyPI API token). See [Trusted Publishing Setup](#trusted-publishing-setup-one-time) below — this is a one-time setup required before the first PyPI publication.
 
 > **Note:** The package is **not** currently published on PyPI. The CI pipeline
 > (step 4) is designed for automated PyPI publishing via Trusted Publishing,
 > but this requires the Trusted Publisher to be configured in PyPI project
 > settings first (see [Trusted Publishing Setup](#trusted-publishing-setup-one-time)
-> below). Until that is done, `pip install pylasdev` will return a 404 error.
+> below). Until the Trusted Publisher is configured and the first release is
+> published, `pip install pylasdev` will return a 404 error.
 > For now, install from source: `git clone` + `pip install .` or `uv sync`.
 
 ## Steps
@@ -68,9 +69,16 @@ Pushing a `v*` tag triggers two workflows:
 ### 5. Verify the release
 
 - Check the [GitHub Releases page](https://github.com/itohnobue/pylasdev-reborn/releases) for the new release
-- Verify the package is available on [PyPI](https://pypi.org/project/pylasdev/):
+- **After first PyPI publication:** verify the package is available on [PyPI](https://pypi.org/project/pylasdev/):
   ```bash
   pip install pylasdev==X.Y.Z
+  ```
+- **Before first PyPI publication:** verify the release locally:
+  ```bash
+  git clone https://github.com/itohnobue/pylasdev-reborn.git --branch vX.Y.Z /tmp/pylasdev-test
+  cd /tmp/pylasdev-test
+  pip install .
+  python -c "import pylasdev; print(pylasdev.__version__)"
   ```
 
 ## Trusted Publishing Setup (one-time)

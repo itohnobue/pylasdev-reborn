@@ -131,6 +131,7 @@ class LASParser:
         # F-3: Accumulate other-section lines in a list to avoid O(n^2)
         # string concatenation (self.las_file.other += ... per line).
         self._other_lines: list[str] = []
+        self.source_file: str = ""
 
     @property
     def data_line_count(self) -> int:
@@ -190,11 +191,16 @@ class LASParser:
         count = 0
 
         for line in lines:
-            match = SECTION_PATTERN.match(line)
+            stripped = line.strip()
+            match = SECTION_PATTERN.match(stripped)
             if match:
                 in_ascii = match.group(1).upper() == "A"
                 continue
-            if in_ascii and not COMMENT_PATTERN.match(line) and not EMPTY_PATTERN.match(line):
+            if (
+                in_ascii
+                and not COMMENT_PATTERN.match(stripped)
+                and not EMPTY_PATTERN.match(stripped)
+            ):
                 count += 1
 
         self._data_line_count = count
@@ -223,9 +229,11 @@ class LASParser:
             else:
                 # F-2: Unknown section type (e.g., custom-named LAS 3.0 sections).
                 # Log a warning and accumulate as free-form text (like ~O).
+                source_info = f" in {self.source_file}" if self.source_file else ""
                 logger.warning(
-                    "Unknown section type '~%s' at line: %s",
+                    "Unknown section type '~%s' at line%s: %s",
                     self._current_section,
+                    source_info,
                     line[:80],
                 )
 
@@ -306,6 +314,12 @@ class LASParser:
                         f"'{format_match.group('offset')}' is not a valid number "
                         f"in curve description '{description}'"
                     ) from exc
+                if not np.isfinite(array_time_offset):
+                    raise LASParseError(
+                        f"Format specifier offset overflow: "
+                        f"'{format_match.group('offset')}' produced "
+                        f"{array_time_offset} in curve description '{description}'"
+                    )
             # Remove format specifier from description
             description = FORMAT_SPEC_PATTERN.sub("", description).strip()
 
@@ -314,7 +328,13 @@ class LASParser:
         array_match = ARRAY_MNEMONIC_PATTERN.match(raw_mnemonic)
         if array_match:
             base_name = array_match.group("base").upper()
-            index = int(array_match.group("index"))
+            try:
+                index = int(array_match.group("index"))
+            except ValueError as exc:
+                raise LASParseError(
+                    f"Invalid array index '{array_match.group('index')}' in "
+                    f"curve mnemonic '{raw_mnemonic}'"
+                ) from exc
             array_info = ArrayElementInfo(
                 base_name=base_name,
                 index=index,
@@ -360,9 +380,18 @@ class LASParser:
         zone: ParameterZone | None = None
         zone_match = ZONE_ASSOC_PATTERN.search(description)
         if zone_match:
+            zone_index: int | None = None
+            if zone_match.group("index"):
+                try:
+                    zone_index = int(zone_match.group("index"))
+                except ValueError as exc:
+                    raise LASParseError(
+                        f"Invalid zone index '{zone_match.group('index')}' in "
+                        f"parameter '{raw_mnemonic}'"
+                    ) from exc
             zone = ParameterZone(
                 zone_name=zone_match.group("zone").upper(),
-                zone_index=(int(zone_match.group("index")) if zone_match.group("index") else None),
+                zone_index=zone_index,
             )
             # Remove zone association from description
             description = ZONE_ASSOC_PATTERN.sub("", description).strip()
@@ -371,7 +400,13 @@ class LASParser:
         array_index: int | None = None
         array_match = ARRAY_MNEMONIC_PATTERN.match(raw_mnemonic)
         if array_match:
-            array_index = int(array_match.group("index"))
+            try:
+                array_index = int(array_match.group("index"))
+            except ValueError as exc:
+                raise LASParseError(
+                    f"Invalid array index '{array_match.group('index')}' in "
+                    f"parameter mnemonic '{raw_mnemonic}'"
+                ) from exc
 
         # Apply mnemonic normalization from mnem_base (same as curve handling)
         normalized = self._mnem_base_upper.get(raw_mnemonic, raw_mnemonic)
@@ -421,7 +456,7 @@ class LASParser:
 
         # GD-05: Deduplicate curve names for LAS 3.0 path (same logic as
         # data_reader._deduplicate_curves used for LAS 1.2/2.0).
-        _deduplicate_curves(self.las_file)
+        _deduplicate_curves(self.las_file, _stacklevel=3)
         curves = self.las_file.curves  # refresh reference after dedup
 
         # Determine which curves are string type
@@ -494,7 +529,15 @@ class LASParser:
                 data_section.data[curve.mnemonic] = arr
 
         # Fill arrays by index (no list accumulation overhead for numerics)
+        # Pre-extract numeric data arrays to avoid O(rows x curves) dict lookups.
+        # Use direct indexing (not .get()) so mypy knows values are non-None
+        # for curves that have been pre-allocated above.
+        numeric_arrays = [
+            data_section.data[c.mnemonic] if not string_curves.get(i, False) else None
+            for i, c in enumerate(curves)
+        ]
         idx = 0
+        warned_extra = False  # Track extra-column warning per section
         for line in self._ascii_data_lines:
             # Skip comment lines
             if COMMENT_PATTERN.match(line):
@@ -506,6 +549,17 @@ class LASParser:
                 values = line.split()
             else:
                 values = line.split(delimiter)
+
+            # Warn about extra columns being silently discarded
+            if len(values) > num_curves and not warned_extra:
+                warned_extra = True
+                logger.warning(
+                    "Data line in section '%s' has %d values but only "
+                    "%d curves declared. Extra columns are discarded.",
+                    self._current_section_name or "ASCII",
+                    len(values),
+                    num_curves,
+                )
 
             # Pad with null values if needed
             while len(values) < num_curves:
@@ -523,12 +577,22 @@ class LASParser:
                         # space-delimited files) are treated as null to match the
                         # behavior of most LAS processing tools.
                         val = _to_finite_float(val_str, null_value)
-                        data_section.data[curves[i].mnemonic][idx] = val
+                        arr = numeric_arrays[i]  # type: ignore[assignment]
+                        if arr is None:
+                            raise LASParseError(
+                                f"Internal error: numeric array '{i}' was not pre-allocated"
+                            )
+                        arr[idx] = val
                 except ValueError:
                     if string_curves.get(i, False):
                         string_data_lists[i].append(val_str)
                     else:
-                        data_section.data[curves[i].mnemonic][idx] = null_value
+                        arr = numeric_arrays[i]  # type: ignore[assignment]
+                        if arr is None:
+                            raise LASParseError(
+                                f"Internal error: numeric array '{i}' was not pre-allocated"
+                            ) from None
+                        arr[idx] = null_value
 
             idx += 1
 

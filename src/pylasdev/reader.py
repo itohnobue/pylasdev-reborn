@@ -39,7 +39,8 @@ def read_las_file(
             exceeds this limit, a ValueError is raised.
 
     Returns:
-        Dictionary with keys: version, well, parameters, logs, curves_order.
+        Dictionary with keys: version, well, parameters, parameter_details,
+        curves, logs, curves_order, other, data_sections, string_data, encoding.
         Well values are strings. Log values are numpy arrays.
 
     Raises:
@@ -107,10 +108,11 @@ def read_las_file_as_object(
 
     try:
         detected_encoding, content = read_with_encoding(file_path, encoding, max_file_size)
-    except PermissionError as e:
-        raise LASReadError(f"Cannot read file (permission denied): {file_path}") from e
+    except OSError as e:
+        raise LASReadError(f"Cannot read file: {file_path}") from e
 
     parser = LASParser(mnem_base)
+    parser.source_file = str(file_path)
     # PERF-01: Split content once, pass lines list to both parser and
     # data_reader to eliminate redundant content.splitlines() calls
     # (double splitlines doubles peak memory for large files).

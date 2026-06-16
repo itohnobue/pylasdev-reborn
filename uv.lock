@@ -761,7 +761,7 @@ requires-dist = [
     { name = "bandit", marker = "extra == 'dev'", specifier = ">=1.7" },
     { name = "chardet", marker = "extra == 'encoding'", specifier = ">=5.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
-    { name = "numpy", specifier = ">=1.24.3" },
+    { name = "numpy", specifier = ">=1.26.0" },
     { name = "pip-audit", marker = "extra == 'dev'", specifier = ">=2.7" },
     { name = "pylasdev", extras = ["dev", "encoding"], marker = "extra == 'all'" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },

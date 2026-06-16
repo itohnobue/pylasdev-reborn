@@ -7,12 +7,15 @@ and O(n) performance (vs O(n^2) numpy.append bug in original).
 
 from __future__ import annotations
 
+import logging
 import warnings
 
 import numpy as np
 
 from .exceptions import LASParseError
 from .models import LASFile, WellSection
+
+logger = logging.getLogger(__name__)
 
 # Maximum bounds for array allocations to prevent memory exhaustion
 # from malformed or malicious files. Overridable by setting the module constant.
@@ -287,10 +290,14 @@ def _read_normal(
     for curve_name in las_file.curves_order:
         las_file.logs[curve_name] = np.zeros(data_line_count, dtype=np.float64)
 
+    # Pre-extract arrays to avoid O(rows x curves) dict lookups in inner loop
+    curve_arrays = [las_file.logs[name] for name in las_file.curves_order]
+
     null_value = _get_null_value(las_file.well)
 
     in_ascii = False
     current_line = 0
+    warned_extra = False  # Track extra-column warning per file
 
     for line in lines:
         stripped = line.strip()
@@ -311,25 +318,23 @@ def _read_normal(
 
         values = stripped.split()
 
+        # Warn about extra columns being silently discarded
+        if len(values) > curve_count and not warned_extra:
+            warned_extra = True
+            logger.warning(
+                "Data line has %d values but only %d curves declared "
+                "in ~C section. Extra columns are discarded.",
+                len(values),
+                curve_count,
+            )
+
         for i in range(min(len(values), curve_count)):
-            try:
-                las_file.logs[las_file.curves_order[i]][current_line] = _to_finite_float(
-                    values[i], null_value
-                )
-            except IndexError:
-                # IndexError can occur when curve_count was reduced after deduplication
-                # (the pre-allocated arrays are sized for the deduplicated curve_count
-                # which may be smaller than the original data column count)
-                if (
-                    i < curve_count
-                    and current_line < las_file.logs[las_file.curves_order[i]].shape[0]
-                ):
-                    las_file.logs[las_file.curves_order[i]][current_line] = null_value
+            curve_arrays[i][current_line] = _to_finite_float(values[i], null_value)
 
         # Fill remaining curves with null_value when line has fewer values
         for i in range(len(values), curve_count):
-            if current_line < len(las_file.logs[las_file.curves_order[i]]):
-                las_file.logs[las_file.curves_order[i]][current_line] = null_value
+            if current_line < len(curve_arrays[i]):
+                curve_arrays[i][current_line] = null_value
 
         current_line += 1
 
