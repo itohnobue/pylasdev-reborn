@@ -100,9 +100,7 @@ def read_with_encoding(
     # Public entry points (read_las_file_as_object) also check is_file(),
     # but this module should be self-protecting when called directly.
     if not file_path.is_file():
-        raise LASEncodingError(
-            f"Cannot read {file_path}: not a regular file."
-        )
+        raise LASEncodingError(f"Cannot read {file_path}: not a regular file.")
 
     if max_file_size is not None:
         file_size = file_path.stat().st_size
@@ -127,7 +125,8 @@ def read_with_encoding(
     except UnicodeDecodeError:
         logger.debug(
             "Failed to decode %s with detected encoding %s, trying fallback chain",
-            file_path, detected,
+            file_path,
+            detected,
         )
 
     # Fallback chain — decode the same raw_bytes in memory.
@@ -142,6 +141,4 @@ def read_with_encoding(
     # This point should be unreachable, but if it is reached (e.g. because someone
     # removed latin-1 from the fallback chain), raise a proper error instead of
     # silently substituting replacement characters.
-    raise LASEncodingError(
-        f"Failed to decode {file_path} with any encoding in the fallback chain."
-    )
+    raise LASEncodingError(f"Failed to decode {file_path} with any encoding in the fallback chain.")

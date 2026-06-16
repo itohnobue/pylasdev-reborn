@@ -522,4 +522,3 @@ Line two of free text.
         assert las.data_sections[0].data["DT"][0] == 50.0
         assert las.data_sections[0].data["DEPT"][1] == 101.0
         assert las.data_sections[0].data["DT"][1] == 51.0
-

@@ -3,12 +3,17 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
     strategy:
       matrix:
         python-version: ["3.12", "3.13"]
@@ -29,8 +34,20 @@ jobs:
       - name: Lint
         run: uv run ruff check src/ tests/
 
+      - name: Format check
+        run: uv run ruff format --check src/ tests/
+
       - name: Type check
         run: uv run mypy src/
 
       - name: Test
         run: uv run pytest -v --cov=src/pylasdev --cov-report=term-missing
+
+      - name: Build package
+        run: uv build
+
+      - name: Security scan (bandit)
+        run: uv run bandit -r src/
+
+      - name: Dependency audit (pip-audit)
+        run: uv run pip-audit

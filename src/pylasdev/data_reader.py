@@ -152,9 +152,7 @@ def _detect_actual_wrap(lines: list[str], curve_count: int) -> bool:
     return True  # No data found, default to wrapped
 
 
-def _deduplicate_curves(
-    las_file: LASFile, _stacklevel: int = 2
-) -> None:
+def _deduplicate_curves(las_file: LASFile, _stacklevel: int = 2) -> None:
     """Detect and rename duplicate curve names with warning.
 
     Appends _2, _3, etc. to duplicate mnemonics so each curve gets
@@ -185,7 +183,13 @@ def _deduplicate_curves(
             # Update the seen counter to match the actual suffix used
             seen[name] = suffix
             _rename_duplicate_curve(
-                las_file, idx, name, new_name, new_order, output_names, _stacklevel,
+                las_file,
+                idx,
+                name,
+                new_name,
+                new_order,
+                output_names,
+                _stacklevel,
             )
         else:
             # F-22: Check for cross-base collisions where an
@@ -201,7 +205,13 @@ def _deduplicate_curves(
                     new_name = f"{name}_{suffix}"
                 seen[name] = suffix
                 _rename_duplicate_curve(
-                    las_file, idx, name, new_name, new_order, output_names, _stacklevel,
+                    las_file,
+                    idx,
+                    name,
+                    new_name,
+                    new_order,
+                    output_names,
+                    _stacklevel,
                 )
             else:
                 seen[name] = 1
@@ -281,12 +291,17 @@ def _read_normal(
 
         for i in range(min(len(values), curve_count)):
             try:
-                las_file.logs[las_file.curves_order[i]][current_line] = _to_finite_float(values[i], null_value)
+                las_file.logs[las_file.curves_order[i]][current_line] = _to_finite_float(
+                    values[i], null_value
+                )
             except IndexError:
                 # IndexError can occur when curve_count was reduced after deduplication
                 # (the pre-allocated arrays are sized for the deduplicated curve_count
                 # which may be smaller than the original data column count)
-                if i < curve_count and current_line < las_file.logs[las_file.curves_order[i]].shape[0]:
+                if (
+                    i < curve_count
+                    and current_line < las_file.logs[las_file.curves_order[i]].shape[0]
+                ):
                     las_file.logs[las_file.curves_order[i]][current_line] = null_value
 
         # Fill remaining curves with null_value when line has fewer values

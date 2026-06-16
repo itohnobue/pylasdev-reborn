@@ -134,5 +134,6 @@ class TestReadWithEncoding:
         with mock.patch("pylasdev.encoding.FALLBACK_ENCODINGS", []):
             with mock.patch("pylasdev.encoding.HAS_CHARDET", False):
                 from pylasdev.exceptions import LASEncodingError
+
                 with pytest.raises(LASEncodingError, match="Failed to decode"):
                     read_with_encoding(test_file)

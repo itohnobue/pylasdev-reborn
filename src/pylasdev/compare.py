@@ -69,20 +69,45 @@ def compare_las_dicts(
                     logger.warning("Key '%s.%s' not found in first dict", key, in_key)
                     return False
 
-                if isinstance(val2[in_key], np.ndarray):
-                    if not _compare_arrays(val1[in_key], val2[in_key], key, in_key, rtol, atol):
+                # Guard: val1 may not be subscriptable with val2's keys
+                # (e.g., val1 is str/int/float but val2 is a dict with ndarray children).
+                try:
+                    if isinstance(val2[in_key], np.ndarray):
+                        if not _compare_arrays(
+                            val1[in_key],
+                            val2[in_key],
+                            key,
+                            in_key,
+                            rtol,
+                            atol,
+                        ):
+                            return False
+                    elif isinstance(val1[in_key], np.ndarray):
+                        # val1 has array but val2 doesn't — type mismatch
+                        logger.warning(
+                            "Type mismatch at '%s.%s': %s vs %s",
+                            key,
+                            in_key,
+                            type(val1[in_key]).__name__,
+                            type(val2[in_key]).__name__,
+                        )
                         return False
-                elif isinstance(val1[in_key], np.ndarray):
-                    # val1 has array but val2 doesn't — type mismatch
+                    elif val1[in_key] != val2[in_key]:
+                        logger.warning(
+                            "Mismatch at '%s.%s': %r vs %r",
+                            key,
+                            in_key,
+                            val1[in_key],
+                            val2[in_key],
+                        )
+                        return False
+                except TypeError:
                     logger.warning(
-                        "Type mismatch at '%s.%s': %s vs %s",
-                        key, in_key,
-                        type(val1[in_key]).__name__, type(val2[in_key]).__name__,
-                    )
-                    return False
-                elif val1[in_key] != val2[in_key]:
-                    logger.warning(
-                        "Mismatch at '%s.%s': %r vs %r", key, in_key, val1[in_key], val2[in_key]
+                        "Type mismatch at '%s.%s': cannot compare %s with %s",
+                        key,
+                        in_key,
+                        type(val1).__name__,
+                        type(val2).__name__,
                     )
                     return False
 
@@ -159,7 +184,8 @@ def _compare_data_sections(
     if len(sections1) != len(sections2):
         logger.warning(
             "data_sections length mismatch: %d vs %d",
-            len(sections1), len(sections2),
+            len(sections1),
+            len(sections2),
         )
         return False
 
@@ -169,11 +195,15 @@ def _compare_data_sections(
             only_in_second = set(ds2.keys()) - set(ds1.keys())
             if only_in_first:
                 logger.warning(
-                    "Keys 'data_sections[%d]' only in first: %s", i, only_in_first,
+                    "Keys 'data_sections[%d]' only in first: %s",
+                    i,
+                    only_in_first,
                 )
             if only_in_second:
                 logger.warning(
-                    "Keys 'data_sections[%d]' only in second: %s", i, only_in_second,
+                    "Keys 'data_sections[%d]' only in second: %s",
+                    i,
+                    only_in_second,
                 )
             return False
 
@@ -181,21 +211,32 @@ def _compare_data_sections(
             v1, v2 = ds1[k], ds2[k]
             if isinstance(v2, np.ndarray):
                 if not _compare_arrays(
-                    v1, v2, f"data_sections[{i}].{k}", None, rtol, atol,
+                    v1,
+                    v2,
+                    f"data_sections[{i}].{k}",
+                    None,
+                    rtol,
+                    atol,
                 ):
                     return False
             elif isinstance(v2, list):
                 if v1 != v2:
                     logger.warning(
                         "List mismatch at 'data_sections[%d].%s': %r vs %r",
-                        i, k, v1, v2,
+                        i,
+                        k,
+                        v1,
+                        v2,
                     )
                     return False
             else:
                 if v1 != v2:
                     logger.warning(
                         "Mismatch at 'data_sections[%d].%s': %r vs %r",
-                        i, k, v1, v2,
+                        i,
+                        k,
+                        v1,
+                        v2,
                     )
                     return False
 

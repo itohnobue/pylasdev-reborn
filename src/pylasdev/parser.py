@@ -297,7 +297,14 @@ class LASParser:
         if format_match:
             data_format = format_match.group("format")
             if data_format == "A" and format_match.group("offset"):
-                array_time_offset = float(format_match.group("offset"))
+                try:
+                    array_time_offset = float(format_match.group("offset"))
+                except ValueError as exc:
+                    raise LASParseError(
+                        f"Invalid format specifier offset: "
+                        f"'{format_match.group('offset')}' is not a valid number "
+                        f"in curve description '{description}'"
+                    ) from exc
             # Remove format specifier from description
             description = FORMAT_SPEC_PATTERN.sub("", description).strip()
 
@@ -437,9 +444,7 @@ class LASParser:
         num_curves = len(curves)
 
         # Count actual data lines (excluding comments) for array sizing.
-        actual_count = sum(
-            1 for line in self._ascii_data_lines if not COMMENT_PATTERN.match(line)
-        )
+        actual_count = sum(1 for line in self._ascii_data_lines if not COMMENT_PATTERN.match(line))
 
         if actual_count > MAX_DATA_LINES:
             raise LASParseError(

@@ -123,12 +123,7 @@ class TestReadDEVFile:
 
     def test_non_numeric_values(self, tmp_path: Path) -> None:
         """Test DEV file with non-numeric values gets substituted with NaN."""
-        content = (
-            "MD TVD X Y\n"
-            "0.0 0.0 100.0 200.0\n"
-            "100.0 BAD 101.0 201.0\n"
-            "200.0 198.0 102.0 ERR\n"
-        )
+        content = "MD TVD X Y\n0.0 0.0 100.0 200.0\n100.0 BAD 101.0 201.0\n200.0 198.0 102.0 ERR\n"
         test_file = tmp_path / "nonnum.dev"
         test_file.write_text(content, encoding="utf-8")
         data = read_dev_file(test_file)
@@ -147,10 +142,7 @@ class TestReadDEVFile:
         Exercises dev_reader.py:45-67 — the read_dev_file_as_object function.
         """
         content = (
-            "MD TVD X Y\n"
-            "0.0 0.0 100.0 200.0\n"
-            "100.0 99.0 101.0 201.0\n"
-            "200.0 198.0 102.0 202.0\n"
+            "MD TVD X Y\n0.0 0.0 100.0 200.0\n100.0 99.0 101.0 201.0\n200.0 198.0 102.0 202.0\n"
         )
         test_file = tmp_path / "direct.dev"
         test_file.write_text(content, encoding="utf-8")
@@ -171,11 +163,7 @@ class TestReadDEVFile:
         Exercises dev_reader.py:69-76 — the max_file_size guard via
         read_with_encoding.
         """
-        content = (
-            "MD TVD\n"
-            "0.0 0.0\n"
-            "100.0 99.0\n"
-        )
+        content = "MD TVD\n0.0 0.0\n100.0 99.0\n"
         test_file = tmp_path / "size.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -224,11 +212,7 @@ class TestReadDEVFile:
         Exercises dev_reader.py:119-126 — the min(len(values), len(names))
         guard that prevents IndexError on extra columns.
         """
-        content = (
-            "MD TVD\n"
-            "0.0 0.0 100.0 200.0\n"
-            "100.0 99.0\n"
-        )
+        content = "MD TVD\n0.0 0.0 100.0 200.0\n100.0 99.0\n"
         test_file = tmp_path / "extra_cols.dev"
         test_file.write_text(content, encoding="utf-8")
 

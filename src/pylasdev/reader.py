@@ -54,8 +54,8 @@ def read_las_file(
 
     Example:
         >>> data = read_las_file("sample.las")
-        >>> print(data['well']['WELL'])
-        >>> print(data['logs']['DEPT'])
+        >>> print(data["well"]["WELL"])
+        >>> print(data["logs"]["DEPT"])
     """
     las_file = read_las_file_as_object(
         file_path,
@@ -118,9 +118,7 @@ def read_las_file_as_object(
     try:
         las_file = parser.parse(content, lines=lines)
     except LASParseError as e:
-        raise LASParseError(
-            f"Error reading {file_path}: {e}"
-        ) from e
+        raise LASParseError(f"Error reading {file_path}: {e}") from e
     las_file.source_file = str(file_path)
     las_file.encoding = detected_encoding
 

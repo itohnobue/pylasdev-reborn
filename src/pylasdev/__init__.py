@@ -1,16 +1,23 @@
 """pylasdev — Python library for LAS (Log ASCII Standard) and DEV well log files.
 
 Public API:
-    read_las_file()     — Read LAS file, returns dict (backward compatible)
-    write_las_file()    — Write LAS data to file
-    read_dev_file()     — Read DEV deviation file, returns dict
-    compare_las_dicts() — Compare two LAS data dictionaries
-    LASFile             — Dataclass for rich LAS file access
-    DevFile             — Dataclass for DEV file access
-    MNEM_BASE           — Mnemonic alias database for curve name normalization
+    read_las_file()            — Read LAS file, returns dict (backward compatible)
+    read_las_file_as_object()  — Read LAS file, returns typed LASFile (new API)
+    write_las_file()           — Write LAS data to file
+    read_dev_file()            — Read DEV deviation file, returns dict
+    read_dev_file_as_object()  — Read DEV file, returns typed DevFile (new API)
+    compare_las_dicts()        — Compare two LAS data dictionaries
+    LASFile                    — Dataclass for rich LAS file access
+    DevFile                    — Dataclass for DEV file access
+    MNEM_BASE                  — Mnemonic alias database for curve name normalization
 """
 
-__version__ = "1.6.0"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("pylasdev")
+except PackageNotFoundError:
+    __version__ = "0.0.0"  # fallback for editable installs during development
 
 from .compare import compare_las_dicts
 from .dev_reader import read_dev_file, read_dev_file_as_object

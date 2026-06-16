@@ -123,7 +123,9 @@ class TestParameterEntry:
         from pylasdev.models import ParameterZone
 
         p = ParameterEntry(
-            mnemonic="MATR", value="SAND", description="Matrix",
+            mnemonic="MATR",
+            value="SAND",
+            description="Matrix",
             zone=ParameterZone(zone_name="RUN", zone_index=1),
         )
         assert p.zone is not None
@@ -215,18 +217,24 @@ class TestLASFile:
 
         las = LASFile()
         las.curves.append(CurveDefinition(mnemonic="DEPT"))
-        las.curves.append(CurveDefinition(
-            mnemonic="NMR[1]",
-            array_info=ArrayElementInfo(base_name="NMR", index=1),
-        ))
-        las.curves.append(CurveDefinition(
-            mnemonic="NMR[2]",
-            array_info=ArrayElementInfo(base_name="NMR", index=2),
-        ))
-        las.curves.append(CurveDefinition(
-            mnemonic="T1[1]",
-            array_info=ArrayElementInfo(base_name="T1", index=1),
-        ))
+        las.curves.append(
+            CurveDefinition(
+                mnemonic="NMR[1]",
+                array_info=ArrayElementInfo(base_name="NMR", index=1),
+            )
+        )
+        las.curves.append(
+            CurveDefinition(
+                mnemonic="NMR[2]",
+                array_info=ArrayElementInfo(base_name="NMR", index=2),
+            )
+        )
+        las.curves.append(
+            CurveDefinition(
+                mnemonic="T1[1]",
+                array_info=ArrayElementInfo(base_name="T1", index=1),
+            )
+        )
 
         nmr_curves = las.get_array_curves("NMR")
         assert len(nmr_curves) == 2
@@ -311,13 +319,22 @@ class TestLASFile:
         las.curves.append(CurveDefinition(mnemonic="DEPT"))
         las.logs["DEPT"] = np.array([100.0])
         from pylasdev.models import ParameterZone
-        las.parameters.append(ParameterEntry(
-            mnemonic="MATR", value="SAND", description="Matrix",
-            zone=ParameterZone(zone_name="RUN", zone_index=1),
-        ))
-        las.parameters.append(ParameterEntry(
-            mnemonic="RUN[1]", value="1.0", array_index=1,
-        ))
+
+        las.parameters.append(
+            ParameterEntry(
+                mnemonic="MATR",
+                value="SAND",
+                description="Matrix",
+                zone=ParameterZone(zone_name="RUN", zone_index=1),
+            )
+        )
+        las.parameters.append(
+            ParameterEntry(
+                mnemonic="RUN[1]",
+                value="1.0",
+                array_index=1,
+            )
+        )
 
         d = las.to_dict()
         las2 = LASFile.from_dict(d)

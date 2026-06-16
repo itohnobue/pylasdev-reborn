@@ -58,7 +58,9 @@ class TestRoundTrip:
         las.well["NULL"] = "-999.25"
         las.curves_order = ["DEPT", "DT"]
         las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", description="DEPTH"))
-        las.curves.append(CurveDefinition(mnemonic="DT", unit="US/M", api_code="123", description="SONIC"))
+        las.curves.append(
+            CurveDefinition(mnemonic="DT", unit="US/M", api_code="123", description="SONIC")
+        )
         las.logs["DEPT"] = np.array([100.0])
         las.logs["DT"] = np.array([50.0])
 

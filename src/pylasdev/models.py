@@ -289,7 +289,9 @@ class LASFile:
             "curves_order": list(self.curves_order),
             "other": self.other,
             "data_sections": [ds.to_dict() for ds in self.data_sections],
-            "string_data": {k: v.copy() for k, v in self.string_data.items()},  # same defensive copy as logs above
+            "string_data": {
+                k: v.copy() for k, v in self.string_data.items()
+            },  # same defensive copy as logs above
             "encoding": self.encoding,
         }
 
@@ -334,15 +336,17 @@ class LASFile:
                         index=ai.get("index", 0),
                         time_offset=ai.get("time_offset"),
                     )
-                las_file.curves.append(CurveDefinition(
-                    mnemonic=curve_dict.get("mnemonic", ""),
-                    unit=curve_dict.get("unit", ""),
-                    api_code=curve_dict.get("api_code", ""),
-                    description=curve_dict.get("description", ""),
-                    original_mnemonic=curve_dict.get("original_mnemonic", ""),
-                    data_format=curve_dict.get("data_format", ""),
-                    array_info=array_info,
-                ))
+                las_file.curves.append(
+                    CurveDefinition(
+                        mnemonic=curve_dict.get("mnemonic", ""),
+                        unit=curve_dict.get("unit", ""),
+                        api_code=curve_dict.get("api_code", ""),
+                        description=curve_dict.get("description", ""),
+                        original_mnemonic=curve_dict.get("original_mnemonic", ""),
+                        data_format=curve_dict.get("data_format", ""),
+                        array_info=array_info,
+                    )
+                )
         else:
             # Legacy format: only curve names available
             for curve_name in curves_order:
@@ -378,10 +382,7 @@ class LASFile:
             ds = DataSection(
                 name=ds_dict.get("name", ""),
                 curves_order=list(ds_dict.get("curves_order", [])),
-                data={
-                    k: np.array(v, dtype=np.float64)
-                    for k, v in ds_dict.get("data", {}).items()
-                },
+                data={k: np.array(v, dtype=np.float64) for k, v in ds_dict.get("data", {}).items()},
             )
             las_file.data_sections.append(ds)
 
@@ -402,14 +403,39 @@ class LASFile:
         return self.version.is_las30
 
     def get_curve_by_mnemonic(self, mnemonic: str) -> CurveDefinition | None:
-        """Get curve definition by mnemonic (supports base name for arrays)."""
+        """Get curve definition by mnemonic name.
+
+        Searches the curve list for an exact mnemonic match. For LAS 3.0
+        array curves (e.g., ``NMR[1]``), also matches on the base mnemonic
+        (e.g., ``"NMR"``) so that callers can find array elements without
+        knowing the exact index.
+
+        Args:
+            mnemonic: Curve mnemonic to look up (e.g., ``"GR"``, ``"NMR"``).
+
+        Returns:
+            Matching ``CurveDefinition`` if found, or ``None`` if no curve
+            matches the given mnemonic.
+        """
         for curve in self.curves:
             if curve.mnemonic == mnemonic or curve.base_mnemonic == mnemonic:
                 return curve
         return None
 
     def get_array_curves(self, base_name: str) -> list[CurveDefinition]:
-        """Get all array elements for a base curve name (LAS 3.0)."""
+        """Get all array-element curves for a base name (LAS 3.0).
+
+        LAS 3.0 files use array notation (e.g., ``NMR[1]``, ``NMR[2]``) to
+        represent multi-element curves. This method collects all curve
+        definitions that belong to the same logical array group.
+
+        Args:
+            base_name: Base mnemonic of the array (e.g., ``"NMR"``).
+
+        Returns:
+            List of ``CurveDefinition`` objects whose ``array_info.base_name``
+            matches *base_name*. Returns an empty list if no array curves match.
+        """
         return [c for c in self.curves if c.array_info and c.array_info.base_name == base_name]
 
 
