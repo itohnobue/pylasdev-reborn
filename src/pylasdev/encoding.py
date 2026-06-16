@@ -44,7 +44,26 @@ def detect_encoding(file_path: Path) -> str:
     if HAS_CHARDET:
         with open(file_path, "rb") as f:
             raw = f.read(50_000)
-        result = chardet.detect(raw)
+        return _detect_encoding_from_bytes(raw)
+
+    return "utf-8"
+
+
+def _detect_encoding_from_bytes(raw_data: bytes) -> str:
+    """Detect encoding from pre-read bytes using chardet.
+
+    Internal helper that avoids redundant disk I/O when the caller
+    already has the raw bytes available (e.g. ``read_with_encoding()``).
+
+    Args:
+        raw_data: Raw bytes from the file (at least the first few KB).
+
+    Returns:
+        Detected encoding name, or ``"utf-8"`` if chardet is unavailable
+        or confidence is too low.
+    """
+    if HAS_CHARDET:
+        result = chardet.detect(raw_data[:50_000])
         if result["confidence"] and result["confidence"] > 0.7:
             return result["encoding"] or "utf-8"
 
@@ -100,8 +119,8 @@ def read_with_encoding(
         content = raw_bytes.decode(encoding)
         return encoding, content
 
-    # Try auto-detection first
-    detected = detect_encoding(file_path)
+    # Try auto-detection from the already-read bytes
+    detected = _detect_encoding_from_bytes(raw_bytes[:50_000])
     try:
         content = raw_bytes.decode(detected)
         return detected, content

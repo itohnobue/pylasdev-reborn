@@ -233,27 +233,33 @@ def _format_data_rows(
         row_values: list[str] = []
         for arr, is_string in curve_arrays:
             if arr is None or i >= len(arr):
-                row_values.append(_format_number(null_value, precision))
+                row_values.append(_format_number(null_value, precision, null_value))
             elif is_string:
                 row_values.append(str(arr[i]))
             else:
                 val = arr[i]
                 if np.isnan(val) or np.isinf(val):
-                    row_values.append(_format_number(null_value, precision))
+                    row_values.append(_format_number(null_value, precision, null_value))
                 else:
-                    row_values.append(_format_number(val, precision))
+                    row_values.append(_format_number(val, precision, null_value))
         lines.append(delimiter.join(row_values))
     return lines
 
 
-def _format_number(value: float, precision: str = ".8g") -> str:
+def _format_number(value: float, precision: str = ".8g", null_value: float | None = None) -> str:
     """Format a numeric value with configurable precision.
 
     Handles whole numbers as integers to avoid unnecessary decimal noise.
     Self-protecting against NaN and Inf — caller guards these already,
     but a NaN slipping through would otherwise crash on ``int(np.nan)``.
+    If a ``null_value`` is provided and a NaN/Inf value slips past the
+    primary guard, the null value is output instead of formatting the
+    NaN/Inf directly (which would produce invalid LAS values like
+    ``"nan"`` / ``"inf"``).
     """
     if np.isnan(value) or np.isinf(value):
+        if null_value is not None:
+            return format(null_value, precision)
         return format(float(value), precision)
     if value == int(value):
         return format(int(value), precision)
