@@ -17,7 +17,13 @@ from typing import ClassVar
 
 import numpy as np
 
-from .data_reader import _deduplicate_curves, _get_null_value
+from .data_reader import (
+    MAX_CURVES,
+    MAX_DATA_LINES,
+    _deduplicate_curves,
+    _get_null_value,
+    _to_finite_float,
+)
 from .exceptions import LASParseError
 from .mnem_base import resolve_mnemonic
 from .models import (
@@ -430,15 +436,27 @@ class LASParser:
 
         num_curves = len(curves)
 
+        # Count actual data lines (excluding comments) for array sizing.
+        actual_count = sum(
+            1 for line in self._ascii_data_lines if not COMMENT_PATTERN.match(line)
+        )
+
+        if actual_count > MAX_DATA_LINES:
+            raise LASParseError(
+                f"ASCII data line count ({actual_count}) exceeds maximum allowed "
+                f"({MAX_DATA_LINES}). The file may be malformed or corrupt."
+            )
+        if num_curves > MAX_CURVES:
+            raise LASParseError(
+                f"Curve count ({num_curves}) exceeds maximum allowed "
+                f"({MAX_CURVES}). The file may be malformed or corrupt."
+            )
+
         # PERF-03: Pre-allocate numpy arrays for numeric curves.
         # String curves use list accumulation because np.empty(dtype=np.str_)
         # would truncate variable-length strings (numpy infers a fixed
         # max string length at creation time). Numeric curves get the full
         # pre-allocation benefit.
-        # Count actual data lines (excluding comments) for array sizing.
-        actual_count = sum(
-            1 for line in self._ascii_data_lines if not COMMENT_PATTERN.match(line)
-        )
 
         # Pre-allocate numeric arrays; defer string arrays
         string_data_lists: dict[int, list[str]] = {}
@@ -489,7 +507,7 @@ class LASParser:
                         # Empty-string values (e.g. whitespace-only columns from
                         # space-delimited files) are treated as null to match the
                         # behavior of most LAS processing tools.
-                        val = float(val_str) if val_str else null_value
+                        val = _to_finite_float(val_str, null_value)
                         data_section.data[curves[i].mnemonic][idx] = val
                 except ValueError:
                     if string_curves.get(i, False):

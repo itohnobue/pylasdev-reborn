@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 
+from .data_reader import MAX_DATA_LINES, _to_finite_float
 from .encoding import read_with_encoding
 from .exceptions import DEVReadError
 from .models import DevFile
@@ -83,7 +84,10 @@ def read_dev_file_as_object(
     if not file_path.is_file():
         raise DEVReadError(f"Not a file: {file_path}")
 
-    detected_encoding, content = read_with_encoding(file_path, encoding, max_file_size)
+    try:
+        detected_encoding, content = read_with_encoding(file_path, encoding, max_file_size)
+    except PermissionError as e:
+        raise DEVReadError(f"Cannot read file (permission denied): {file_path}") from e
 
     lines = content.splitlines()
 
@@ -103,6 +107,12 @@ def read_dev_file_as_object(
             header_found = True  # First non-comment line is the header
         else:
             data_lines += 1
+
+    if data_lines > MAX_DATA_LINES:
+        raise DEVReadError(
+            f"Data line count ({data_lines}) exceeds maximum allowed "
+            f"({MAX_DATA_LINES}). The file may be malformed or corrupt."
+        )
 
     # Pass 2: Parse header and data
     dev = DevFile()
@@ -130,8 +140,8 @@ def read_dev_file_as_object(
             # Data lines
             for k in range(min(len(values), len(names))):
                 try:
-                    dev.columns[names[k]][current_line] = float(values[k])
-                except (ValueError, IndexError):
+                    dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
+                except IndexError:
                     dev.columns[names[k]][current_line] = np.nan
             current_line += 1
 

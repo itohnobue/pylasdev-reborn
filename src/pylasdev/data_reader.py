@@ -11,7 +11,13 @@ import warnings
 
 import numpy as np
 
+from .exceptions import LASParseError
 from .models import LASFile, WellSection
+
+# Maximum bounds for array allocations to prevent memory exhaustion
+# from malformed or malicious files. Overridable by setting the module constant.
+MAX_CURVES = 100_000
+MAX_DATA_LINES = 10_000_000
 
 
 def _is_section_header(stripped: str) -> bool:
@@ -52,6 +58,36 @@ def _get_null_value(
         return default_float
 
 
+def _to_finite_float(value_str: str, null_value: float) -> float:
+    """Convert string to float, replacing non-finite values with null_value.
+
+    Python's ``float()`` accepts ``"nan"``, ``"inf"``, ``"-inf"`` and
+    overflow exponents (e.g. ``"1e309"``) without error.  These non-finite
+    values corrupt downstream numpy computations (NaN propagation, Inf
+    making statistics invalid).  This helper catches them and returns
+    *null_value* instead.
+
+    Also handles empty strings and non-numeric strings gracefully.
+
+    Args:
+        value_str: String to convert.  May be empty.
+        null_value: Value to return when conversion fails or result is
+            non-finite.
+
+    Returns:
+        A finite float, or *null_value*.
+    """
+    if not value_str:
+        return null_value
+    try:
+        val = float(value_str)
+    except ValueError:
+        return null_value
+    if not np.isfinite(val):
+        return null_value
+    return val
+
+
 def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int) -> None:
     """Read the ~A (ASCII data) section and populate las_file.logs.
 
@@ -64,6 +100,12 @@ def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int) -
     curve_count = len(las_file.curves_order)
     if curve_count == 0:
         return
+
+    if curve_count > MAX_CURVES:
+        raise LASParseError(
+            f"Curve count ({curve_count}) exceeds maximum allowed ({MAX_CURVES}). "
+            f"The file may be malformed or corrupt."
+        )
 
     wrap_mode = las_file.version.wrap.upper() == "YES"
 
@@ -203,6 +245,12 @@ def _read_normal(
     _deduplicate_curves(las_file)
     curve_count = len(las_file.curves_order)
 
+    if data_line_count > MAX_DATA_LINES:
+        raise LASParseError(
+            f"Data line count ({data_line_count}) exceeds maximum allowed "
+            f"({MAX_DATA_LINES}). The file may be malformed or corrupt."
+        )
+
     # Pre-allocate arrays
     for curve_name in las_file.curves_order:
         las_file.logs[curve_name] = np.zeros(data_line_count, dtype=np.float64)
@@ -233,12 +281,11 @@ def _read_normal(
 
         for i in range(min(len(values), curve_count)):
             try:
-                las_file.logs[las_file.curves_order[i]][current_line] = float(values[i])
-            except (ValueError, IndexError):
+                las_file.logs[las_file.curves_order[i]][current_line] = _to_finite_float(values[i], null_value)
+            except IndexError:
                 # IndexError can occur when curve_count was reduced after deduplication
                 # (the pre-allocated arrays are sized for the deduplicated curve_count
                 # which may be smaller than the original data column count)
-                # ValueError covers non-numeric values — fill with null_value
                 if i < curve_count and current_line < las_file.logs[las_file.curves_order[i]].shape[0]:
                     las_file.logs[las_file.curves_order[i]][current_line] = null_value
 
@@ -268,6 +315,28 @@ def _read_wrapped(
     # Deduplicate curve names before reading
     _deduplicate_curves(las_file)
     curve_count = len(las_file.curves_order)
+
+    # Count actual data lines for MAX_DATA_LINES bound check.
+    # All other reading paths (_read_normal, parser, dev_reader)
+    # already have this guard.
+    _count_in_ascii = False
+    _count = 0
+    for line in lines:
+        stripped = line.strip()
+        if _is_section_header(stripped):
+            if stripped[1].upper() == "A":
+                _count_in_ascii = True
+            elif _count_in_ascii:
+                break  # End of ~A section
+            continue
+        if _count_in_ascii and stripped and not stripped.startswith("#"):
+            _count += 1
+
+    if _count > MAX_DATA_LINES:
+        raise LASParseError(
+            f"Data line count ({_count}) exceeds maximum allowed "
+            f"({MAX_DATA_LINES}). The file may be malformed or corrupt."
+        )
 
     # Accumulate into lists, convert to numpy at end
     data_lists: list[list[float]] = [[] for _ in range(curve_count)]
@@ -306,8 +375,8 @@ def _read_wrapped(
                     stacklevel=2,
                 )
             try:
-                data_lists[0].append(float(values[0]))
-            except (ValueError, IndexError):
+                data_lists[0].append(_to_finite_float(values[0], null_value))
+            except IndexError:
                 data_lists[0].append(null_value)
             depth_line = False
             counter = 0
@@ -316,8 +385,8 @@ def _read_wrapped(
             for val_str in values:
                 counter += 1
                 try:
-                    data_lists[counter].append(float(val_str))
-                except (ValueError, IndexError):
+                    data_lists[counter].append(_to_finite_float(val_str, null_value))
+                except IndexError:
                     if counter < curve_count:
                         data_lists[counter].append(null_value)
 

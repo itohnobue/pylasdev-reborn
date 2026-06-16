@@ -237,11 +237,11 @@ def _format_data_rows(
             elif is_string:
                 row_values.append(str(arr[i]))
             else:
-                val = arr[i]  # type: ignore[index]
-                if np.isnan(val) or np.isinf(val):  # type: ignore[arg-type]
+                val = arr[i]
+                if np.isnan(val) or np.isinf(val):
                     row_values.append(_format_number(null_value, precision))
                 else:
-                    row_values.append(_format_number(val, precision))  # type: ignore[arg-type]
+                    row_values.append(_format_number(val, precision))
         lines.append(delimiter.join(row_values))
     return lines
 
