@@ -148,7 +148,7 @@ class TestLowConfidenceChardetFallback:
         from pylasdev.encoding import _detect_encoding_from_bytes
 
         with mock.patch("pylasdev.encoding.HAS_CHARDET", True):
-            with mock.patch("pylasdev.encoding.chardet") as mock_chardet:
+            with mock.patch("pylasdev.encoding.chardet", create=True) as mock_chardet:
                 mock_chardet.detect.return_value = {
                     "encoding": "cp1251",
                     "confidence": None,
@@ -161,7 +161,7 @@ class TestLowConfidenceChardetFallback:
         from pylasdev.encoding import _detect_encoding_from_bytes
 
         with mock.patch("pylasdev.encoding.HAS_CHARDET", True):
-            with mock.patch("pylasdev.encoding.chardet") as mock_chardet:
+            with mock.patch("pylasdev.encoding.chardet", create=True) as mock_chardet:
                 mock_chardet.detect.return_value = {
                     "encoding": "cp1251",
                     "confidence": 0.0,
@@ -174,7 +174,7 @@ class TestLowConfidenceChardetFallback:
         from pylasdev.encoding import _detect_encoding_from_bytes
 
         with mock.patch("pylasdev.encoding.HAS_CHARDET", True):
-            with mock.patch("pylasdev.encoding.chardet") as mock_chardet:
+            with mock.patch("pylasdev.encoding.chardet", create=True) as mock_chardet:
                 mock_chardet.detect.return_value = {
                     "encoding": "cp1251",
                     "confidence": 0.7,
@@ -187,7 +187,7 @@ class TestLowConfidenceChardetFallback:
         from pylasdev.encoding import _detect_encoding_from_bytes
 
         with mock.patch("pylasdev.encoding.HAS_CHARDET", True):
-            with mock.patch("pylasdev.encoding.chardet") as mock_chardet:
+            with mock.patch("pylasdev.encoding.chardet", create=True) as mock_chardet:
                 mock_chardet.detect.return_value = {
                     "encoding": "cp1251",
                     "confidence": 0.9,
@@ -200,7 +200,7 @@ class TestLowConfidenceChardetFallback:
         from pylasdev.encoding import _detect_encoding_from_bytes
 
         with mock.patch("pylasdev.encoding.HAS_CHARDET", True):
-            with mock.patch("pylasdev.encoding.chardet") as mock_chardet:
+            with mock.patch("pylasdev.encoding.chardet", create=True) as mock_chardet:
                 mock_chardet.detect.return_value = {
                     "encoding": None,
                     "confidence": 0.9,

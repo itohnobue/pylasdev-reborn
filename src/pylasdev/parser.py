@@ -497,7 +497,7 @@ class LASParser:
         # curve_count and data_line_count checks pass but product exhausts memory.
         if num_curves * actual_count > MAX_TOTAL_ELEMENTS:
             raise LASParseError(
-                f"Total allocation ({num_curves} curves × {actual_count} lines = "
+                f"Total allocation ({num_curves} curves x {actual_count} lines = "
                 f"{num_curves * actual_count} elements) exceeds maximum allowed "
                 f"({MAX_TOTAL_ELEMENTS}). The file may be malformed or corrupt."
             )
