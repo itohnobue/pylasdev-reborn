@@ -26,12 +26,9 @@ It is "Reborn" because it was updated, fixed and refactored to work with modern 
   - [Encoding Override](#encoding-override)
   - [Reading LAS 1.2 Files](#reading-las-12-files)
 - [Features](#features)
-- [Limits](#limits)
 - [Troubleshooting](#troubleshooting)
-- [Migration from Original pylasdev](#migration-from-original-pylasdev)
 - [Requirements](#requirements)
 - [Development](#development)
-- [Changelog](#changelog)
 - [License](#license)
 
 ## Installation
@@ -406,59 +403,6 @@ for curve in las.curves:        # All curves from ~C section
 - Compare LAS files for equality with configurable tolerance
 - Wrapped and non-wrapped data mode support
 
-## Limits
-
-pylasdev enforces bounds on input files to prevent memory exhaustion from
-malformed or malicious input.
-
-| Constant | Default | Description |
-|----------|---------|-------------|
-| `MAX_CURVES` | `100_000` | Maximum number of curve definitions (~C section) |
-| `MAX_DATA_LINES` | `10_000_000` | Maximum number of data lines (~A section) |
-| `max_file_size` | `None` (no limit) | Optional limit in bytes, passed as parameter |
-
-### Setting Limits
-
-```python
-from pylasdev import read_las_file
-
-# Enforce a file size limit (10 MB)
-data = read_las_file("large.las", max_file_size=10 * 1024 * 1024)
-
-# Raises ValueError (NOT a PylasdevError subclass) if the file exceeds the limit
-# Use `except ValueError` to catch this — `except PylasdevError` will miss it
-```
-
-The `MAX_CURVES` and `MAX_DATA_LINES` module-level constants can be overridden
-if needed:
-
-```python
-import pylasdev.data_reader as dr
-
-dr.MAX_CURVES = 200_000       # Allow more curves
-dr.MAX_DATA_LINES = 20_000_000  # Allow more data lines
-```
-
-> **Note:** `pylasdev.data_reader` is an internal module. Its API is not covered
-> by the public backward-compatibility guarantee. Prefer the public API
-> (`read_las_file(..., max_file_size=N)`) for production code. Use internal
-> imports only when you need to override module-level constants directly.
-
-> **Warning (LAS 3.0):** Overriding `data_reader.MAX_CURVES` and
-> `data_reader.MAX_DATA_LINES` only affects LAS 1.2/2.0 files. For LAS 3.0
-> files, the parser imports these constants via ``from .data_reader import
-> MAX_CURVES``, which binds the integer value at import time. Reassigning
-> ``data_reader.MAX_CURVES`` after import does **not** update the parser's
-> copy. To override limits for LAS 3.0, also reassign ``pylasdev.parser.MAX_CURVES``:
->
-> ```python
-> import pylasdev.data_reader as dr
-> import pylasdev.parser
->
-> dr.MAX_CURVES = 200_000
-> pylasdev.parser.MAX_CURVES = 200_000
-> ```
-
 ## Troubleshooting
 
 ### File won't open — encoding issues
@@ -532,31 +476,6 @@ print('Detected encoding:', las.encoding)
 "
 ```
 
-## Migration from Original pylasdev
-
-pylasdev Reborn is a complete rewrite of the original pylasdev (Python 2) for
-Python 3.12+. The dict-based API (`read_las_file()`, `read_dev_file()`,
-`write_las_file()`) is backward compatible. Key differences:
-
-| Original pylasdev | pylasdev Reborn |
-|-------------------|-----------------|
-| Python 2 only | Python 3.12+ |
-| Returns dict only | Dict API + typed dataclass API |
-| PLY-based parser (~450 lines) | Regex-based parser (~170 lines) |
-| `las_compare.compare()` | `compare_las_dicts()` |
-| LAS 1.2 and 2.0 only | LAS 1.2, 2.0, and 3.0 |
-| No encoding detection | Auto-detection with chardet |
-| Thread-unsafe (global state) | Thread-safe |
-| Global `base_mnems` variable | Locally importable `MNEM_BASE` |
-| Writer destroys units/descriptions (hardcoded `.X`) | Writer preserves original units and descriptions |
-
-To migrate:
-1. The import statement is the same: `import pylasdev` (no change for most users)
-2. Replace `pylasdev.las_compare.compare(a, b)` with `pylasdev.compare_las_dicts(a, b)` — the `las_compare` module has been removed; the function is now a top-level import
-3. Replace `pylasdev.base_mnems` with `pylasdev.MNEM_BASE`
-4. Existing `read_las_file()` and `read_dev_file()` calls work without changes
-5. `write_las_file()` now preserves original curve units and descriptions from the `~C` section instead of writing hardcoded ``.X`` placeholders. If you were relying on the old destructive behavior, you may need to manually strip units/descriptions before writing.
-
 ## Requirements
 
 - Python >= 3.12
@@ -587,88 +506,6 @@ uv run ruff check src/ tests/
 uv run ruff format src/ tests/
 uv run mypy src/
 ```
-
-## Changelog
-
-### Version 1.6.0 (2026-06-16)
-
-Bug fixes and production hardening:
-- NaN/Inf guard for null_value and array bounds checks
-- Case-sensitive section detection, strict mypy config, CI pipeline
-- Encoding I/O hardening, mnemonic chain normalization, None-to-string conversion
-- Parameter normalization and error handling improvements
-- Eliminated redundant file read path
-- Test coverage increased from 184 to 206
-
-### Version 1.5.0 (2026-06-02)
-
-Production stability release with 58 adversarially verified fixes:
-- Code quality fixes: deduplication, security null guards, dead code removal
-- LAS 3.0 data section handling hardened
-- Writer output verification improved
-- Parser robustness for edge-case LAS files
-- Total: +795/-75 lines, 184 passing tests, ruff + mypy clean
-
-### Version 1.4.0 (2026-05-28)
-
-Second production check with 32 adversarially verified fixes:
-- Deep security review with null value guards
-- Test coverage expanded (+13 tests)
-- Production configuration hardening
-
-### Version 1.3.0 (2026-05-20)
-
-First production check passes:
-- Code quality: CQ deduplication, dead code removal
-- Security: null value guards across parser and data reader
-- Test coverage expansion (+24 tests)
-
-### Version 1.2.0 (2026-05-12)
-
-Installation and infrastructure fixes:
-- Installation section updated for local clone-and-install workflow
-- Package is not published on PyPI (source install only) — clarified in README
-- Extras install syntax corrected to PEP 508 direct reference
-- All repository URLs fixed to github.com/itohnobue/pylasdev-reborn
-
-### Version 1.1.0 (2026-05-01)
-
-General cleanup and initialization:
-- Module names standardized with underscore convention
-- README and LICENSE files added
-- Unicode support for curve names and well names
-- Initial GitHub repository setup
-
-### Version 1.0.0 (2026-02-12)
-
-Complete rewrite from Python 2 to Python 3.12+.
-
-#### New Features
-- LAS 3.0 support: array notation, format specifiers ({F}, {E}, {S}, {A:x}), multiple data sections, delimiters
-- Type hints on all public APIs
-- Object-oriented API: `read_las_file_as_object()` returns typed `LASFile`
-- Encoding detection with chardet + fallback chain (cp1251, cp1252, cp866, latin-1)
-- Custom exception hierarchy: `LASReadError`, `LASWriteError`, `LASParseError`, `LASVersionError`, `LASEncodingError`, `DEVReadError`
-- Comprehensive pytest suite (184 tests)
-
-#### Performance Improvements
-- Wrapped mode: O(n²) → O(n) (fixed `numpy.append()` bug)
-- Regex parser: 450+ → 170 lines (replaces PLY)
-
-#### Bug Fixes
-- Writer preserves original units/descriptions (old writer hardcoded `.X`)
-- Writer always outputs WRAP=NO (matches actual non-wrapped output format)
-- Parser handles spaces between mnemonic and dot (e.g., `DT  .US/M`)
-- Parser supports LAS 3.0 array notation in mnemonic names (e.g., `NMR[1].ms`)
-- Auto-detection of mislabeled WRAP headers (files claiming WRAP=YES with non-wrapped data)
-- Parser only processes ASCII data inline for LAS 3.0 (prevents double-parsing for 1.2/2.0)
-- Roundtrip handles LAS 3.0 string curves stored separately from numeric logs
-- Thread-safe parser (no global state)
-- Format specifier regex handles trailing spaces (e.g., `{A:0 }` in LAS 3.0 spec files)
-- Data reader stops at section boundaries (prevents reading garbage after `~A` section)
-
-#### Mnemonic Database Cleanup
-- Deduplicated: 5,577 → 2,020 unique entries
 
 ## License
 
