@@ -1,6 +1,5 @@
 # pylasdev Reborn
 
-[![CI](https://github.com/itohnobue/pylasdev-reborn/actions/workflows/ci.yml/badge.svg)](https://github.com/itohnobue/pylasdev-reborn/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-green.svg)](https://github.com/itohnobue/pylasdev-reborn/blob/main/LICENSE)
 
@@ -674,6 +673,3 @@ Complete rewrite from Python 2 to Python 3.12+.
 ## License
 
 BSD-3-Clause
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidelines and
-[SECURITY.md](SECURITY.md) for the security policy.
