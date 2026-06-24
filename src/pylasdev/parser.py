@@ -174,6 +174,15 @@ class LASParser:
                 "missing required ~V (Version Information) section."
             )
 
+        # Warn when empty/whitespace-only content is parsed without a ~V section.
+        # An empty file produces a default LASFile with version "2.0" — this is
+        # intentional for robustness, but callers should know about it.
+        if not self._version_found and not content.strip():
+            logger.warning(
+                "Empty or whitespace-only content parsed without a ~V section; "
+                "returning default LASFile with version '2.0'."
+            )
+
         # Finalize accumulated ~O section text (F-3: O(n) join vs O(n^2) concat)
         if self._other_lines:
             self.las_file.other = "\n".join(self._other_lines) + "\n"

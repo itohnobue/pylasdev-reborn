@@ -626,3 +626,29 @@ class TestWriteLASFile:
         assert temp_file.exists()
         content = temp_file.read_text()
         assert "~VERSION" in content
+
+    # --- Test: write_las_file rejects invalid input types ---
+    def test_write_rejects_invalid_types(self, tmp_path: Path) -> None:
+        """Test that write_las_file raises LASWriteError for invalid types.
+
+        Only dict and LASFile are valid; int, str, None, and list should
+        all raise LASWriteError with a descriptive message naming the
+        received type.
+        """
+        temp_file = tmp_path / "output.las"
+
+        # int
+        with pytest.raises(LASWriteError, match="expects a dict or LASFile, got int"):
+            write_las_file(temp_file, 42)
+
+        # str
+        with pytest.raises(LASWriteError, match="expects a dict or LASFile, got str"):
+            write_las_file(temp_file, "not valid las data")
+
+        # None
+        with pytest.raises(LASWriteError, match="expects a dict or LASFile, got NoneType"):
+            write_las_file(temp_file, None)
+
+        # list
+        with pytest.raises(LASWriteError, match="expects a dict or LASFile, got list"):
+            write_las_file(temp_file, [1, 2, 3])

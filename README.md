@@ -5,7 +5,7 @@
 
 Python library for reading and writing LAS (Log ASCII Standard) and DEV (deviation) well log files.
 
-It is "Reborn" because it was updated, fixed and refactored to work with modern tech along with fixing many bugs, adding support for LAS 3.0 files and much more (see full list at the end of this file).
+It is "Reborn" because it was updated, fixed and refactored to work with modern tech along with fixing many bugs, adding support for LAS 3.0 files and much more.
 
 ## Table of Contents
 
@@ -33,7 +33,7 @@ It is "Reborn" because it was updated, fixed and refactored to work with modern 
 
 ## Installation
 
-**Requirements:** Python >= 3.12, NumPy >= 1.24. See [Requirements](#requirements) for details.
+**Requirements:** Python >= 3.12, NumPy >= 1.26. See [Requirements](#requirements) for details.
 
 > **Note:** This package is **not** published on PyPI. `pip install pylasdev` will
 > fail with a 404 error. Install from source:
@@ -479,7 +479,7 @@ print('Detected encoding:', las.encoding)
 ## Requirements
 
 - Python >= 3.12
-- NumPy >= 1.24
+- NumPy >= 1.26
 - chardet >= 5.0 (optional, for encoding detection)
 
 ```bash

@@ -79,8 +79,12 @@ def write_las_file(
 
     if isinstance(las_data, dict):
         las_file = LASFile.from_dict(las_data)
-    else:
+    elif isinstance(las_data, LASFile):
         las_file = las_data
+    else:
+        raise LASWriteError(
+            f"write_las_file expects a dict or LASFile, got {type(las_data).__name__}"
+        )
 
     # Always write with the specified encoding (default: utf-8).
     # The original file's encoding (e.g. cp866) is detected by the reader

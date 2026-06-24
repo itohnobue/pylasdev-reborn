@@ -120,12 +120,14 @@ def read_with_encoding(
             raise LASEncodingError(
                 f"Failed to decode {file_path} with encoding '{encoding}': {e}"
             ) from e
+        content = content.lstrip("\ufeff")
         return encoding, content
 
     # Try auto-detection from the already-read bytes
     detected = _detect_encoding_from_bytes(raw_bytes[:50_000])
     try:
         content = raw_bytes.decode(detected)
+        content = content.lstrip("\ufeff")
         return detected, content
     except UnicodeDecodeError:
         logger.debug(
@@ -138,6 +140,7 @@ def read_with_encoding(
     for enc in FALLBACK_ENCODINGS:
         try:
             content = raw_bytes.decode(enc)
+            content = content.lstrip("\ufeff")
             return enc, content
         except UnicodeDecodeError:
             continue

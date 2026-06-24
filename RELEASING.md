@@ -8,8 +8,8 @@ This document describes how to create a new release of pylasdev.
 - Python 3.12+ with `uv` installed
 - A [PyPI](https://pypi.org) account with Trusted Publishing configured for this repository (or a PyPI API token). See [Trusted Publishing Setup](#trusted-publishing-setup-one-time) below — this is a one-time setup required before the first PyPI publication.
 
-> **Note:** The package is **not** currently published on PyPI. The CI pipeline
-> (step 4) is designed for automated PyPI publishing via Trusted Publishing,
+> **Note:** The package is **not** currently published on PyPI. Step 4
+> describes manual build and publishing via Trusted Publishing,
 > but this requires the Trusted Publisher to be configured in PyPI project
 > settings first (see [Trusted Publishing Setup](#trusted-publishing-setup-one-time)
 > below). Until the Trusted Publisher is configured and the first release is
@@ -18,9 +18,16 @@ This document describes how to create a new release of pylasdev.
 
 ## Steps
 
-### 1. Ensure CI is green
+### 1. Run local checks
 
-All checks on the `main` branch must pass before releasing.
+Run the full test suite, linting, and type checking locally before releasing:
+
+```bash
+uv run ruff check src/ tests/
+uv run ruff format --check src/ tests/
+uv run mypy src/
+uv run pytest -v
+```
 
 ### 2. Update the version
 
@@ -58,13 +65,19 @@ git push origin main
 git push origin vX.Y.Z
 ```
 
-### 4. Automated release (CI)
+### 4. Build and publish
 
-Pushing a `v*` tag triggers two workflows:
+Build the package and publish to PyPI:
 
-1. **CI** (`.github/workflows/ci.yml`) — Runs the full test suite, linting, type checking, and security scans on the tagged commit to ensure everything is clean.
+```bash
+uv build
+uv publish
+```
 
-2. **Release** (`.github/workflows/release.yml`) — Builds the package with `uv build`, publishes to PyPI via [Trusted Publishing](https://docs.pypi.org/trusted-publishers/), and creates a GitHub Release with auto-generated release notes.
+> **Note:** The package uses [Trusted Publishing](https://docs.pypi.org/trusted-publishers/)
+> for PyPI authentication. Configure the Trusted Publisher in your PyPI project
+> settings (see [Trusted Publishing Setup](#trusted-publishing-setup-one-time) below)
+> before the first publication.
 
 ### 5. Verify the release
 
@@ -83,10 +96,10 @@ Pushing a `v*` tag triggers two workflows:
 
 ## Trusted Publishing Setup (one-time)
 
-To enable automated PyPI publishing, configure Trusted Publishing in PyPI:
+To publish to PyPI with `uv publish`, configure authentication:
 1. Go to your [PyPI project settings](https://pypi.org/manage/project/pylasdev/settings/publishing/)
-2. Add a new Trusted Publisher with:
+2. Either add a PyPI API token, or set up a Trusted Publisher with:
    - **Owner**: `itohnobue`
    - **Repository**: `pylasdev-reborn`
-   - **Workflow**: `release.yml`
    - **Environment**: (leave blank)
+3. See `uv publish --help` for authentication options.

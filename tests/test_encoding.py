@@ -207,3 +207,98 @@ class TestLowConfidenceChardetFallback:
                 }
                 result = _detect_encoding_from_bytes(b"hello")
                 assert result == "utf-8"
+
+
+class TestBOMHandling:
+    """Tests for UTF-8 BOM (Byte Order Mark) handling.
+
+    LAS files may inadvertently contain a UTF-8 BOM at the start of
+    the file. The encoding module strips it via content.lstrip("\\ufeff")
+    on all decode paths so that the BOM does not interfere with section
+    header detection.
+    """
+
+    def test_bom_stripped_from_las_file_read(self, tmp_path: Path) -> None:
+        """Test that a LAS file with UTF-8 BOM is parsed correctly.
+
+        The BOM should be stripped during decoding so that the leading
+        ``~VERSION`` section header is recognised and the file content
+        is parsed as valid LAS.
+        """
+        from pylasdev import read_las_file_as_object
+
+        # Build valid LAS content (no BOM in the string)
+        las_body = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            " STRT.M   100.0   : START DEPTH\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A  DEPT  DT\n"
+            "100.0  50.0\n"
+            "101.0  51.0\n"
+        )
+
+        # Prepend UTF-8 BOM and write as raw bytes
+        bom = b"\xef\xbb\xbf"
+        raw = bom + las_body.encode("utf-8")
+
+        test_file = tmp_path / "bom_test.las"
+        test_file.write_bytes(raw)
+
+        # Read via read_las_file_as_object (exercises all decode paths)
+        las = read_las_file_as_object(test_file)
+
+        # Verify the BOM was stripped — version info must be correct
+        assert las.version.vers == "2.0"
+
+        # Verify curves were parsed
+        assert len(las.curves) == 2
+        assert las.curves_order == ["DEPT", "DT"]
+
+        # Verify logs were parsed with correct data
+        assert len(las.logs["DEPT"]) == 2
+        assert las.logs["DEPT"][0] == 100.0
+        assert las.logs["DEPT"][1] == 101.0
+        assert las.logs["DT"][0] == 50.0
+        assert las.logs["DT"][1] == 51.0
+
+        # Verify well section entries present
+        assert "STRT" in las.well
+
+    def test_bom_with_explicit_encoding(self, tmp_path: Path) -> None:
+        """Test BOM stripping works when an explicit encoding is passed.
+
+        Exercises the explicit-encoding decode path at encoding.py:117-124
+        where ``content.lstrip("\\ufeff")`` is called after decoding.
+        """
+        from pylasdev import read_las_file
+
+        las_body = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~A  DEPT\n"
+            "100.0\n"
+        )
+
+        bom = b"\xef\xbb\xbf"
+        raw = bom + las_body.encode("utf-8")
+
+        test_file = tmp_path / "bom_explicit.las"
+        test_file.write_bytes(raw)
+
+        # Read with explicit encoding — exercises the encoding != None path
+        data = read_las_file(test_file, encoding="utf-8")
+
+        assert data["version"]["VERS"] == "2.0"
+        assert "DEPT" in data["logs"]
+        assert data["logs"]["DEPT"][0] == 100.0
