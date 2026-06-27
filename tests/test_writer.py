@@ -652,3 +652,58 @@ class TestWriteLASFile:
         # list
         with pytest.raises(LASWriteError, match="expects a dict or LASFile, got list"):
             write_las_file(temp_file, [1, 2, 3])
+
+    # --- F25: dict conversion error wrapping (writer.py:86-87) ---
+    def test_write_malformed_dict_raises_las_write_error(self, tmp_path: Path) -> None:
+        """Test that malformed dict triggers LASWriteError in from_dict path.
+
+        When a dict contains non-numeric values in logs that cannot be
+        converted to float64, LASFile.from_dict() raises ValueError,
+        which is wrapped in LASWriteError at writer.py:86-87.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO"},
+            "well": {},
+            "parameters": {},
+            "logs": {"DEPT": ["not", "numeric"]},  # non-numeric strings cannot become float64
+            "curves_order": ["DEPT"],
+        }
+        temp_file = tmp_path / "malformed.las"
+        with pytest.raises(LASWriteError, match="Cannot create LASFile from dict"):
+            write_las_file(temp_file, data)
+
+    # --- F26: _generate_las_content error wrapping (writer.py:98-99) ---
+    def test_generate_las_content_error_wrapped(self, tmp_path: Path) -> None:
+        """Test that errors during _generate_las_content are wrapped.
+
+        Setting curves to None causes TypeError when _write_curve_section
+        tries to iterate, which is caught by the except block at
+        writer.py:98-99 and re-raised as LASWriteError.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="2.0")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves = None  # type: ignore[assignment]  # triggers TypeError during iteration
+        las.logs["DEPT"] = np.array([100.0])
+
+        temp_file = tmp_path / "broken_gen.las"
+        with pytest.raises(LASWriteError, match="Failed to generate LAS file content"):
+            write_las_file(temp_file, las)
+
+    def test_generate_las_content_error_las30(self, tmp_path: Path) -> None:
+        """Test LAS 3.0 generation error wrapping.
+
+        Setting version.vers to "3.0" with broken curves exercises the
+        LAS 3.0 write path through _generate_las_content error wrapping.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves = None  # type: ignore[assignment]
+        las.logs["DEPT"] = np.array([100.0])
+
+        temp_file = tmp_path / "broken_las30.las"
+        with pytest.raises(LASWriteError, match="Failed to generate LAS file content"):
+            write_las_file(temp_file, las)

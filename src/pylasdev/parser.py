@@ -500,15 +500,14 @@ class LASParser:
         is_first_section = not self.las_file.data_sections
         seen: dict[str, int] = {}
         deduped_order: list[str] = []
+        output_names: set[str] = set()  # F12: dynamic set for cross-base collision detection
         for i, curve in enumerate(section_curves):
             name = curve.mnemonic
             if name in seen:
                 seen[name] += 1
                 suffix = seen[name]
                 new_name = f"{name}_{suffix}"
-                # Check for collisions within the section
-                existing = {c.mnemonic for c in section_curves}
-                while new_name in existing:
+                while new_name in output_names:
                     suffix += 1
                     new_name = f"{name}_{suffix}"
                 seen[name] = suffix
@@ -525,6 +524,7 @@ class LASParser:
                     array_info=curve.array_info,
                 )
                 deduped_order.append(new_name)
+                output_names.add(new_name)
                 # M1: For the first data section, write renamed mnemonic
                 # back to global curves/curves_order so the global metadata
                 # stays consistent with the locally-deduped data.
@@ -532,9 +532,37 @@ class LASParser:
                     global_idx = self._section_curve_start_idx + i
                     self.las_file.curves[global_idx].mnemonic = new_name
                     self.las_file.curves_order[global_idx] = new_name
+            elif name in output_names:
+                # F12: Cross-base collision — an original name matches a
+                # previously generated _N suffix, or a previously renamed
+                # curve.  Rename to avoid duplicate keys.
+                suffix = 2
+                new_name = f"{name}_{suffix}"
+                while new_name in output_names:
+                    suffix += 1
+                    new_name = f"{name}_{suffix}"
+                seen[name] = suffix
+                section_curves[i] = CurveDefinition(
+                    mnemonic=new_name,
+                    unit=curve.unit,
+                    api_code=curve.api_code,
+                    description=curve.description,
+                    original_mnemonic=name
+                    if not curve.original_mnemonic
+                    else curve.original_mnemonic,
+                    data_format=curve.data_format,
+                    array_info=curve.array_info,
+                )
+                deduped_order.append(new_name)
+                output_names.add(new_name)
+                if is_first_section:
+                    global_idx = self._section_curve_start_idx + i
+                    self.las_file.curves[global_idx].mnemonic = new_name
+                    self.las_file.curves_order[global_idx] = new_name
             else:
                 seen[name] = 1
                 deduped_order.append(name)
+                output_names.add(name)
 
         # Determine which curves are string type
         string_curves = {i: c.data_format == "S" for i, c in enumerate(section_curves)}

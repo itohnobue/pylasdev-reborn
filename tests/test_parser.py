@@ -671,3 +671,144 @@ class TestConcurrentParserAccess:
         # per-instance state that parse() resets)
         if errors:
             pytest.fail(f"LASParser is not thread-safe for shared-instance use (errors: {errors})")
+
+
+class TestFormatSpecOffsetError:
+    """F29: Test ValueError handler for malformed format specifier offset.
+
+    When a LAS 3.0 curve has a {A:XYZ} format specifier where the offset
+    portion is non-numeric, float() raises ValueError which is caught at
+    parser.py:337-338 and re-raised as LASParseError.
+    """
+
+    def test_malformed_offset_raises_las_parse_error(self) -> None:
+        """Test that a non-numeric/dot-only offset in {A:...} raises LASParseError.
+
+        The FORMAT_SPEC_PATTERN only captures digits and dots as the offset.
+        A value like '..' matches the pattern (digits and dots) but
+        float('..') raises ValueError which is caught and re-raised
+        as LASParseError at parser.py:337-338.
+        """
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DEPT.M       : DEPTH {F}
+ NMR[1].ms    : NMR Echo Array {A:..}
+"""
+        parser = LASParser()
+        with pytest.raises(LASParseError, match="Invalid format specifier offset"):
+            parser.parse(content)
+
+    def test_malformed_offset_multiple_dots(self) -> None:
+        """Test offset with multiple dots like '1.2.3' raises LASParseError."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DEPT.M       : DEPTH {F}
+ NMR[1].ms    : NMR Echo Array {A:1.2.3}
+"""
+        parser = LASParser()
+        with pytest.raises(LASParseError, match="Invalid format specifier offset"):
+            parser.parse(content)
+
+
+class TestLAS30AsciiDataBranches:
+    """F35: Tests for uncovered branches in _process_ascii_data.
+
+    Exercises three branches in parser.py:
+    - Comment skip (line 596-597)
+    - Extra-column warning (line 606-614)
+    - Padding for short rows (line 617-618)
+    """
+
+    def test_las30_ascii_comment_skip_in_data(self) -> None:
+        """Test LAS 3.0 data section with comment lines skipped."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M       : DEPTH {F}
+ DT.US/M      : SONIC {F}
+~A
+# This is a comment between data lines
+100.0,50.0
+# Another comment
+101.0,51.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.data_sections) == 1
+        # Comments should be skipped: only 2 data lines
+        assert len(las.data_sections[0].data["DEPT"]) == 2
+        assert las.data_sections[0].data["DEPT"][0] == 100.0
+        assert las.data_sections[0].data["DEPT"][1] == 101.0
+
+    def test_las30_extra_columns_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Test LAS 3.0 extra-column warning triggered."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M       : DEPTH {F}
+ DT.US/M      : SONIC {F}
+~A
+100.0,50.0,75.0,99.0
+101.0,51.0,76.0,100.0
+"""
+        parser = LASParser()
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            las = parser.parse(content)
+            assert "Extra columns are discarded" in caplog.text
+
+        assert len(las.data_sections) == 1
+        # Extra values are truncated — only first 2 (matching curve count) kept
+        assert las.data_sections[0].data["DEPT"][0] == 100.0
+        assert las.data_sections[0].data["DT"][0] == 50.0
+        assert las.data_sections[0].data["DEPT"][1] == 101.0
+
+    def test_las30_short_rows_padding(self) -> None:
+        """Test LAS 3.0 data with short rows padded to curve count.
+
+        When a data line has FEWER values than curves, the padding loop
+        at parser.py:617-618 appends null_value strings to fill the gap.
+        """
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M       : DEPTH {F}
+ DT.US/M      : SONIC {F}
+ GR.GAPI      : GAMMA RAY {F}
+~A
+100.0,50.0
+101.0,51.0,75.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+
+        # 3 curves, first row has only 2 values → GR gets padded with null
+        assert "DEPT" in las.data_sections[0].data
+        assert "DT" in las.data_sections[0].data
+        assert "GR" in las.data_sections[0].data
+
+        # Row 0: DEPT=100.0, DT=50.0, GR=padded with null_value
+        assert las.data_sections[0].data["DEPT"][0] == 100.0
+        assert las.data_sections[0].data["DT"][0] == 50.0
+        assert las.data_sections[0].data["GR"][0] == -999.25
+        # Row 1: all values present
+        assert las.data_sections[0].data["DEPT"][1] == 101.0
+        assert las.data_sections[0].data["DT"][1] == 51.0
+        assert las.data_sections[0].data["GR"][1] == 75.0

@@ -121,9 +121,42 @@ def compare_las_dicts(
             if key == "data_sections":
                 if not _compare_data_sections(val1, val2, rtol, atol):
                     return False
-            elif val1 != val2:
-                logger.warning("List mismatch at '%s': %r vs %r", key, val1, val2)
-                return False
+            else:
+                try:
+                    if val1 != val2:
+                        logger.warning("List mismatch at '%s': %r vs %r", key, val1, val2)
+                        return False
+                except (ValueError, TypeError):
+                    # F13: List elements may contain numpy arrays or other
+                    # non-comparable types that raise "truth value is ambiguous".
+                    if not isinstance(val1, list):
+                        logger.warning(
+                            "Type mismatch at '%s': %s vs list",
+                            key,
+                            type(val1).__name__,
+                        )
+                        return False
+                    if len(val1) != len(val2):
+                        logger.warning(
+                            "List length mismatch at '%s': %d vs %d",
+                            key,
+                            len(val1),
+                            len(val2),
+                        )
+                        return False
+                    for idx, (a, b) in enumerate(zip(val1, val2, strict=False)):
+                        if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+                            if not _compare_arrays(a, b, f"{key}[{idx}]", None, rtol, atol):
+                                return False
+                        elif a != b:
+                            logger.warning(
+                                "List[%d] mismatch at '%s': %r vs %r",
+                                idx,
+                                key,
+                                a,
+                                b,
+                            )
+                            return False
         else:
             if val1 != val2:
                 logger.warning("Mismatch at '%s': %r vs %r", key, val1, val2)

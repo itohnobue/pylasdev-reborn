@@ -419,3 +419,60 @@ class TestDevSafetyGuards:
             dev = read_dev_file_as_object(test_file)
             assert np.isnan(dev.columns["X"][0])
             assert np.isnan(dev.columns["Y"][0])
+
+
+class TestDevDedupWhileLoop:
+    """F23: Tests for DEV dedup while-loop collision bodies.
+
+    Exercises the while-loops in dev_reader.py:159-161 (duplicate branch)
+    and dev_reader.py:179-181 (cross-base collision branch) where generated
+    _N suffix names collide with already-existing output names.
+    """
+
+    def test_duplicate_while_loop_collision(self, tmp_path: Path) -> None:
+        """Test duplicate branch while-loop when generated _N suffix collides.
+
+        Input columns: ["A", "A_2", "A"]
+        Expected: ["A", "A_2", "A_3"] — second "A" tries to become "A_2"
+        but "A_2" is already in output_names, so the while-loop at line
+        159-161 increments suffix to 3 producing "A_3".
+        """
+        content = "A A_2 A\n10.0 20.0 30.0\n"
+        test_file = tmp_path / "dup_while.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+            dup_warnings = [x for x in w if "Duplicate DEV column name" in str(x.message)]
+            assert len(dup_warnings) >= 1
+
+        assert list(data.keys()) == ["A", "A_2", "A_3"]
+        np.testing.assert_array_equal(data["A"], [10.0])
+        np.testing.assert_array_equal(data["A_2"], [20.0])
+        np.testing.assert_array_equal(data["A_3"], [30.0])
+
+    def test_cross_base_while_loop_collision(self, tmp_path: Path) -> None:
+        """Test cross-base while-loop when generated _2 suffix collides.
+
+        Input columns: ["A", "A", "A_2_2", "A_2"]
+        Expected: ["A", "A_2", "A_2_2", "A_2_3"] — "A_2" triggers the
+        cross-base collision at line 176, producing "A_2_2", but "A_2_2"
+        is ALREADY in output_names from the original third column, so the
+        while-loop at line 179-181 increments suffix to 3 producing "A_2_3".
+        """
+        content = "A A A_2_2 A_2\n10.0 20.0 30.0 40.0\n"
+        test_file = tmp_path / "cross_while.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+            dup_warnings = [x for x in w if "Duplicate DEV column name" in str(x.message)]
+            assert len(dup_warnings) >= 2
+
+        assert list(data.keys()) == ["A", "A_2", "A_2_2", "A_2_3"]
+        np.testing.assert_array_equal(data["A"], [10.0])
+        np.testing.assert_array_equal(data["A_2"], [20.0])
+        np.testing.assert_array_equal(data["A_2_2"], [30.0])
+        np.testing.assert_array_equal(data["A_2_3"], [40.0])

@@ -312,14 +312,14 @@ class LASFile:
         """
         las_file = cls()
 
-        version = data.get("version", {})
+        version = data.get("version") or {}
         las_file.version = VersionSection(
             vers=_safe_str(version.get("VERS"), "2.0"),
             wrap=_safe_str(version.get("WRAP"), "NO"),
             dlm=_safe_str(version.get("DLM"), "SPACE"),
         )
 
-        well = data.get("well", {})
+        well = data.get("well") or {}
         for key, value in well.items():
             las_file.well[key] = _safe_str(value)
 
@@ -354,7 +354,7 @@ class LASFile:
             for curve_name in curves_order:
                 las_file.curves.append(CurveDefinition(mnemonic=curve_name))
 
-        params = data.get("parameters", [])
+        params = data.get("parameters") or []
         if isinstance(params, dict):
             # Legacy format: {mnemonic: value}
             # Check for parameter_details first to preserve full metadata
@@ -401,7 +401,12 @@ class LASFile:
 
         logs = data.get("logs", {})
         for name, arr in logs.items():
-            las_file.logs[name] = np.array(arr, dtype=np.float64)
+            try:
+                las_file.logs[name] = np.array(arr, dtype=np.float64)
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"Cannot convert log data for curve '{name}' to numeric array: {e}"
+                ) from e
 
         return las_file
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import warnings
 from pathlib import Path
@@ -1226,3 +1227,112 @@ class TestMetadataOnlyLas:
         assert "DEPT" in las.logs
         assert len(las.logs["DEPT"]) == 0
         assert las.well["STRT"] == "100.0"
+
+
+class TestArrayTrimmingOvercount:
+    """F24: Tests for array trimming when pre-scan over-counts data lines.
+
+    The trimming branch (data_reader.py:354-359) runs when current_line <
+    data_line_count. This happens when the parser's _pre_scan counts data
+    lines across ALL ~A sections but _read_normal stops at the first
+    non-A section header (~OTHER, ~P, etc.).
+    """
+
+    def test_multi_a_section_trimming(self, tmp_path: Path) -> None:
+        """Test array trimming when second ~A data is excluded by ~OTHER.
+
+        The pre-scan counts 3 data lines across both ~A sections, but
+        _read_normal stops at ~OTHER after only 2 lines, triggering the
+        tail-fill-and-slice branch (current_line=2 < data_line_count=3).
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A  DEPT  DT\n"
+            "100.0  50.0\n"
+            "101.0  51.0\n"
+            "~OTHER\n"
+            "Freeform text.\n"
+            "~A  DEPT  DT\n"
+            "200.0  60.0\n"
+        )
+        test_file = tmp_path / "multi_a_trim.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_las_file(test_file)
+        # Only first section's 2 data lines should be present
+        assert len(data["logs"]["DEPT"]) == 2
+        assert len(data["logs"]["DT"]) == 2
+        np.testing.assert_array_almost_equal(data["logs"]["DEPT"], [100.0, 101.0])
+        np.testing.assert_array_almost_equal(data["logs"]["DT"], [50.0, 51.0])
+        # The tail (positions 2+) should not contain stale 0.0 values
+        # (they should have been filled with null_value and sliced off)
+        assert len(data["logs"]["DEPT"]) < 3
+
+
+class TestExtraColumnWarning:
+    """F34: Tests for extra-column warning in _read_normal.
+
+    The warning at data_reader.py:330-331 triggers when a data line has
+    MORE columns than curve_count. Exercises the `warned_extra` flag path.
+    """
+
+    def test_extra_columns_warning_normal(
+        self, caplog: pytest.LogCaptureFixture, tmp_path: Path
+    ) -> None:
+        """Test extra-column warning triggered in non-wrapped mode."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A  DEPT  DT\n"
+            "100.0  50.0  75.0  99.0\n"  # 4 values but only 2 curves
+            "101.0  51.0\n"
+        )
+        test_file = tmp_path / "extra_cols.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING, logger="pylasdev.data_reader"):
+            data = read_las_file(test_file)
+            assert "Extra columns are discarded" in caplog.text
+
+        # Data should be read correctly: extra values are silently skipped
+        assert data["logs"]["DEPT"][0] == 100.0
+        assert data["logs"]["DT"][0] == 50.0
+        assert data["logs"]["DEPT"][1] == 101.0
+        assert data["logs"]["DT"][1] == 51.0
+
+    def test_extra_columns_only_first_row_warns(
+        self, caplog: pytest.LogCaptureFixture, tmp_path: Path
+    ) -> None:
+        """Test extra-column warning fires only once (warned_extra flag)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~A  DEPT\n"
+            "100.0  1.0  2.0\n"  # 3 values, 1 curve
+            "101.0  3.0  4.0\n"  # 3 values, 1 curve — should NOT warn again
+        )
+        test_file = tmp_path / "extra_once.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING, logger="pylasdev.data_reader"):
+            read_las_file(test_file)
+            # The warning text should appear exactly once
+            assert caplog.text.count("Extra columns are discarded") == 1

@@ -88,7 +88,10 @@ def _to_finite_float(value_str: str, null_value: float) -> float:
     if not value_str:
         return null_value
     try:
-        val = float(value_str)
+        # Handle Fortran D-exponent notation (e.g., "1.0D+03") used by
+        # some scientific software.  Python's float() only understands
+        # E/e exponents; replace D/d with E/e before conversion.
+        val = float(value_str.replace("D", "E").replace("d", "e"))
     except ValueError:
         return null_value
     if not np.isfinite(val):
@@ -482,6 +485,18 @@ def _read_wrapped(
                     counter = 0
                     depth_line = True
                     break
+
+            # F11: After overflow (extra values on data line were
+            # discarded), reset for the next depth line.  The break in
+            # the overflow branch leaves counter at >= curve_count and
+            # depth_line=False; without this reset the next line would
+            # be incorrectly treated as a continuation of this depth step.
+            # Partial under-fill (fewer values than needed) is NOT reset
+            # here — in valid wrapped files data values can legitimately
+            # span multiple lines.
+            if counter >= curve_count and not depth_line:
+                depth_line = True
+                counter = 0
 
     # Validate array lengths — pad incomplete last depth step
     max_len = max((len(dl) for dl in data_lists), default=0)

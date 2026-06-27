@@ -383,3 +383,220 @@ class TestCompareLasDicts:
     ) -> None:
         """Parametrized test for array comparison with tolerance values."""
         assert compare_las_dicts(d1, d2, atol=atol, rtol=rtol) is expected
+
+
+class TestCompareDataSectionsNestedDict:
+    """F7: Tests for _compare_data_sections isinstance(v2, dict) branch.
+
+    When a data_sections entry has a dict value (e.g. LAS 3.0 DataSection.to_dict()
+    structure where 'data' or 'string_data' maps curve names to ndarrays),
+    the isinstance(v2, dict) branch at compare.py:222-290 is exercised.
+    """
+
+    def test_data_sections_nested_dict_match(self) -> None:
+        """Test data_sections with nested dict values that match."""
+        d1 = {
+            "data_sections": [
+                {
+                    "data": {"DEPT": np.array([1000.0, 1001.0]), "DT": np.array([50.0, 51.0])},
+                    "string_data": {},
+                    "curves_order": ["DEPT", "DT"],
+                    "name": "Section_0",
+                },
+            ],
+        }
+        d2 = {
+            "data_sections": [
+                {
+                    "data": {"DEPT": np.array([1000.0, 1001.0]), "DT": np.array([50.0, 51.0])},
+                    "string_data": {},
+                    "curves_order": ["DEPT", "DT"],
+                    "name": "Section_0",
+                },
+            ],
+        }
+        assert compare_las_dicts(d1, d2) is True
+
+    def test_data_sections_nested_dict_ndarray_mismatch(self) -> None:
+        """Test data_sections nested dict ndarray value mismatch."""
+        d1 = {
+            "data_sections": [
+                {
+                    "data": {"DEPT": np.array([1000.0, 1001.0])},
+                    "curves_order": ["DEPT"],
+                    "name": "S1",
+                },
+            ],
+        }
+        d2 = {
+            "data_sections": [
+                {
+                    "data": {"DEPT": np.array([1000.0, 9999.0])},
+                    "curves_order": ["DEPT"],
+                    "name": "S1",
+                },
+            ],
+        }
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_data_sections_nested_dict_key_mismatch(self) -> None:
+        """Test data_sections nested dict with different keys."""
+        d1 = {
+            "data_sections": [
+                {
+                    "data": {"DEPT": np.array([1.0]), "DT": np.array([2.0])},
+                    "curves_order": ["DEPT", "DT"],
+                    "name": "S1",
+                },
+            ],
+        }
+        d2 = {
+            "data_sections": [
+                {
+                    "data": {"DEPT": np.array([1.0]), "GR": np.array([3.0])},
+                    "curves_order": ["DEPT", "GR"],
+                    "name": "S1",
+                },
+            ],
+        }
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_data_sections_nested_dict_missing_inner_key(self) -> None:
+        """Test data_sections nested dict where a key is missing in first."""
+        d1 = {
+            "data_sections": [
+                {
+                    "data": {"DEPT": np.array([1.0])},
+                    "curves_order": ["DEPT"],
+                    "name": "S1",
+                },
+            ],
+        }
+        d2 = {
+            "data_sections": [
+                {
+                    "data": {"DEPT": np.array([1.0]), "DT": np.array([2.0])},
+                    "curves_order": ["DEPT", "DT"],
+                    "name": "S1",
+                },
+            ],
+        }
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_data_sections_nested_dict_type_mismatch(self) -> None:
+        """Test data_sections nested dict where v1 is not a dict (type mismatch)."""
+        d1 = {
+            "data_sections": [
+                {
+                    "data": ["not", "a", "dict"],
+                    "curves_order": [],
+                    "name": "S1",
+                },
+            ],
+        }
+        d2 = {
+            "data_sections": [
+                {
+                    "data": {"DEPT": np.array([1.0])},
+                    "curves_order": ["DEPT"],
+                    "name": "S1",
+                },
+            ],
+        }
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_data_sections_nested_dict_scalar_mismatch(self) -> None:
+        """Test data_sections nested dict with scalar value mismatch."""
+        d1 = {
+            "data_sections": [
+                {
+                    "meta": {"version": "3.0", "source": "file1"},
+                    "curves_order": [],
+                    "name": "S1",
+                },
+            ],
+        }
+        d2 = {
+            "data_sections": [
+                {
+                    "meta": {"version": "3.0", "source": "file2"},
+                    "curves_order": [],
+                    "name": "S1",
+                },
+            ],
+        }
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_data_sections_nested_dict_array_type_mismatch(self) -> None:
+        """Test data_sections nested dict where v1 has array but v2 doesn't."""
+        d1 = {
+            "data_sections": [
+                {
+                    "data": {"DEPT": np.array([1.0]), "DT": np.array([2.0])},
+                    "curves_order": ["DEPT", "DT"],
+                    "name": "S1",
+                },
+            ],
+        }
+        d2 = {
+            "data_sections": [
+                {
+                    "data": {"DEPT": np.array([1.0]), "DT": 5},
+                    "curves_order": ["DEPT", "DT"],
+                    "name": "S1",
+                },
+            ],
+        }
+        assert compare_las_dicts(d1, d2) is False
+
+
+class TestTypeErrorHandler:
+    """F5: Tests for TypeError handler at compare.py:104-112.
+
+    When val1 is a non-subscriptable type (e.g., int, float, str) and
+    val2 is a dict, the subscript access `val1[in_key]` raises TypeError,
+    which is caught at line 104 and returns False.
+    """
+
+    def test_val1_int_val2_dict(self) -> None:
+        """Test TypeError when val1 is int and val2 is dict."""
+        d1 = {"section": 42}
+        d2 = {"section": {0: "value"}}
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_val1_float_val2_dict(self) -> None:
+        """Test TypeError when val1 is float and val2 is dict."""
+        d1 = {"section": 3.14}
+        d2 = {"section": {0: "value"}}
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_val1_str_val2_dict(self) -> None:
+        """Test TypeError when val1 is str and val2 is dict with non-int keys."""
+        d1 = {"section": "hello"}
+        d2 = {"section": {"key": "value"}}
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_val1_str_val2_dict_with_int_keys(self) -> None:
+        """Test TypeError when val1 is str and val2 dict has int keys.
+
+        str supports integer subscript so val1[0] gives 'h', which falls
+        through to scalar comparison with val2[0] == "hello".  Since 'h'
+        != "hello", the comparison correctly returns False.
+
+        This exercises the subscriptable-with-int-keys path WITHOUT
+        triggering TypeError (str supports integer subscript).
+        """
+        d1 = {"section": "hello"}
+        d2 = {"section": {0: "hello"}}
+        assert compare_las_dicts(d1, d2) is False
+
+        # Matching single-character str vs dict with int keys
+        d1["section"] = "h"
+        d2 = {"section": {0: "h"}}
+        assert compare_las_dicts(d1, d2) is True
+
+    def test_val1_str_val2_dict_multi_key(self) -> None:
+        """Test TypeError when str val1 doesn't match dict val2 with multiple keys."""
+        d1 = {"section": "ab"}
+        d2 = {"section": {0: "a", 1: "c"}}
+        assert compare_las_dicts(d1, d2) is False

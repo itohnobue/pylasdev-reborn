@@ -21,8 +21,11 @@ from .exceptions import LASWriteError
 from .models import LASFile
 
 # Control characters except space and tab (which are valid LAS whitespace).
-# Matches \x00-\x08, \x0B, \x0C, \x0E-\x1F, and \x7F (DEL).
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+# Matches \x00-\x08, \x0B, \x0C, \x0E-\x1F, \x7F (DEL), \x85 (NEL),
+# \u2028 (LINE SEPARATOR), and \u2029 (PARAGRAPH SEPARATOR).
+# The Unicode line break characters are treated as line breaks by Python's
+# splitlines() but are not caught by \n/\r replacement.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85\u2028\u2029]")
 
 # Pattern to detect section-header-like leading content after sanitization.
 # A value starting with ~ followed by an alphabetic character mimics a
@@ -43,8 +46,17 @@ def _sanitize_las_value(value: str) -> str:
     Returns:
         Sanitized string safe for LAS output.
     """
-    # Strip all newline characters (prevents section injection)
-    value = value.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    # Strip all newline characters (prevents section injection).
+    # Unicode line separators (\u2028, \u2029) and NEL (\x85) are also
+    # treated as line breaks by Python's splitlines().
+    value = (
+        value.replace("\r\n", " ")
+        .replace("\n", " ")
+        .replace("\r", " ")
+        .replace("\u2028", " ")
+        .replace("\u2029", " ")
+        .replace("\x85", " ")
+    )
     # Strip control characters
     value = _CONTROL_CHARS_RE.sub("", value)
     # If the value now starts with ~ followed by a letter, remove the leading ~
@@ -164,7 +176,9 @@ def _write_curve_section(las_file: LASFile) -> list[str]:
             desc = f"{desc}  {format_str}"
 
         api = f"  {curve.api_code}" if curve.api_code else ""
-        lines.append(f" {_sanitize_las_value(curve.mnemonic)}.{unit}{api}  : {desc}")
+        lines.append(
+            f" {_sanitize_las_value(curve.mnemonic)}.{unit}{api}  : {_sanitize_las_value(desc)}"
+        )
     lines.append("")
     return lines
 
@@ -186,7 +200,9 @@ def _write_parameter_section(las_file: LASFile) -> list[str]:
                 zone_str += f"[{param.zone.zone_index}]"
             desc = f"{desc}{zone_str}"
 
-        lines.append(f" {param.mnemonic}.{unit}  {_sanitize_las_value(param.value)}  : {desc}")
+        lines.append(
+            f" {param.mnemonic}.{unit}  {_sanitize_las_value(param.value)}  : {_sanitize_las_value(desc)}"
+        )
     lines.append("")
     return lines
 
