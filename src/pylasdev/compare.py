@@ -219,6 +219,75 @@ def _compare_data_sections(
                     atol,
                 ):
                     return False
+            elif isinstance(v2, dict):
+                # F31: Handle dict values (LAS 3.0 data_sections entries
+                # where values are dicts mapping curve names to ndarrays).
+                if not isinstance(v1, dict):
+                    logger.warning(
+                        "Type mismatch at 'data_sections[%d].%s': expected dict, got %s",
+                        i,
+                        k,
+                        type(v1).__name__,
+                    )
+                    return False
+                if set(v1.keys()) != set(v2.keys()):
+                    only_in_first = set(v1.keys()) - set(v2.keys())
+                    only_in_second = set(v2.keys()) - set(v1.keys())
+                    if only_in_first:
+                        logger.warning(
+                            "Keys 'data_sections[%d].%s' only in first: %s",
+                            i,
+                            k,
+                            only_in_first,
+                        )
+                    if only_in_second:
+                        logger.warning(
+                            "Keys 'data_sections[%d].%s' only in second: %s",
+                            i,
+                            k,
+                            only_in_second,
+                        )
+                    return False
+                for in_key in v2:
+                    if in_key not in v1:
+                        logger.warning(
+                            "Key 'data_sections[%d].%s.%s' not found in first dict",
+                            i,
+                            k,
+                            in_key,
+                        )
+                        return False
+                    if isinstance(v2[in_key], np.ndarray):
+                        if not _compare_arrays(
+                            v1[in_key],
+                            v2[in_key],
+                            f"data_sections[{i}].{k}.{in_key}",
+                            None,
+                            rtol,
+                            atol,
+                        ):
+                            return False
+                    elif isinstance(v1[in_key], np.ndarray):
+                        # v1 has array but v2 doesn't — type mismatch
+                        logger.warning(
+                            "Type mismatch at 'data_sections[%d].%s.%s': %s vs %s",
+                            i,
+                            k,
+                            in_key,
+                            type(v1[in_key]).__name__,
+                            type(v2[in_key]).__name__,
+                        )
+                        return False
+                    elif v1[in_key] != v2[in_key]:
+                        logger.warning(
+                            "Mismatch at 'data_sections[%d].%s.%s': %r vs %r",
+                            i,
+                            k,
+                            in_key,
+                            v1[in_key],
+                            v2[in_key],
+                        )
+                        return False
             elif isinstance(v2, list):
                 if v1 != v2:
                     logger.warning(

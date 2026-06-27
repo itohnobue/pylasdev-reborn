@@ -78,7 +78,13 @@ def write_las_file(
     file_path = Path(file_path)
 
     if isinstance(las_data, dict):
-        las_file = LASFile.from_dict(las_data)
+        # F34: Wrap from_dict in try/except so that malformed input
+        # (e.g., non-numeric log values that fail np.array(dtype=np.float64)
+        # in models.py) raises LASWriteError instead of raw ValueError.
+        try:
+            las_file = LASFile.from_dict(las_data)
+        except (ValueError, TypeError) as e:
+            raise LASWriteError(f"Cannot create LASFile from dict: {e}") from e
     elif isinstance(las_data, LASFile):
         las_file = las_data
     else:
@@ -87,12 +93,10 @@ def write_las_file(
         )
 
     # Always write with the specified encoding (default: utf-8).
-    # The original file's encoding (e.g. cp866) is detected by the reader
-    # for correct input parsing, but output should use a modern encoding
-    # that chardet can unambiguously detect. Legacy single-byte Cyrillic
-    # encodings (cp866, cp1251) are too similar for chardet to distinguish
-    # reliably in re-read scenarios, causing roundtrip failures.
-    content = _generate_las_content(las_file, precision)
+    try:
+        content = _generate_las_content(las_file, precision)
+    except (ValueError, TypeError, KeyError, AttributeError) as e:
+        raise LASWriteError(f"Failed to generate LAS file content: {e}") from e
 
     try:
         file_path.write_text(content, encoding=encoding)

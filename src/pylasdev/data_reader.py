@@ -107,6 +107,13 @@ def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int) -
     """
     curve_count = len(las_file.curves_order)
     if curve_count == 0:
+        # F32: Warn when data is present but no curves are defined,
+        # so malformed files don't silently lose data.
+        warnings.warn(
+            "ASCII data section found but no curves are defined. Data has been discarded.",
+            UserWarning,
+            stacklevel=2,
+        )
         return
 
     if curve_count > MAX_CURVES:
@@ -338,12 +345,18 @@ def _read_normal(
 
         current_line += 1
 
-    # Trim arrays when ~A section ended early (fewer data lines than declared).
-    # Pre-allocated np.zeros tail would otherwise expose 0.0 values that differ
-    # from null_value, corrupting downstream analysis.
+    # F36: Trim arrays when ~A section ended early (fewer data lines than
+    # declared). Pre-allocated np.zeros tail would otherwise expose 0.0
+    # values that differ from null_value, corrupting downstream analysis.
+    # Fill the tail with null_value before slicing to ensure consistency
+    # even when pre-scan over-counts relative to _read_normal's actual
+    # line consumption.
     if current_line < data_line_count:
         for curve_name in las_file.curves_order:
-            las_file.logs[curve_name] = las_file.logs[curve_name][:current_line]
+            arr = las_file.logs[curve_name]
+            if current_line < len(arr):
+                arr[current_line:] = null_value
+            las_file.logs[curve_name] = arr[:current_line]
 
 
 def _read_wrapped(
@@ -441,13 +454,27 @@ def _read_wrapped(
             # Data lines: values for remaining curves
             for val_str in values:
                 counter += 1
+
+                if counter >= curve_count:
+                    # F2: Overflow — more values on this line than non-depth
+                    # curves remaining in the step.  Extra values would shift
+                    # subsequent lines if consumed silently; warn and discard
+                    # the overflow portion.
+                    warnings.warn(
+                        f"Wrapped mode: overflow on data line — {len(values)} "
+                        f"values but only {curve_count - 1} non-depth curves. "
+                        f"Extra value(s) discarded. Line content: '{stripped[:80]}'",
+                        stacklevel=2,
+                    )
+                    break
+
                 try:
                     data_lists[counter].append(_to_finite_float(val_str, null_value))
                 except IndexError:
                     if counter < curve_count:
                         data_lists[counter].append(null_value)
 
-                if counter >= curve_count - 1:
+                if counter == curve_count - 1:
                     # All curves for this depth step are complete.
                     # Break to discard any extra values on this line
                     # (prevents silent misalignment if a line has

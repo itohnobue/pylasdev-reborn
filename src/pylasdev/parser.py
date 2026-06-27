@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import re
+import warnings
 from typing import ClassVar
 
 import numpy as np
@@ -21,7 +22,6 @@ from .data_reader import (
     MAX_CURVES,
     MAX_DATA_LINES,
     MAX_TOTAL_ELEMENTS,
-    _deduplicate_curves,
     _get_null_value,
     _to_finite_float,
 )
@@ -132,6 +132,9 @@ class LASParser:
         # string concatenation (self.las_file.other += ... per line).
         self._other_lines: list[str] = []
         self.source_file: str = ""
+        # F1: Track per-section curve boundaries for LAS 3.0 files where
+        # different ~C blocks define different curve sets before each ~A section.
+        self._section_curve_start_idx: int = 0
 
     @property
     def data_line_count(self) -> int:
@@ -219,11 +222,25 @@ class LASParser:
         section_match = SECTION_PATTERN.match(line)
         if section_match:
             new_section = section_match.group(1).upper()
-            # If we're switching to a new ~A section, process previous data first
-            if new_section == "A" and self._current_section == "A":
+            # F1: When leaving ~A for a non-A section (~C, ~O, etc.),
+            # process any pending data from the previous ~A section.
+            # This prevents data from different sections from being
+            # merged into a single _ascii_data_lines batch.
+            if self._current_section == "A" and new_section != "A":
                 self._process_ascii_data()
                 self._ascii_data_lines = []
                 self._current_data_section_idx += 1
+            # If we're switching to a new ~A section, process previous data first
+            elif new_section == "A" and self._current_section == "A":
+                self._process_ascii_data()
+                self._ascii_data_lines = []
+                self._current_data_section_idx += 1
+            # F1: Track per-section curve boundaries for LAS 3.0.
+            # When entering ~C, mark the current curve list position so
+            # _process_ascii_data can isolate curves defined since the
+            # most recent ~C block.
+            if new_section == "C":
+                self._section_curve_start_idx = len(self.las_file.curves)
             self._current_section = new_section
             self._current_section_name = section_match.group(2).strip()
             return
@@ -451,6 +468,8 @@ class LASParser:
         """Process collected ASCII data lines into numpy arrays.
 
         Handles LAS 3.0 delimiters and string data formats.
+        Uses per-section curves (F1) to support LAS 3.0 files where
+        different ~C blocks define different curve sets before each ~A.
         """
         if not self._ascii_data_lines:
             return
@@ -458,35 +477,78 @@ class LASParser:
         # Get delimiter character
         delimiter = self.las_file.version.delimiter_char
 
-        # Get curve information
-        curves = self.las_file.curves
-        if not curves:
+        # F1: Get per-section curves — only curves defined since the
+        # most recent ~C block.  For the first data section (no ~C
+        # encountered or _section_curve_start_idx == 0), this is the
+        # full curve list (backward-compatible).
+        section_curves = list(self.las_file.curves[self._section_curve_start_idx :])
+        if not section_curves:
+            # F32: Warn when data is present but no curves are defined
+            # for this section, then return early.
+            warnings.warn(
+                "ASCII data present but no curves defined for this section. "
+                "Data has been discarded.",
+                UserWarning,
+                stacklevel=2,
+            )
             return
 
-        # GD-05: Deduplicate curve names for LAS 3.0 path (same logic as
-        # data_reader._deduplicate_curves used for LAS 1.2/2.0).
-        _deduplicate_curves(self.las_file, _stacklevel=3)
-        curves = self.las_file.curves  # refresh reference after dedup
+        # F1: Local dedup on per-section curves.  For the first data section,
+        # renamed mnemonics are also written back to global curves/curves_order
+        # so that to_dict() and the writer see consistent, unique mnemonics
+        # (M1: LAS 3.0 global curve dedup regression fix).
+        is_first_section = not self.las_file.data_sections
+        seen: dict[str, int] = {}
+        deduped_order: list[str] = []
+        for i, curve in enumerate(section_curves):
+            name = curve.mnemonic
+            if name in seen:
+                seen[name] += 1
+                suffix = seen[name]
+                new_name = f"{name}_{suffix}"
+                # Check for collisions within the section
+                existing = {c.mnemonic for c in section_curves}
+                while new_name in existing:
+                    suffix += 1
+                    new_name = f"{name}_{suffix}"
+                seen[name] = suffix
+                # Create a renamed copy
+                section_curves[i] = CurveDefinition(
+                    mnemonic=new_name,
+                    unit=curve.unit,
+                    api_code=curve.api_code,
+                    description=curve.description,
+                    original_mnemonic=name
+                    if not curve.original_mnemonic
+                    else curve.original_mnemonic,
+                    data_format=curve.data_format,
+                    array_info=curve.array_info,
+                )
+                deduped_order.append(new_name)
+                # M1: For the first data section, write renamed mnemonic
+                # back to global curves/curves_order so the global metadata
+                # stays consistent with the locally-deduped data.
+                if is_first_section:
+                    global_idx = self._section_curve_start_idx + i
+                    self.las_file.curves[global_idx].mnemonic = new_name
+                    self.las_file.curves_order[global_idx] = new_name
+            else:
+                seen[name] = 1
+                deduped_order.append(name)
 
         # Determine which curves are string type
-        string_curves = {i: c.data_format == "S" for i, c in enumerate(curves)}
+        string_curves = {i: c.data_format == "S" for i, c in enumerate(section_curves)}
 
         # Get null value (shared utility, used by parser, data_reader, writer)
         null_value = _get_null_value(self.las_file.well)
 
-        # Create data section.
-        # NOTE (GD-11): LAS 3.0 _process_ascii_data currently uses the global
-        # curve set (self.las_file.curves) for all data sections. Per-section
-        # curve subsets (where different ~A sections define different curves)
-        # are not yet supported. If a LAS 3.0 file uses different curves per
-        # section, only the globally declared curves will be populated and
-        # extra columns in per-section data may be silently dropped.
+        # Create data section with per-section curves.
         data_section = DataSection(
             name=self._current_section_name or f"Section_{self._current_data_section_idx}",
-            curves_order=[c.mnemonic for c in curves],
+            curves_order=deduped_order,
         )
 
-        num_curves = len(curves)
+        num_curves = len(section_curves)
 
         # Count actual data lines (excluding comments) for array sizing.
         actual_count = sum(1 for line in self._ascii_data_lines if not COMMENT_PATTERN.match(line))
@@ -512,24 +574,9 @@ class LASParser:
             )
 
         # PERF-03: Pre-allocate numpy arrays for numeric curves.
-        # String curves use list accumulation because np.empty(dtype=np.str_)
-        # would truncate variable-length strings (numpy infers a fixed
-        # max string length at creation time). Numeric curves get the full
-        # pre-allocation benefit.
-
-        # Pre-allocate numeric arrays; defer string arrays
         string_data_lists: dict[int, list[str]] = {}
-        # F-9: Only populate las_file.logs from the first data section
-        # to preserve backward compatibility (to_dict() reads from logs).
-        # Subsequent sections only write to data_section.data — their
-        # data is still accessible via las_file.data_sections[N].data.
-        is_first_section = not self.las_file.data_sections
-        for i, curve in enumerate(curves):
+        for i, curve in enumerate(section_curves):
             if string_curves.get(i, False):
-                # String curves: accumulate as list, convert at end.
-                # PERF: No zeros allocation in data_section.data — the writer
-                # reads string curves from las_file.string_data, not from
-                # data_section.data, so the np.zeros allocation here was dead.
                 string_data_lists[i] = []
             else:
                 arr = np.zeros(actual_count, dtype=np.float64)
@@ -538,12 +585,9 @@ class LASParser:
                 data_section.data[curve.mnemonic] = arr
 
         # Fill arrays by index (no list accumulation overhead for numerics)
-        # Pre-extract numeric data arrays to avoid O(rows x curves) dict lookups.
-        # Use direct indexing (not .get()) so mypy knows values are non-None
-        # for curves that have been pre-allocated above.
         numeric_arrays = [
             data_section.data[c.mnemonic] if not string_curves.get(i, False) else None
-            for i, c in enumerate(curves)
+            for i, c in enumerate(section_curves)
         ]
         idx = 0
         warned_extra = False  # Track extra-column warning per section
@@ -554,7 +598,6 @@ class LASParser:
 
             # Split by delimiter
             if delimiter == " ":
-                # For space delimiter, split on any whitespace
                 values = line.split()
             else:
                 values = line.split(delimiter)
@@ -575,50 +618,25 @@ class LASParser:
                 values.append(str(null_value))
 
             for i in range(num_curves):
-                # After the while loop above, len(values) >= num_curves is guaranteed,
-                # so values[i] is always valid for i in range(num_curves).
                 val_str = values[i].strip()
-                try:
-                    if string_curves.get(i, False):
-                        string_data_lists[i].append(val_str)
-                    else:
-                        # Empty-string values (e.g. whitespace-only columns from
-                        # space-delimited files) are treated as null to match the
-                        # behavior of most LAS processing tools.
-                        val = _to_finite_float(val_str, null_value)
-                        arr = numeric_arrays[i]  # type: ignore[assignment]
-                        if arr is None:
-                            raise LASParseError(
-                                f"Internal error: numeric array '{i}' was not pre-allocated"
-                            )
-                        arr[idx] = val
-                except ValueError:
-                    if string_curves.get(i, False):
-                        string_data_lists[i].append(val_str)
-                    else:
-                        arr = numeric_arrays[i]  # type: ignore[assignment]
-                        if arr is None:
-                            raise LASParseError(
-                                f"Internal error: numeric array '{i}' was not pre-allocated"
-                            ) from None
-                        arr[idx] = null_value
+                if string_curves.get(i, False):
+                    string_data_lists[i].append(val_str)
+                else:
+                    val = _to_finite_float(val_str, null_value)
+                    arr = numeric_arrays[i]  # type: ignore[assignment]
+                    if arr is None:
+                        raise LASParseError(
+                            f"Internal error: numeric array '{i}' was not pre-allocated"
+                        )
+                    arr[idx] = val
 
             idx += 1
 
         # Convert string data lists to numpy arrays
-        # Using np.array(list, dtype=np.str_) infers the correct max string
-        # length, preserving the full string values (unlike np.empty).
-        for i, curve in enumerate(curves):
+        for i, curve in enumerate(section_curves):
             if i in string_data_lists:
                 string_arr = np.array(string_data_lists[i], dtype=np.str_)
-                # Per-section storage: prevents later sections from overwriting
-                # earlier sections' string data (same pattern as numeric data at
-                # lines 481-483 above).
                 data_section.string_data[curve.mnemonic] = string_arr
-                # Backward compat: only the first section writes to the global
-                # las_file.string_data dict, matching the numeric-data pattern
-                # (F-9 comment at lines 467-471). The writer.py module reads
-                # string curves from las_file.string_data.
                 if is_first_section:
                     self.las_file.string_data[curve.mnemonic] = string_arr
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +29,7 @@ class TestReadDEVFile:
 
     def test_file_not_found(self, tmp_path: Path) -> None:
         """Test error handling for missing file."""
-        with pytest.raises(DEVReadError):
+        with pytest.raises(DEVReadError, match="File not found"):
             read_dev_file(tmp_path / "nonexistent.dev")
 
     def test_sample_dev_columns(self, test_data_dir: Path) -> None:
@@ -241,3 +242,180 @@ class TestDevIndexErrorHandler:
         assert data["MD"][2] == 200.0
         assert data["X"][0] == 100.0
         assert data["X"][2] == 102.0
+
+
+class TestDevDedup:
+    """F12: DEV deduplication tests.
+
+    The DEV reader (dev_reader.py:146-194) has deduplication logic
+    mirroring LAS _deduplicate_curves: duplicate column names get
+    ``_N`` suffixes, and cross-base collisions (where an original
+    name matches a previously generated ``_N`` suffix) are resolved
+    correctly.
+    """
+
+    def test_duplicate_column_names_get_suffix(self, tmp_path: Path) -> None:
+        """Duplicate DEV columns receive _N suffixes.
+
+        Input columns: ["DEPTH", "GR", "GR"]
+        Expected: ["DEPTH", "GR", "GR_2"] — first duplicate starts at _2
+        (matching the LAS _deduplicate_curves convention).
+        """
+        content = "DEPTH GR GR\n100.0 10.0 20.0\n"
+        test_file = tmp_path / "dup.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+            # Should warn about the duplicate
+            assert any("Duplicate DEV column name" in str(x.message) for x in w)
+
+        assert list(data.keys()) == ["DEPTH", "GR", "GR_2"]
+        np.testing.assert_array_equal(data["DEPTH"], [100.0])
+        np.testing.assert_array_equal(data["GR"], [10.0])
+        np.testing.assert_array_equal(data["GR_2"], [20.0])
+
+    def test_cross_base_collision_dedup(self, tmp_path: Path) -> None:
+        """Cross-base collision: original name matches prior _N suffix.
+
+        Input columns: ["A", "A", "A_2"]
+        Expected: ["A", "A_2", "A_2_2"] — second "A" → "A_2" which
+        collides with the third original name "A_2", so the third
+        becomes "A_2_2".
+        """
+        content = "A A A_2\n10.0 20.0 30.0\n"
+        test_file = tmp_path / "cross_base.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+            dup_warnings = [x for x in w if "Duplicate DEV column name" in str(x.message)]
+            assert len(dup_warnings) >= 2
+
+        assert list(data.keys()) == ["A", "A_2", "A_2_2"]
+        np.testing.assert_array_equal(data["A"], [10.0])
+        np.testing.assert_array_equal(data["A_2"], [20.0])
+        np.testing.assert_array_equal(data["A_2_2"], [30.0])
+
+
+class TestDevSafetyGuards:
+    """F13/F37: DEV reader safety guard tests.
+
+    Tests all six guards in dev_reader.py:
+    - OSError handler (line 98)
+    - MAX_DATA_LINES (line 119-123)
+    - MAX_CURVES (line 196-200)
+    - MAX_TOTAL_ELEMENTS (line 201-206)
+    - IndexError handler (line 225-226)
+    """
+
+    def test_oserror_read_with_encoding_raises_dev_read_error(self, tmp_path: Path) -> None:
+        """OSError from read_with_encoding is wrapped in DEVReadError.
+
+        Exercises dev_reader.py:97-98.
+        """
+        from unittest import mock
+
+        test_file = tmp_path / "denied.dev"
+        test_file.write_text("MD TVD\n0.0 0.0\n", encoding="utf-8")
+
+        with mock.patch(
+            "pylasdev.dev_reader.read_with_encoding",
+            side_effect=OSError("Permission denied"),
+        ):
+            with pytest.raises(DEVReadError, match="Cannot read file"):
+                read_dev_file(test_file)
+
+    def test_max_data_lines_guard(self, tmp_path: Path) -> None:
+        """MAX_DATA_LINES guard raises DEVReadError for excess data lines.
+
+        Exercises dev_reader.py:119-123.
+        """
+        from unittest import mock
+
+        content = "MD TVD\n0.0 0.0\n100.0 99.0\n"
+        test_file = tmp_path / "max_lines.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Monkey-patch MAX_DATA_LINES to 0: any data line triggers guard
+        with mock.patch("pylasdev.dev_reader.MAX_DATA_LINES", 0):
+            with pytest.raises(DEVReadError, match="Data line count"):
+                read_dev_file(test_file)
+
+    def test_max_curves_guard(self, tmp_path: Path) -> None:
+        """MAX_CURVES guard raises DEVReadError for excess columns.
+
+        Exercises dev_reader.py:196-200.
+        """
+        from unittest import mock
+
+        content = "MD TVD X\n0.0 0.0 100.0\n"
+        test_file = tmp_path / "max_curves.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Monkey-patch MAX_CURVES to 1: 3 columns > 1
+        with mock.patch("pylasdev.dev_reader.MAX_CURVES", 1):
+            with pytest.raises(DEVReadError, match="Column count"):
+                read_dev_file(test_file)
+
+    def test_max_total_elements_guard(self, tmp_path: Path) -> None:
+        """MAX_TOTAL_ELEMENTS guard raises DEVReadError for excess allocation.
+
+        Exercises dev_reader.py:201-206.
+        """
+        from unittest import mock
+
+        content = "MD TVD X\n0.0 0.0 100.0\n"
+        test_file = tmp_path / "max_total.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Monkey-patch MAX_TOTAL_ELEMENTS to 1: 3 cols * 1 line = 3 > 1
+        with mock.patch("pylasdev.dev_reader.MAX_TOTAL_ELEMENTS", 1):
+            with pytest.raises(DEVReadError, match="Total allocation"):
+                read_dev_file(test_file)
+
+    def test_index_error_handler_caught_by_safety_net(self, tmp_path: Path) -> None:
+        """IndexError in _to_finite_float is caught by safety net.
+
+        Exercises dev_reader.py:225-226.  The IndexError handler is a
+        safety net for pass-1/pass-2 line-count inconsistency.  Under
+        normal conditions both passes process the same lines identically
+        so the handler is unreachable.  We trigger it by mocking
+        ``_to_finite_float`` to raise IndexError, which the handler
+        catches and substitutes ``np.nan``.
+        """
+        from unittest import mock
+
+        content = "MD TVD\n0.0 0.0\n"
+        test_file = tmp_path / "index_err.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with mock.patch(
+            "pylasdev.dev_reader._to_finite_float",
+            side_effect=IndexError("simulated"),
+        ):
+            data = read_dev_file(test_file)
+            # Values should be NaN (substituted by handler)
+            assert np.isnan(data["MD"][0])
+            assert np.isnan(data["TVD"][0])
+
+    def test_index_error_handler_read_dev_file_as_object(self, tmp_path: Path) -> None:
+        """IndexError safety net also covers read_dev_file_as_object path.
+
+        Same as above but exercises the read_dev_file_as_object API.
+        """
+        from unittest import mock
+
+        content = "X Y\n1.0 2.0\n"
+        test_file = tmp_path / "index_err2.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with mock.patch(
+            "pylasdev.dev_reader._to_finite_float",
+            side_effect=IndexError("simulated"),
+        ):
+            dev = read_dev_file_as_object(test_file)
+            assert np.isnan(dev.columns["X"][0])
+            assert np.isnan(dev.columns["Y"][0])

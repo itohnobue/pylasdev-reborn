@@ -24,12 +24,16 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Ordered by likelihood in Russian geoscience context.
+# cp866 is the correct Russian DOS geoscience encoding and appears BEFORE
+# cp1251 (Windows Cyrillic) because chardet returns low confidence on cp866
+# files, causing the fallback to try cp1251 first, which "succeeds" but
+# produces garbled Cyrillic that fails DATA_LINE_PATTERN.
 # latin-1 is used as the terminal fallback because it can decode any byte
 # sequence (every byte 0x00-0xFF maps to a valid character), guaranteeing
 # that read_with_encoding() always returns content even for files with
 # unknown or corrupted encodings. This design choice prioritizes data
 # recovery over strictness — geoscience files often have mixed encodings.
-FALLBACK_ENCODINGS = ["utf-8", "cp1251", "cp1252", "cp866", "latin-1"]
+FALLBACK_ENCODINGS = ["utf-8", "cp866", "cp1251", "cp1252", "latin-1"]
 
 
 def detect_encoding(file_path: Path) -> str:
