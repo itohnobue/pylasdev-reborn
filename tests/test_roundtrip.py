@@ -57,6 +57,27 @@ class TestRoundTrip:
                         err_msg=(f"Data mismatch for {curve} in {las_path.name}"),
                     )
 
+            # Verify string_data entries preserved (LAS 3.0 {S} format curves)
+            orig_string_data = original.get("string_data", {})
+            rt_string_data = roundtrip.get("string_data", {})
+            for key in orig_string_data:
+                assert key in rt_string_data, (
+                    f"string_data key {key} missing in roundtrip for {las_path.name}"
+                )
+                np.testing.assert_array_equal(
+                    orig_string_data[key],
+                    rt_string_data[key],
+                    err_msg=f"string_data mismatch for {key} in {las_path.name}",
+                )
+
+            # Verify data_sections count preserved (LAS 3.0 multi-section files)
+            orig_sections = original.get("data_sections", [])
+            rt_sections = roundtrip.get("data_sections", [])
+            assert len(rt_sections) == len(orig_sections), (
+                f"data_sections count mismatch in {las_path.name}: "
+                f"{len(rt_sections)} vs {len(orig_sections)}"
+            )
+
     def test_roundtrip_preserves_curve_metadata(self) -> None:
         """Test that to_dict/from_dict round-trip preserves curve metadata."""
         from pylasdev.models import CurveDefinition, LASFile, VersionSection

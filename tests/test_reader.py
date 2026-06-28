@@ -86,7 +86,18 @@ class TestReadLASFile:
         assert sample.exists(), f"Required test data missing: {sample}"
         data = read_las_file(sample)
         assert "DEPT" in data["logs"]
-        assert len(data["logs"]["DEPT"]) > 0
+        assert len(data["logs"]["DEPT"]) == 3
+        # Verify specific data values from sample.las
+        np.testing.assert_array_almost_equal(
+            data["logs"]["DEPT"], np.array([1670.0, 1669.875, 1669.75])
+        )
+        # Verify well section values
+        assert data["well"]["COMP"] == "COMPANY"
+        assert data["well"]["WELL"] == "WELL"
+        assert data["well"]["STRT"] == "1670.000000"
+        # Verify parameter values
+        assert data["parameters"]["BHT"] == "35.5000"
+        assert data["parameters"]["BS"] == "200.0000"
 
     def test_wrapped_file_correct_shape(self, test_data_dir: Path) -> None:
         """Test that wrapped files produce equal-length arrays."""

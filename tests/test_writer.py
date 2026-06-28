@@ -185,14 +185,51 @@ class TestWriteLASFile:
         """Test writing all real LAS files and reading back."""
         for las_path in all_las_files:
             data = read_las_file(las_path)
-            # Skip LAS 3.0 files (different data handling)
-            if data["version"]["VERS"].startswith("3"):
-                continue
             temp_file = tmp_path / las_path.name
             write_las_file(temp_file, data)
             assert temp_file.exists()
             reread = read_las_file(temp_file)
             assert len(reread["curves_order"]) > 0
+
+            # Verify version preserved
+            assert reread["version"]["VERS"] == data["version"]["VERS"]
+
+            # Verify curves_order preserved
+            assert reread["curves_order"] == data["curves_order"], (
+                f"curves_order mismatch in {las_path.name}: "
+                f"{reread['curves_order']} vs {data['curves_order']}"
+            )
+
+            # Verify data shapes and values for non-empty log files
+            if data.get("logs"):
+                for curve in data["curves_order"]:
+                    if curve in reread["logs"]:
+                        assert data["logs"][curve].shape == reread["logs"][curve].shape, (
+                            f"Shape mismatch for {curve} in {las_path.name}: "
+                            f"{data['logs'][curve].shape} vs {reread['logs'][curve].shape}"
+                        )
+                        np.testing.assert_allclose(
+                            data["logs"][curve],
+                            reread["logs"][curve],
+                            rtol=1e-5,
+                            err_msg=f"Data mismatch for {curve} in {las_path.name}",
+                        )
+
+            # For LAS 3.0 files, verify data_sections and string_data if present
+            if data.get("string_data"):
+                for key in data["string_data"]:
+                    assert key in reread.get("string_data", {}), (
+                        f"string_data key {key} missing in roundtrip for {las_path.name}"
+                    )
+                    np.testing.assert_array_equal(
+                        data["string_data"][key],
+                        reread["string_data"][key],
+                        err_msg=f"string_data mismatch for {key} in {las_path.name}",
+                    )
+            if data.get("data_sections"):
+                assert len(reread.get("data_sections", [])) == len(data["data_sections"]), (
+                    f"data_sections count mismatch in {las_path.name}"
+                )
 
     def test_write_other_section(self, tmp_path: Path) -> None:
         """Test that ~O (other) section is written when present."""

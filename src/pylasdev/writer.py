@@ -134,12 +134,14 @@ def _write_version_section(las_file: LASFile) -> list[str]:
     is_las30 = las_file.is_las30
     lines.append("~VERSION INFORMATION")
     vers_desc = "CWLS LOG ASCII STANDARD -VERSION 3.0" if is_las30 else "CWLS LOG ASCII STANDARD"
-    lines.append(f" VERS.   {las_file.version.vers}  : {vers_desc}")
+    lines.append(f" VERS.   {_sanitize_las_value(las_file.version.vers)}  : {vers_desc}")
     # Always write WRAP=NO since we write one line per depth step (non-wrapped)
     lines.append(" WRAP.   NO  : ONE LINE PER DEPTH STEP")
     if is_las30:
         dlm_desc = "DELIMITING CHARACTER BETWEEN DATA COLUMNS"
-        lines.append(f" DLM .                        {las_file.version.dlm} : {dlm_desc}")
+        lines.append(
+            f" DLM .                        {_sanitize_las_value(las_file.version.dlm)} : {dlm_desc}"
+        )
     lines.append("")
     return lines
 
@@ -149,7 +151,7 @@ def _write_well_section(las_file: LASFile) -> list[str]:
     lines: list[str] = []
     lines.append("~WELL INFORMATION")
     for key, value in las_file.well.entries.items():
-        lines.append(f" {key}.   {_sanitize_las_value(value)}  :")
+        lines.append(f" {_sanitize_las_value(key)}.   {_sanitize_las_value(value)}  :")
     lines.append("")
     return lines
 
@@ -160,7 +162,7 @@ def _write_curve_section(las_file: LASFile) -> list[str]:
     is_las30 = las_file.is_las30
     lines.append("~CURVE INFORMATION")
     for curve in las_file.curves:
-        unit = curve.unit if curve.unit else ""
+        unit = _sanitize_las_value(curve.unit) if curve.unit else ""
         desc = curve.description if curve.description else ""
 
         if is_las30 and curve.data_format:
@@ -175,7 +177,7 @@ def _write_curve_section(las_file: LASFile) -> list[str]:
             format_str += "}"
             desc = f"{desc}  {format_str}"
 
-        api = f"  {curve.api_code}" if curve.api_code else ""
+        api = f"  {_sanitize_las_value(curve.api_code)}" if curve.api_code else ""
         lines.append(
             f" {_sanitize_las_value(curve.mnemonic)}.{unit}{api}  : {_sanitize_las_value(desc)}"
         )
@@ -191,7 +193,7 @@ def _write_parameter_section(las_file: LASFile) -> list[str]:
     is_las30 = las_file.is_las30
     lines.append("~PARAMETER INFORMATION")
     for param in las_file.parameters:
-        unit = param.unit if param.unit else ""
+        unit = _sanitize_las_value(param.unit) if param.unit else ""
         desc = param.description if param.description else ""
 
         if is_las30 and param.zone:
@@ -201,7 +203,7 @@ def _write_parameter_section(las_file: LASFile) -> list[str]:
             desc = f"{desc}{zone_str}"
 
         lines.append(
-            f" {param.mnemonic}.{unit}  {_sanitize_las_value(param.value)}  : {_sanitize_las_value(desc)}"
+            f" {_sanitize_las_value(param.mnemonic)}.{unit}  {_sanitize_las_value(param.value)}  : {_sanitize_las_value(desc)}"
         )
     lines.append("")
     return lines
@@ -230,7 +232,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
     if las_file.data_sections:
         # LAS 3.0: Multiple data sections
         for section in las_file.data_sections:
-            section_name = f" {section.name}" if section.name else ""
+            section_name = f" {_sanitize_las_value(section.name)}" if section.name else ""
             lines.append(f"~A{section_name}")
             lines.extend(
                 _format_data_rows(
@@ -246,7 +248,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
         # Legacy single data section
         curve_names = las_file.curves_order
         if any(name in las_file.logs for name in curve_names):
-            lines.append("~A  " + "  ".join(curve_names))
+            lines.append("~A  " + "  ".join(_sanitize_las_value(name) for name in curve_names))
             lines.extend(
                 _format_data_rows(
                     curve_names,

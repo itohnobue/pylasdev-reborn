@@ -54,4 +54,9 @@ def sample_las_data() -> dict[str, Any]:
             "RHOB": np.array([2550.0, 2551.0, 2552.0]),
         },
         "curves_order": ["DEPT", "DT", "RHOB"],
+        "curves": [
+            {"mnemonic": "DEPT", "unit": "M", "description": "Depth"},
+            {"mnemonic": "DT", "unit": "US/M", "description": "Sonic Transit Time"},
+            {"mnemonic": "RHOB", "unit": "K/M3", "description": "Bulk Density"},
+        ],
     }
