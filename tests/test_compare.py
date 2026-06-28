@@ -600,3 +600,23 @@ class TestTypeErrorHandler:
         d1 = {"section": "ab"}
         d2 = {"section": {0: "a", 1: "c"}}
         assert compare_las_dicts(d1, d2) is False
+
+    # --- F19: List with numpy arrays triggers ValueError/TypeError handler ---
+    def test_numpy_array_in_list_comparison(self) -> None:
+        """Test comparison when non-data_sections list contains numpy arrays.
+
+        Exercises compare.py:129-159 — the except (ValueError, TypeError) block
+        that handles numpy arrays in lists. Direct list equality comparison
+        between lists containing numpy arrays raises ValueError because the
+        element-wise array comparison produces an array of bools with ambiguous
+        truth value. The exception handler falls through to per-element
+        comparison using _compare_arrays for ndarray elements.
+        """
+        d1 = {"other_data": [np.array([1.0, 2.0]), np.array([3.0, 4.0])]}
+        d2 = {"other_data": [np.array([1.0, 5.0]), np.array([3.0, 4.0])]}
+        # Arrays at index 0 differ — should return False without crashing
+        assert compare_las_dicts(d1, d2) is False
+
+        # Matching arrays should return True
+        d3 = {"other_data": [np.array([1.0, 2.0]), np.array([3.0, 4.0])]}
+        assert compare_las_dicts(d1, d3) is True

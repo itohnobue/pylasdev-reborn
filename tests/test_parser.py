@@ -565,6 +565,87 @@ Line two of free text.
         assert las.data_sections[0].data["DEPT"][1] == 101.0
         assert las.data_sections[0].data["DT"][1] == 51.0
 
+    # --- F25a: LAS 3.0 per-section duplicate curve dedup ---
+    def test_las30_duplicate_curves_renamed_in_section(self) -> None:
+        """Test LAS 3.0 per-section dedup renames duplicate curve mnemonics.
+
+        Exercises parser.py:506-527 — when two curves in the same ~C block
+        share the same mnemonic, the second is renamed with a _N suffix.
+        The dedup logic uses a section-local `seen` dict and `output_names`
+        set to ensure mnemonics are unique within each data section.
+        """
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DT.US/M       : SONIC {F}
+ DT.US/M       : SONIC DUPLICATE {F}
+~A
+100.0,50.0
+101.0,51.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+
+        assert len(las.data_sections) == 1
+        section = las.data_sections[0]
+        # First DT keeps its name, second becomes DT_2
+        assert "DT" in section.data
+        assert "DT_2" in section.data
+        # Verify data values
+        assert section.data["DT"][0] == 100.0
+        assert section.data["DT_2"][0] == 50.0
+        assert section.data["DT"][1] == 101.0
+        assert section.data["DT_2"][1] == 51.0
+        # Deduped order reflects the renaming
+        assert section.curves_order == ["DT", "DT_2"]
+        # DT_2 should have original_mnemonic set
+        # (original_mnemonic is tracked on the CurveDefinition object)
+
+    # --- F25b: LAS 3.0 cross-base collision dedup ---
+    def test_las30_cross_base_collision_dedup(self) -> None:
+        """Test LAS 3.0 cross-base collision when original name matches a suffix.
+
+        Exercises parser.py:535-561 — when a curve's original name matches a
+        suffix that was already generated for an earlier duplicate (e.g., the
+        second "DT" becomes "DT_2", which collides with the third curve whose
+        original name IS "DT_2"), the third curve is renamed with a higher
+        suffix to avoid a duplicate key.
+        """
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DT.US/M       : SONIC 1 {F}
+ DT.US/M       : SONIC 2 {F}
+ DT_2.US/M     : CROSS COLLISION {F}
+~A
+100.0,50.0,75.0
+101.0,51.0,76.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+
+        assert len(las.data_sections) == 1
+        section = las.data_sections[0]
+        # Expected: DT stays, second DT → DT_2 (collides with third curve),
+        # third DT_2 → DT_2_2
+        assert "DT" in section.data
+        assert "DT_2" in section.data
+        assert "DT_2_2" in section.data
+        assert len(section.data) == 3
+        # Verify data values are preserved
+        assert section.data["DT"][0] == 100.0
+        assert section.data["DT_2"][0] == 50.0
+        assert section.data["DT_2_2"][0] == 75.0
+        assert section.data["DT"][1] == 101.0
+        assert section.data["DT_2"][1] == 51.0
+        assert section.data["DT_2_2"][1] == 76.0
+        # Deduped order reflects the collision resolution
+        assert section.curves_order == ["DT", "DT_2", "DT_2_2"]
+
 
 class TestUnknownSectionWarning:
     """F-031: Unknown section handler warning test."""

@@ -162,6 +162,21 @@ class TestReadLASFileAsObject:
         with pytest.raises(LASReadError, match="Not a file"):
             read_las_file_as_object(tmp_path)
 
+    # --- F22: LASParseError from parser re-raised with file path ---
+    def test_parse_error_re_raises_with_filename(self, tmp_path: Path) -> None:
+        """Test that LASParseError from parser is re-raised with file path.
+
+        Exercises reader.py:122-123 — when parser.parse() raises LASParseError
+        (e.g., missing required ~V section), the reader catches it and re-raises
+        a new LASParseError that includes the file path in the message.
+        """
+        content = "~W WELL.NAME: Test Well\n~A\n1.0 2.0"
+        test_file = tmp_path / "no_version.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        with pytest.raises(LASParseError, match="Error reading"):
+            read_las_file_as_object(test_file)
+
     def test_las30_object_has_version(self, test_data_dir: Path) -> None:
         """Test LAS 3.0 file parsed as object has correct version."""
         las30 = test_data_dir / "sample_3.0.las"
