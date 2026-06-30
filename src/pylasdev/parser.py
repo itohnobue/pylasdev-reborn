@@ -38,8 +38,12 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-# Section header: line starting with ~, followed by section letter or name
-SECTION_PATTERN = re.compile(r"^~([A-Za-z])(.*)")
+# Section header: line starting with ~, followed by section keyword and trailing content.
+# Captures the full section word (e.g., "VERSION", "Core_Definition", "Core[1]")
+# and any trailing content (e.g., "| Core_Definition", "INFORMATION").
+# F-01/F-08: Previous pattern ^~([A-Za-z])(.*) captured only the first letter,
+# causing ~Core_Data and ~Core_Definition to both route to the curve handler (letter C).
+SECTION_PATTERN = re.compile(r"^~(\S+)(.*)")
 
 # Data line pattern: MNEMONIC.UNIT  VALUE : DESCRIPTION
 # Uses \w which matches Unicode (including Cyrillic) in Python 3
@@ -88,6 +92,46 @@ ZONE_ASSOC_PATTERN = re.compile(r"\|\s*(?P<zone>[\w\-]+)(?:\[(?P<index>\d+)\])?$
 COMMENT_PATTERN = re.compile(r"^\s*#")
 EMPTY_PATTERN = re.compile(r"^\s*$")
 
+# LAS 3.0 section type keywords for structured data-type sections.
+# These are data sections (contain rows of values) — NOT definition sections.
+# Definition sections (Core_Definition, Drilling_Definition, etc.) are
+# routed to _parse_curve since they define curves for their data type.
+_DATA_SECTION_WORDS = {
+    "A", "ASCII",            # Standard log data
+    "CORE",                   # Core data section
+    "CORE_DATA",              # Core data section (written form)
+    "DRILLING",               # Drilling data section
+    "DRILLING_DATA",          # Drilling data section (written form)
+    "INCLINOMETRY",           # Inclinometry data section
+    "INCLINOMETRY_DATA",      # Inclinometry data section (written form)
+    "TOPS",                   # Tops data section
+    "TOPS_DATA",              # Tops data section (written form)
+    "TEST",                   # Test data section
+    "TEST_DATA",              # Test data section (written form)
+    "PERFORATIONS",           # Perforations data section
+    "PERFORATIONS_DATA",      # Perforations data section (written form)
+    "LOG_DATA",               # Explicit log data section
+}
+
+# LAS 3.0 section type to canonical DataSection.section_type mapping.
+_SECTION_TYPE_MAP: dict[str, str] = {
+    "A": "LOG_DATA",
+    "ASCII": "LOG_DATA",
+    "CORE": "CORE_DATA",
+    "CORE_DATA": "CORE_DATA",
+    "DRILLING": "DRILLING_DATA",
+    "DRILLING_DATA": "DRILLING_DATA",
+    "INCLINOMETRY": "INCLINOMETRY_DATA",
+    "INCLINOMETRY_DATA": "INCLINOMETRY_DATA",
+    "TOPS": "TOPS_DATA",
+    "TOPS_DATA": "TOPS_DATA",
+    "TEST": "TEST_DATA",
+    "TEST_DATA": "TEST_DATA",
+    "PERFORATIONS": "PERFORATIONS_DATA",
+    "PERFORATIONS_DATA": "PERFORATIONS_DATA",
+    "LOG_DATA": "LOG_DATA",
+}
+
 
 class LASParser:
     """Regex-based LAS file parser.
@@ -124,6 +168,7 @@ class LASParser:
         self.las_file = LASFile()
         self._current_section: str | None = None
         self._current_section_name: str = ""
+        self._current_data_section_type: str = "LOG_DATA"
         self._data_line_count = 0
         self._ascii_data_lines: list[str] = []
         self._current_data_section_idx: int = 0
@@ -135,6 +180,10 @@ class LASParser:
         # F1: Track per-section curve boundaries for LAS 3.0 files where
         # different ~C blocks define different curve sets before each ~A section.
         self._section_curve_start_idx: int = 0
+        # F-01/F-08: Track the end of the main (non-_Definition) curve block.
+        # When a data section has a pipe "| CURVE" association, the per-section
+        # curves revert to using the main block (curves[0:_main_curve_end]).
+        self._main_curve_end: int = 0
 
     @property
     def data_line_count(self) -> int:
@@ -206,7 +255,8 @@ class LASParser:
             stripped = line.strip()
             match = SECTION_PATTERN.match(stripped)
             if match:
-                in_ascii = match.group(1).upper() == "A"
+                section_word = match.group(1).upper()
+                in_ascii = section_word in _DATA_SECTION_WORDS
                 continue
             if (
                 in_ascii
@@ -221,29 +271,141 @@ class LASParser:
         """Route a single line to the appropriate section handler."""
         section_match = SECTION_PATTERN.match(line)
         if section_match:
-            new_section = section_match.group(1).upper()
-            # F1: When leaving ~A for a non-A section (~C, ~O, etc.),
-            # process any pending data from the previous ~A section.
-            # This prevents data from different sections from being
-            # merged into a single _ascii_data_lines batch.
-            if self._current_section == "A" and new_section != "A":
-                self._process_ascii_data()
-                self._ascii_data_lines = []
-                self._current_data_section_idx += 1
-            # If we're switching to a new ~A section, process previous data first
-            elif new_section == "A" and self._current_section == "A":
-                self._process_ascii_data()
-                self._ascii_data_lines = []
-                self._current_data_section_idx += 1
-            # F1: Track per-section curve boundaries for LAS 3.0.
-            # When entering ~C, mark the current curve list position so
-            # _process_ascii_data can isolate curves defined since the
-            # most recent ~C block.
-            if new_section == "C":
-                self._section_curve_start_idx = len(self.las_file.curves)
-            self._current_section = new_section
-            self._current_section_name = section_match.group(2).strip()
-            return
+            section_word = section_match.group(1).upper()
+            section_rest = section_match.group(2).strip()
+
+            # Parse pipe-delimited definition association (LAS 3.0).
+            # e.g., "~Core[1] | Core_Definition" or "~ASCII | CURVE".
+            pipe_target: str | None = None
+            pipe_idx = section_rest.find("|")
+            if pipe_idx >= 0:
+                # Split section name at pipe; pipe target follows.
+                pipe_target = section_rest[pipe_idx + 1:].strip()
+                section_rest = section_rest[:pipe_idx].strip()
+            elif "|" in section_word:
+                # Edge case: no space before pipe (e.g., "~Core|Definition")
+                pipe_idx_w = section_word.find("|")
+                pipe_target = (section_word[pipe_idx_w + 1:] + " " + section_rest).strip()
+                section_word = section_word[:pipe_idx_w].strip()
+                section_rest = ""
+
+            # M-03: Save the previous data section type before the new-section
+            # detection block overwrites it.  When two consecutive data sections
+            # appear (e.g., ~A then ~Core[1]), this saved value is used to give
+            # the PREVIOUS section's DataSection its correct section_type.
+            _prev_data_section_type: str | None = None
+
+            # Classify section_word for dispatch.
+            # Standard sections (V, W, C, P, O, A) — also accept full
+            # section-word names (VERSION, WELL, CURVE, PARAMETER, OTHER, ASCII).
+            # LAS 3.0 structured definition sections → route to curve handler.
+            # LAS 3.0 data-type sections → route to data handler.
+            if section_word in {"V", "VERSION"}:
+                new_section = "V"
+                section_name = section_rest or ""
+            elif section_word in {"W", "WELL"}:
+                new_section = "W"
+                section_name = section_rest or ""
+            elif section_word in {"C", "CURVE"} or section_word.endswith("_DEFINITION"):
+                new_section = "C"
+                if section_word.endswith("_DEFINITION"):
+                    section_name = f"{section_word} {section_rest}".strip()
+                    # F-01: When the first _Definition section is encountered,
+                    # freeze the main curve block endpoint so pipe "| CURVE"
+                    # associations can reference it later.
+                    if self._main_curve_end == 0:
+                        self._main_curve_end = len(self.las_file.curves)
+                else:
+                    section_name = section_rest or ""
+            elif section_word in {"P", "PARAMETER", "PARAMETERS"}:
+                new_section = "P"
+                section_name = section_rest or ""
+            elif section_word in {"O", "OTHER"}:
+                new_section = "O"
+                section_name = section_rest or ""
+            elif section_word in _DATA_SECTION_WORDS or section_word.startswith("CORE["):
+                # LAS 3.0 structured data sections and standard ~A/ASCII.
+                new_section = "A"
+                # For standard 'A' or 'ASCII' sections and written-form *_DATA
+                # sections (e.g., ~DRILLING_DATA DRILLING), use only the rest
+                # as the section name (backward-compatible).
+                if section_word in {"A", "ASCII"} or section_word.endswith("_DATA"):
+                    section_name = section_rest
+                else:
+                    section_name = f"{section_word} {section_rest}".strip() if section_rest else section_word
+                # M-03: Save the previous data section type BEFORE overwriting.
+                # When two consecutive data sections appear (e.g., ~A then
+                # ~Core[1]),_process_ascii_data() for the PREVIOUS section
+                # must use ITS type, not the newly-set one.
+                _prev_data_section_type = self._current_data_section_type
+                # Derive section_type from keyword, falling back to LOG_DATA.
+                if section_word.startswith("CORE["):
+                    self._current_data_section_type = "CORE_DATA"
+                else:
+                    self._current_data_section_type = _SECTION_TYPE_MAP.get(
+                        section_word, "LOG_DATA"
+                    )
+                # F-08: Handle pipe-delimited definition association.
+                # "| CURVE" means use the main curve block (before
+                # _Definition sections). "| X_Definition" means use
+                # the per-section curves from that definition block.
+                if pipe_target:
+                    pipe_target_upper = pipe_target.upper()
+                    if pipe_target_upper in {"CURVE", "C"}:
+                        # Pipe "| CURVE" → use main curve block.
+                        self._section_curve_start_idx = 0
+                    # For specific definition targets (e.g., "| Core_Definition"),
+                    # the per-section curve tracking already positions correctly.
+                    # _section_curve_start_idx was set when entering that
+                    # _Definition's ~C block.
+            else:
+                # Unknown section type — accumulate lines as free-form text (like ~O).
+                # F-01 fix: Actually accumulate lines instead of just warning.
+                new_section = None
+                section_name = f"{section_word} {section_rest}".strip()
+                self._other_lines.append(line)
+                source_info = f" in {self.source_file}" if self.source_file else ""
+                logger.warning(
+                    "Unknown section type '~%s' at line%s — lines accumulated as other section: %s",
+                    section_word,
+                    source_info,
+                    line[:80],
+                )
+                return
+
+            # F1: When leaving a data section for a non-data section,
+            # process pending data from the previous section.
+            if new_section is not None:
+                if self._current_section == "A" and new_section != "A":
+                    self._process_ascii_data()
+                    self._ascii_data_lines = []
+                    self._current_data_section_idx += 1
+                elif new_section == "A" and self._current_section == "A":
+                    # Consecutive data sections — process previous first.
+                    # M-03: _current_data_section_type was already overwritten
+                    # for the newly-detected section (lines 337-345).  Swap
+                    # back to the saved previous-section type while processing
+                    # the previous section's accumulated data lines, then
+                    # restore the new-section type for the rest of parsing.
+                    if _prev_data_section_type is not None:
+                        _new_type = self._current_data_section_type
+                        self._current_data_section_type = _prev_data_section_type
+                        self._process_ascii_data()
+                        self._current_data_section_type = _new_type
+                    else:
+                        self._process_ascii_data()
+                    self._ascii_data_lines = []
+                    self._current_data_section_idx += 1
+
+                # F1: Track per-section curve boundaries for LAS 3.0.
+                # When entering ~C (including _Definition sections), mark the
+                # current curve list position for per-section curve scoping.
+                if new_section == "C":
+                    self._section_curve_start_idx = len(self.las_file.curves)
+
+                self._current_section = new_section
+                self._current_section_name = section_name.strip() if section_name else section_word
+                return
 
         if COMMENT_PATTERN.match(line) or EMPTY_PATTERN.match(line):
             return
@@ -253,15 +415,8 @@ class LASParser:
             if handler_name:
                 getattr(self, handler_name)(line)
             else:
-                # F-2: Unknown section type (e.g., custom-named LAS 3.0 sections).
-                # Log a warning and accumulate as free-form text (like ~O).
-                source_info = f" in {self.source_file}" if self.source_file else ""
-                logger.warning(
-                    "Unknown section type '~%s' at line%s: %s",
-                    self._current_section,
-                    source_info,
-                    line[:80],
-                )
+                # Fallback for unknown section types — accumulate in _other_lines.
+                self._other_lines.append(line)
 
     def _match_data_line(self, line: str) -> re.Match[str] | None:
         """Try to match a header data line with colon, then without."""
@@ -290,20 +445,40 @@ class LASParser:
     def _parse_well(self, line: str) -> None:
         """Parse ~W (well information) section line.
 
-        Note: Only the value portion of each well entry is preserved.
-        The unit field (e.g. 'M' in 'STRT.M') is discarded because
-        WellSection stores values as plain strings. This matches the
-        original pylasdev behavior where well values are simple strings
-        without unit metadata.
+        LAS 1.2 uses format ``MNEM.UNIT DESCRIPTION :VALUE``.
+        LAS 2.0+ uses ``MNEM.UNIT VALUE :DESCRIPTION``.
+        This method applies version-based dispatch to swap the
+        value/description fields for LAS 1.2.
+
+        The unit field (e.g. ``'.M'`` from ``'STRT.M'``) is preserved
+        in ``self.las_file.well.units`` for roundtrip fidelity.
         """
         match = self._match_data_line(line)
         if not match:
             return
 
         mnemonic = match.group("mnemonic").upper().strip()
+        unit = match.group("unit") or ""
         value = match.group("value").strip()
+        description = (
+            match.group("description").strip()
+            if "description" in match.groupdict() and match.group("description")
+            else ""
+        )
 
-        self.las_file.well[mnemonic] = value
+        # LAS 1.2: the actual well data is AFTER the colon (in the description
+        # group), not before it.  Swap value and description accordingly.
+        is_las12 = self.las_file.version.vers.startswith("1.")
+        if is_las12 and description:
+            # LAS 1.2: MNEM.UNIT DESCRIPTION :VALUE
+            actual_value = description
+        else:
+            # LAS 2.0+: MNEM.UNIT VALUE :DESCRIPTION
+            actual_value = value
+
+        self.las_file.well[mnemonic] = actual_value
+        if unit:
+            self.las_file.well.units[mnemonic] = unit
 
     def _parse_curve(self, line: str) -> None:
         """Parse ~C (curve information) section line.
@@ -573,6 +748,7 @@ class LASParser:
         # Create data section with per-section curves.
         data_section = DataSection(
             name=self._current_section_name or f"Section_{self._current_data_section_idx}",
+            section_type=self._current_data_section_type,
             curves_order=deduped_order,
         )
 
@@ -619,6 +795,7 @@ class LASParser:
         ]
         idx = 0
         warned_extra = False  # Track extra-column warning per section
+        warned_short = False  # F-11: Track short-row warning per section
         for line in self._ascii_data_lines:
             # Skip comment lines
             if COMMENT_PATTERN.match(line):
@@ -640,6 +817,24 @@ class LASParser:
                     len(values),
                     num_curves,
                 )
+
+            # F-11: Warn when non-wrapped data lines have fewer values than
+            # declared curves.  Short rows in wrapped mode are expected
+            # (values span multiple lines), so this warning only fires in
+            # non-wrapped (WRAP=NO) mode.
+            if len(values) < num_curves and not warned_short:
+                is_not_wrapped = self.las_file.version.wrap.upper() != "YES"
+                if is_not_wrapped:
+                    warned_short = True
+                    logger.warning(
+                        "Data line in section '%s' has %d values but %d "
+                        "curves declared. Missing values are filled with "
+                        "the null value (%s).",
+                        self._current_section_name or "ASCII",
+                        len(values),
+                        num_curves,
+                        null_value,
+                    )
 
             # Pad with null values if needed
             while len(values) < num_curves:

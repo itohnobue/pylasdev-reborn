@@ -308,6 +308,7 @@ def _read_normal(
     in_ascii = False
     current_line = 0
     warned_extra = False  # Track extra-column warning per file
+    warned_short = False  # F-11: Track short-row warning per file
 
     for line in lines:
         stripped = line.strip()
@@ -336,6 +337,20 @@ def _read_normal(
                 "in ~C section. Extra columns are discarded.",
                 len(values),
                 curve_count,
+            )
+
+        # F-11: Warn when non-wrapped data lines have fewer values than
+        # declared curves. Short rows in WRAP=YES mode are expected;
+        # this warning only fires in non-wrapped (WRAP=NO) mode,
+        # which we know because _read_normal is only called for non-wrapped.
+        if len(values) < curve_count and not warned_short:
+            warned_short = True
+            logger.warning(
+                "Data line has %d values but %d curves declared in ~C section. "
+                "Missing values are filled with the null value (%.2f).",
+                len(values),
+                curve_count,
+                null_value,
             )
 
         for i in range(min(len(values), curve_count)):
@@ -419,6 +434,7 @@ def _read_wrapped(
     in_ascii = False
     depth_line = True  # First data line is always a depth line
     counter = 0  # Tracks position within non-depth curves
+    depth_had_extra = False  # F-06: track pathologically-malformed depth lines
 
     for line in lines:
         stripped = line.strip()
@@ -447,6 +463,10 @@ def _read_wrapped(
                     f"Extra values discarded. Line content: '{stripped[:80]}'",
                     stacklevel=2,
                 )
+                # F-06: Mark this depth line as malformed.  If the subsequent
+                # data line cannot fill all non-depth curves, the file is
+                # pathologically misaligned and will be rejected.
+                depth_had_extra = True
             try:
                 data_lists[0].append(_to_finite_float(values[0], null_value))
             except IndexError:
@@ -455,6 +475,39 @@ def _read_wrapped(
             counter = 0
         else:
             # Data lines: values for remaining curves
+            # F-06: Pathological misalignment detection.  If the previous
+            # depth line had extra values AND this data line has fewer
+            # values than the number of unfilled non-depth curves
+            # (curve_count - 1 - counter), the file is likely misaligned.
+            # A truly pathological case (depth line has extra data, next
+            # line has very few values, and the gap exceeds 2 curves)
+            # raises an error because data corruption is certain.
+            if depth_had_extra and curve_count >= 3:
+                remaining_curves = curve_count - 1 - counter
+                if len(values) < remaining_curves:
+                    if len(values) <= 2 and remaining_curves - len(values) >= 2:
+                        # Truly pathological: data line provides ≤2 values
+                        # but ≥2 more curves need filling — data WILL be
+                        # irrecoverably misaligned across all curves.
+                        raise LASParseError(
+                            f"Wrapped mode: pathologically malformed data — the "
+                            f"previous depth line had extra values, and this data "
+                            f"line has only {len(values)} values but "
+                            f"{remaining_curves} non-depth curves still need "
+                            f"values (total curves={curve_count}). File is "
+                            f"irrecoverably misaligned."
+                        )
+                    # Warn but continue: the padding logic at the end of
+                    # _read_wrapped will fill gaps with null_value.
+                    warnings.warn(
+                        f"Wrapped mode: previous depth line had extra values, "
+                        f"and this data line has only {len(values)} values but "
+                        f"{remaining_curves} non-depth curves still need values "
+                        f"(total curves={curve_count}). Data may be misaligned.",
+                        stacklevel=2,
+                    )
+                depth_had_extra = False  # This line handled the extra-values case
+
             for val_str in values:
                 counter += 1
 

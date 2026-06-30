@@ -93,6 +93,7 @@ class WellSection:
     """
 
     entries: dict[str, str] = field(default_factory=dict)
+    units: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, str]:
         """Convert to legacy dict format."""
@@ -232,6 +233,7 @@ class DataSection:
     """
 
     name: str = ""  # Section name from ~A line (e.g., "ASCII" or custom name)
+    section_type: str = "LOG_DATA"  # Section type: LOG_DATA, CORE_DATA, DRILLING_DATA, etc.
     curves_order: list[str] = field(default_factory=list)
     data: dict[str, NDArray[np.float64]] = field(default_factory=dict)
     string_data: dict[str, NDArray[np.str_]] = field(default_factory=dict)  # For {S} format curves
@@ -240,6 +242,7 @@ class DataSection:
         """Convert DataSection to dict for serialization."""
         return {
             "name": self.name,
+            "section_type": self.section_type,
             "curves_order": list(self.curves_order),
             "data": {k: v.copy() for k, v in self.data.items()},
             "string_data": {k: v.copy() for k, v in self.string_data.items()},
@@ -282,6 +285,7 @@ class LASFile:
         return {
             "version": self.version.to_dict(),
             "well": self.well.to_dict(),
+            "well_units": dict(self.well.units) if self.well.units else {},
             "parameters": params_dict,
             "parameter_details": [p.to_dict() for p in self.parameters],
             "curves": [c.to_dict() for c in self.curves],
@@ -322,6 +326,10 @@ class LASFile:
         well = data.get("well") or {}
         for key, value in well.items():
             las_file.well[key] = _safe_str(value)
+        # Restore well units if present (from v1.7+ roundtrip data)
+        well_units = data.get("well_units") or {}
+        for key, unit in well_units.items():
+            las_file.well.units[key] = _safe_str(unit)
 
         curves_order = data.get("curves_order", [])
         las_file.curves_order = list(curves_order)
@@ -386,6 +394,7 @@ class LASFile:
                 ds_string_data[name] = np.array(arr, dtype=np.str_)
             ds = DataSection(
                 name=ds_dict.get("name", ""),
+                section_type=ds_dict.get("section_type", "LOG_DATA"),
                 curves_order=list(ds_dict.get("curves_order", [])),
                 data={k: np.array(v, dtype=np.float64) for k, v in ds_dict.get("data", {}).items()},
                 string_data=ds_string_data,

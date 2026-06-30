@@ -135,8 +135,21 @@ def _write_version_section(las_file: LASFile) -> list[str]:
     lines.append("~VERSION INFORMATION")
     vers_desc = "CWLS LOG ASCII STANDARD -VERSION 3.0" if is_las30 else "CWLS LOG ASCII STANDARD"
     lines.append(f" VERS.   {_sanitize_las_value(las_file.version.vers)}  : {vers_desc}")
-    # Always write WRAP=NO since we write one line per depth step (non-wrapped)
-    lines.append(" WRAP.   NO  : ONE LINE PER DEPTH STEP")
+    # F-05: Write the actual WRAP value from the model instead of hardcoding "NO".
+    # If the writer cannot produce wrapped output (we always write one line per
+    # depth step), emit a warning when WRAP=YES is preserved verbatim.
+    actual_wrap = las_file.version.wrap.upper() if las_file.version.wrap else "NO"
+    wrap_desc = "ONE LINE PER DEPTH STEP" if actual_wrap == "NO" else "MULTIPLE LINES PER DEPTH STEP"
+    lines.append(f" WRAP.   {actual_wrap}  : {wrap_desc}")
+    if actual_wrap == "YES":
+        import warnings
+
+        warnings.warn(
+            "WRAP=YES preserved in output VERS section, but the writer "
+            "always produces ONE LINE PER DEPTH STEP (non-wrapped) output. "
+            "The data WILL be non-wrapped regardless of the header declaration.",
+            stacklevel=3,
+        )
     if is_las30:
         dlm_desc = "DELIMITING CHARACTER BETWEEN DATA COLUMNS"
         lines.append(
@@ -147,11 +160,25 @@ def _write_version_section(las_file: LASFile) -> list[str]:
 
 
 def _write_well_section(las_file: LASFile) -> list[str]:
-    """Write ~W Well section."""
+    """Write ~W Well section.
+
+    LAS 1.2 uses format ``MNEM.UNIT    :VALUE`` (value after colon,
+    no description before colon).  LAS 2.0+ uses ``MNEM.UNIT VALUE  :``
+    (value before colon, description after).
+    """
     lines: list[str] = []
+    is_las12 = las_file.version.vers.startswith("1.")
     lines.append("~WELL INFORMATION")
     for key, value in las_file.well.entries.items():
-        lines.append(f" {_sanitize_las_value(key)}.   {_sanitize_las_value(value)}  :")
+        unit = _sanitize_las_value(las_file.well.units.get(key, ""))
+        unit_dot = f".{unit}" if unit else "."
+        val = _sanitize_las_value(value)
+        if is_las12:
+            # LAS 1.2: MNEM.UNIT    :VALUE  (description is the label, not stored)
+            lines.append(f" {_sanitize_las_value(key)}{unit_dot}    : {val}")
+        else:
+            # LAS 2.0+: MNEM.UNIT VALUE  :
+            lines.append(f" {_sanitize_las_value(key)}{unit_dot}   {val}  :")
     lines.append("")
     return lines
 
@@ -223,17 +250,36 @@ def _write_other_section(las_file: LASFile) -> list[str]:
     return lines
 
 
+# Map DataSection.section_type values to the LAS 3.0 section header prefix.
+# The default "LOG_DATA" maps to "A" for backward compatibility.
+_SECTION_TYPE_TO_PREFIX: dict[str, str] = {
+    "LOG_DATA": "A",
+    "CORE_DATA": "CORE_DATA",
+    "DRILLING_DATA": "DRILLING_DATA",
+    "INCLINOMETRY_DATA": "INCLINOMETRY_DATA",
+    "TOPS_DATA": "TOPS_DATA",
+    "TEST_DATA": "TEST_DATA",
+    "PERFORATIONS_DATA": "PERFORATIONS_DATA",
+}
+
+
+def _section_type_to_prefix(section_type: str) -> str:
+    """Convert a DataSection.section_type to the LAS header prefix."""
+    return _SECTION_TYPE_TO_PREFIX.get(section_type, "A")
+
+
 def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str]:
-    """Write ~A ASCII data section(s)."""
+    """Write data sections — ~A for LAS 1.2/2.0, typed sections for LAS 3.0."""
     lines: list[str] = []
     null_value = _get_null_value(las_file.well)
     delimiter = las_file.version.delimiter_char
 
     if las_file.data_sections:
-        # LAS 3.0: Multiple data sections
+        # LAS 3.0: Multiple data sections with typed headers.
         for section in las_file.data_sections:
             section_name = f" {_sanitize_las_value(section.name)}" if section.name else ""
-            lines.append(f"~A{section_name}")
+            section_prefix = _section_type_to_prefix(section.section_type)
+            lines.append(f"~{section_prefix}{section_name}")
             lines.extend(
                 _format_data_rows(
                     section.curves_order,
@@ -245,7 +291,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
                 )
             )
     else:
-        # Legacy single data section
+        # Legacy single data section (~A).
         curve_names = las_file.curves_order
         if any(name in las_file.logs for name in curve_names):
             lines.append("~A  " + "  ".join(_sanitize_las_value(name) for name in curve_names))

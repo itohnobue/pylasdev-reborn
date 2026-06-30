@@ -91,9 +91,11 @@ class TestReadLASFile:
         np.testing.assert_array_almost_equal(
             data["logs"]["DEPT"], np.array([1670.0, 1669.875, 1669.75])
         )
-        # Verify well section values
-        assert data["well"]["COMP"] == "COMPANY"
-        assert data["well"]["WELL"] == "WELL"
+        # Verify well section values (LAS 1.2: data is after colon, not before)
+        # COMP.   COMPANY:   # ANY OIL COMPANY LTD. → value is "# ANY OIL COMPANY LTD."
+        assert data["well"]["COMP"] == "# ANY OIL COMPANY LTD."
+        # WELL.   WELL:   ANY ET AL OIL WELL #12 → value is "ANY ET AL OIL WELL #12"
+        assert data["well"]["WELL"] == "ANY ET AL OIL WELL #12"
         assert data["well"]["STRT"] == "1670.000000"
         # Verify parameter values
         assert data["parameters"]["BHT"] == "35.5000"
@@ -745,7 +747,7 @@ class TestDataReaderEdgeCases:
         assert data["logs"]["DEPT"][1] == 101.0
         assert data["logs"]["DT"][0] == 50.0
         assert data["logs"]["DT"][1] == 51.0
-        assert data["well"]["NULL"] == "BADNULL"
+        assert data["well"]["NULL"] == "NON-NUMERIC NULL VALUE"
 
     # --- TEST-04: IndexError branch in normal mode (line 151->143) ---
     def test_index_error_branch_normal(self, tmp_path: Path) -> None:
