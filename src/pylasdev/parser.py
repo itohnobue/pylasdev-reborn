@@ -21,6 +21,7 @@ import numpy as np
 from .data_reader import (
     MAX_CURVES,
     MAX_DATA_LINES,
+    MAX_TOKENS_PER_LINE,
     MAX_TOTAL_ELEMENTS,
     _get_null_value,
     _to_finite_float,
@@ -38,12 +39,33 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
+# F-26: Global aggregate limit on data sections to prevent multi-section DoS.
+# Each section passes per-section bounds (MAX_DATA_LINES, MAX_CURVES,
+# MAX_TOTAL_ELEMENTS) but no global cap existed — an attacker could craft N
+# data sections cumulatively exhausting memory.  Overridable at module level.
+MAX_DATA_SECTIONS = 1_000
+
+# F-29: Maximum parameter entries per file.  Curves have MAX_CURVES (100K)
+# checked in 3 locations; parameters had zero protection anywhere.
+MAX_PARAMETERS = 100_000
+
+# F-32 + G-17: Characters that Python's splitlines() treats as line breaks
+# beyond \\n and \\r.  When present in file content, they cause splitlines()
+# to produce fake section headers and corrupt parsed data.  The writer's
+# _CONTROL_CHARS_RE already strips these; this makes the read path symmetric.
+# Characters: \\x0b (VT), \\x0c (FF), \\x1c (FS), \\x1d (GS), \\x1e (RS),
+# \\x85 (NEL), \\u2028 (LINE SEPARATOR), \\u2029 (PARAGRAPH SEPARATOR).
+_SPLITLINES_CHARS_RE = re.compile(r"[\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+
 # Section header: line starting with ~, followed by section keyword and trailing content.
 # Captures the full section word (e.g., "VERSION", "Core_Definition", "Core[1]")
 # and any trailing content (e.g., "| Core_Definition", "INFORMATION").
 # F-01/F-08: Previous pattern ^~([A-Za-z])(.*) captured only the first letter,
 # causing ~Core_Data and ~Core_Definition to both route to the curve handler (letter C).
-SECTION_PATTERN = re.compile(r"^~(\S+)(.*)")
+# G-05: Narrowed to require a letter after ~, matching data_reader._is_section_header.
+# Prevents divergence where _pre_scan treated non-alphabetic headers like ~3D_DATA
+# as section boundaries but _read_normal did not (causing array overrun, G-04).
+SECTION_PATTERN = re.compile(r"^~([A-Za-z]\S*)(.*)")
 
 # Data line pattern: MNEMONIC.UNIT  VALUE : DESCRIPTION
 # Uses \w which matches Unicode (including Cyrillic) in Python 3
@@ -84,7 +106,7 @@ VALUE_ONLY_PATTERN = re.compile(
 ARRAY_MNEMONIC_PATTERN = re.compile(r"^(?P<base>[\w\-]+)\[(?P<index>\d+)\]$")
 
 # LAS 3.0: Format specifier in braces (e.g., {F}, {E}, {S}, {A:0})
-FORMAT_SPEC_PATTERN = re.compile(r"\{(?P<format>[FESA]):?(?P<offset>[\d.]*)\s*\}")
+FORMAT_SPEC_PATTERN = re.compile(r"\{(?P<format>[FESAI]):?(?P<offset>[\d.]*)\s*\}")
 
 # LAS 3.0: Zone association via pipe (e.g., | Run[1], | Zone[2])
 ZONE_ASSOC_PATTERN = re.compile(r"\|\s*(?P<zone>[\w\-]+)(?:\[(?P<index>\d+)\])?$")
@@ -211,6 +233,12 @@ class LASParser:
         # When a data section has a pipe "| CURVE" association, the per-section
         # curves revert to using the main block (curves[0:_main_curve_end]).
         self._main_curve_end: int = 0
+        # G-02: Per-_Definition curve range storage.  Consecutive _Definition
+        # sections overwrote _section_curve_start_idx, making later data
+        # sections without pipe associations use the wrong curve range.
+        # Maps definition name (e.g. "CORE_DEFINITION") → (start_idx, end_idx).
+        self._definition_curve_ranges: dict[str, tuple[int, int]] = {}
+        self._current_definition_name: str | None = None
 
     @property
     def data_line_count(self) -> int:
@@ -240,7 +268,7 @@ class LASParser:
         # Three separate passes are necessary because Pass 2 performs array
         # pre-allocation (using the count from Pass 1) BEFORE Pass 3 fills them.
         if lines is None:
-            lines = content.splitlines()
+            lines = _SPLITLINES_CHARS_RE.sub(" ", content).splitlines()
         self._pre_scan(lines)
 
         for line in lines:
@@ -356,8 +384,14 @@ class LASParser:
                     # associations can reference it later.
                     if self._main_curve_end == 0:
                         self._main_curve_end = len(self.las_file.curves)
+                    # G-02: Track which _Definition is active so curve ranges
+                    # can be saved per-definition type (prevents overwrite
+                    # by consecutive _Definition sections).
+                    self._current_definition_name = section_word.upper()
                 else:
                     section_name = section_rest or ""
+                    # G-02: Regular ~C or ~CURVE section — no definition name.
+                    self._current_definition_name = None
             elif section_word in {"P", "PARAMETER", "PARAMETERS"}:
                 new_section = "P"
                 section_name = section_rest or ""
@@ -418,10 +452,23 @@ class LASParser:
                         self._section_curve_end_idx = (
                             self._main_curve_end if self._main_curve_end > 0 else None
                         )
-                    # For specific definition targets (e.g., "| Core_Definition"),
-                    # the per-section curve tracking already positions correctly.
-                    # _section_curve_start_idx was set when entering that
-                    # _Definition's ~C block.
+                    elif pipe_target_upper in self._definition_curve_ranges:
+                        # G-02: Explicit pipe to a known _Definition —
+                        # look up the saved (start, end) range.
+                        start, end = self._definition_curve_ranges[pipe_target_upper]
+                        self._section_curve_start_idx = start
+                        self._section_curve_end_idx = end
+                elif self._current_data_section_type != "LOG_DATA":
+                    # G-02: No pipe — try to match data section type
+                    # to a _Definition (e.g., CORE_DATA → CORE_DEFINITION).
+                    def_prefix = (
+                        self._current_data_section_type.replace("_DATA", "")
+                        + "_DEFINITION"
+                    )
+                    if def_prefix in self._definition_curve_ranges:
+                        start, end = self._definition_curve_ranges[def_prefix]
+                        self._section_curve_start_idx = start
+                        self._section_curve_end_idx = end
             else:
                 # Unknown section type — accumulate lines as free-form text (like ~O).
                 new_section = None
@@ -484,6 +531,19 @@ class LASParser:
                 # F1: Track per-section curve boundaries for LAS 3.0.
                 # When entering ~C (including _Definition sections), mark the
                 # current curve list position for per-section curve scoping.
+
+                # G-02: Before overwriting _section_curve_start_idx for the new
+                # ~C section, save the previous _Definition's curve range so
+                # later data sections can look up the correct range even when
+                # consecutive _Definitions overwrite the active tracking.
+                if self._current_section == "C" and self._current_definition_name is not None:
+                    self._definition_curve_ranges[self._current_definition_name] = (
+                        self._section_curve_start_idx,
+                        self._section_curve_end_idx
+                        if self._section_curve_end_idx is not None
+                        else len(self.las_file.curves),
+                    )
+
                 if new_section == "C":
                     self._section_curve_start_idx = len(self.las_file.curves)
                     self._section_curve_end_idx = None
@@ -599,7 +659,12 @@ class LASParser:
         if not match:
             return
 
-        raw_mnemonic = match.group("mnemonic").upper().strip()
+        # F-01: Preserve original casing before uppercasing.
+        # raw_mnemonic is used for mnem_base lookup (case-insensitive);
+        # _original_cased stores the pre-uppercased value so
+        # CurveDefinition.original_mnemonic reflects the file's casing.
+        _original_cased = match.group("mnemonic").strip()
+        raw_mnemonic = _original_cased.upper()
         unit = match.group("unit") or ""
         api_code = match.group("value").strip() if match.group("value") else ""
         description = (
@@ -658,10 +723,20 @@ class LASParser:
             unit=unit,
             api_code=api_code,
             description=description,
-            original_mnemonic=raw_mnemonic if raw_mnemonic != normalized else "",
+            original_mnemonic=_original_cased if _original_cased.upper() != normalized else "",
             data_format=data_format,
             array_info=array_info,
         )
+        # F-28: Guard against unbounded curve accumulation during ~C parsing.
+        # Without this check, a metadata-only LAS 3.0 file can accumulate
+        # unlimited CurveDefinition objects without triggering any bounds
+        # check (MAX_CURVES was only checked later in _process_ascii_data,
+        # which early-returns when no data section exists).
+        if len(self.las_file.curves) >= MAX_CURVES:
+            raise LASParseError(
+                f"Curve count ({len(self.las_file.curves) + 1}) exceeds maximum "
+                f"allowed ({MAX_CURVES}). The file may be malformed or corrupt."
+            )
         self.las_file.curves.append(curve)
         self.las_file.curves_order.append(normalized)
 
@@ -676,7 +751,9 @@ class LASParser:
         if not match:
             return
 
-        raw_mnemonic = match.group("mnemonic").upper().strip()
+        # F-01: Preserve original casing (same pattern as _parse_curve).
+        _original_cased = match.group("mnemonic").strip()
+        raw_mnemonic = _original_cased.upper()
         unit = match.group("unit") or ""
         value = match.group("value").strip()
         description = (
@@ -698,8 +775,10 @@ class LASParser:
                         f"Invalid zone index '{zone_match.group('index')}' in "
                         f"parameter '{raw_mnemonic}'"
                     ) from exc
+            # F-01: Preserve original zone name casing
+            _orig_zone = zone_match.group("zone")
             zone = ParameterZone(
-                zone_name=zone_match.group("zone").upper(),
+                zone_name=_orig_zone.upper(),
                 zone_index=zone_index,
             )
             # Remove zone association from description
@@ -728,6 +807,15 @@ class LASParser:
             array_index=array_index,
             zone=zone,
         )
+        # F-29: Guard against unbounded parameter accumulation.
+        # Curves have MAX_CURVES checked in 3 locations; parameters had zero
+        # protection anywhere despite following the same append pattern.
+        if len(self.las_file.parameters) >= MAX_PARAMETERS:
+            raise LASParseError(
+                f"Parameter count ({len(self.las_file.parameters) + 1}) exceeds "
+                f"maximum allowed ({MAX_PARAMETERS}). "
+                f"The file may be malformed or corrupt."
+            )
         self.las_file.parameters.append(param)
 
     def _parse_other(self, line: str) -> None:
@@ -745,6 +833,16 @@ class LASParser:
         """
         if not self.las_file.version.is_las30:
             return
+        # F-27: Early bounds check during accumulation — reject before the
+        # list grows unbounded.  The main check in _process_ascii_data runs
+        # AFTER all lines are collected, offering no protection during the
+        # accumulation phase itself.
+        if len(self._ascii_data_lines) >= MAX_DATA_LINES:
+            raise LASParseError(
+                f"ASCII data line count exceeds maximum allowed "
+                f"({MAX_DATA_LINES}) during accumulation. "
+                f"The file may be malformed or corrupt."
+            )
         self._ascii_data_lines.append(line)
 
     def _process_ascii_data(self) -> None:
@@ -876,6 +974,18 @@ class LASParser:
         # Count actual data lines (excluding comments) for array sizing.
         actual_count = sum(1 for line in self._ascii_data_lines if not COMMENT_PATTERN.match(line))
 
+        # F-26: Global aggregate limit across ALL data sections.
+        # Each section passes per-section bounds (MAX_DATA_LINES, MAX_CURVES,
+        # MAX_TOTAL_ELEMENTS) individually, but an attacker can craft N
+        # sections (each just under the limits) to cumulatively exhaust
+        # memory.  This caps the total number of data sections processed.
+        if self._current_data_section_idx >= MAX_DATA_SECTIONS:
+            raise LASParseError(
+                f"Data section count ({self._current_data_section_idx + 1}) exceeds "
+                f"maximum allowed ({MAX_DATA_SECTIONS}). "
+                f"The file may be malformed or corrupt."
+            )
+
         if actual_count > MAX_DATA_LINES:
             raise LASParseError(
                 f"ASCII data line count ({actual_count}) exceeds maximum allowed "
@@ -922,9 +1032,9 @@ class LASParser:
 
             # Split by delimiter
             if delimiter == " ":
-                values = line.split()
+                values = line.split(maxsplit=MAX_TOKENS_PER_LINE)
             else:
-                values = line.split(delimiter)
+                values = line.split(delimiter, maxsplit=MAX_TOKENS_PER_LINE)
 
             # Warn about extra columns being silently discarded
             if len(values) > num_curves and not warned_extra:

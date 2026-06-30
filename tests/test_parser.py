@@ -700,6 +700,125 @@ Line two of free text.
         assert section.curves_order == ["DT", "DT_2", "DT_2_2"]
 
 
+class TestLAS12WellSectionSwap:
+    """T1/F-10: LAS 1.2 value/description swap across versions."""
+
+    def test_las12_vs_las20_well_equivalent_extraction(self) -> None:
+        """Test that LAS 1.2 and 2.0 ~W sections with identical semantic content
+        produce equivalent well values.
+
+        LAS 1.2 uses two conventions in the wild:
+          (a) CWLS spec: MNEM.UNIT VALUE : DESCRIPTION (numeric fields)
+          (b) lasio conv: MNEM.UNIT DESCRIPTION : VALUE (non-numeric fields)
+        The parser auto-detects numeric fields (STRT, STOP, STEP, NULL)
+        by trying float(value) first. Non-numeric fields always use the
+        lasio convention (value = description group).
+
+        LAS 2.0+: value BEFORE colon for all fields.
+        """
+        # LAS 1.2: non-numeric fields use lasio convention (value=description)
+        las12 = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   1000.5 : START DEPTH\n"
+            " STOP.M   500.0  : STOP DEPTH\n"
+            " STEP.M   -0.125 : STEP\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            " COMP.    COMPANY : TestCo\n"
+            " WELL.    WELL : WellA\n"
+        )
+        # LAS 2.0: value BEFORE colon for all fields
+        las20 = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   1000.5 : START DEPTH\n"
+            " STOP.M   500.0  : STOP DEPTH\n"
+            " STEP.M   -0.125 : STEP\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            " COMP.    TestCo : COMPANY\n"
+            " WELL.    WellA  : WELL NAME\n"
+        )
+
+        parser = LASParser()
+        d12 = parser.parse(las12)
+        d20 = parser.parse(las20)
+
+        # Numeric fields must match across both versions
+        for mnem in ("STRT", "STOP", "STEP", "NULL"):
+            assert d12.well[mnem] == d20.well[mnem], (
+                f"Mismatch for {mnem}: {d12.well[mnem]} vs {d20.well[mnem]}"
+            )
+
+        # Non-numeric fields: LAS 1.2 uses lasio convention, LAS 2.0 uses standard.
+        # Both should extract the same value from the file.
+        assert d12.well["COMP"] == "TestCo"
+        assert d12.well["WELL"] == "WellA"
+        assert d20.well["COMP"] == "TestCo"
+        assert d20.well["WELL"] == "WellA"
+
+    def test_las12_numeric_fields_detect_spec_format(self) -> None:
+        """Test that LAS 1.2 numeric fields (STRT, STOP, STEP, NULL)
+        use the value-before-colon convention when value is numeric."""
+        # A file where the description is a non-numeric string but the
+        # value is numeric — parser should use value group.
+        las12 = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   1670.0 : START DEPTH\n"
+        )
+        parser = LASParser()
+        las = parser.parse(las12)
+        assert las.well["STRT"] == "1670.0"
+
+    def test_las12_non_numeric_fields_use_lasio_convention(self) -> None:
+        """Test that LAS 1.2 non-numeric fields (COMP, WELL, etc.)
+        use the lasio convention: value = description group."""
+        # File where value group is non-numeric for COMP
+        las12 = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.20 : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " COMP.    COMPANY : Test Oil Company Ltd.\n"
+        )
+        parser = LASParser()
+        las = parser.parse(las12)
+        assert las.well["COMP"] == "Test Oil Company Ltd."
+
+
+class TestLAS30IntegerFormat:
+    """T3/F-16: LAS 3.0 {I} integer format specifier."""
+
+    def test_las30_integer_format_specifier(self) -> None:
+        """Test that LAS 3.0 {I} format specifier is recognized by parser.
+
+        The LAS 3.0 spec supports {I} for integer values.
+        The parser's FORMAT_SPEC_PATTERN should capture {I} and pass it
+        through as data_format.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   :\n"
+            " DLM.   COMMA :\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       : DEPTH  {F}\n"
+            " RUN_NO.      : RUN NUMBER  {I}\n"
+        )
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.curves) == 2
+        run_no = las.curves[1]
+        assert run_no.mnemonic == "RUN_NO"
+        assert run_no.data_format == "I"
+
+
 class TestUnknownSectionWarning:
     """F-031: Unknown section handler warning test."""
 

@@ -26,6 +26,12 @@ MAX_DATA_LINES = 10_000_000
 # with 1K curves x 1M lines (1B elements ≈ 8 GB) passes both guards independently
 # but OOMs during np.zeros pre-allocation. Overridable by setting module constant.
 MAX_TOTAL_ELEMENTS = 1_000_000_000
+# G-18: Per-line token limit to prevent single-line memory DoS via unbounded
+# split().  Existing guards (MAX_DATA_LINES, MAX_CURVES, MAX_TOTAL_ELEMENTS)
+# are product-based and do not protect against a single line with millions
+# of space-separated tokens.  Legitimate LAS files never exceed MAX_CURVES
+# tokens per line — this cap matches the curve limit.  Overridable.
+MAX_TOKENS_PER_LINE = MAX_CURVES
 
 
 def _is_section_header(stripped: str) -> bool:
@@ -338,7 +344,7 @@ def _read_normal(
         if not in_ascii or not stripped or stripped.startswith("#"):
             continue
 
-        values = stripped.split()
+        values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
 
         # Warn about extra columns being silently discarded
         if len(values) > curve_count and not warned_extra:
@@ -363,6 +369,13 @@ def _read_normal(
                 curve_count,
                 null_value,
             )
+
+        # G-04: Bounds guard — skip writes when current_line exceeds
+        # pre-allocated array size.  This can happen when _pre_scan
+        # undercounts data lines (e.g., due to section-header detection
+        # mismatch — G-05).  Mirroring _read_wrapped guards at lines ~490.
+        if current_line >= data_line_count:
+            continue
 
         for i in range(min(len(values), curve_count)):
             curve_arrays[i][current_line] = _to_finite_float(values[i], null_value)
@@ -412,6 +425,7 @@ def _read_wrapped(
     # already have this guard.
     _count_in_ascii = False
     _count = 0
+    _depth_steps = 0
     for line in lines:
         stripped = line.strip()
         if _is_section_header(stripped):
@@ -422,6 +436,13 @@ def _read_wrapped(
             continue
         if _count_in_ascii and stripped and not stripped.startswith("#"):
             _count += 1
+            # G-01: Count depth steps (single-value lines) separately.
+            # In wrapped mode the depth line has exactly 1 value; data
+            # lines may have 1 or more.  Using total line count (_count)
+            # in the product check over-counts elements by up to a factor
+            # of curve_count, causing false rejection of valid files.
+            if len(stripped.split()) == 1:
+                _depth_steps += 1
 
     if _count > MAX_DATA_LINES:
         raise LASParseError(
@@ -430,10 +451,13 @@ def _read_wrapped(
         )
 
     # Combined bound: protect against combination attacks.
-    if curve_count * _count > MAX_TOTAL_ELEMENTS:
+    # Use depth_steps (actual data rows) when single-value depth lines
+    # were detected; fall back to _count for non-standard wrapped files.
+    element_count = _depth_steps if _depth_steps > 0 else _count
+    if curve_count * element_count > MAX_TOTAL_ELEMENTS:
         raise LASParseError(
-            f"Total allocation ({curve_count} curves x {_count} lines = "
-            f"{curve_count * _count} elements) exceeds maximum allowed "
+            f"Total allocation ({curve_count} curves x {element_count} depth steps = "
+            f"{curve_count * element_count} elements) exceeds maximum allowed "
             f"({MAX_TOTAL_ELEMENTS}). The file may be malformed or corrupt."
         )
 
@@ -464,7 +488,7 @@ def _read_wrapped(
         if not in_ascii or not stripped or stripped.startswith("#"):
             continue
 
-        values = stripped.split()
+        values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
 
         if depth_line:
             # Depth line: single value = depth for this step

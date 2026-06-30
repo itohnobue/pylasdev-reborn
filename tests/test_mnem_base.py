@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import numpy as np
 import pytest
 
 from pylasdev.mnem_base import MNEM_BASE, resolve_mnemonic
@@ -41,6 +44,87 @@ class TestMnemBase:
             # Just verify it doesn't crash with mnem_base
             data = read_las_file(las_files[0], mnem_base=MNEM_BASE)
             assert "logs" in data
+
+    # --- T12/G-15: MNEM_BASE reader integration end-to-end ---
+    def test_mnem_base_normalizes_curve_names(self, tmp_path: Path) -> None:
+        """Test that reading a file with mnem_base actually normalizes
+        curve names to canonical forms.
+
+        Uses a custom mnem_base dict with single-hop mappings to avoid
+        case conflicts in the full MNEM_BASE dict. Verifies end-to-end
+        integration: read → parser normalizes → curves_order/logs use
+        canonical names.
+        """
+        from pylasdev import read_las_file
+
+        # Custom mnem_base: AK → DT, APS → ALPS
+        custom_mb = {"AK": "DT", "APTS": "SP"}
+
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth\n"
+            " AK.US/M      :  Sonic\n"
+            " APTS.        :  SP\n"
+            "~A  DEPT  AK  APTS\n"
+            "100.0  50.0  10.0\n"
+            "101.0  51.0  11.0\n"
+        )
+        test_file = tmp_path / "mnem_test.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_las_file(test_file, mnem_base=custom_mb)
+        # Curve names should be normalized
+        assert "DEPT" in data["curves_order"]
+        assert "DT" in data["curves_order"]
+        assert "SP" in data["curves_order"]
+        # Original mnemonics should NOT appear
+        assert "AK" not in data["curves_order"]
+        assert "APTS" not in data["curves_order"]
+        # Data should be accessible via normalized names
+        assert "DT" in data["logs"]
+        assert "SP" in data["logs"]
+        np.testing.assert_allclose(data["logs"]["DT"], [50.0, 51.0])
+        np.testing.assert_allclose(data["logs"]["SP"], [10.0, 11.0])
+
+    def test_mnem_base_chain_resolution_in_reader(self, tmp_path: Path) -> None:
+        """Test multi-hop chain resolution end-to-end through the reader.
+
+        Uses a custom mnem_base with a two-hop chain: BK-3 → BK → BFV.
+        Verifies the parser walks the full chain to the terminal canonical name.
+        """
+        from pylasdev import read_las_file
+
+        # Custom two-hop chain: BK-3 → BK → BFV
+        custom_mb = {"BK-3": "BK", "BK": "BFV"}
+
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth\n"
+            " BK-3.OHMM    :  Resistivity\n"
+            "~A  DEPT  BK-3\n"
+            "100.0  15.0\n"
+            "101.0  16.0\n"
+        )
+        test_file = tmp_path / "chain_test.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_las_file(test_file, mnem_base=custom_mb)
+        # BK-3 → BK → BFV (two-hop chain to terminal)
+        assert "BFV" in data["curves_order"]
+        assert "BK-3" not in data["curves_order"]
+        assert "BK" not in data["curves_order"]
+        assert "BFV" in data["logs"]
+        np.testing.assert_allclose(data["logs"]["BFV"], [15.0, 16.0])
 
 
 class TestResolveMnemonic:

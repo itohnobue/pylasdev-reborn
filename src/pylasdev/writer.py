@@ -174,8 +174,14 @@ def _write_well_section(las_file: LASFile) -> list[str]:
         unit_dot = f".{unit}" if unit else "."
         val = _sanitize_las_value(value)
         if is_las12:
-            # LAS 1.2: MNEM.UNIT    :VALUE  (description is the label, not stored)
-            lines.append(f" {_sanitize_las_value(key)}{unit_dot}    : {val}")
+            # F-03: LAS 1.2 CWLS spec places numeric well fields (STRT,
+            # STOP, STEP, NULL) BEFORE the colon.  Non-numeric fields
+            # keep the lasio convention (value AFTER colon) for backward
+            # compatibility with files that use that convention.
+            if key in {"STRT", "STOP", "STEP", "NULL"}:
+                lines.append(f" {_sanitize_las_value(key)}{unit_dot}   {val}  :")
+            else:
+                lines.append(f" {_sanitize_las_value(key)}{unit_dot}    : {val}")
         else:
             # LAS 2.0+: MNEM.UNIT VALUE  :
             lines.append(f" {_sanitize_las_value(key)}{unit_dot}   {val}  :")
@@ -461,5 +467,14 @@ def _format_number(value: float, precision: str = ".8g", null_value: float | Non
             return format(null_value, precision)
         return format(float(value), precision)
     if value == int(value):
-        return format(int(value), precision)
-    return format(float(value), precision)
+        result = format(int(value), precision)
+    else:
+        result = format(float(value), precision)
+    # F-02: The default '.8g' precision can produce exponent notation
+    # (e.g., '1e+08' for values >= 1e8).  The LAS spec forbids exponents
+    # in data sections.  Detect exponent output and reformat using the
+    # equivalent fixed-point precision (e.g., '.8g' → '.8f').
+    if "e" in result.lower():
+        f_precision = precision.replace("g", "f")
+        result = format(float(value), f_precision)
+    return result

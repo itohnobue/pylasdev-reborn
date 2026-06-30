@@ -7,6 +7,7 @@ context managers, and no global state.
 from __future__ import annotations
 
 import logging
+import re
 import warnings
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,12 @@ from .models import LASFile
 from .parser import LASParser
 
 logger = logging.getLogger(__name__)
+
+# F-32 + G-17: Characters that Python's splitlines() treats as line breaks
+# beyond \n and \r.  Sanitize before splitlines() to prevent section-header
+# injection in crafted files.  The writer's _CONTROL_CHARS_RE already strips
+# these; this makes the read path symmetric.
+_SPLITLINES_CHARS_RE = re.compile(r"[\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
 
 
 def read_las_file(
@@ -116,7 +123,9 @@ def read_las_file_as_object(
     # PERF-01: Split content once, pass lines list to both parser and
     # data_reader to eliminate redundant content.splitlines() calls
     # (double splitlines doubles peak memory for large files).
-    lines = content.splitlines()
+    # F-32 + G-17: Sanitize splitlines() line-break characters BEFORE
+    # splitting to prevent section-header injection.
+    lines = _SPLITLINES_CHARS_RE.sub(" ", content).splitlines()
     try:
         las_file = parser.parse(content, lines=lines)
     except LASParseError as e:

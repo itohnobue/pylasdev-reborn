@@ -224,7 +224,7 @@ class ParameterEntry:
         return self.mnemonic
 
 
-@dataclass
+@dataclass(eq=False)
 class DataSection:
     """LAS 3.0 data section (~A).
 
@@ -251,7 +251,7 @@ class DataSection:
         }
 
 
-@dataclass
+@dataclass(eq=False)
 class LASFile:
     """Complete LAS file data structure.
 
@@ -485,7 +485,7 @@ class LASFile:
         return [c for c in self.curves if c.array_info and c.array_info.base_name == base_name]
 
 
-@dataclass
+@dataclass(eq=False)
 class DevFile:
     """DEV (deviation survey) file data structure."""
 

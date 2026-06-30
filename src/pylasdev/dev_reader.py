@@ -13,7 +13,13 @@ from typing import Any
 
 import numpy as np
 
-from .data_reader import MAX_CURVES, MAX_DATA_LINES, MAX_TOTAL_ELEMENTS, _to_finite_float
+from .data_reader import (
+    MAX_CURVES,
+    MAX_DATA_LINES,
+    MAX_TOKENS_PER_LINE,
+    MAX_TOTAL_ELEMENTS,
+    _to_finite_float,
+)
 from .encoding import read_with_encoding
 from .exceptions import DEVReadError, LASEncodingError  # noqa: F401
 from .models import DevFile
@@ -136,7 +142,7 @@ def read_dev_file_as_object(
         if not stripped or stripped.startswith("#"):
             continue
 
-        values = stripped.split()
+        values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
 
         if not header_found:
             # First non-comment line = column names

@@ -112,6 +112,66 @@ class TestRoundTrip:
                     f"{orig_sec['curves_order']} vs {rt_sec['curves_order']}"
                 )
 
+    # --- T9/G-12: LAS 3.0 structured sections roundtrip value verification ---
+    def test_roundtrip_structured_sections_values(self, test_data_dir: Path, tmp_path: Path) -> None:
+        """Test that LAS 3.0 structured data sections roundtrip preserves
+        data VALUES, not just shapes.
+
+        Reads sample_las3.0_spec.las, writes, re-reads, and verifies that
+        per-section data arrays and string_data arrays match in shape AND
+        in actual values (within numeric tolerance).
+        """
+        spec_file = test_data_dir / "sample_las3.0_spec.las"
+        assert spec_file.exists(), f"Required test data missing: {spec_file}"
+
+        original = read_las_file(spec_file)
+        temp_file = tmp_path / "roundtrip_spec.las"
+        write_las_file(temp_file, original)
+        roundtrip = read_las_file(temp_file)
+
+        # Verify data_sections count matches
+        orig_sections = original.get("data_sections", [])
+        rt_sections = roundtrip.get("data_sections", [])
+        assert len(rt_sections) == len(orig_sections)
+
+        # Per-section value verification
+        for i, (orig_sec, rt_sec) in enumerate(zip(orig_sections, rt_sections, strict=True)):
+            section_type = orig_sec["section_type"]
+            # Verify curves_order preserved
+            assert orig_sec["curves_order"] == rt_sec["curves_order"], (
+                f"curves_order mismatch for section {i} ({section_type}): "
+                f"{orig_sec['curves_order']} vs {rt_sec['curves_order']}"
+            )
+            # Verify data arrays: shapes and values
+            orig_data = orig_sec.get("data", {})
+            rt_data = rt_sec.get("data", {})
+            for curve in orig_sec["curves_order"]:
+                if curve not in orig_data:
+                    continue
+                assert curve in rt_data, (
+                    f"curve {curve} missing in roundtrip data for section {i}"
+                )
+                assert orig_data[curve].shape == rt_data[curve].shape, (
+                    f"Shape mismatch for {curve} in section {i}: "
+                    f"{orig_data[curve].shape} vs {rt_data[curve].shape}"
+                )
+                np.testing.assert_allclose(
+                    orig_data[curve],
+                    rt_data[curve],
+                    rtol=1e-5,
+                    err_msg=f"Data mismatch for {curve} in section {i} ({section_type})",
+                )
+            # Verify string_data arrays if present
+            orig_str = orig_sec.get("string_data", {})
+            rt_str = rt_sec.get("string_data", {})
+            for key in orig_str:
+                assert key in rt_str, f"string_data key {key} missing in section {i}"
+                np.testing.assert_array_equal(
+                    orig_str[key],
+                    rt_str[key],
+                    err_msg=f"string_data mismatch for {key} in section {i}",
+                )
+
     def test_roundtrip_preserves_curve_metadata(self) -> None:
         """Test that to_dict/from_dict round-trip preserves curve metadata."""
         from pylasdev.models import CurveDefinition, LASFile, VersionSection
