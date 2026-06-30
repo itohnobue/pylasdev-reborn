@@ -27,6 +27,147 @@ from .models import DevFile
 logger = logging.getLogger(__name__)
 
 
+def _deduplicate_dev_columns(names: list[str]) -> list[str]:
+    """Deduplicate DEV column names with cross-base collision detection.
+
+    Ported from ``_deduplicate_curves`` in ``data_reader.py``.  Uses an
+    ``output_names`` set + while-loop to ensure generated ``_N`` suffixes
+    don't collide with any name already in the output.
+
+    Args:
+        names: Raw column names from the header line.
+
+    Returns:
+        Deduplicated column names.  A warning is emitted for each
+        duplicate.
+    """
+    seen: dict[str, int] = {}
+    deduped: list[str] = []
+    output_names: set[str] = set()
+    for name in names:
+        if name in seen:
+            seen[name] += 1
+            suffix = seen[name]
+            new_name = f"{name}_{suffix}"
+            while new_name in output_names:
+                suffix += 1
+                new_name = f"{name}_{suffix}"
+            seen[name] = suffix
+            warnings.warn(
+                f"Duplicate DEV column name '{name}' renamed to "
+                f"'{new_name}'. Data may come from a file with "
+                f"repeated column names.",
+                stacklevel=2,
+            )
+            deduped.append(new_name)
+            output_names.add(new_name)
+        else:
+            if name in output_names:
+                suffix = 2
+                new_name = f"{name}_{suffix}"
+                while new_name in output_names:
+                    suffix += 1
+                    new_name = f"{name}_{suffix}"
+                seen[name] = suffix
+                warnings.warn(
+                    f"Duplicate DEV column name '{name}' renamed to "
+                    f"'{new_name}'. Data may come from a file with "
+                    f"repeated column names.",
+                    stacklevel=2,
+                )
+                deduped.append(new_name)
+                output_names.add(new_name)
+            else:
+                seen[name] = 1
+                deduped.append(name)
+                output_names.add(name)
+    return deduped
+
+
+def _is_float_token(token: str) -> bool:
+    """Check if a token can be parsed as a float.
+
+    Handles standard scientific notation (e/E) and Fortran D-exponent
+    notation (d/D) used by some scientific software.
+
+    Used by ``_detect_dev_format`` to distinguish numeric data lines
+    from column-name header lines.
+    """
+    # Reject special float strings (nan, inf, -inf, infinity) that
+    # float() can parse but are not meaningful numeric well-log data.
+    lower = token.replace("D", "E").replace("d", "e")
+    if lower.lower() in ("nan", "inf", "-inf", "infinity", "+inf", "-infinity", "+infinity"):
+        return False
+    try:
+        float(lower)
+        return True
+    except ValueError:
+        return False
+
+
+def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int]:
+    """Detect DEV file format from first few content lines.
+
+    Inspects the first 1-3 non-comment, non-empty lines to determine
+    which of the three supported DEV format variants the file uses.
+
+    Args:
+        content_entries: List of ``(line_index, stripped_content)``
+            for the first non-comment, non-empty lines.
+
+    Returns:
+        Tuple of ``(format_type, skip_content_lines)`` where *format_type*
+        is ``"simple"``, ``"dug"``, or ``"headerless"``, and
+        *skip_content_lines* is the number of content-bearing lines to
+        skip before data starts (used by Pass 1 counting).
+    """
+    if not content_entries:
+        return ("simple", 1)
+
+    first_tokens = content_entries[0][1].split()
+
+    # DUG Insight format detection — two patterns.
+    #
+    # Pattern A: single-token first line = column count (no separate title).
+    #   "4"              ← integer column count (also serves as title)
+    #   "MD TVD X Y"     ← header with non-numeric tokens
+    #   2 content lines before data: count + header.
+    if len(first_tokens) == 1:
+        try:
+            int(first_tokens[0])
+        except ValueError:
+            pass
+        else:
+            if len(content_entries) >= 2:
+                second_tokens = content_entries[1][1].split()
+                if any(not _is_float_token(t) for t in second_tokens):
+                    return ("dug", 2)
+
+    # Pattern B: multi-word title, integer column count, header.
+    #   "Deviation survey for Well-1"   ← descriptive title
+    #   "4"                              ← integer column count
+    #   "MDKB TVDSS X Y"                ← header with non-numeric tokens
+    #   3 content lines before data: title + count + header.
+    if len(content_entries) >= 3:
+        second_tokens = content_entries[1][1].split()
+        if len(second_tokens) == 1:
+            try:
+                int(second_tokens[0])
+            except ValueError:
+                pass
+            else:
+                third_tokens = content_entries[2][1].split()
+                if third_tokens and any(not _is_float_token(t) for t in third_tokens):
+                    return ("dug", 3)
+
+    # Headerless format: every token on the first content line parses as
+    # a float (no column names present).  No content lines to skip.
+    if first_tokens and all(_is_float_token(t) for t in first_tokens):
+        return ("headerless", 0)
+
+    return ("simple", 1)
+
+
 def read_dev_file(
     file_path: str | Path,
     encoding: str | None = None,
@@ -113,44 +254,61 @@ def read_dev_file_as_object(
 
     lines = content.splitlines()
 
-    # Auto-detect delimiter if not explicitly provided.
-    # Comma-delimited DEV files are common; the original code only
-    # split on whitespace, silently parsing them as single tokens.
-    if delimiter is None:
-        # Find the first non-comment, non-empty line (the header)
-        for line in lines:
-            hdr = line.strip()
-            if hdr and not hdr.startswith("#"):
-                # If the header contains commas and splitting on comma
-                # yields at least as many tokens as splitting on whitespace,
-                # treat the file as comma-delimited.  Using >= (not >) so
-                # that "MD, TVD, INC, AZI" (commas with trailing spaces)
-                # correctly detects comma delimiter.
-                comma_tokens = [t for t in hdr.split(",") if t.strip()]
-                space_tokens = hdr.split()
-                if len(comma_tokens) >= len(space_tokens) and len(comma_tokens) >= 2:
-                    delimiter = ","
-                else:
-                    delimiter = " "
+    # --- Gather first few content lines for format detection ---
+    # Scan past comments and empty lines to collect up to 3 content-bearing
+    # lines.  These are used for both format detection and delimiter
+    # auto-detection.
+    content_entries: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            content_entries.append((i, stripped))
+            if len(content_entries) >= 3:
                 break
+
+    format_type, skip_content_lines = _detect_dev_format(content_entries)
+
+    # --- Auto-detect delimiter ---
+    if delimiter is None:
+        # Use the actual header line for delimiter detection:
+        # - simple:   first content line
+        # - dug:      third content line (the header — skip title+count)
+        # - headerless: first content line (the data)
+        if format_type == "dug" and len(content_entries) > skip_content_lines - 1:
+            hdr = content_entries[skip_content_lines - 1][1]
+        elif content_entries:
+            hdr = content_entries[0][1]
         else:
-            delimiter = " "  # No header found — default to space
+            hdr = ""
 
-    # Two-pass processing: first pass counts data lines to pre-allocate
-    # numpy arrays at the correct size, second pass parses the data.
-    # This avoids dynamic array resizing (O(n^2) behavior) and ensures
-    # all columns have consistent lengths even with ragged input.
+        if hdr:
+            # If the header contains commas and splitting on comma
+            # yields at least as many tokens as splitting on whitespace,
+            # treat the file as comma-delimited.  Using >= (not >) so
+            # that "MD, TVD, INC, AZI" (commas with trailing spaces)
+            # correctly detects comma delimiter.
+            comma_tokens = [t for t in hdr.split(",") if t.strip()]
+            space_tokens = hdr.split()
+            if len(comma_tokens) >= len(space_tokens) and len(comma_tokens) >= 2:
+                delimiter = ","
+            else:
+                delimiter = " "
+        else:
+            delimiter = " "
 
-    # Pass 1: Count data lines (excluding comments, empty lines, and header)
+    # --- Pass 1: Count data lines ---
+    # skip_content_lines is returned by _detect_dev_format:
+    #   dug:         2 (pattern A) or 3 (pattern B)
+    #   headerless:  0 (no header — first content line IS data)
+    #   simple:      1 (header only)
+    content_seen = 0
     data_lines = 0
-    header_found = False
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if not header_found:
-            header_found = True  # First non-comment line is the header
-        else:
+        content_seen += 1
+        if content_seen > skip_content_lines:
             data_lines += 1
 
     if data_lines > MAX_DATA_LINES:
@@ -159,12 +317,12 @@ def read_dev_file_as_object(
             f"({MAX_DATA_LINES}). The file may be malformed or corrupt."
         )
 
-    # Pass 2: Parse header and data
+    # --- Pass 2: Parse header and data ---
     dev = DevFile()
     dev.source_file = str(file_path)
     dev.encoding = detected_encoding
     names: list[str] = []
-    header_found = False
+    content_seen = 0
     current_line = 0
     warned_extra = False  # Track extra-column warning per file
 
@@ -173,97 +331,154 @@ def read_dev_file_as_object(
         if not stripped or stripped.startswith("#"):
             continue
 
+        content_seen += 1
+
         if delimiter == " ":
             values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
         else:
             values = [v.strip() for v in stripped.split(delimiter, maxsplit=MAX_TOKENS_PER_LINE)]
 
-        if not header_found:
-            # First non-comment line = column names
-            names = values
-            # Deduplicate column names with cross-base collision detection.
-            # Ported from _deduplicate_curves in data_reader.py: uses an
-            # output_names set + while-loop to ensure generated _N suffixes
-            # don't collide with any name already in the output.
-            seen: dict[str, int] = {}
-            deduped_names: list[str] = []
-            output_names: set[str] = set()
-            for name in names:
-                if name in seen:
-                    seen[name] += 1
-                    # Ensure the generated name doesn't collide with
-                    # any name already in the output (including original names
-                    # that match the _N suffix pattern).
-                    suffix = seen[name]
-                    new_name = f"{name}_{suffix}"
-                    while new_name in output_names:
-                        suffix += 1
-                        new_name = f"{name}_{suffix}"
-                    seen[name] = suffix
-                    warnings.warn(
-                        f"Duplicate DEV column name '{name}' renamed to "
-                        f"'{new_name}'. Data may come from a file with "
-                        f"repeated column names.",
-                        stacklevel=2,
+        if format_type == "headerless":
+            if content_seen == 1:
+                # Auto-generate column names from the first data row.
+                names = [f"col_{i}" for i in range(len(values))]
+                if len(names) > MAX_CURVES:
+                    raise DEVReadError(
+                        f"Column count ({len(names)}) exceeds maximum allowed "
+                        f"({MAX_CURVES}). The file may be malformed or corrupt."
                     )
-                    deduped_names.append(new_name)
-                    output_names.add(new_name)
-                else:
-                    # Check for cross-base collisions where an
-                    # original name matches a previously generated _N suffix.
-                    # Input ["A","A","A_2"] should produce
-                    # ["A","A_2","A_2_2"], not ["A","A_2","A_2"].
-                    if name in output_names:
-                        suffix = 2
-                        new_name = f"{name}_{suffix}"
-                        while new_name in output_names:
-                            suffix += 1
-                            new_name = f"{name}_{suffix}"
-                        seen[name] = suffix
-                        warnings.warn(
-                            f"Duplicate DEV column name '{name}' renamed to "
-                            f"'{new_name}'. Data may come from a file with "
-                            f"repeated column names.",
-                            stacklevel=2,
+                if len(names) * data_lines > MAX_TOTAL_ELEMENTS:
+                    raise DEVReadError(
+                        f"Total allocation ({len(names)} columns x "
+                        f"{data_lines} lines = "
+                        f"{len(names) * data_lines} elements) exceeds "
+                        f"maximum allowed ({MAX_TOTAL_ELEMENTS}). "
+                        f"The file may be malformed or corrupt."
+                    )
+                for name in names:
+                    dev.columns[name] = np.full(data_lines, np.nan, dtype=np.float64)
+                dev.column_order = list(names)
+                # Store first data row.
+                for k in range(len(names)):
+                    try:
+                        dev.columns[names[k]][current_line] = _to_finite_float(
+                            values[k], np.nan
                         )
-                        deduped_names.append(new_name)
-                        output_names.add(new_name)
-                    else:
-                        seen[name] = 1
-                        deduped_names.append(name)
-                        output_names.add(name)
-            names = deduped_names
-            if len(names) > MAX_CURVES:
-                raise DEVReadError(
-                    f"Column count ({len(names)}) exceeds maximum allowed "
-                    f"({MAX_CURVES}). The file may be malformed or corrupt."
-                )
-            if len(names) * data_lines > MAX_TOTAL_ELEMENTS:
-                raise DEVReadError(
-                    f"Total allocation ({len(names)} columns x {data_lines} lines = "
-                    f"{len(names) * data_lines} elements) exceeds maximum allowed "
-                    f"({MAX_TOTAL_ELEMENTS}). The file may be malformed or corrupt."
-                )
-            for name in names:
-                dev.columns[name] = np.full(data_lines, np.nan, dtype=np.float64)
-            dev.column_order = list(names)
-            header_found = True
-        else:
-            # Data lines
-            # Warn about extra columns being silently discarded
-            if len(values) > len(names) and not warned_extra:
-                warned_extra = True
-                logger.warning(
-                    "Data line has %d values but only %d columns declared "
-                    "in the header. Extra columns are discarded.",
-                    len(values),
-                    len(names),
-                )
-            for k in range(min(len(values), len(names))):
-                try:
-                    dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
-                except IndexError:
-                    dev.columns[names[k]][current_line] = np.nan
-            current_line += 1
+                    except IndexError:
+                        dev.columns[names[k]][current_line] = np.nan
+                current_line += 1
+            else:
+                # Remaining data rows.
+                if len(values) > len(names) and not warned_extra:
+                    warned_extra = True
+                    logger.warning(
+                        "Data line has %d values but only %d columns declared "
+                        "in the header. Extra columns are discarded.",
+                        len(values),
+                        len(names),
+                    )
+                for k in range(min(len(values), len(names))):
+                    try:
+                        dev.columns[names[k]][current_line] = _to_finite_float(
+                            values[k], np.nan
+                        )
+                    except IndexError:
+                        dev.columns[names[k]][current_line] = np.nan
+                current_line += 1
+
+        elif format_type == "dug":
+            if content_seen < skip_content_lines:
+                # Skip title line(s) and column-count line.
+                continue
+            elif content_seen == skip_content_lines:
+                # Header line — parse column names.
+                names = values
+                if not names:
+                    raise DEVReadError(
+                        "Empty header line in DUG-format DEV file. "
+                        "Expected column names on the third content line."
+                    )
+                # Deduplicate column names.
+                names = _deduplicate_dev_columns(names)
+                if len(names) > MAX_CURVES:
+                    raise DEVReadError(
+                        f"Column count ({len(names)}) exceeds maximum allowed "
+                        f"({MAX_CURVES}). The file may be malformed or corrupt."
+                    )
+                if len(names) * data_lines > MAX_TOTAL_ELEMENTS:
+                    raise DEVReadError(
+                        f"Total allocation ({len(names)} columns x "
+                        f"{data_lines} lines = "
+                        f"{len(names) * data_lines} elements) exceeds "
+                        f"maximum allowed ({MAX_TOTAL_ELEMENTS}). "
+                        f"The file may be malformed or corrupt."
+                    )
+                for name in names:
+                    dev.columns[name] = np.full(data_lines, np.nan, dtype=np.float64)
+                dev.column_order = list(names)
+            else:
+                # Data lines.
+                if len(values) > len(names) and not warned_extra:
+                    warned_extra = True
+                    logger.warning(
+                        "Data line has %d values but only %d columns declared "
+                        "in the header. Extra columns are discarded.",
+                        len(values),
+                        len(names),
+                    )
+                for k in range(min(len(values), len(names))):
+                    try:
+                        dev.columns[names[k]][current_line] = _to_finite_float(
+                            values[k], np.nan
+                        )
+                    except IndexError:
+                        dev.columns[names[k]][current_line] = np.nan
+                current_line += 1
+
+        else:  # simple header format
+            if content_seen == 1:
+                # First non-comment line = column names.
+                names = values
+                if not names:
+                    raise DEVReadError(
+                        "Empty header line in DEV file. "
+                        "Expected column names on the first content line."
+                    )
+                # Deduplicate column names.
+                names = _deduplicate_dev_columns(names)
+                if len(names) > MAX_CURVES:
+                    raise DEVReadError(
+                        f"Column count ({len(names)}) exceeds maximum allowed "
+                        f"({MAX_CURVES}). The file may be malformed or corrupt."
+                    )
+                if len(names) * data_lines > MAX_TOTAL_ELEMENTS:
+                    raise DEVReadError(
+                        f"Total allocation ({len(names)} columns x "
+                        f"{data_lines} lines = "
+                        f"{len(names) * data_lines} elements) exceeds "
+                        f"maximum allowed ({MAX_TOTAL_ELEMENTS}). "
+                        f"The file may be malformed or corrupt."
+                    )
+                for name in names:
+                    dev.columns[name] = np.full(data_lines, np.nan, dtype=np.float64)
+                dev.column_order = list(names)
+            else:
+                # Data lines.
+                if len(values) > len(names) and not warned_extra:
+                    warned_extra = True
+                    logger.warning(
+                        "Data line has %d values but only %d columns declared "
+                        "in the header. Extra columns are discarded.",
+                        len(values),
+                        len(names),
+                    )
+                for k in range(min(len(values), len(names))):
+                    try:
+                        dev.columns[names[k]][current_line] = _to_finite_float(
+                            values[k], np.nan
+                        )
+                    except IndexError:
+                        dev.columns[names[k]][current_line] = np.nan
+                current_line += 1
 
     return dev

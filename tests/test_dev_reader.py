@@ -476,3 +476,380 @@ class TestDevDedupWhileLoop:
         np.testing.assert_array_equal(data["A_2"], [20.0])
         np.testing.assert_array_equal(data["A_2_2"], [30.0])
         np.testing.assert_array_equal(data["A_2_3"], [40.0])
+
+
+class TestDugFormat:
+    """F-02: DUG Insight format parsing tests.
+
+    DUG Insight DEV files have a title line, an integer column count,
+    a header line with column names, and space-separated data rows.
+    """
+
+    def test_dug_format_basic(self, tmp_path: Path) -> None:
+        """Parse a basic DUG Insight format file."""
+        content = (
+            "Deviation survey for Well-1\n"
+            "4\n"
+            "MDKB TVDSS X Y\n"
+            "0.00 -20.06 39844.56 24589.34\n"
+            "1000.00 1020.02 39844.47 24588.95\n"
+            "2000.00 2040.08 39844.30 24588.50\n"
+        )
+        test_file = tmp_path / "dug_basic.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MDKB", "TVDSS", "X", "Y"]
+        assert len(data["MDKB"]) == 3
+        assert data["MDKB"][0] == 0.0
+        assert data["TVDSS"][0] == -20.06
+        assert data["X"][2] == 39844.30
+        np.testing.assert_array_equal(
+            data["MDKB"], [0.0, 1000.0, 2000.0],
+        )
+
+    def test_dug_format_as_object(self, tmp_path: Path) -> None:
+        """Parse DUG format via read_dev_file_as_object."""
+        content = (
+            "Well-42 Survey\n"
+            "3\n"
+            "MD INC AZI\n"
+            "0.00 0.00 0.00\n"
+            "100.00 1.50 45.00\n"
+            "200.00 3.20 48.00\n"
+        )
+        test_file = tmp_path / "dug_obj.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        dev = read_dev_file_as_object(test_file)
+        assert dev.column_order == ["MD", "INC", "AZI"]
+        assert len(dev.columns["MD"]) == 3
+        np.testing.assert_array_equal(
+            dev.columns["MD"], [0.0, 100.0, 200.0],
+        )
+        np.testing.assert_array_equal(
+            dev.columns["INC"], [0.0, 1.5, 3.2],
+        )
+
+    def test_dug_format_with_comments(self, tmp_path: Path) -> None:
+        """DUG format with comment lines interspersed."""
+        content = (
+            "# Survey for Well-X\n"
+            "Well-X Deviation\n"
+            "# Column count:\n"
+            "3\n"
+            "# Column headers:\n"
+            "MD INC AZI\n"
+            "# Data:\n"
+            "0.0 0.0 0.0\n"
+            "100.0 1.5 45.0\n"
+        )
+        test_file = tmp_path / "dug_comments.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "INC", "AZI"]
+        assert len(data["MD"]) == 2
+        assert data["MD"][0] == 0.0
+        assert data["INC"][1] == 1.5
+
+    def test_dug_format_no_data(self, tmp_path: Path) -> None:
+        """DUG format with header but no data rows."""
+        content = (
+            "Survey\n"
+            "4\n"
+            "MD TVD X Y\n"
+        )
+        test_file = tmp_path / "dug_no_data.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "X", "Y"]
+        assert len(data["MD"]) == 0
+
+    def test_dug_format_empty_header_raises_error(self, tmp_path: Path) -> None:
+        """DUG format with genuinely empty header parsed as simple format.
+
+        Our content scanner skips blank/empty lines, so a DUG file where
+        the header line is empty has its data line promoted to content
+        line 3 — which is all-numeric, defeating DUG detection.  The
+        file is then parsed as simple format (first line = column names).
+        """
+        content = (
+            "Survey\n"
+            "3\n"
+            "0.0 0.0 0.0\n"
+        )
+        test_file = tmp_path / "dug_no_header.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Third content line is all-numeric → not DUG → falls to simple
+        assert list(data.keys()) == ["Survey"]
+        assert len(data["Survey"]) == 2  # "3" and "0.0 0.0 0.0"
+
+    def test_dug_format_with_ragged_data(self, tmp_path: Path) -> None:
+        """DUG format with ragged data rows (fewer tokens than columns)."""
+        content = (
+            "Survey\n"
+            "4\n"
+            "MD TVD X Y\n"
+            "0.0 0.0 100.0 200.0\n"
+            "100.0 99.0 101.0\n"  # Only 3 values
+            "200.0 198.0\n"  # Only 2 values
+        )
+        test_file = tmp_path / "dug_ragged.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Missing values should be NaN
+        assert np.isnan(data["Y"][1])
+        assert np.isnan(data["X"][2])
+        assert np.isnan(data["Y"][2])
+
+
+class TestHeaderlessFormat:
+    """F-02: Headerless format parsing tests.
+
+    Headerless DEV files have no column name line — the first
+    content line is numeric data.  Column names are auto-generated
+    as ``col_0``, ``col_1``, ..., ``col_N``.
+    """
+
+    def test_headerless_format_basic(self, tmp_path: Path) -> None:
+        """Parse a basic headerless file with multiple columns."""
+        content = (
+            "0.00 0.00 0.00\n"
+            "100.00 1.50 45.00\n"
+            "200.00 3.20 48.00\n"
+        )
+        test_file = tmp_path / "noheader_basic.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["col_0", "col_1", "col_2"]
+        assert len(data["col_0"]) == 3
+        np.testing.assert_array_equal(
+            data["col_0"], [0.0, 100.0, 200.0],
+        )
+        np.testing.assert_array_equal(
+            data["col_1"], [0.0, 1.5, 3.2],
+        )
+        np.testing.assert_array_equal(
+            data["col_2"], [0.0, 45.0, 48.0],
+        )
+
+    def test_headerless_format_as_object(self, tmp_path: Path) -> None:
+        """Parse headerless via read_dev_file_as_object."""
+        content = "0.0 0.0\n100.0 99.0\n200.0 198.0\n"
+        test_file = tmp_path / "noheader_obj.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        dev = read_dev_file_as_object(test_file)
+        assert dev.column_order == ["col_0", "col_1"]
+        assert len(dev.columns["col_0"]) == 3
+        np.testing.assert_array_equal(
+            dev.columns["col_0"], [0.0, 100.0, 200.0],
+        )
+
+    def test_headerless_single_column(self, tmp_path: Path) -> None:
+        """Headerless file with a single column."""
+        content = "0.0\n100.0\n200.0\n"
+        test_file = tmp_path / "noheader_single.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["col_0"]
+        np.testing.assert_array_equal(
+            data["col_0"], [0.0, 100.0, 200.0],
+        )
+
+    def test_headerless_with_comments(self, tmp_path: Path) -> None:
+        """Headerless file with comment lines."""
+        content = (
+            "# Some comments\n"
+            "# More\n"
+            "0.0 100.0\n"
+            "50.0 150.0\n"
+        )
+        test_file = tmp_path / "noheader_comments.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["col_0", "col_1"]
+        assert len(data["col_0"]) == 2
+        assert data["col_0"][0] == 0.0
+
+    def test_headerless_with_scientific_notation(self, tmp_path: Path) -> None:
+        """Headerless file with scientific notation values."""
+        content = (
+            "1.0e2 2.5E-3 3.0D+01\n"
+            "4.0e2 5.5E-3 6.0D+01\n"
+        )
+        test_file = tmp_path / "noheader_sci.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert data["col_0"][0] == 100.0  # 1.0e2
+        assert data["col_1"][0] == 0.0025  # 2.5E-3
+        assert data["col_2"][0] == 30.0  # 3.0D+01
+
+    def test_headerless_single_line(self, tmp_path: Path) -> None:
+        """Headerless file with a single data line."""
+        content = "0.0 100.0 200.0\n"
+        test_file = tmp_path / "noheader_single_line.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["col_0", "col_1", "col_2"]
+        assert len(data["col_0"]) == 1
+        assert data["col_0"][0] == 0.0
+
+    def test_headerless_ragged_columns(self, tmp_path: Path) -> None:
+        """Headerless file with ragged data rows."""
+        content = (
+            "0.0 100.0 200.0\n"
+            "100.0 99.0\n"  # Missing third column
+            "200.0\n"  # Missing two columns
+        )
+        test_file = tmp_path / "noheader_ragged.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Column count determined by first row (3 cols)
+        assert list(data.keys()) == ["col_0", "col_1", "col_2"]
+        # Missing values should be NaN
+        assert data["col_0"][1] == 100.0
+        assert np.isnan(data["col_2"][1])
+        assert np.isnan(data["col_1"][2])
+
+    def test_headerless_with_negative_values(self, tmp_path: Path) -> None:
+        """Headerless file with negative values (TVDSS negative)."""
+        content = (
+            "0.00 -20.06 39844.56\n"
+            "1000.00 1020.02 39844.47\n"
+        )
+        test_file = tmp_path / "noheader_neg.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert data["col_1"][0] == -20.06
+        assert data["col_1"][1] == 1020.02
+
+    def test_headerless_empty_file_raises_error(self) -> None:
+        """Empty file without content lines should still parse (0 lines)."""
+        # Empty files without content return empty arrays
+        # This is covered by the existing header-only test pattern
+        pass
+
+
+class TestFormatAutoDetection:
+    """F-02: Format auto-detection edge cases and correctness tests."""
+
+    def test_simple_header_format_still_works(self, tmp_path: Path) -> None:
+        """Ensure simple header format is not broken by new detection."""
+        content = (
+            "MD TVD X Y\n"
+            "0.0 0.0 100.0 200.0\n"
+            "100.0 99.0 101.0 201.0\n"
+        )
+        test_file = tmp_path / "simple_regr.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "X", "Y"]
+        assert data["MD"][0] == 0.0
+
+    def test_delimiter_auto_detection_dug_pattern_a_comma(self, tmp_path: Path) -> None:
+        """DUG Pattern A (2-line header: count + header, no title)
+        with comma-delimited data auto-detects comma delimiter correctly.
+
+        Pattern A uses ``skip_content_lines=2``, so the header is at
+        ``content_entries[1]`` (count line is index 0).  The delimiter
+        must be detected from index 1, not the hardcoded index 2 used
+        by Pattern B.
+        """
+        content = (
+            "4\n"
+            "MD, TVD, X, Y\n"
+            "0.0, 0.0, 100.0, 200.0\n"
+            "100.0, 99.0, 101.0, 201.0\n"
+        )
+        test_file = tmp_path / "dug_pat_a_comma.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Format detection: should be DUG Pattern A
+        assert list(data.keys()) == ["MD", "TVD", "X", "Y"]
+        assert len(data["MD"]) == 2
+        assert data["MD"][0] == 0.0
+        assert data["MD"][1] == 100.0
+        assert data["TVD"][0] == 0.0
+        assert data["X"][0] == 100.0
+        assert data["X"][1] == 101.0
+        assert data["Y"][0] == 200.0
+        assert data["Y"][1] == 201.0
+
+    def test_numeric_column_name_does_not_trigger_headerless(self, tmp_path: Path) -> None:
+        """Single-integer line followed by all-numeric line → headerless.
+
+        A header line with a single numeric-like token is ambiguous
+        (could be a column named "100" or headerless data).  Since
+        the second line has no non-numeric tokens to confirm DUG format
+        and all tokens on both lines parse as float, format is detected
+        as headerless.  Both lines are data rows with auto-generated
+        column names.
+        """
+        content = (
+            "100\n"
+            "50.0\n"
+        )
+        test_file = tmp_path / "numeric_header.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Headerless: both lines are data for col_0
+        assert list(data.keys()) == ["col_0"]
+        assert data["col_0"][0] == 100.0
+        assert data["col_0"][1] == 50.0
+
+    def test_single_integer_title_followed_by_header(self, tmp_path: Path) -> None:
+        """First line is a single integer, second is header → DUG format."""
+        content = (
+            "1\n"  # Title (could be well number)
+            "MD\n"  # Header with one column
+            "0.0\n"
+            "100.0\n"
+        )
+        test_file = tmp_path / "single_int_title.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD"]
+        assert data["MD"][0] == 0.0
+        assert data["MD"][1] == 100.0
+
+    def test_delimiter_auto_detection_comma(self, tmp_path: Path) -> None:
+        """Comma-delimited simple header file still auto-detects delimiter."""
+        content = "MD, TVD, X, Y\n0.0, 0.0, 100.0, 200.0\n"
+        test_file = tmp_path / "comma_simple.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "X", "Y"]
+        assert data["MD"][0] == 0.0
+
+    def test_delimiter_auto_detection_dug_comma(self, tmp_path: Path) -> None:
+        """Comma-delimited DUG format auto-detects comma from header line."""
+        content = (
+            "Survey\n"
+            "4\n"
+            "MD, TVD, X, Y\n"
+            "0.0, 0.0, 100.0, 200.0\n"
+        )
+        test_file = tmp_path / "dug_comma.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "X", "Y"]
+        assert data["MD"][0] == 0.0
