@@ -53,7 +53,7 @@ class VersionSection:
 
     vers: str = "2.0"
     wrap: str = "NO"
-    dlm: str = "SPACE"  # LAS 3.0: SPACE, TAB, or COMMA
+    dlm: str = "SPACE"  # LAS 2.0+: SPACE, TAB, or COMMA
 
     def to_dict(self) -> dict[str, str]:
         """Convert to legacy dict format for backward compatibility."""
@@ -226,10 +226,12 @@ class ParameterEntry:
 
 @dataclass(eq=False)
 class DataSection:
-    """LAS 3.0 data section (~A).
+    """~A data section (LAS 1.2/2.0) and LAS 3.0 typed data sections.
 
-    LAS 3.0 can have multiple data sections, each potentially with different
-    curve sets or depth ranges.
+    In LAS 1.2/2.0 files, the data section is a single ``~A`` block.
+    LAS 3.0 can have multiple typed data sections (``~ASCII``, ``~Log_Data``,
+    ``~Core_Data``, etc.), each potentially with different curve sets or
+    depth ranges.
     """
 
     name: str = ""  # Section name from ~A line (e.g., "ASCII" or custom name)
@@ -391,6 +393,8 @@ class LASFile:
         # Restore LAS 3.0 data sections
         ds_data = data.get("data_sections", [])
         for ds_dict in ds_data:
+            if not isinstance(ds_dict, dict):
+                continue
             ds_string_data = {}
             for name, arr in ds_dict.get("string_data", {}).items():
                 ds_string_data[name] = np.array(arr, dtype=np.str_)

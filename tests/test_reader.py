@@ -647,7 +647,13 @@ class TestDataReaderEdgeCases:
 
     # --- TEST-12: _detect_actual_wrap with no data after ~A ---
     def test_detect_wrap_no_data(self, tmp_path: Path) -> None:
-        """Test _detect_actual_wrap returns True when no data lines exist."""
+        """Test _detect_actual_wrap returns True when no data lines exist.
+
+        When no data follows ~A, _detect_actual_wrap defaults to True
+        (data_reader.py:196). Verify that the returned dict has the
+        expected structure: all required keys present, logs empty, and
+        the version section correctly reflects WRAP=YES.
+        """
         content = (
             "~VERSION INFORMATION\n"
             " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
@@ -665,6 +671,21 @@ class TestDataReaderEdgeCases:
         # Should not crash — _detect_actual_wrap defaults to True
         data = read_las_file(test_file)
         assert isinstance(data, dict)
+        # F-M-21: Strengthen assertions — verify expected keys and structure.
+        assert "version" in data
+        assert "well" in data
+        assert "logs" in data
+        assert "curves_order" in data
+        # No data lines were parsed — logs contain pre-allocated empty arrays.
+        assert data["logs"] != {}
+        assert len(data["logs"]["DEPT"]) == 0
+        # curves_order should still list the declared curve
+        assert data["curves_order"] == ["DEPT"]
+        # Version section must reflect WRAP=YES
+        assert data["version"]["VERS"] == "1.2"
+        assert data["version"]["WRAP"] == "YES"
+        # Well section should contain the NULL value
+        assert data["well"]["NULL"] == "-999.25"
 
     # --- TEST-13: Wrapped-mode ValueError/IndexError handlers ---
     def test_wrapped_malformed_data_handlers(self, tmp_path: Path) -> None:

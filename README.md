@@ -140,7 +140,7 @@ las2 = LASFile.from_dict(d)               # Create from dict
 
 | Function | Description |
 |----------|-------------|
-| `write_las_file(file_path, data, encoding="utf-8", precision=".8g")` | Write LAS data (dict or `LASFile`) to a `.las` file with configurable encoding and numeric precision |
+| `write_las_file(file_path, las_data, encoding="utf-8", precision=".8g")` | Write LAS data (dict or `LASFile`) to a `.las` file with configurable encoding and numeric precision |
 
 ### Comparison
 
@@ -152,7 +152,7 @@ from pylasdev import compare_las_dicts
 #       Values are considered equal if |a-b| <= atol + rtol*|b|
 # atol: Absolute tolerance for numpy array comparison (default 0.0).
 #       Allows small absolute differences (e.g. 1e-6).
-are_equal = compare_las_dicts(las_dict1, las_dict2, rtol=1e-7, atol=0.0)
+are_equal = compare_las_dicts(dict1, dict2, rtol=1e-7, atol=0.0)
 print(are_equal)  # True if equivalent, False otherwise
 ```
 
@@ -185,7 +185,7 @@ All data model types are available as imports from `pylasdev`:
 | `ParameterEntry` | Parameter from ~P section with optional array index and zone metadata |
 | `ParameterZone` | LAS 3.0 zone association for parameters |
 | `ArrayElementInfo` | LAS 3.0 array element metadata (base name, index, time offset) |
-| `DataSection` | LAS 3.0 data section (~A) with name, curve order, and numeric data |
+| `DataSection` | LAS data section (~A in LAS 1.2/2.0, named sections in LAS 3.0) with name, curve order, and numeric data |
 
 #### LASFile Properties
 
@@ -196,7 +196,7 @@ las: LASFile = read_las_file_as_object("well.las")
 las.version         # VersionSection(vers="2.0", wrap="NO", dlm="SPACE")
 las.version.vers    # str — "1.2", "2.0", "3.0"
 las.version.wrap    # str — "YES" or "NO"
-las.version.dlm     # str — "SPACE", "TAB", or "COMMA" (LAS 3.0)
+las.version.dlm     # str — "SPACE", "TAB", or "COMMA" (LAS 2.0+)
 las.is_las30        # bool — True if version string starts with "3"
 
 # Well information (dict-like)

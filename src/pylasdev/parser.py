@@ -49,6 +49,11 @@ MAX_DATA_SECTIONS = 1_000
 # checked in 3 locations; parameters had zero protection anywhere.
 MAX_PARAMETERS = 100_000
 
+# F-M-02: Maximum other-section lines.  All other accumulators have explicit
+# MAX_* constants; _other_lines had no bound, enabling unbounded memory growth
+# from malformed files.  Overridable at module level.
+MAX_OTHER_LINES = 1_000_000
+
 # F-32 + G-17: Characters that Python's splitlines() treats as line breaks
 # beyond \\n and \\r.  When present in file content, they cause splitlines()
 # to produce fake section headers and corrupt parsed data.  The writer's
@@ -105,8 +110,13 @@ VALUE_ONLY_PATTERN = re.compile(
 # LAS 3.0: Array notation pattern (e.g., NMR[1], RUN[2])
 ARRAY_MNEMONIC_PATTERN = re.compile(r"^(?P<base>[\w\-]+)\[(?P<index>\d+)\]$")
 
-# LAS 3.0: Format specifier in braces (e.g., {F}, {E}, {S}, {A:0})
-FORMAT_SPEC_PATTERN = re.compile(r"\{(?P<format>[FESAI]):?(?P<offset>[\d.]*)\s*\}")
+# LAS 3.0: Format specifier in braces (e.g., {F}, {E}, {S}, {A:0},
+# {D}, {DEG}, {DD/MM/YYYY}, {E0.00E+00}).
+# F-M-05: Expanded from [FESAI] to match multi-character format codes
+# (D, DEG, date templates, extended exponent notation).  Format group
+# captures one or more non-brace, non-colon characters; colon and
+# optional offset follow.
+FORMAT_SPEC_PATTERN = re.compile(r"\{(?P<format>[A-Za-z][^}:]*?)(?::(?P<offset>[\d.]*))?\s*\}")
 
 # LAS 3.0: Zone association via pipe (e.g., | Run[1], | Zone[2])
 ZONE_ASSOC_PATTERN = re.compile(r"\|\s*(?P<zone>[\w\-]+)(?:\[(?P<index>\d+)\])?$")
@@ -205,7 +215,17 @@ class LASParser:
         # Build uppercased lookup with multi-step chain resolution.
         # resolve_mnemonic walks chains like BK-3 → BK → BFV to reach
         # the terminal canonical name. Single .get() only resolves one hop.
-        _raw_upper = {k.upper(): v for k, v in self.mnem_base.items()}
+        #
+        # F-H-01: Use first-wins semantics — canonical uppercase entries
+        # (e.g. "BK": "BFV") appear first in insertion order.  Later
+        # lowercased aliases (e.g. "bk": "BK") that collide on uppercased
+        # key must not overwrite.  Dict comprehension gives last-wins,
+        # which breaks chain resolution.
+        _raw_upper: dict[str, str] = {}
+        for k, v in self.mnem_base.items():
+            key = k.upper()
+            if key not in _raw_upper:
+                _raw_upper[key] = v
         self._mnem_base_upper: dict[str, str] = {}
         for k in _raw_upper:
             self._mnem_base_upper[k] = resolve_mnemonic(_raw_upper, k)
@@ -331,7 +351,10 @@ class LASParser:
 
     def _parse_line(self, line: str) -> None:
         """Route a single line to the appropriate section handler."""
-        section_match = SECTION_PATTERN.match(line)
+        # F-M-07: Strip leading whitespace before matching SECTION_PATTERN,
+        # matching _pre_scan behavior.  Leading spaces would otherwise break
+        # section header detection in the main parse pass.
+        section_match = SECTION_PATTERN.match(line.strip())
         if section_match:
             section_word = section_match.group(1).upper()
             section_rest = section_match.group(2).strip()
@@ -392,7 +415,12 @@ class LASParser:
                     section_name = section_rest or ""
                     # G-02: Regular ~C or ~CURVE section — no definition name.
                     self._current_definition_name = None
-            elif section_word in {"P", "PARAMETER", "PARAMETERS"}:
+            elif section_word in {"P", "PARAMETER", "PARAMETERS"} or section_word.endswith(
+                "_PARAMETER"
+            ):
+                # F-M-01: LAS 3.0 typed parameter sections (e.g.,
+                # ~Core_Parameter, ~Drilling_Parameter) route to the
+                # parameter parser like standard ~P/~Parameter sections.
                 new_section = "P"
                 section_name = section_rest or ""
             elif section_word in {"O", "OTHER"}:
@@ -429,17 +457,35 @@ class LASParser:
                 _prev_data_section_type = self._current_data_section_type
                 # Derive section_type from keyword, falling back to LOG_DATA.
                 # F-03: Handle indexed sections (e.g., CORE[1] → CORE_DATA).
+                # F-M-03: Warn when section_word is not a recognized type
+                # before defaulting to LOG_DATA.
                 bracket_idx = section_word.find("[")
                 if bracket_idx >= 0:
                     base_type = section_word[:bracket_idx]
                     base_with_data = f"{base_type}_DATA"
-                    self._current_data_section_type = _SECTION_TYPE_MAP.get(
-                        base_type, _SECTION_TYPE_MAP.get(base_with_data, "LOG_DATA")
-                    )
+                    stype = _SECTION_TYPE_MAP.get(base_type)
+                    if stype is None:
+                        stype = _SECTION_TYPE_MAP.get(base_with_data)
+                    if stype is None:
+                        warnings.warn(
+                            f"Unrecognized data section type '~{section_word}', "
+                            f"defaulting to LOG_DATA.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                        stype = "LOG_DATA"
+                    self._current_data_section_type = stype
                 else:
-                    self._current_data_section_type = _SECTION_TYPE_MAP.get(
-                        section_word, "LOG_DATA"
-                    )
+                    stype = _SECTION_TYPE_MAP.get(section_word)
+                    if stype is None:
+                        warnings.warn(
+                            f"Unrecognized data section type '~{section_word}', "
+                            f"defaulting to LOG_DATA.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                        stype = "LOG_DATA"
+                    self._current_data_section_type = stype
                 # F-08: Handle pipe-delimited definition association.
                 # "| CURVE" means use the main curve block (before
                 # _Definition sections). "| X_Definition" means use
@@ -473,7 +519,7 @@ class LASParser:
                 # Unknown section type — accumulate lines as free-form text (like ~O).
                 new_section = None
                 section_name = f"{section_word} {section_rest}".strip()
-                self._other_lines.append(line)
+                self._append_other_line(line)
                 source_info = f" in {self.source_file}" if self.source_file else ""
                 logger.warning(
                     "Unknown section type '~%s' at line%s — lines accumulated as other section: %s",
@@ -561,12 +607,22 @@ class LASParser:
                 getattr(self, handler_name)(line)
             else:
                 # Fallback for unknown section types — accumulate in _other_lines.
-                self._other_lines.append(line)
+                self._append_other_line(line)
         else:
             # F-02/F-08: Data lines without an active section (e.g., body lines
             # of an unknown section where _current_section was reset to None).
             # Accumulate as free-form text (like ~O).
-            self._other_lines.append(line)
+            self._append_other_line(line)
+
+    def _append_other_line(self, line: str) -> None:
+        """Append a line to _other_lines with a bounds check (F-M-02)."""
+        if len(self._other_lines) >= MAX_OTHER_LINES:
+            raise LASParseError(
+                f"Other section line count ({len(self._other_lines) + 1}) exceeds "
+                f"maximum allowed ({MAX_OTHER_LINES}). "
+                f"The file may be malformed or corrupt."
+            )
+        self._other_lines.append(line)
 
     def _match_data_line(self, line: str) -> re.Match[str] | None:
         """Try to match a header data line with colon, then without."""
@@ -820,7 +876,7 @@ class LASParser:
 
     def _parse_other(self, line: str) -> None:
         """Parse ~O (other) section — free-form text, accumulated."""
-        self._other_lines.append(line)
+        self._append_other_line(line)
 
     def _parse_ascii_data(self, line: str) -> None:
         """Collect ASCII data lines for later processing.

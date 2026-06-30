@@ -19,7 +19,7 @@ from pylasdev.models import (
     ParameterZone,
     VersionSection,
 )
-from pylasdev.writer import _sanitize_las_value
+from pylasdev.writer import _format_fixed_precision, _format_number, _sanitize_las_value
 
 
 class TestWriteLASFile:
@@ -276,6 +276,68 @@ class TestWriteLASFile:
         assert "DLM" in content
         assert "COMMA" in content
         assert "VERSION 3.0" in content
+
+    # --- F-M-26: DLM=TAB writer test ---
+    def test_write_las30_with_dlm_tab(self, tmp_path: Path) -> None:
+        """Test writing LAS 3.0 with DLM=TAB produces tab-delimited data.
+
+        The writer supports three DLM values: SPACE, COMMA, and TAB.
+        This test verifies that DLM=TAB produces actual tab characters
+        ("\\t") as separators in the data section.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="TAB")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "DT", "GR"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
+        las.curves.append(CurveDefinition(mnemonic="DT", unit="US/M", data_format="F"))
+        las.curves.append(CurveDefinition(mnemonic="GR", unit="GAPI", data_format="F"))
+        las.logs["DEPT"] = np.array([100.0, 101.0, 102.0])
+        las.logs["DT"] = np.array([50.0, 51.0, 52.0])
+        las.logs["GR"] = np.array([75.0, 76.0, 77.0])
+
+        temp_file = tmp_path / "las30_tab.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        # DLM should be present in version section
+        assert "DLM" in content
+        assert "TAB" in content
+
+        # Find the data section after ~A (or ~ASCII/~LOG_DATA)
+        data_section = ""
+        for header in ("~ASCII", "~LOG_DATA", "~A"):
+            if header in content:
+                data_section = content.split(header, 1)[1]
+                break
+        assert data_section != "", "No data section header found"
+
+        # Get data lines (skip header line with curve names)
+        data_lines = [
+            line for line in data_section.splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        # Skip the first line (curve names header)
+        data_lines = data_lines[1:]
+
+        assert len(data_lines) >= 3, f"Expected >=3 data lines, got {len(data_lines)}"
+
+        # Each data line must use tab characters as separators
+        for line in data_lines:
+            assert "\t" in line, (
+                f"Expected tab-separated data line, got: {line!r}"
+            )
+            # The tab separator must produce the correct number of columns
+            parts = line.split("\t")
+            assert len(parts) == 3, (
+                f"Expected 3 tab-separated values, got {len(parts)}: {line!r}"
+            )
+
+        # Verify roundtrip: re-read and check data values
+        reread = read_las_file(temp_file)
+        np.testing.assert_allclose(reread["logs"]["DEPT"], [100.0, 101.0, 102.0])
+        np.testing.assert_allclose(reread["logs"]["DT"], [50.0, 51.0, 52.0])
+        np.testing.assert_allclose(reread["logs"]["GR"], [75.0, 76.0, 77.0])
 
     def test_write_las30_format_specifiers(self, tmp_path: Path) -> None:
         """Test writing LAS 3.0 curve format specifiers {F}, {S}."""
@@ -903,3 +965,73 @@ class TestWriteLASFile:
         assert len(data_lines) >= 2  # at least the data lines
         # Verify WRAP value is preserved in output (header says YES even though data isn't wrapped)
         assert "WRAP.   YES" in content
+
+    # --- F-S6-M4: _format_fixed_precision unit tests ---
+
+    def test_format_fixed_precision_normal_value(self) -> None:
+        """Normal value (no exponent in .8g output): magnitude 2, 8 sig digits."""
+        result = _format_fixed_precision(123.456, ".8g")
+        # magnitude = floor(log10(123.456)) = 2
+        # decimal_places = 8 + max(0, -2-1) = 8 → format(..., ".8f")
+        assert result == "123.45600000"
+
+    def test_format_fixed_precision_zero(self) -> None:
+        """Zero special case: math.log10(0) is guarded by value==0 check."""
+        result = _format_fixed_precision(0.0, ".8g")
+        assert result == "0.00000000"
+
+    def test_format_fixed_precision_small_value(self) -> None:
+        """Small value: magnitude=-3, gets extra decimal places for sig digits."""
+        result = _format_fixed_precision(0.001, ".8g")
+        # magnitude = floor(log10(0.001)) = -3
+        # decimal_places = 8 + max(0, 3-1) = 10 → format(..., ".10f")
+        assert result == "0.0010000000"
+
+    def test_format_fixed_precision_large_value(self) -> None:
+        """Large value: magnitude=6, stays at sig_digits decimal places."""
+        result = _format_fixed_precision(1234567.89, ".8g")
+        # magnitude = floor(log10(1234567.89)) = 6
+        # decimal_places = 8 + max(0, -6-1) = 8 → format(..., ".8f")
+        assert result == "1234567.89000000"
+
+    def test_format_fixed_precision_exponent_trigger_large(self) -> None:
+        """Value >= 1e8 triggers exponent in .8g format → _format_fixed_precision.
+
+        Verified through _format_number: format(1.23456789e8, ".8g") produces
+        "1.2345679e+08", which contains "e", so _format_fixed_precision is called.
+        """
+        result = _format_number(1.23456789e8)
+        # magnitude = floor(log10(1.23456789e8)) = 8
+        # decimal_places = 8 → format(..., ".8f")
+        assert "e" not in result.lower()
+        assert result == "123456789.00000000"
+
+    def test_format_fixed_precision_exponent_trigger_small(self) -> None:
+        """Value < 1e-4 triggers exponent in .8g → _format_fixed_precision path."""
+        result = _format_number(1e-5)
+        # magnitude = -5, decimal_places = 8 + max(0, 5-1) = 12 → ".12f"
+        assert "e" not in result.lower()
+        assert result == "0.000010000000"
+
+    def test_format_fixed_precision_negative_value(self) -> None:
+        """Negative value: abs() makes magnitude positive, format uses minus sign."""
+        result = _format_fixed_precision(-123.456, ".8g")
+        # magnitude = floor(log10(123.456)) = 2 (abs used)
+        # decimal_places = 8 → format(..., ".8f")
+        assert result == "-123.45600000"
+
+    def test_format_fixed_precision_custom_sig_digits(self) -> None:
+        """Custom precision string: .5g → 5 significant digits."""
+        result = _format_fixed_precision(12345.6789, ".5g")
+        # sig_digits = 5, magnitude = 4
+        # decimal_places = 5 + max(0, -4-1) = 5 → format(..., ".5f")
+        assert result == "12345.67890"
+
+    def test_format_fixed_precision_subnormal_value(self) -> None:
+        """Very small value: magnitude=-12, decimal_places clamped to 30."""
+        result = _format_fixed_precision(1e-12, ".8g")
+        # magnitude = -12, decimal_places = 8 + max(0, 12-1) = 19
+        # 19 < 30 → no clamp, stays at 19
+        assert "e" not in result.lower()
+        assert result.startswith("0.")
+        assert len(result.split(".")[1]) == 19

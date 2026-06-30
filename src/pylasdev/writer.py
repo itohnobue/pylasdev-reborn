@@ -9,6 +9,7 @@ Supports LAS 1.2, 2.0, and 3.0 formats.
 
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -82,7 +83,10 @@ def write_las_file(
             re-reading of files containing non-ASCII characters (e.g.
             Cyrillic curve mnemonics in Russian LAS files).
         precision: Format specifier for numeric data values (default: '.8g').
-            Pass a Python format spec like '.6g' or '.10e' for more precision.
+            Pass a Python format spec like '.6g' or '.8f' for more precision.
+            e-format specifiers (e.g. '.10e') produce exponent notation
+            forbidden by the LAS spec and are automatically converted to
+            fixed-point format.
 
     Raises:
         LASWriteError: If file cannot be written.
@@ -95,7 +99,7 @@ def write_las_file(
         # in models.py) raises LASWriteError instead of raw ValueError.
         try:
             las_file = LASFile.from_dict(las_data)
-        except (ValueError, TypeError) as e:
+        except (ValueError, TypeError, AttributeError) as e:
             raise LASWriteError(f"Cannot create LASFile from dict: {e}") from e
     elif isinstance(las_data, LASFile):
         las_file = las_data
@@ -470,11 +474,41 @@ def _format_number(value: float, precision: str = ".8g", null_value: float | Non
         result = format(int(value), precision)
     else:
         result = format(float(value), precision)
-    # F-02: The default '.8g' precision can produce exponent notation
-    # (e.g., '1e+08' for values >= 1e8).  The LAS spec forbids exponents
-    # in data sections.  Detect exponent output and reformat using the
-    # equivalent fixed-point precision (e.g., '.8g' → '.8f').
+    # The LAS spec forbids exponent notation in data sections.
+    # Detect exponent output and reformat using magnitude-aware
+    # fixed-point precision that preserves significant digits.
     if "e" in result.lower():
-        f_precision = precision.replace("g", "f")
-        result = format(float(value), f_precision)
+        result = _format_fixed_precision(value, precision)
     return result
+
+
+def _format_fixed_precision(value: float, precision: str) -> str:
+    """Convert a value to fixed-point notation with magnitude-aware precision.
+
+    ``.8f`` would lose significant digits for values < 1e-4 (e.g.,
+    ``0.0000123`` → ``"0.00001230"`` with ``.8f`` loses 4 digits).
+    This helper computes the number of decimal places needed to preserve
+    the significant-digit count implied by the original precision spec.
+
+    Also handles e-format precision strings (e.g., ``".10e"``) that
+    would otherwise pass through ``.replace("g", "f")`` unchanged.
+    """
+    # Extract the significant-digit count from the precision spec.
+    # ".8g" → 8, ".10e" → 10, ".6f" → 6
+    m = re.match(r"\.(\d+)", precision)
+    sig_digits = int(m.group(1)) if m else 8
+
+    if value == 0:
+        return format(value, f".{sig_digits}f")
+
+    magnitude = math.floor(math.log10(abs(value)))
+    # Values >= 1e8 hit exponent with .8g but .8f is fine.
+    # Values < 1: need sig_digits - magnitude - 1 decimal places
+    #   e.g., 1.2345678e-05 (mag=-5): need 8 - (-5) - 1 = 12 → ".12f"
+    decimal_places = sig_digits + max(0, (-magnitude) - 1)
+    # Cap at a reasonable maximum to avoid excessively long output
+    decimal_places = min(decimal_places, 30)
+    # Ensure at least sig_digits places (for values > 1)
+    decimal_places = max(decimal_places, sig_digits)
+
+    return format(value, f".{decimal_places}f")

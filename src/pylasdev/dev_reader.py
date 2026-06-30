@@ -31,6 +31,7 @@ def read_dev_file(
     file_path: str | Path,
     encoding: str | None = None,
     max_file_size: int | None = None,
+    delimiter: str | None = None,
 ) -> dict[str, Any]:
     """Read a DEV (deviation survey) file and return data dictionary.
 
@@ -41,6 +42,9 @@ def read_dev_file(
         encoding: Optional encoding override.
         max_file_size: Optional maximum file size in bytes. If the file
             exceeds this limit, a ValueError is raised.
+        delimiter: Column delimiter.  ``None`` (default) auto-detects
+            comma vs whitespace from the header line.  Pass ``" "`` for
+            whitespace-only, ``","`` for comma-delimited files.
 
     Returns:
         Dictionary mapping column names to numpy arrays.
@@ -51,7 +55,7 @@ def read_dev_file(
         LASEncodingError: If the explicit encoding parameter fails to decode
             the file.
     """
-    dev = read_dev_file_as_object(file_path, encoding=encoding, max_file_size=max_file_size)
+    dev = read_dev_file_as_object(file_path, encoding=encoding, max_file_size=max_file_size, delimiter=delimiter)
     return dev.to_dict()
 
 
@@ -59,6 +63,7 @@ def read_dev_file_as_object(
     file_path: str | Path,
     encoding: str | None = None,
     max_file_size: int | None = None,
+    delimiter: str | None = None,
 ) -> DevFile:
     """Read a DEV file and return DevFile dataclass (new API).
 
@@ -70,6 +75,9 @@ def read_dev_file_as_object(
         encoding: Optional encoding override.
         max_file_size: Optional maximum file size in bytes. If the file
             exceeds this limit, a ValueError is raised.
+        delimiter: Column delimiter.  ``None`` (default) auto-detects
+            comma vs whitespace from the header line.  Pass ``" "`` for
+            whitespace-only, ``","`` for comma-delimited files.
 
     Returns:
         DevFile dataclass with full parsed data.
@@ -104,6 +112,29 @@ def read_dev_file_as_object(
         raise DEVReadError(f"Cannot read file: {file_path}") from e
 
     lines = content.splitlines()
+
+    # Auto-detect delimiter if not explicitly provided.
+    # Comma-delimited DEV files are common; the original code only
+    # split on whitespace, silently parsing them as single tokens.
+    if delimiter is None:
+        # Find the first non-comment, non-empty line (the header)
+        for line in lines:
+            hdr = line.strip()
+            if hdr and not hdr.startswith("#"):
+                # If the header contains commas and splitting on comma
+                # yields at least as many tokens as splitting on whitespace,
+                # treat the file as comma-delimited.  Using >= (not >) so
+                # that "MD, TVD, INC, AZI" (commas with trailing spaces)
+                # correctly detects comma delimiter.
+                comma_tokens = [t for t in hdr.split(",") if t.strip()]
+                space_tokens = hdr.split()
+                if len(comma_tokens) >= len(space_tokens) and len(comma_tokens) >= 2:
+                    delimiter = ","
+                else:
+                    delimiter = " "
+                break
+        else:
+            delimiter = " "  # No header found — default to space
 
     # Two-pass processing: first pass counts data lines to pre-allocate
     # numpy arrays at the correct size, second pass parses the data.
@@ -142,7 +173,10 @@ def read_dev_file_as_object(
         if not stripped or stripped.startswith("#"):
             continue
 
-        values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
+        if delimiter == " ":
+            values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
+        else:
+            values = [v.strip() for v in stripped.split(delimiter, maxsplit=MAX_TOKENS_PER_LINE)]
 
         if not header_found:
             # First non-comment line = column names

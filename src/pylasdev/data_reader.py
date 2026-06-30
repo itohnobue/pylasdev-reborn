@@ -141,20 +141,19 @@ def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int) -
         )
 
     wrap_mode = las_file.version.wrap.upper() == "YES"
+    delimiter = las_file.version.delimiter_char
 
     if wrap_mode:
         # Auto-detect wrap mismatch: if the first data line has >= curve_count
         # values, the data is actually non-wrapped despite WRAP=YES header.
         # This handles mislabeled files (e.g., Petrel exports).
-        actual_wrap = _detect_actual_wrap(
-            lines, curve_count, las_file.version.delimiter_char
-        )
+        actual_wrap = _detect_actual_wrap(lines, curve_count, delimiter)
         if actual_wrap:
-            _read_wrapped(lines, las_file, curve_count)
+            _read_wrapped(lines, las_file, curve_count, delimiter)
         else:
-            _read_normal(lines, las_file, curve_count, data_line_count)
+            _read_normal(lines, las_file, curve_count, data_line_count, delimiter)
     else:
-        _read_normal(lines, las_file, curve_count, data_line_count)
+        _read_normal(lines, las_file, curve_count, data_line_count, delimiter)
 
 
 def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " ") -> bool:
@@ -186,9 +185,9 @@ def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " "
 
         # First data line found — count values using DLM-aware split.
         if delimiter == " ":
-            values = stripped.split()
+            values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
         else:
-            values = [v for v in stripped.split(delimiter) if v]
+            values = [v.strip() for v in stripped.split(delimiter, maxsplit=MAX_TOKENS_PER_LINE)]
         # In proper wrapped mode, first line has only the depth value (1 value).
         # If it has as many or more values as curves, it's non-wrapped.
         return len(values) < curve_count
@@ -293,6 +292,7 @@ def _read_normal(
     las_file: LASFile,
     curve_count: int,
     data_line_count: int,
+    delimiter: str = " ",
 ) -> None:
     """Read non-wrapped ASCII data. One depth step per line."""
     # Deduplicate curve names before allocating arrays
@@ -344,7 +344,10 @@ def _read_normal(
         if not in_ascii or not stripped or stripped.startswith("#"):
             continue
 
-        values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
+        if delimiter == " ":
+            values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
+        else:
+            values = [v.strip() for v in stripped.split(delimiter, maxsplit=MAX_TOKENS_PER_LINE)]
 
         # Warn about extra columns being silently discarded
         if len(values) > curve_count and not warned_extra:
@@ -405,6 +408,7 @@ def _read_wrapped(
     lines: list[str],
     las_file: LASFile,
     curve_count: int,
+    delimiter: str = " ",
 ) -> None:
     """Read wrapped ASCII data using depth_line flag protocol.
 
@@ -425,7 +429,6 @@ def _read_wrapped(
     # already have this guard.
     _count_in_ascii = False
     _count = 0
-    _depth_steps = 0
     for line in lines:
         stripped = line.strip()
         if _is_section_header(stripped):
@@ -436,13 +439,6 @@ def _read_wrapped(
             continue
         if _count_in_ascii and stripped and not stripped.startswith("#"):
             _count += 1
-            # G-01: Count depth steps (single-value lines) separately.
-            # In wrapped mode the depth line has exactly 1 value; data
-            # lines may have 1 or more.  Using total line count (_count)
-            # in the product check over-counts elements by up to a factor
-            # of curve_count, causing false rejection of valid files.
-            if len(stripped.split()) == 1:
-                _depth_steps += 1
 
     if _count > MAX_DATA_LINES:
         raise LASParseError(
@@ -451,15 +447,19 @@ def _read_wrapped(
         )
 
     # Combined bound: protect against combination attacks.
-    # Use depth_steps (actual data rows) when single-value depth lines
-    # were detected; fall back to _count for non-standard wrapped files.
-    element_count = _depth_steps if _depth_steps > 0 else _count
-    if curve_count * element_count > MAX_TOTAL_ELEMENTS:
-        raise LASParseError(
-            f"Total allocation ({curve_count} curves x {element_count} depth steps = "
-            f"{curve_count * element_count} elements) exceeds maximum allowed "
-            f"({MAX_TOTAL_ELEMENTS}). The file may be malformed or corrupt."
-        )
+    # In wrapped mode each depth step spans ~curve_count lines
+    # (1 depth + curve_count-1 data values).  Estimate depth steps
+    # conservatively from total line count — the alternative heuristic
+    # of counting single-value lines overcounts depth steps when curve
+    # values legitimately appear one per line, causing false rejection.
+    if curve_count > 0:
+        depth_steps = max(1, _count // curve_count)
+        if curve_count * depth_steps > MAX_TOTAL_ELEMENTS:
+            raise LASParseError(
+                f"Total allocation ({curve_count} curves x ~{depth_steps} depth steps ≈ "
+                f"{curve_count * depth_steps} elements) exceeds maximum allowed "
+                f"({MAX_TOTAL_ELEMENTS}). The file may be malformed or corrupt."
+            )
 
     # Accumulate into lists, convert to numpy at end
     data_lists: list[list[float]] = [[] for _ in range(curve_count)]
@@ -488,7 +488,10 @@ def _read_wrapped(
         if not in_ascii or not stripped or stripped.startswith("#"):
             continue
 
-        values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
+        if delimiter == " ":
+            values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
+        else:
+            values = [v.strip() for v in stripped.split(delimiter, maxsplit=MAX_TOKENS_PER_LINE)]
 
         if depth_line:
             # Depth line: single value = depth for this step

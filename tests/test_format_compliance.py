@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 
-from pylasdev import write_las_file
+from pylasdev import read_las_file, write_las_file
 from pylasdev.models import (
     CurveDefinition,
     LASFile,
@@ -305,3 +305,140 @@ class TestFormatCompliance:
         assert v_pos < w_pos < c_pos < p_pos < a_pos, (
             f"Section order violated: V={v_pos} W={w_pos} C={c_pos} P={p_pos} A={a_pos}"
         )
+
+    # --- F-M-25: LAS 1.2 256-char line-length compliance ---
+    def test_las12_long_data_lines_do_not_crash(self, tmp_path: Path) -> None:
+        """Test LAS 1.2 output with data lines exceeding 256 characters.
+
+        The LAS 1.2 spec allows a maximum of 256 characters per line in
+        unwrapped mode (each line = one depth step). This test verifies
+        that the library does not crash or silently corrupt data when
+        data lines exceed this limit.
+
+        NOTE: The library currently does NOT enforce the 256-char limit.
+        Long lines are written as-is and read back correctly. This test
+        documents the current behavior (no enforcement).
+        """
+        # Create 30 curves — each formatted value is ~10 chars, so 30
+        # columns produce lines well over 256 characters.
+        curve_names = [f"C{i:02d}" for i in range(30)]
+        logs: dict[str, np.ndarray] = {}
+        for i, name in enumerate(curve_names):
+            logs[name] = np.array(
+                [123456.789 + i * 10, 234567.890 + i * 10], dtype=np.float64
+            )
+
+        data: dict[str, Any] = {
+            "version": {"VERS": "1.2", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {
+                "STRT": "0.0",
+                "STOP": "1.0",
+                "STEP": "1.0",
+                "NULL": "-999.25",
+                "COMP": "TestCo",
+                "WELL": "Well1",
+            },
+            "parameters": {},
+            "logs": logs,
+            "curves_order": curve_names,
+        }
+        temp_file = tmp_path / "las12_long_lines.las"
+        write_las_file(temp_file, data)
+
+        content = temp_file.read_text()
+        # Extract data section after ~A
+        data_section = content.split("~A")[-1]
+        data_lines = [
+            line for line in data_section.splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        # Skip header line (curve names)
+        data_lines = data_lines[1:]
+
+        # All data lines should be present
+        assert len(data_lines) == 2, f"Expected 2 data lines, got {len(data_lines)}"
+
+        # Verify at least one line exceeds 256 characters
+        long_lines = [line for line in data_lines if len(line) > 256]
+        assert len(long_lines) > 0, (
+            f"No data line exceeded 256 chars; max was {max(len(ln) for ln in data_lines)}"
+        )
+
+        # Verify roundtrip: re-read and check data is intact
+        reread = read_las_file(temp_file)
+        assert reread["curves_order"] == curve_names
+        for name in curve_names:
+            np.testing.assert_allclose(
+                reread["logs"][name],
+                logs[name],
+                rtol=1e-4,
+                err_msg=f"Data mismatch for {name} after long-line roundtrip",
+            )
+
+    # --- F-M-27: LAS 3.0 WRAP=NO enforcement ---
+    def test_las30_wrap_yes_emits_warning(self, tmp_path: Path) -> None:
+        """Test that writing LAS 3.0 with WRAP=YES emits a warning.
+
+        The LAS 3.0 specification states that WRAP must be NO
+        (non-wrapped mode is mandatory in LAS 3.0). This test verifies
+        that the library warns when WRAP=YES is used with LAS 3.0.
+
+        NOTE: The library currently emits a warning but does NOT raise
+        LASWriteError. VersionSection accepts any wrap value silently.
+        This test documents the current behavior (warning-only).
+        """
+        import warnings
+
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="YES", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        temp_file = tmp_path / "las30_wrap_yes.las"
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            write_las_file(temp_file, las)
+            wrap_warnings = [x for x in w if "WRAP=YES" in str(x.message)]
+            assert len(wrap_warnings) >= 1, (
+                "Expected warning about WRAP=YES in LAS 3.0, but none was emitted"
+            )
+
+        # Verify the file was written despite the warning
+        content = temp_file.read_text()
+        assert "~VERSION" in content
+        assert "3.0" in content
+        # The WRAP value in output must be preserved (even though spec forbids it)
+        assert "WRAP.   YES" in content
+        # Data should be written in non-wrapped format (one line per depth step)
+        assert "100" in content
+
+    def test_las30_wrap_no_silent(self, tmp_path: Path) -> None:
+        """Test that LAS 3.0 with WRAP=NO is accepted silently (no warnings).
+
+        This is the correct/expected LAS 3.0 configuration per spec.
+        """
+        import warnings
+
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "DT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
+        las.curves.append(CurveDefinition(mnemonic="DT", unit="US/M", data_format="F"))
+        las.logs["DEPT"] = np.array([100.0, 101.0])
+        las.logs["DT"] = np.array([50.0, 51.0])
+
+        temp_file = tmp_path / "las30_wrap_no.las"
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            write_las_file(temp_file, las)
+            wrap_warnings = [x for x in w if "WRAP=YES" in str(x.message)]
+            assert len(wrap_warnings) == 0, (
+                "Unexpected WRAP=YES warning for LAS 3.0 with WRAP=NO"
+            )
+
+        content = temp_file.read_text()
+        assert "WRAP.   NO" in content
+        assert "~VERSION 3.0" in content or "VERSION 3.0" in content
