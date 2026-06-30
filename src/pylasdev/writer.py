@@ -18,7 +18,7 @@ from numpy.typing import NDArray
 
 from .data_reader import _get_null_value
 from .exceptions import LASWriteError
-from .models import LASFile
+from .models import CurveDefinition, LASFile
 
 # Control characters except space and tab (which are valid LAS whitespace).
 # Matches \x00-\x08, \x0B, \x0C, \x0E-\x1F, \x7F (DEL), \x85 (NEL),
@@ -184,30 +184,33 @@ def _write_well_section(las_file: LASFile) -> list[str]:
 
 
 def _write_curve_section(las_file: LASFile) -> list[str]:
-    """Write ~C Curve section — preserve units and descriptions."""
+    """Write ~C Curve section — preserve units and descriptions.
+
+    For LAS 3.0 files with structured data sections, only the main
+    (LOG_DATA) curves are emitted in ~CURVE.  Per-section curves are
+    emitted in their own Definition sections by _write_ascii_sections.
+    """
     lines: list[str] = []
     is_las30 = las_file.is_las30
     lines.append("~CURVE INFORMATION")
-    for curve in las_file.curves:
-        unit = _sanitize_las_value(curve.unit) if curve.unit else ""
-        desc = curve.description if curve.description else ""
 
-        if is_las30 and curve.data_format:
-            format_str = f"{{{curve.data_format}"
-            if curve.array_info and curve.array_info.time_offset is not None:
-                # Format time_offset as int if it's a whole number, float otherwise
-                offset = curve.array_info.time_offset
-                if offset == int(offset):
-                    format_str += f":{int(offset)}"
-                else:
-                    format_str += f":{offset}"
-            format_str += "}"
-            desc = f"{desc}  {format_str}"
-
-        api = f"  {_sanitize_las_value(curve.api_code)}" if curve.api_code else ""
-        lines.append(
-            f" {_sanitize_las_value(curve.mnemonic)}.{unit}{api}  : {_sanitize_las_value(desc)}"
+    if is_las30 and las_file.data_sections:
+        # Use the LOG_DATA section's curve definitions for the main ~C block.
+        log_section = next(
+            (ds for ds in las_file.data_sections if ds.section_type == "LOG_DATA"),
+            None,
         )
+        curves_to_emit = (
+            log_section.section_curves
+            if log_section and log_section.section_curves
+            else las_file.curves
+        )
+        for curve in curves_to_emit:
+            lines.append(_format_curve_line(curve, is_las30))
+    else:
+        for curve in las_file.curves:
+            lines.append(_format_curve_line(curve, is_las30))
+
     lines.append("")
     return lines
 
@@ -237,16 +240,33 @@ def _write_parameter_section(las_file: LASFile) -> list[str]:
 
 
 def _write_other_section(las_file: LASFile) -> list[str]:
-    """Write ~O Other section."""
+    """Write ~O Other section.
+
+    LAS 3.0 deprecates the ~Other section — content must go into
+    user-defined Parameter or Column Data sections instead.
+    """
     lines: list[str] = []
-    if las_file.other and las_file.other.strip():
-        lines.append("~OTHER")
-        # Sanitize each line of free-form other content against section injection
-        for line in las_file.other.splitlines():
-            sanitized = _sanitize_las_value(line)
-            if sanitized.strip():
-                lines.append(sanitized)
-        lines.append("")
+    if not las_file.other or not las_file.other.strip():
+        return lines
+    # F-05: ~Other is NOT ALLOWED in LAS 3.0 per spec.  Skip emission
+    # and warn so the caller knows the content was not written.
+    if las_file.is_las30:
+        import warnings
+
+        warnings.warn(
+            "~Other section content was NOT written because LAS 3.0 "
+            "deprecates the ~Other section.  Other content should be "
+            "migrated to user-defined Parameter or Column Data sections.",
+            stacklevel=3,
+        )
+        return lines
+    lines.append("~OTHER")
+    # Sanitize each line of free-form other content against section injection
+    for line in las_file.other.splitlines():
+        sanitized = _sanitize_las_value(line)
+        if sanitized.strip():
+            lines.append(sanitized)
+    lines.append("")
     return lines
 
 
@@ -262,10 +282,41 @@ _SECTION_TYPE_TO_PREFIX: dict[str, str] = {
     "PERFORATIONS_DATA": "PERFORATIONS_DATA",
 }
 
+# Map DataSection.section_type values to the Definition section header prefix
+# (the root name without the _DATA suffix).  e.g., CORE_DATA → "Core_Definition".
+_SECTION_TYPE_TO_DEFINITION_PREFIX: dict[str, str] = {
+    "CORE_DATA": "Core",
+    "DRILLING_DATA": "Drilling",
+    "INCLINOMETRY_DATA": "Inclinometry",
+    "TOPS_DATA": "Tops",
+    "TEST_DATA": "Test",
+    "PERFORATIONS_DATA": "Perforations",
+}
+
 
 def _section_type_to_prefix(section_type: str) -> str:
     """Convert a DataSection.section_type to the LAS header prefix."""
     return _SECTION_TYPE_TO_PREFIX.get(section_type, "A")
+
+
+def _format_curve_line(curve: CurveDefinition, is_las30: bool) -> str:
+    """Format a single CurveDefinition as a LAS curve line."""
+    unit = _sanitize_las_value(curve.unit) if curve.unit else ""
+    desc = curve.description if curve.description else ""
+
+    if is_las30 and curve.data_format:
+        format_str = f"{{{curve.data_format}"
+        if curve.array_info and curve.array_info.time_offset is not None:
+            offset = curve.array_info.time_offset
+            if offset == int(offset):
+                format_str += f":{int(offset)}"
+            else:
+                format_str += f":{offset}"
+        format_str += "}"
+        desc = f"{desc}  {format_str}"
+
+    api = f"  {_sanitize_las_value(curve.api_code)}" if curve.api_code else ""
+    return f" {_sanitize_las_value(curve.mnemonic)}.{unit}{api}  : {_sanitize_las_value(desc)}"
 
 
 def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str]:
@@ -273,13 +324,42 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
     lines: list[str] = []
     null_value = _get_null_value(las_file.well)
     delimiter = las_file.version.delimiter_char
+    is_las30 = las_file.is_las30
 
     if las_file.data_sections:
         # LAS 3.0: Multiple data sections with typed headers.
+        emitted_defs: set[str] = set()
         for section in las_file.data_sections:
-            section_name = f" {_sanitize_las_value(section.name)}" if section.name else ""
             section_prefix = _section_type_to_prefix(section.section_type)
-            lines.append(f"~{section_prefix}{section_name}")
+            section_name = f" {_sanitize_las_value(section.name)}" if section.name else ""
+
+            # For non-LOG_DATA sections: emit per-section Definition section
+            # so that the parser can correctly re-associate per-section curve
+            # names on re-read.  Without this, all data sections get the
+            # global curve set on roundtrip.  Only emit once per section type
+            # (e.g., one Core_Definition for both Core[1] and Core[2]).
+            if (
+                is_las30
+                and section.section_type != "LOG_DATA"
+                and section.section_curves
+            ):
+                def_prefix = _SECTION_TYPE_TO_DEFINITION_PREFIX.get(
+                    section.section_type
+                )
+                if def_prefix and def_prefix not in emitted_defs:
+                    emitted_defs.add(def_prefix)
+                    lines.append(f"~{def_prefix}_Definition")
+                    for curve in section.section_curves:
+                        lines.append(_format_curve_line(curve, is_las30))
+                    lines.append("")  # blank line after definition
+
+            # LOG_DATA sections associate to the main curve block via
+            # "| CURVE" pipe notation so the parser scopes curves
+            # to only the global ~CURVE set on re-read.
+            if section.section_type == "LOG_DATA" and is_las30:
+                lines.append(f"~{section_prefix}{section_name} | CURVE")
+            else:
+                lines.append(f"~{section_prefix}{section_name}")
             lines.extend(
                 _format_data_rows(
                     section.curves_order,

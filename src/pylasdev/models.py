@@ -237,6 +237,7 @@ class DataSection:
     curves_order: list[str] = field(default_factory=list)
     data: dict[str, NDArray[np.float64]] = field(default_factory=dict)
     string_data: dict[str, NDArray[np.str_]] = field(default_factory=dict)  # For {S} format curves
+    section_curves: list[CurveDefinition] = field(default_factory=list)  # Per-section curve definitions
 
     def to_dict(self) -> dict[str, Any]:
         """Convert DataSection to dict for serialization."""
@@ -246,6 +247,7 @@ class DataSection:
             "curves_order": list(self.curves_order),
             "data": {k: v.copy() for k, v in self.data.items()},
             "string_data": {k: v.copy() for k, v in self.string_data.items()},
+            "section_curves": [c.to_dict() for c in self.section_curves],
         }
 
 
@@ -392,12 +394,34 @@ class LASFile:
             ds_string_data = {}
             for name, arr in ds_dict.get("string_data", {}).items():
                 ds_string_data[name] = np.array(arr, dtype=np.str_)
+            ds_section_curves = []
+            for sc_dict in ds_dict.get("section_curves", []):
+                sc_array_info = None
+                if "array_info" in sc_dict:
+                    ai = sc_dict["array_info"]
+                    sc_array_info = ArrayElementInfo(
+                        base_name=ai.get("base_name", ""),
+                        index=ai.get("index", 0),
+                        time_offset=ai.get("time_offset"),
+                    )
+                ds_section_curves.append(
+                    CurveDefinition(
+                        mnemonic=sc_dict.get("mnemonic", ""),
+                        unit=sc_dict.get("unit", ""),
+                        api_code=sc_dict.get("api_code", ""),
+                        description=sc_dict.get("description", ""),
+                        original_mnemonic=sc_dict.get("original_mnemonic", ""),
+                        data_format=sc_dict.get("data_format", ""),
+                        array_info=sc_array_info,
+                    )
+                )
             ds = DataSection(
                 name=ds_dict.get("name", ""),
                 section_type=ds_dict.get("section_type", "LOG_DATA"),
                 curves_order=list(ds_dict.get("curves_order", [])),
                 data={k: np.array(v, dtype=np.float64) for k, v in ds_dict.get("data", {}).items()},
                 string_data=ds_string_data,
+                section_curves=ds_section_curves,
             )
             las_file.data_sections.append(ds)
 

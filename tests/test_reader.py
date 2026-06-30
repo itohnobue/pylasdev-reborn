@@ -1364,3 +1364,253 @@ class TestExtraColumnWarning:
             read_las_file(test_file)
             # The warning text should appear exactly once
             assert caplog.text.count("Extra columns are discarded") == 1
+
+
+class TestLAS30StructuredDataValues:
+    """F-15: Value validation for structured data sections in sample_las3.0_spec.las.
+
+    Tests that data_sections values from the spec-conformant LAS 3.0 file
+    are parsed correctly on INITIAL READ (not roundtrip). The roundtrip
+    path has a known key-name corruption issue (per-section curve names
+    become global curve names on re-read), so only first-read validation
+    is performed here.
+    """
+
+    def assert_section_values(
+        self,
+        sections: list[dict],
+        expected_name: str,
+        expected_type: str,
+        expected_data: dict[str, list[float]],
+    ) -> dict:
+        """Find a section by name and assert its numeric data."""
+        for section in sections:
+            if section["name"] == expected_name:
+                assert section["section_type"] == expected_type
+                data = section["data"]
+                for key, expected_values in expected_data.items():
+                    assert key in data, (
+                        f"Key '{key}' missing in {expected_name} section. "
+                        f"Available keys: {list(data.keys())}"
+                    )
+                    np.testing.assert_array_almost_equal(
+                        data[key],
+                        np.array(expected_values),
+                        err_msg=f"{expected_name}.{key} value mismatch",
+                    )
+                return section
+        pytest.fail(f"Section '{expected_name}' not found in data_sections")
+
+    def test_las30_spec_drilling_data(self, test_data_dir: Path) -> None:
+        """Validate Drilling data section values from sample_las3.0_spec.las."""
+        spec_file = test_data_dir / "sample_las3.0_spec.las"
+        assert spec_file.exists(), f"Required test data missing: {spec_file}"
+        las = read_las_file_as_object(spec_file)
+        sections = [ds.to_dict() for ds in las.data_sections]
+
+        self.assert_section_values(
+            sections,
+            "DRILLING",
+            "DRILLING_DATA",
+            {
+                "DEPT": [322.02, 323.05],
+                "DIST": [1.02, 2.05],
+                "HRS": [0.0, 0.1],
+                "ROP": [24.0, 37.5],
+                "WOB": [3.0, 2.0],
+                "RPM": [59.0, 69.0],
+                "TQ": [111.0, 118.0],
+                "PUMP": [1199.0, 1182.0],
+                "TSPM": [179.0, 175.0],
+                "GPM": [879.0, 861.0],
+                "ECD": [8.73, 8.73],
+                "TBR": [39.0, 202.0],
+            },
+        )
+
+    def test_las30_spec_core1_data(self, test_data_dir: Path) -> None:
+        """Validate CORE[1] data section values from sample_las3.0_spec.las."""
+        spec_file = test_data_dir / "sample_las3.0_spec.las"
+        assert spec_file.exists(), f"Required test data missing: {spec_file}"
+        las = read_las_file_as_object(spec_file)
+        sections = [ds.to_dict() for ds in las.data_sections]
+
+        self.assert_section_values(
+            sections,
+            "CORE[1]",
+            "CORE_DATA",
+            {
+                "CORET": [545.50, 551.20, 575.00],
+                "COREB": [550.60, 554.90, 595.00],
+            },
+        )
+
+    def test_las30_spec_core2_data(self, test_data_dir: Path) -> None:
+        """Validate CORE[2] data section values from sample_las3.0_spec.las."""
+        spec_file = test_data_dir / "sample_las3.0_spec.las"
+        assert spec_file.exists(), f"Required test data missing: {spec_file}"
+        las = read_las_file_as_object(spec_file)
+        sections = [ds.to_dict() for ds in las.data_sections]
+
+        self.assert_section_values(
+            sections,
+            "CORE[2]",
+            "CORE_DATA",
+            {
+                "CORET": [655.50, 661.20, 675.00],
+                "COREB": [660.60, 664.90, 695.00],
+            },
+        )
+
+    def test_las30_spec_inclinometry_data(self, test_data_dir: Path) -> None:
+        """Validate Inclinometry data section values from sample_las3.0_spec.las."""
+        spec_file = test_data_dir / "sample_las3.0_spec.las"
+        assert spec_file.exists(), f"Required test data missing: {spec_file}"
+        las = read_las_file_as_object(spec_file)
+        sections = [ds.to_dict() for ds in las.data_sections]
+
+        self.assert_section_values(
+            sections,
+            "INCLINOMETRY",
+            "INCLINOMETRY_DATA",
+            {
+                "MD": [0.00, 100.00, 200.00, 300.00, 400.00, 500.00, 600.00],
+                "TVD": [0.00, 100.00, 198.34, 295.44, 390.71, 482.85, 571.90],
+                "AZIM": [290.00, 234.00, 284.86, 234.21, 224.04, 224.64, 204.39],
+                "DEVI": [0.00, 0.00, 1.43, 2.04, 3.93, 5.88, 7.41],
+            },
+        )
+
+    def test_las30_spec_tops_data(self, test_data_dir: Path) -> None:
+        """Validate Tops data section values from sample_las3.0_spec.las."""
+        spec_file = test_data_dir / "sample_las3.0_spec.las"
+        assert spec_file.exists(), f"Required test data missing: {spec_file}"
+        las = read_las_file_as_object(spec_file)
+        sections = [ds.to_dict() for ds in las.data_sections]
+
+        self.assert_section_values(
+            sections,
+            "TOPS",
+            "TOPS_DATA",
+            {
+                "TOPT": [545.50, 602.00, 615.00],
+                "TOPB": [602.00, 615.00, 655.00],
+            },
+        )
+
+    def test_las30_spec_perforations_data(self, test_data_dir: Path) -> None:
+        """Validate Perforations data section values from sample_las3.0_spec.las."""
+        spec_file = test_data_dir / "sample_las3.0_spec.las"
+        assert spec_file.exists(), f"Required test data missing: {spec_file}"
+        las = read_las_file_as_object(spec_file)
+        sections = [ds.to_dict() for ds in las.data_sections]
+
+        self.assert_section_values(
+            sections,
+            "PERFORATIONS",
+            "PERFORATIONS_DATA",
+            {
+                "PERFT": [545.50, 551.20, 575.00],
+                "PERFB": [550.60, 554.90, 595.00],
+                "PERFD": [12.0, 12.0, 12.0],
+            },
+        )
+
+    def test_las30_spec_string_data_in_sections(self, test_data_dir: Path) -> None:
+        """Validate string_data within structured data sections.
+
+        CORE[1] has CDES with string descriptions; Core[2] has same.
+        Perforations has PERFT (charge type) as string.
+        """
+        spec_file = test_data_dir / "sample_las3.0_spec.las"
+        assert spec_file.exists(), f"Required test data missing: {spec_file}"
+        las = read_las_file_as_object(spec_file)
+
+        # Find CORE[1] section (parser uppercases section names)
+        core1 = None
+        for ds in las.data_sections:
+            if ds.name == "CORE[1]":
+                core1 = ds
+                break
+        assert core1 is not None, "CORE[1] section not found"
+        assert "CDES" in core1.string_data, (
+            f"CDES missing from CORE[1] string_data. Keys: {list(core1.string_data.keys())}"
+        )
+        np.testing.assert_array_equal(
+            core1.string_data["CDES"],
+            np.array(["Long cylindrical hunk of rock", "Long broken hunk of rock", "Debris only"]),
+        )
+
+        # Verify section count and names (parser uppercases all section names)
+        section_names = [ds.name for ds in las.data_sections]
+        # Should include 8 sections: DRILLING, CORE[1], CORE[2], INCLINOMETRY, TEST, TOPS, PERFORATIONS, ASCII
+        assert "DRILLING" in section_names
+        assert "CORE[1]" in section_names
+        assert "CORE[2]" in section_names
+        assert "INCLINOMETRY" in section_names
+        assert "TEST" in section_names
+        assert "TOPS" in section_names
+        assert "PERFORATIONS" in section_names
+        assert len(las.data_sections) == 8
+
+        # Validate CORE[2] CDES string_data
+        core2 = None
+        for ds in las.data_sections:
+            if ds.name == "CORE[2]":
+                core2 = ds
+                break
+        assert core2 is not None, "CORE[2] section not found"
+        assert "CDES" in core2.string_data, (
+            f"CDES missing from CORE[2] string_data. Keys: {list(core2.string_data.keys())}"
+        )
+        np.testing.assert_array_equal(
+            core2.string_data["CDES"],
+            np.array(["Long cylindrical hunk of rock", "Long broken hunk of rock", "Debris only"]),
+        )
+
+        # Validate TEST BLOWD string_data
+        test_section = None
+        for ds in las.data_sections:
+            if ds.name == "TEST":
+                test_section = ds
+                break
+        assert test_section is not None, "TEST section not found"
+        assert "BLOWD" in test_section.string_data, (
+            f"BLOWD missing from TEST string_data. Keys: {list(test_section.string_data.keys())}"
+        )
+        np.testing.assert_array_equal(
+            test_section.string_data["BLOWD"],
+            np.array(["Weak Blow", "Strong Blow", "Blow Out"]),
+        )
+
+        # Validate TOPS TOPN string_data
+        tops_section = None
+        for ds in las.data_sections:
+            if ds.name == "TOPS":
+                tops_section = ds
+                break
+        assert tops_section is not None, "TOPS section not found"
+        assert "TOPN" in tops_section.string_data, (
+            f"TOPN missing from TOPS string_data. Keys: {list(tops_section.string_data.keys())}"
+        )
+        np.testing.assert_array_equal(
+            tops_section.string_data["TOPN"],
+            np.array(["Viking", "Colony", "Basal Quartz"]),
+        )
+
+        # Validate PERFORATIONS PERFT_2 string_data (PERFT appears twice:
+        # once as float depth, once as string charge type — the string
+        # one gets renamed to PERFT_2 by per-section dedup)
+        perfs_section = None
+        for ds in las.data_sections:
+            if ds.name == "PERFORATIONS":
+                perfs_section = ds
+                break
+        assert perfs_section is not None, "PERFORATIONS section not found"
+        assert "PERFT_2" in perfs_section.string_data, (
+            f"PERFT_2 missing from PERFORATIONS string_data. Keys: {list(perfs_section.string_data.keys())}"
+        )
+        np.testing.assert_array_equal(
+            perfs_section.string_data["PERFT_2"],
+            np.array(["BIG HOLE", "BIG HOLE", "BIG HOLE"]),
+        )

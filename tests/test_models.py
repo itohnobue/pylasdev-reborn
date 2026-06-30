@@ -7,7 +7,9 @@ from typing import Any
 import numpy as np
 
 from pylasdev.models import (
+    ArrayElementInfo,
     CurveDefinition,
+    DataSection,
     DevFile,
     LASFile,
     ParameterEntry,
@@ -344,6 +346,139 @@ class TestLASFile:
         assert d2["parameter_details"][0]["mnemonic"] == "MATR"
         assert d2["parameter_details"][0]["zone"]["zone_name"] == "RUN"
         assert d2["parameter_details"][1]["array_index"] == 1
+
+    def test_section_curves_serialization_roundtrip(self) -> None:
+        """Test DataSection section_curves preserve all fields through to_dict/from_dict.
+
+        Creates a DataSection with section_curves (full/partial/minimal
+        CurveDefinition metadata including data_format, array_info),
+        roundtrips through LASFile.to_dict()/from_dict(), and asserts
+        every CurveDefinition field is preserved. Covers MEDIUM-3 from
+        post-fix review.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0, 101.0])
+
+        section = DataSection(
+            name="Core[1]",
+            section_type="CORE_DATA",
+            curves_order=["CORET", "COREB", "CDES"],
+            data={
+                "CORET": np.array([1.0, 2.0]),
+                "COREB": np.array([3.0, 4.0]),
+                "CDES": np.array([5.0, 6.0]),
+            },
+            section_curves=[
+                # Full metadata with array_info
+                CurveDefinition(
+                    mnemonic="CORET",
+                    unit="S",
+                    api_code="123",
+                    description="Core Top",
+                    original_mnemonic="CORET_ORIG",
+                    data_format="F",
+                    array_info=ArrayElementInfo(
+                        base_name="CORE",
+                        index=1,
+                        time_offset=0.0,
+                    ),
+                ),
+                # Partial metadata
+                CurveDefinition(
+                    mnemonic="COREB",
+                    unit="S",
+                    description="Core Bottom",
+                    data_format="F",
+                ),
+                # Minimal metadata (string format)
+                CurveDefinition(
+                    mnemonic="CDES",
+                    description="Core Description",
+                    data_format="S",
+                ),
+            ],
+        )
+        las.data_sections.append(section)
+
+        d = las.to_dict()
+        las2 = LASFile.from_dict(d)
+
+        assert len(las2.data_sections) == 1
+        rt_section = las2.data_sections[0]
+        assert rt_section.section_type == "CORE_DATA"
+        assert rt_section.curves_order == ["CORET", "COREB", "CDES"]
+        assert len(rt_section.section_curves) == 3
+
+        # Verify curve with full metadata
+        c1 = rt_section.section_curves[0]
+        assert c1.mnemonic == "CORET"
+        assert c1.unit == "S"
+        assert c1.api_code == "123"
+        assert c1.description == "Core Top"
+        assert c1.original_mnemonic == "CORET_ORIG"
+        assert c1.data_format == "F"
+        assert c1.array_info is not None
+        assert c1.array_info.base_name == "CORE"
+        assert c1.array_info.index == 1
+        assert c1.array_info.time_offset == 0.0
+
+        # Verify curve with partial metadata
+        c2 = rt_section.section_curves[1]
+        assert c2.mnemonic == "COREB"
+        assert c2.unit == "S"
+        assert c2.description == "Core Bottom"
+        assert c2.data_format == "F"
+        assert c2.api_code == ""
+        assert c2.original_mnemonic == ""
+        assert c2.array_info is None
+
+        # Verify curve with minimal metadata (string format)
+        c3 = rt_section.section_curves[2]
+        assert c3.mnemonic == "CDES"
+        assert c3.description == "Core Description"
+        assert c3.data_format == "S"
+        assert c3.array_info is None
+
+        # Verify numeric data is preserved
+        np.testing.assert_array_equal(
+            rt_section.data["CORET"], np.array([1.0, 2.0])
+        )
+        np.testing.assert_array_equal(
+            rt_section.data["COREB"], np.array([3.0, 4.0])
+        )
+
+    def test_section_curves_empty_roundtrip(self) -> None:
+        """Test DataSection with empty section_curves survives roundtrip.
+
+        Covers the edge case where section_curves=[] should serialize
+        as [] and deserialize as [].
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        section = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["DEPT"],
+            data={"DEPT": np.array([100.0])},
+            section_curves=[],
+        )
+        las.data_sections.append(section)
+
+        d = las.to_dict()
+        las2 = LASFile.from_dict(d)
+
+        assert len(las2.data_sections) == 1
+        rt_section = las2.data_sections[0]
+        assert rt_section.section_curves == []
 
 
 class TestDevFile:

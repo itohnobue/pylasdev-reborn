@@ -33,11 +33,14 @@ class TestRoundTrip:
         """Test round-trip on all test files."""
         # sample_las3.0_spec.las contains structured data-type sections
         # (~Drilling, ~Core, ~Inclinometry, ~Tops, ~Test, ~Perforations)
-        # whose curve data is populated on re-read (F-01 fix). The
-        # current architecture stores all curves globally, so roundtrip
-        # of structured data produces differently-named curves than the
-        # original read. Skip strict per-curve data comparison for this
-        # file — it's tested separately via data_sections verification.
+        # whose per-section curve data is populated on re-read. The
+        # roundtrip fix (s7-fix-roundtrip) now preserves per-section
+        # curve names — these are verified below via data_sections
+        # curves_order comparison. However, the global curves_order list
+        # and per-curve data values may differ on roundtrip because
+        # re-read populates structured-section data from their own
+        # sections rather than from the main ASCII section. Skip strict
+        # per-curve data value comparison for this file — shapes only.
         structured_files = {"sample_las3.0_spec.las"}
 
         for las_path in all_las_files:
@@ -96,6 +99,18 @@ class TestRoundTrip:
                 f"data_sections count mismatch in {las_path.name}: "
                 f"{len(rt_sections)} vs {len(orig_sections)}"
             )
+
+            # Verify per-section curve name preservation (MEDIUM-2)
+            for i, (orig_sec, rt_sec) in enumerate(zip(orig_sections, rt_sections, strict=True)):
+                assert orig_sec["section_type"] == rt_sec["section_type"], (
+                    f"section_type mismatch for section {i} in {las_path.name}: "
+                    f"{orig_sec['section_type']} vs {rt_sec['section_type']}"
+                )
+                assert orig_sec["curves_order"] == rt_sec["curves_order"], (
+                    f"curves_order mismatch for section {i} "
+                    f"({orig_sec['section_type']}) in {las_path.name}: "
+                    f"{orig_sec['curves_order']} vs {rt_sec['curves_order']}"
+                )
 
     def test_roundtrip_preserves_curve_metadata(self) -> None:
         """Test that to_dict/from_dict round-trip preserves curve metadata."""

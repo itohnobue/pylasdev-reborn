@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import threading
 import warnings
+from pathlib import Path
 
+import numpy as np
 import pytest
 
 from pylasdev.exceptions import LASParseError
@@ -564,6 +566,57 @@ Line two of free text.
         assert las.data_sections[0].data["DT"][0] == 50.0
         assert las.data_sections[0].data["DEPT"][1] == 101.0
         assert las.data_sections[0].data["DT"][1] == 51.0
+
+    # --- F-14: TAB delimiter from real file ---
+    def test_las30_tab_delimiter_from_real_file(self, test_data_dir: Path) -> None:
+        """Test LAS 3.0 TAB delimiter using a real file from test_data/.
+
+        Exercises the full parsing path (DLM.TAB header -> delimiter_char ->
+        split('\t') -> float conversion) with actual file content.
+        """
+        tab_file = test_data_dir / "sample_las3.0_tab.las"
+        assert tab_file.exists(), f"Required test data missing: {tab_file}"
+        content = tab_file.read_text(encoding="utf-8")
+
+        parser = LASParser()
+        las = parser.parse(content)
+
+        assert len(las.data_sections) == 1
+        assert las.version.dlm == "TAB"
+        assert las.version.delimiter_char == "\t"
+
+        # Verify parsed values from the real file
+        data = las.data_sections[0].data
+        assert len(data["DEPT"]) == 3
+        np.testing.assert_array_almost_equal(data["DEPT"], [100.0, 110.0, 120.0])
+        np.testing.assert_array_almost_equal(data["DT"], [123.45, 123.55, 123.65])
+        np.testing.assert_array_almost_equal(data["RHOB"], [2550.0, 2552.0, 2551.0])
+        np.testing.assert_array_almost_equal(data["NPHI"], [0.450, 0.445, 0.440])
+
+    def test_las30_tab_delimiter_consecutive_tabs(self) -> None:
+        """Test LAS 3.0 TAB delimiter with consecutive TABs (empty fields).
+
+        When consecutive TABs produce empty strings from split('\\t'),
+        the empty value should be handled as null_value rather than
+        causing column misalignment or crash.
+        """
+        content = "~VERSION INFORMATION\n VERS.   3.0  :\n WRAP.   NO   :\n DLM .   TAB  :\n~WELL INFORMATION\n NULL.    -999.25 : NULL VALUE\n~CURVE INFORMATION\n DEPT.M      :  DEPTH {F}\n DT.US/M     :  SONIC {F}\n GR.GAPI     :  GAMMA RAY {F}\n~A\n100.0\t\t75.0\n101.0\t51.0\t76.0\n"
+        parser = LASParser()
+        las = parser.parse(content)
+
+        assert len(las.data_sections) == 1
+        data = las.data_sections[0].data
+
+        # Row 0: consecutive TAB between 100.0 and 75.0 -> split produces ['100.0', '', '75.0']
+        # The empty string for DT -> null_value (-999.25)
+        assert data["DEPT"][0] == 100.0
+        assert data["DT"][0] == -999.25
+        assert data["GR"][0] == 75.0
+
+        # Row 1: all values present
+        assert data["DEPT"][1] == 101.0
+        assert data["DT"][1] == 51.0
+        assert data["GR"][1] == 76.0
 
     # --- F25a: LAS 3.0 per-section duplicate curve dedup ---
     def test_las30_duplicate_curves_renamed_in_section(self) -> None:

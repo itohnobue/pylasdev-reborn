@@ -140,7 +140,9 @@ def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int) -
         # Auto-detect wrap mismatch: if the first data line has >= curve_count
         # values, the data is actually non-wrapped despite WRAP=YES header.
         # This handles mislabeled files (e.g., Petrel exports).
-        actual_wrap = _detect_actual_wrap(lines, curve_count)
+        actual_wrap = _detect_actual_wrap(
+            lines, curve_count, las_file.version.delimiter_char
+        )
         if actual_wrap:
             _read_wrapped(lines, las_file, curve_count)
         else:
@@ -149,11 +151,17 @@ def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int) -
         _read_normal(lines, las_file, curve_count, data_line_count)
 
 
-def _detect_actual_wrap(lines: list[str], curve_count: int) -> bool:
+def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " ") -> bool:
     """Detect if data is actually wrapped by checking the first data line.
 
     In true wrapped mode, the first data line has only 1 value (the depth).
     In non-wrapped mode (even if WRAP=YES header), each line has >= curve_count values.
+
+    Args:
+        lines: File content split into lines.
+        curve_count: Number of curves declared in ~C section.
+        delimiter: Data column delimiter character (default space).
+            Uses DLM-aware splitting when delimiter is not a space.
 
     Returns:
         True if data is actually wrapped, False if non-wrapped despite header.
@@ -170,8 +178,11 @@ def _detect_actual_wrap(lines: list[str], curve_count: int) -> bool:
         if not in_ascii or not stripped or stripped.startswith("#"):
             continue
 
-        # First data line found — check value count
-        values = stripped.split()
+        # First data line found — count values using DLM-aware split.
+        if delimiter == " ":
+            values = stripped.split()
+        else:
+            values = [v for v in stripped.split(delimiter) if v]
         # In proper wrapped mode, first line has only the depth value (1 value).
         # If it has as many or more values as curves, it's non-wrapped.
         return len(values) < curve_count
