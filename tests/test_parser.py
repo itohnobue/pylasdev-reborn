@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from pylasdev import read_las_file
 from pylasdev.exceptions import LASParseError
 from pylasdev.parser import LASParser, _is_indexed_data_section
 
@@ -170,8 +171,13 @@ Line two of free text.
         assert len(las.curves) == 2
         assert las.curves[1].mnemonic == "\u0413\u041a"
 
-    def test_pre_scan_counts_data_lines(self) -> None:
-        """Test that pre-scan correctly counts ASCII data lines."""
+    def test_pre_scan_counts_data_lines(self, tmp_path: Path) -> None:
+        """Test that pre-scan correctly counts ASCII data lines.
+
+        Uses public API (read_las_file) instead of asserting on private
+        _data_line_count. The correct pre-scan count produces correct
+        data array lengths on read.
+        """
         content = """~VERSION INFORMATION
  VERS.   2.0  :
  WRAP.   NO   :
@@ -183,9 +189,11 @@ Line two of free text.
 100.1  51.0
 100.2  52.0
 """
-        parser = LASParser()
-        parser.parse(content)
-        assert parser._data_line_count == 3
+        test_file = tmp_path / "pre_scan_data.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        assert len(data["logs"]["DEPT"]) == 3
+        assert len(data["logs"]["DT"]) == 3
 
     def test_las30_version_detected(self) -> None:
         """Test that LAS 3.0 version is detected correctly."""
@@ -1172,8 +1180,12 @@ class TestLAS30AsciiDataBranches:
             assert len(mandatory_warnings) == 0
 
     # --- F-M2: Pre-scan only counts ~A/~ASCII sections ---
-    def test_pre_scan_ignores_non_ascii_sections(self) -> None:
-        """Pre-scan should only count lines in ~A/~ASCII data sections."""
+    def test_pre_scan_ignores_non_ascii_sections(self, tmp_path: Path) -> None:
+        """Pre-scan should only count lines in ~A/~ASCII data sections.
+
+        Uses public API to verify that only 2 data points (from ~A section)
+        are read, not 4 (the ~Core lines are excluded by pre-scan).
+        """
         content = """~VERSION INFORMATION
  VERS.   2.0  :
  WRAP.   NO   :
@@ -1187,14 +1199,18 @@ class TestLAS30AsciiDataBranches:
 550.0  1.0
 551.0  1.0
 """
-        parser = LASParser()
-        parser.parse(content)
-        # Only 2 data lines in ~A section, not 4 (the 2 in ~Core are excluded)
-        assert parser._data_line_count == 2
+        test_file = tmp_path / "pre_scan_non_ascii.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        assert len(data["logs"]["DEPT"]) == 2
+        assert len(data["logs"]["DT"]) == 2
 
-    def test_pre_scan_las30_counts_all_data_sections(self) -> None:
-        """For LAS 3.0, pre-scan counting doesn't matter (parser uses actual_count),
-        but ~A/~ASCII are still the only ones counted by pre_scan."""
+    def test_parse_las30_creates_expected_data_sections(self) -> None:
+        """For LAS 3.0, the parser creates data_sections for each section
+        found during the full parse.  Both ~A and ~Core sections appear
+        in the result regardless of pre-scan behavior (which only counts
+        ~A/~ASCII lines for pre-allocation).
+        """
         content = """~VERSION INFORMATION
  VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
  WRAP.   NO   :
@@ -1212,11 +1228,14 @@ class TestLAS30AsciiDataBranches:
 """
         parser = LASParser()
         las = parser.parse(content)
-        # Pre-scan only counts ~A sections — Core section lines are excluded
-        assert parser._data_line_count == 2
-        # But LAS 3.0 parser processes Core section data too (via _process_ascii_data)
-        # and uses actual_count, not _data_line_count
+        # Both ~A and ~Core sections appear as data_sections
         assert len(las.data_sections) == 2
+        # LOG_DATA section: ~A
+        assert las.data_sections[0].section_type == "LOG_DATA"
+        assert len(las.data_sections[0].data["DEPT"]) == 2
+        # CORE_DATA section: ~Core
+        assert las.data_sections[1].section_type == "CORE_DATA"
+        assert len(las.data_sections[1].data["DEPT"]) == 1
 
 
 class TestIndexedDataSectionNegativeBranches:
@@ -1279,3 +1298,151 @@ class TestIndexedDataSectionNegativeBranches:
         The index_str is empty, which means ``isdigit()`` returns False.
         """
         assert _is_indexed_data_section("CORE[]") is False
+
+
+class TestSplitlinesCharsSanitization:
+    """F-ITER2-T1-M02: Test _SPLITLINES_CHARS_RE sanitization.
+
+    The regex ``[\\x0b\\x0c\\x1c\\x1d\\x1e\\x85\\u2028\\u2029]`` strips 8
+    character types that Python's splitlines() treats as line breaks before
+    actual line splitting. Without sanitization, these characters produce
+    fake line splits and corrupt parsed data.
+    """
+
+    _SPLITLINES_CHARS = (
+        "\x0b",  # VT — vertical tab
+        "\x0c",  # FF — form feed
+        "\x1c",  # FS — file separator
+        "\x1d",  # GS — group separator
+        "\x1e",  # RS — record separator
+        "\x85",  # NEL — next line
+        "\u2028",  # LINE SEPARATOR
+        "\u2029",  # PARAGRAPH SEPARATOR
+    )
+
+    def test_all_splitline_chars_sanitized_in_version_value(self) -> None:
+        """Inject each splitline character into a VERS value and verify
+        they don't cause fake section breaks. The characters are replaced
+        with spaces before splitlines(), so VERS remains on one line.
+        """
+        for ch in self._SPLITLINES_CHARS:
+            content = (
+                f"~VERSION INFORMATION\n"
+                f" VERS.\x20\x20 2.0{ch}  : CWLS LOG ASCII STANDARD\n"
+                f" WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            )
+            parser = LASParser()
+            las = parser.parse(content)
+            # The VERS line should still be parsed despite injected char
+            assert las.version.vers.startswith("2.0")
+
+    def test_all_splitline_chars_sanitized_in_curve_section(self) -> None:
+        """Inject each splitline character between curve lines and verify
+        curves are still parsed correctly.
+        """
+        for ch in self._SPLITLINES_CHARS:
+            content = (
+                f"~VERSION INFORMATION\n"
+                f" VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+                f" WRAP.   NO   :\n"
+                f"~CURVE INFORMATION\n"
+                f" DEPT.M   :  Depth{ch}\n"
+                f" DT.US/M  :  Sonic\n"
+            )
+            parser = LASParser()
+            las = parser.parse(content)
+            assert len(las.curves) == 2
+            assert las.curves[0].mnemonic == "DEPT"
+            assert las.curves[1].mnemonic == "DT"
+
+    def test_all_splitline_chars_sanitized_no_missing_curves(self) -> None:
+        """Inject all 8 characters between curve lines; parse should
+        succeed with all curves detected, not split into fake lines.
+        """
+        # Build content with every splitline char between the two curve lines
+        all_chars = "".join(self._SPLITLINES_CHARS)
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   :\n"
+            "~CURVE INFORMATION\n"
+            f" DEPT.M   :  Depth{all_chars}\n"
+            f" DT.US/M  :  Sonic\n"
+        )
+        parser = LASParser()
+        las = parser.parse(content)
+        # Both curves should be detected — the control chars were
+        # replaced with spaces, not treated as line breaks
+        assert len(las.curves) == 2
+        assert las.curves[0].mnemonic == "DEPT"
+        assert las.curves[1].mnemonic == "DT"
+
+
+class TestValueOnlyPattern:
+    """F-ITER2-T1-M03: Test VALUE_ONLY_PATTERN fallback.
+
+    When a metadata line has no colon (e.g., ``STRT.M   1670.0`` without
+    a trailing colon), DATA_LINE_PATTERN fails to match and the parser
+    falls back to VALUE_ONLY_PATTERN which matches colon-free lines.
+    """
+
+    def test_version_line_without_colon_parsed(self) -> None:
+        """VERSION line without a colon: VALUE_ONLY_PATTERN captures
+        the entire remainder as the value group, which includes the
+        description text since there is no colon to separate them.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+        )
+        parser = LASParser()
+        las = parser.parse(content)
+        # Without colon, the entire rest of the line is the value
+        # (VALUE_ONLY_PATTERN captures everything after unit dot)
+        assert las.version.vers.startswith("2.0")
+
+    def test_parameter_line_without_colon_parsed(self) -> None:
+        """PARAMETER line without a colon uses VALUE_ONLY_PATTERN."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   :\n"
+            "~PARAMETER INFORMATION\n"
+            " BHT.DEGC    35.5\n"
+        )
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.parameters) == 1
+        assert las.parameters[0].mnemonic == "BHT"
+        assert las.parameters[0].value == "35.5"
+
+    def test_curve_line_without_colon_parsed(self) -> None:
+        """CURVE line without a colon uses VALUE_ONLY_PATTERN."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   :\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   Depth\n"
+        )
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.curves) == 1
+        assert las.curves[0].mnemonic == "DEPT"
+        assert las.curves[0].unit == "M"
+
+    def test_mixed_colon_and_no_colon_lines(self) -> None:
+        """Section with mix of colon and colon-free lines."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   :\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   1670.0  : START DEPTH\n"
+            " COMP.    TestCo\n"  # no colon — falls to VALUE_ONLY_PATTERN
+        )
+        parser = LASParser()
+        las = parser.parse(content)
+        assert las.well["STRT"] == "1670.0"
+        assert las.well["COMP"] == "TestCo"

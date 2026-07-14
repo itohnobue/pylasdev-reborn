@@ -157,6 +157,7 @@ _INDEXED_DATA_TYPES = frozenset(
         "TOPS",
         "TEST",
         "PERFORATIONS",
+        "LOG",
         "LOG_DATA",
     }
 )
@@ -205,7 +206,8 @@ class LASParser:
     """Regex-based LAS file parser.
 
     Encapsulates all parsing state in the instance (no global variables).
-    Thread-safe: each instance maintains its own state.
+    Each instance maintains its own state (instance-level isolation).
+    Not thread-safe for concurrent parse() calls on the same instance.
 
     Supports LAS 1.2, 2.0, and 3.0 formats.
     """
@@ -219,9 +221,21 @@ class LASParser:
         "A": "_parse_ascii_data",
     }
 
-    def __init__(self, mnem_base: dict[str, str] | None = None) -> None:
-        """Initialize parser with optional mnemonic base."""
+    def __init__(self, mnem_base: dict[str, str] | None = None, well_format: str = "auto") -> None:
+        """Initialize parser with optional mnemonic base.
+
+        Args:
+            mnem_base: Optional mnemonic-to-canonical-name mapping for
+                curve/parameter normalization.
+            well_format: LAS 1.2 well section format convention:
+                ``"auto"`` (default) heuristically detects CWLS vs lasio
+                convention per field; ``"cwls"`` forces CWLS convention
+                (``MNEM.UNIT VALUE : DESCRIPTION``) for all non-numeric
+                fields; ``"lasio"`` forces lasio convention
+                (``MNEM.UNIT DESCRIPTION : VALUE``).
+        """
         self.mnem_base = mnem_base or {}
+        self._well_format = well_format
         # Build uppercased lookup with multi-step chain resolution.
         # resolve_mnemonic walks chains like BK-3 → BK → BFV to reach
         # the terminal canonical name. Single .get() only resolves one hop.
@@ -232,13 +246,24 @@ class LASParser:
         # key must not overwrite.  Dict comprehension gives last-wins,
         # which breaks chain resolution.
         _raw_upper: dict[str, str] = {}
-        for k, v in self.mnem_base.items():
+        # Sort so canonical uppercase entries come first, ensuring
+        # first-wins semantics are invariant regardless of input dict
+        # ordering.  Without this sort, a dict where lowercase aliases
+        # (e.g. "bk") precede canonical entries ("BK") would break
+        # chain resolution because the lowercase alias would "win"
+        # and overwrite when uppercased.
+        sorted_items = sorted(
+            self.mnem_base.items(),
+            key=lambda item: (not item[0].isupper(), item[0]),
+        )
+        for k, v in sorted_items:
             key = k.upper()
             if key not in _raw_upper:
                 _raw_upper[key] = v
         self._mnem_base_upper: dict[str, str] = {}
         for k in _raw_upper:
             self._mnem_base_upper[k] = resolve_mnemonic(_raw_upper, k)
+        self.source_file: str = ""
         self._reset()
 
     def _reset(self) -> None:
@@ -254,7 +279,6 @@ class LASParser:
         # F-3: Accumulate other-section lines in a list to avoid O(n^2)
         # string concatenation (self.las_file.other += ... per line).
         self._other_lines: list[str] = []
-        self.source_file: str = ""
         # F1: Track per-section curve boundaries for LAS 3.0 files where
         # different ~C blocks define different curve sets before each ~A section.
         self._section_curve_start_idx: int = 0
@@ -262,7 +286,7 @@ class LASParser:
         # F-01/F-08: Track the end of the main (non-_Definition) curve block.
         # When a data section has a pipe "| CURVE" association, the per-section
         # curves revert to using the main block (curves[0:_main_curve_end]).
-        self._main_curve_end: int = 0
+        self._main_curve_end: int = -1
         # G-02: Per-_Definition curve range storage.  Consecutive _Definition
         # sections overwrote _section_curve_start_idx, making later data
         # sections without pipe associations use the wrong curve range.
@@ -431,7 +455,7 @@ class LASParser:
                     # F-01: When the first _Definition section is encountered,
                     # freeze the main curve block endpoint so pipe "| CURVE"
                     # associations can reference it later.
-                    if self._main_curve_end == 0:
+                    if self._main_curve_end == -1:
                         self._main_curve_end = len(self.las_file.curves)
                     # G-02: Track which _Definition is active so curve ranges
                     # can be saved per-definition type (prevents overwrite
@@ -538,7 +562,7 @@ class LASParser:
                         # Pipe "| CURVE" → use main curve block only.
                         self._section_curve_start_idx = 0
                         self._section_curve_end_idx = (
-                            self._main_curve_end if self._main_curve_end > 0 else None
+                            self._main_curve_end if self._main_curve_end >= 0 else None
                         )
                     elif pipe_target_upper in self._definition_curve_ranges:
                         # G-02: Explicit pipe to a known _Definition —
@@ -546,6 +570,21 @@ class LASParser:
                         start, end = self._definition_curve_ranges[pipe_target_upper]
                         self._section_curve_start_idx = start
                         self._section_curve_end_idx = end
+                    else:
+                        # Unrecognized pipe target (not "CURVE"/"C" and
+                        # not a known _Definition).  Curve indices retain
+                        # stale values from the previous section, which may
+                        # route data to the wrong curves.
+                        source_info = (
+                            f" in {self.source_file}" if self.source_file else ""
+                        )
+                        logger.warning(
+                            "Unrecognized pipe target '| %s' for section '~%s'%s — "
+                            "curve indices may be incorrect.",
+                            pipe_target,
+                            section_word,
+                            source_info,
+                        )
                 elif self._current_data_section_type != "LOG_DATA":
                     # G-02: No pipe — try to match data section type
                     # to a _Definition (e.g., CORE_DATA → CORE_DEFINITION).
@@ -677,6 +716,11 @@ class LASParser:
         self._version_found = True
         match = self._match_data_line(line)
         if not match:
+            logger.warning(
+                "Non-matching ~V line in %s: %s",
+                self.source_file or "<unknown>",
+                line.strip()[:120],
+            )
             return
 
         mnemonic = match.group("mnemonic").upper().strip()
@@ -702,6 +746,11 @@ class LASParser:
         """
         match = self._match_data_line(line)
         if not match:
+            logger.warning(
+                "Non-matching ~W line in %s: %s",
+                self.source_file or "<unknown>",
+                line.strip()[:120],
+            )
             return
 
         mnemonic = match.group("mnemonic").upper().strip()
@@ -729,37 +778,61 @@ class LASParser:
         # roundtrip fidelity.
         if is_las12 and description:
             if mnemonic in {"STRT", "STOP", "STEP", "NULL"}:
-                # Try value-before-colon first (spec format).
-                try:
-                    float(value)
-                except ValueError:
-                    # Value is non-numeric — use swap (lasio convention).
+                if self._well_format == "cwls":
+                    # CWLS: pre-colon is always the value.
+                    actual_value = value
+                    self.las_file.well.descriptions[mnemonic] = description
+                elif self._well_format == "lasio":
+                    # lasio: post-colon is always the value.
                     actual_value = description
-                    # In lasio convention, the pre-colon text is the description.
                     self.las_file.well.descriptions[mnemonic] = value
                 else:
-                    # Value IS numeric — spec format, use value group.
-                    actual_value = value
-                    # In spec format, the post-colon text is the description.
-                    self.las_file.well.descriptions[mnemonic] = description
+                    # Auto-detect. Try value-before-colon first (spec format).
+                    # Handle Fortran D-exponent notation (e.g., "1.0D+03")
+                    # used by some scientific software.  Python's float()
+                    # only understands E/e exponents.
+                    try:
+                        float(value.replace("D", "E").replace("d", "e"))
+                    except ValueError:
+                        # Value is non-numeric — use swap (lasio convention).
+                        actual_value = description
+                        # In lasio convention, the pre-colon text is the description.
+                        self.las_file.well.descriptions[mnemonic] = value
+                    else:
+                        # Value IS numeric — spec format, use value group.
+                        actual_value = value
+                        # In spec format, the post-colon text is the description.
+                        self.las_file.well.descriptions[mnemonic] = description
             else:
                 # Non-numeric field — detect CWLS vs lasio convention.
                 # CWLS spec:   MNEM.UNIT VALUE : DESCRIPTION
                 #   e.g. COMP.    ANY OIL     :  Company Name
                 # lasio conv:  MNEM.UNIT DESCRIPTION : VALUE
                 #   e.g. COMP.    COMPANY     :  TestCo
-                # Heuristic: CWLS values are typically multi-word
-                # (contain whitespace), while lasio description
-                # markers are single-word labels.  If the pre-colon
-                # value contains whitespace, treat as CWLS format.
-                # Otherwise default to lasio convention for backward
-                # compatibility.
-                if " " in value:
-                    # CWLS convention: pre-colon text is the value.
+                # Explicit well_format overrides always take priority.
+                # For "auto", use the whitespace heuristic: multi-word
+                # pre-colon text indicates CWLS convention; otherwise
+                # default to lasio for backward compatibility.
+                #
+                # NOTE: The "auto" heuristic cannot distinguish single-word
+                # CWLS values (e.g., "OIL") from single-word lasio
+                # labels (e.g., "COMPANY").  For files known to use
+                # CWLS format, set well_format="cwls" to force CWLS
+                # interpretation for all non-numeric fields.
+                if self._well_format == "cwls":
+                    # Explicit CWLS: pre-colon text is the value.
+                    actual_value = value
+                    self.las_file.well.descriptions[mnemonic] = description
+                elif self._well_format == "lasio":
+                    # Explicit lasio: post-colon text is the value.
+                    actual_value = description
+                    self.las_file.well.descriptions[mnemonic] = value
+                elif " " in value:
+                    # Auto: multi-word pre-colon text → CWLS convention.
                     actual_value = value
                     self.las_file.well.descriptions[mnemonic] = description
                 else:
-                    # lasio convention: post-colon text is the value.
+                    # Auto: single-word pre-colon text → lasio convention.
                     actual_value = description
                     self.las_file.well.descriptions[mnemonic] = value
         else:
@@ -780,6 +853,11 @@ class LASParser:
         """
         match = self._match_data_line(line)
         if not match:
+            logger.warning(
+                "Non-matching ~C line in %s: %s",
+                self.source_file or "<unknown>",
+                line.strip()[:120],
+            )
             return
 
         # F-01: Preserve original casing before uppercasing.
@@ -872,6 +950,11 @@ class LASParser:
         """
         match = self._match_data_line(line)
         if not match:
+            logger.warning(
+                "Non-matching ~P line in %s: %s",
+                self.source_file or "<unknown>",
+                line.strip()[:120],
+            )
             return
 
         # F-01: Preserve original casing (same pattern as _parse_curve).

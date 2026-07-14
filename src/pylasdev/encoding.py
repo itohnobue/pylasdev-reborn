@@ -3,8 +3,8 @@
 Geoscience files commonly use:
 - UTF-8 (modern files)
 - CP1252 / Latin-1 (Western European)
-- CP866 (Russian DOS encoding)
 - CP1251 (Russian Windows encoding)
+- CP866 (Russian DOS encoding)
 """
 
 from __future__ import annotations
@@ -23,17 +23,39 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# F-ITER2-SEC-H01 + F-ITER2-SEC-M05: Default maximum file size (500 MB) to
+# protect against unbounded memory consumption from Path.read_bytes() and
+# content.splitlines() (each doubles peak memory — up to 2x the file size).
+# Geoscience LAS files larger than 500 MB are virtually nonexistent in
+# practice; the largest known real-world LAS file is ~50 MB.
+DEFAULT_MAX_FILE_SIZE = 524_288_000  # 500 MB
+
 # Ordered by likelihood in Russian geoscience context.
-# cp866 is the correct Russian DOS geoscience encoding and appears BEFORE
-# cp1251 (Windows Cyrillic) because chardet returns low confidence on cp866
-# files, causing the fallback to try cp1251 first, which "succeeds" but
-# produces garbled Cyrillic that fails DATA_LINE_PATTERN.
-# latin-1 is used as the terminal fallback because it can decode any byte
-# sequence (every byte 0x00-0xFF maps to a valid character), guaranteeing
-# that read_with_encoding() always returns content even for files with
-# unknown or corrupted encodings. This design choice prioritizes data
-# recovery over strictness — geoscience files often have mixed encodings.
-FALLBACK_ENCODINGS = ["utf-8", "cp866", "cp1251", "cp1252", "latin-1"]
+# F-ITER2-D4b-M09: cp1251 (Windows Cyrillic) is tried before cp866 (DOS
+# Cyrillic) because cp1251 is the dominant encoding for modern Russian
+# geoscience files.  Both are single-byte encodings that never raise
+# UnicodeDecodeError, so fallback ordering determines which encoding wins
+# for files that decode successfully under both.  cp866 was previously
+# first, which caused cp1251 files to decode as mojibake — cp866 maps
+# Cyrillic bytes to different code points, producing non-\\w characters
+# that cause DATA_LINE_PATTERN failures and silently dropped curves.
+# Reversed order: cp1251 first correctly handles modern Windows-encoded
+# files, and legacy cp866 files also decode under cp1251 (as Latin-1
+# mojibake rather than Cyrillic mojibake).  For truly ambiguous files,
+# chardet detection (if available) runs first.
+FALLBACK_ENCODINGS = ["utf-8", "cp1251", "cp866", "cp1252", "latin-1"]
+
+# F-ITER2-D4b-M09: Minimum proportion of word characters (\w) required for
+# a decoded content to pass the mojibake detection heuristic.  Both cp866
+# and cp1251 decode any byte sequence without error, so the fallback chain
+# cannot distinguish them by UnicodeDecodeError alone.  Instead, we compare
+# candidate decodings and select the one with the highest proportion of word
+# characters (alphanumeric + underscore).  Real LAS files have ~50-80% word
+# characters (mnemonics, values, section headers).  Garbled single-byte
+# decode to the wrong encoding typically produces significantly fewer \w
+# chars (e.g. cp866 content decoded as cp1251: 33% vs 100% correctly).
+# Sampling the first _MIN_VALIDATION_CHARS avoids scanning multi-GB files.
+_MIN_VALIDATION_CHARS = 10_000  # Sample first 10K chars for mojibake check
 
 
 def detect_encoding(file_path: Path) -> str:
@@ -74,6 +96,99 @@ def _detect_encoding_from_bytes(raw_data: bytes) -> str:
     return "utf-8"
 
 
+def _decode_best_quality(
+    raw_bytes: bytes,
+    file_path: Path,
+    detected: str,
+    encodings: list[str],
+) -> tuple[str, str]:
+    """Decode raw_bytes using the best-quality encoding from *encodings*.
+
+    When chardet fails or returns low confidence, the fallback chain
+    may produce valid decodes under multiple single-byte encodings
+    (e.g. both cp1251 and cp866 decode any byte sequence).  This
+    function tries each candidate and selects the one whose decoded
+    content has the highest proportion of word characters
+    (alphanumeric + underscore), which correlates with correct
+    Cyrillic decoding in LAS files.
+
+    Args:
+        raw_bytes: Raw file bytes.
+        file_path: File path (for logging only).
+        detected: The chardet-detected encoding (may be ``"utf-8"``
+            when detection failed).  Tried first if not already in
+            *encodings*.
+        encodings: Encoding names to try.
+
+    Returns:
+        Tuple of (selected_encoding, decoded_content).
+
+    Raises:
+        LASEncodingError: If no encoding in the list can decode the bytes.
+    """
+    candidates: list[tuple[str, str, float]] = []
+
+    # Try detected encoding first (may be utf-8 from failed detection)
+    if detected not in encodings:
+        try:
+            content = raw_bytes.decode(detected)
+            content = content.lstrip("\ufeff")
+            sample = content[:_MIN_VALIDATION_CHARS]
+            ratio = sum(1 for c in sample if c.isalnum() or c == "_") / max(len(sample), 1)
+            candidates.append((detected, content, ratio))
+        except UnicodeDecodeError:
+            pass
+
+    # Try each fallback encoding
+    for enc in encodings:
+        try:
+            content = raw_bytes.decode(enc)
+            content = content.lstrip("\ufeff")
+            sample = content[:_MIN_VALIDATION_CHARS]
+            ratio = sum(1 for c in sample if c.isalnum() or c == "_") / max(len(sample), 1)
+            candidates.append((enc, content, ratio))
+        except UnicodeDecodeError:
+            continue
+
+    if not candidates:
+        raise LASEncodingError(
+            f"Failed to decode {file_path} with any encoding in the fallback chain."
+        )
+
+    # Select the encoding with the highest word-character ratio.
+    candidates.sort(key=lambda x: -x[2])
+    best_enc, best_content, best_ratio = candidates[0]
+
+    # UTF-8 preference: when UTF-8 decodes successfully and its word-char
+    # ratio is close to the best candidate's (within 2%), prefer UTF-8.
+    # This prevents single-byte encodings (e.g. cp1251) from "winning" by
+    # a tiny margin on valid UTF-8 files — every byte maps to a printable
+    # character in those encodings, so their word-char ratios can be
+    # marginally higher even when the content is actually UTF-8 Cyrillic.
+    # The 2% threshold is conservative: real encoding mismatches produce
+    # much larger ratio gaps (typically >10%), so this won't override a
+    # genuinely better match.
+    if best_enc != "utf-8":
+        for enc_candidate in candidates:
+            if enc_candidate[0] == "utf-8":
+                utf8_ratio = enc_candidate[2]
+                if best_ratio - utf8_ratio < 0.02:
+                    best_enc, best_content, best_ratio = enc_candidate
+                break
+
+    if len(candidates) > 1 and best_enc != candidates[1][0]:
+        logger.debug(
+            "Selected encoding '%s' (%.1f%% word chars) over '%s' (%.1f%%) for %s",
+            best_enc,
+            best_ratio * 100,
+            candidates[1][0],
+            candidates[1][2] * 100,
+            file_path,
+        )
+
+    return best_enc, best_content
+
+
 def read_with_encoding(
     file_path: Path,
     encoding: str | None = None,
@@ -88,8 +203,10 @@ def read_with_encoding(
     Args:
         file_path: Path to the file.
         encoding: Explicit encoding override. If None, auto-detected.
-        max_file_size: Optional maximum file size in bytes. If the file
-            exceeds this limit, a ValueError is raised.
+        max_file_size: Maximum file size in bytes. If the file exceeds
+            this limit, a ValueError is raised.  Defaults to
+            DEFAULT_MAX_FILE_SIZE (500 MB) to protect against unbounded
+            memory consumption from reading and splitting large files.
 
     Returns:
         Tuple of (detected_encoding, file_content).
@@ -106,16 +223,30 @@ def read_with_encoding(
     if not file_path.is_file():
         raise LASEncodingError(f"Cannot read {file_path}: not a regular file.")
 
-    if max_file_size is not None:
-        file_size = file_path.stat().st_size
-        if file_size > max_file_size:
-            raise ValueError(
-                f"File size ({file_size} bytes) exceeds maximum allowed "
-                f"({max_file_size} bytes): {file_path}"
-            )
+    # F-ITER2-SEC-H01 + F-ITER2-SEC-M05: Apply default max file size when
+    # the caller does not specify one.  Without this, Path.read_bytes()
+    # and content.splitlines() both consume up to 2x file size in memory
+    # with no bound, potentially OOM on large or malformed files.
+    if max_file_size is None:
+        max_file_size = DEFAULT_MAX_FILE_SIZE
+
+    file_size = file_path.stat().st_size
+    if file_size > max_file_size:
+        raise ValueError(
+            f"File size ({file_size} bytes) exceeds maximum allowed "
+            f"({max_file_size} bytes): {file_path}"
+        )
 
     # Read raw bytes once — all subsequent decoding happens in memory.
     raw_bytes = file_path.read_bytes()
+
+    # Strip UTF-8 BOM from raw bytes before encoding detection and decoding.
+    # The BOM (\xef\xbb\xbf) is a 3-byte sequence at the start of some UTF-8
+    # files.  If left in place, decoding as cp1251 produces extra word
+    # characters (п»ї) that inflate the quality score, causing cp1251 to
+    # out-compete UTF-8 in the quality-based selection below.
+    if raw_bytes.startswith(b"\xef\xbb\xbf"):
+        raw_bytes = raw_bytes[3:]
 
     if encoding is not None:
         try:
@@ -129,28 +260,11 @@ def read_with_encoding(
 
     # Try auto-detection from the already-read bytes
     detected = _detect_encoding_from_bytes(raw_bytes[:50_000])
-    try:
-        content = raw_bytes.decode(detected)
-        content = content.lstrip("\ufeff")
-        return detected, content
-    except UnicodeDecodeError:
-        logger.debug(
-            "Failed to decode %s with detected encoding %s, trying fallback chain",
-            file_path,
-            detected,
-        )
 
-    # Fallback chain — decode the same raw_bytes in memory.
-    for enc in FALLBACK_ENCODINGS:
-        try:
-            content = raw_bytes.decode(enc)
-            content = content.lstrip("\ufeff")
-            return enc, content
-        except UnicodeDecodeError:
-            continue
-
-    # The fallback chain always succeeds because latin-1 decodes any byte sequence.
-    # This point should be unreachable, but if it is reached (e.g. because someone
-    # removed latin-1 from the fallback chain), raise a proper error instead of
-    # silently substituting replacement characters.
-    raise LASEncodingError(f"Failed to decode {file_path} with any encoding in the fallback chain.")
+    # F-ITER2-D4b-M09: Use quality-based selection instead of first-wins
+    # fallback chain.  Single-byte Cyrillic encodings (cp1251, cp866) both
+    # decode any byte sequence, so the first that succeeds may be wrong.
+    # By comparing word-character ratios across all candidates, we select
+    # the encoding that produces the most plausible text (highest proportion
+    # of alphanumeric characters — real LAS files have ~50-80%).
+    return _decode_best_quality(raw_bytes, file_path, detected, FALLBACK_ENCODINGS)

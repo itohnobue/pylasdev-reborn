@@ -31,8 +31,8 @@ class TestFormatCompliance:
     def test_las12_no_exponents_in_data_section(self, tmp_path: Path) -> None:
         """Verify that LAS 1.2 written output has no exponent notation in data.
 
-        LAS spec explicitly forbids exponent-formatted numbers (e.g., '1e+08')
-        in data sections. All data values must be plain decimal.
+        CWLS LAS 1.2 §5.6: All data values must be plain decimal numbers.
+        Exponent-formatted numbers (e.g., '1e+08') are explicitly forbidden.
         """
         data: dict[str, Any] = {
             "version": {"VERS": "1.2", "WRAP": "NO", "DLM": "SPACE"},
@@ -69,9 +69,9 @@ class TestFormatCompliance:
     def test_las12_well_section_colon_placement(self, tmp_path: Path) -> None:
         """Verify LAS 1.2 well section has correct colon placement.
 
-        LAS 1.2 spec: numeric fields (STRT, STOP, STEP, NULL) have
-        value BEFORE the colon.  Non-numeric fields (COMP) use the
-        lasio convention: value AFTER the colon.
+        CWLS LAS 1.2 §3.2: Numeric well fields (STRT, STOP, STEP, NULL) have
+        value BEFORE the colon.  Non-numeric fields use the lasio convention
+        (value AFTER colon) for backward compatibility.
         """
         data: dict[str, Any] = {
             "version": {"VERS": "1.2", "WRAP": "NO", "DLM": "SPACE"},
@@ -113,7 +113,11 @@ class TestFormatCompliance:
 
     # --- LAS 2.0 compliance ---
     def test_las20_version_section_format(self, tmp_path: Path) -> None:
-        """Verify LAS 2.0 version section has correct format."""
+        """Verify LAS 2.0 version section has correct format.
+
+        CWLS LAS 2.0 §2.0: VERS value BEFORE colon. WRAP must be YES or NO.
+        DLM line is optional (SPACE is default).
+        """
         data: dict[str, Any] = {
             "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
             "well": {"NULL": "-999.25"},
@@ -150,7 +154,11 @@ class TestFormatCompliance:
         assert "CWLS LOG ASCII STANDARD" in content
 
     def test_las20_data_values_are_space_delimited(self, tmp_path: Path) -> None:
-        """Verify LAS 2.0 data section uses space delimiter."""
+        """Verify LAS 2.0 data section uses space delimiter.
+
+        CWLS LAS 2.0 §5.2: Data values are space-delimited; each depth
+        step on a single line when WRAP=NO.
+        """
         data: dict[str, Any] = {
             "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
             "well": {"NULL": "-999.25"},
@@ -195,7 +203,11 @@ class TestFormatCompliance:
 
     # --- LAS 3.0 compliance ---
     def test_las30_version_section_format(self, tmp_path: Path) -> None:
-        """Verify LAS 3.0 version section has correct format with DLM field."""
+        """Verify LAS 3.0 version section has correct format with DLM field.
+
+        CWLS LAS 3.0 §3.1: VERSION key is "3.0" with description "CWLS LOG
+        ASCII STANDARD -VERSION 3.0". DLM field is required (SPACE / COMMA / TAB).
+        """
         las = LASFile()
         las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
         las.well["NULL"] = "-999.25"

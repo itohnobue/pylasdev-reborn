@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from pylasdev.compare import compare_las_dicts
+from pylasdev.models import CurveDefinition
 
 
 class TestCompareLasDicts:
@@ -620,3 +621,68 @@ class TestTypeErrorHandler:
         # Matching arrays should return True
         d3 = {"other_data": [np.array([1.0, 2.0]), np.array([3.0, 4.0])]}
         assert compare_las_dicts(d1, d3) is True
+
+
+class TestIntegrationCompareLasDicts:
+    """F-T3-M05: Integration test using LASFile.to_dict() output.
+
+    Verifies that compare_las_dicts works correctly with the actual
+    dict produced by LASFile.to_dict() — the primary roundtrip format.
+    """
+
+    def test_compare_las_file_to_dict_self(self) -> None:
+        """A LASFile compared to its own to_dict() output must match."""
+        from pylasdev.models import LASFile, VersionSection
+
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.well["STRT"] = "100.0"
+        las.curves_order = ["DEPT", "DT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.curves.append(CurveDefinition(mnemonic="DT", unit="US/M"))
+        las.logs["DEPT"] = np.array([100.0, 101.0])
+        las.logs["DT"] = np.array([50.0, 51.0])
+
+        d = las.to_dict()
+        assert compare_las_dicts(d, d) is True, "Self-comparison must be True"
+
+    def test_compare_las_file_to_dict_identical(self) -> None:
+        """Two identical LASFile objects produce matching dicts."""
+        from pylasdev.models import LASFile, VersionSection
+
+        las1 = LASFile()
+        las1.version = VersionSection(vers="2.0")
+        las1.well["NULL"] = "-999.25"
+        las1.curves_order = ["DEPT"]
+        las1.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las1.logs["DEPT"] = np.array([1.0, 2.0])
+
+        las2 = LASFile()
+        las2.version = VersionSection(vers="2.0")
+        las2.well["NULL"] = "-999.25"
+        las2.curves_order = ["DEPT"]
+        las2.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las2.logs["DEPT"] = np.array([1.0, 2.0])
+
+        assert compare_las_dicts(las1.to_dict(), las2.to_dict()) is True
+
+    def test_compare_las_file_to_dict_mismatch(self) -> None:
+        """Different LASFile objects produce non-matching dicts."""
+        from pylasdev.models import LASFile, VersionSection
+
+        las1 = LASFile()
+        las1.version = VersionSection(vers="2.0")
+        las1.well["NULL"] = "-999.25"
+        las1.curves_order = ["DEPT"]
+        las1.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las1.logs["DEPT"] = np.array([1.0, 2.0])
+
+        las2 = LASFile()
+        las2.version = VersionSection(vers="1.2")
+        las2.well["NULL"] = "-99.0"
+        las2.curves_order = ["DEPT"]
+        las2.curves.append(CurveDefinition(mnemonic="DEPT", unit="FT"))
+        las2.logs["DEPT"] = np.array([1.0, 3.0])
+
+        assert compare_las_dicts(las1.to_dict(), las2.to_dict()) is False

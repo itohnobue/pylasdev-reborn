@@ -29,9 +29,9 @@ def _create_parameter_entry(param_dict: dict[str, Any]) -> ParameterEntry:
     across the parameter_details and params list branches.
     """
     zone = None
-    if "zone" in param_dict:
+    if "zone" in param_dict and isinstance(param_dict["zone"], dict):
         zone = ParameterZone(
-            zone_name=param_dict["zone"].get("zone_name", ""),
+            zone_name=_safe_str(param_dict["zone"].get("zone_name")),
             zone_index=param_dict["zone"].get("zone_index"),
         )
     return ParameterEntry(
@@ -98,9 +98,14 @@ class WellSection:
         default_factory=dict
     )  # CWLS description text for well fields
 
-    def to_dict(self) -> dict[str, str]:
-        """Convert to legacy dict format."""
-        return dict(self.entries)
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to legacy dict format, including non-empty units and descriptions."""
+        result: dict[str, Any] = dict(self.entries)
+        if self.units:
+            result["units"] = dict(self.units)
+        if self.descriptions:
+            result["descriptions"] = dict(self.descriptions)
+        return result
 
     def __getitem__(self, key: str) -> str:
         return self.entries[key]
@@ -293,7 +298,7 @@ class LASFile:
 
         return {
             "version": self.version.to_dict(),
-            "well": self.well.to_dict(),
+            "well": dict(self.well.entries),
             "well_units": dict(self.well.units) if self.well.units else {},
             "well_descriptions": dict(self.well.descriptions) if self.well.descriptions else {},
             "parameters": params_dict,
@@ -309,6 +314,7 @@ class LASFile:
                 k: v.copy() for k, v in self.string_data.items()
             },  # same defensive copy as logs above
             "encoding": self.encoding,
+            "source_file": self.source_file,
         }
 
     @classmethod
@@ -324,6 +330,11 @@ class LASFile:
         The method is naturally long due to covering all these variants in a
         single backwards-compatible code path.
         """
+        if not isinstance(data, dict):
+            raise TypeError(
+                f"Expected dict, got {type(data).__name__}"
+            )
+
         las_file = cls()
 
         version = data.get("version") or {}
@@ -354,7 +365,7 @@ class LASFile:
         if curves_data and isinstance(curves_data, list) and isinstance(curves_data[0], dict):
             for curve_dict in curves_data:
                 array_info = None
-                if "array_info" in curve_dict:
+                if "array_info" in curve_dict and isinstance(curve_dict["array_info"], dict):
                     ai = curve_dict["array_info"]
                     array_info = ArrayElementInfo(
                         base_name=ai.get("base_name", ""),
@@ -412,7 +423,7 @@ class LASFile:
             ds_section_curves = []
             for sc_dict in ds_dict.get("section_curves", []):
                 sc_array_info = None
-                if "array_info" in sc_dict:
+                if "array_info" in sc_dict and isinstance(sc_dict["array_info"], dict):
                     ai = sc_dict["array_info"]
                     sc_array_info = ArrayElementInfo(
                         base_name=ai.get("base_name", ""),
@@ -509,9 +520,13 @@ class DevFile:
     source_file: str = ""
     encoding: str = "utf-8"
 
-    def to_dict(self) -> dict[str, NDArray[np.float64]]:
-        """Convert to legacy dict format."""
-        return {k: v.copy() for k, v in self.columns.items()}
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to legacy dict format, including file metadata."""
+        result: dict[str, Any] = {k: v.copy() for k, v in self.columns.items()}
+        result["source_file"] = self.source_file
+        result["encoding"] = self.encoding
+        result["column_order"] = list(self.column_order)
+        return result
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DevFile:

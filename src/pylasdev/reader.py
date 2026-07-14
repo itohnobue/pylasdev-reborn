@@ -32,6 +32,7 @@ def read_las_file(
     mnem_base: dict[str, str] | None = None,
     encoding: str | None = None,
     max_file_size: int | None = None,
+    well_format: str = "auto",
 ) -> dict[str, Any]:
     """Read a LAS file and return data dictionary.
 
@@ -44,6 +45,10 @@ def read_las_file(
         encoding: Optional encoding override. If None, auto-detected.
         max_file_size: Optional maximum file size in bytes. If the file
             exceeds this limit, a LASReadError is raised.
+        well_format: LAS 1.2 well section format convention:
+            ``"auto"`` (default) heuristically detects CWLS vs lasio
+            convention per field; ``"cwls"`` forces CWLS convention;
+            ``"lasio"`` forces lasio convention.
 
     Returns:
         Dictionary with keys: version, well, parameters, parameter_details,
@@ -70,6 +75,7 @@ def read_las_file(
         mnem_base=mnem_base,
         encoding=encoding,
         max_file_size=max_file_size,
+        well_format=well_format,
     )
     return las_file.to_dict()
 
@@ -79,6 +85,7 @@ def read_las_file_as_object(
     mnem_base: dict[str, str] | None = None,
     encoding: str | None = None,
     max_file_size: int | None = None,
+    well_format: str = "auto",
 ) -> LASFile:
     """Read a LAS file and return LASFile dataclass (new API).
 
@@ -91,6 +98,10 @@ def read_las_file_as_object(
         encoding: Optional encoding override.
         max_file_size: Optional maximum file size in bytes. If the file
             exceeds this limit, a LASReadError is raised.
+        well_format: LAS 1.2 well section format convention:
+            ``"auto"`` (default) heuristically detects CWLS vs lasio
+            convention per field; ``"cwls"`` forces CWLS convention;
+            ``"lasio"`` forces lasio convention.
 
     Returns:
         LASFile dataclass with full parsed data.
@@ -120,14 +131,14 @@ def read_las_file_as_object(
     except ValueError as e:
         raise LASReadError(f"Cannot read file: {file_path}") from e
 
-    parser = LASParser(mnem_base)
-    parser.source_file = str(file_path)
+    parser = LASParser(mnem_base, well_format=well_format)
     # PERF-01: Split content once, pass lines list to both parser and
     # data_reader to eliminate redundant content.splitlines() calls
     # (double splitlines doubles peak memory for large files).
     # F-32 + G-17: Sanitize splitlines() line-break characters BEFORE
     # splitting to prevent section-header injection.
     lines = _SPLITLINES_CHARS_RE.sub(" ", content).splitlines()
+    parser.source_file = str(file_path)
     try:
         las_file = parser.parse(content, lines=lines)
     except LASParseError as e:

@@ -8,12 +8,19 @@ and O(n) performance (vs O(n^2) numpy.append bug in original).
 from __future__ import annotations
 
 import logging
+import re
 import warnings
 
 import numpy as np
 
 from .exceptions import LASParseError
 from .models import LASFile, WellSection
+
+# F-ITER2-SEC-M06: Null byte and control character sanitization regex
+# for string data values (mirrors writer._CONTROL_CHARS_RE).
+# Null bytes (\x00) are stripped to prevent asymmetry with the writer
+# and to avoid corruption in string-format curves.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85\u2028\u2029]")
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +39,32 @@ MAX_TOTAL_ELEMENTS = 1_000_000_000
 # of space-separated tokens.  Legitimate LAS files never exceed MAX_CURVES
 # tokens per line — this cap matches the curve limit.  Overridable.
 MAX_TOKENS_PER_LINE = MAX_CURVES
+
+
+# F-ITER2-D2-M04: Regex to extract the full section word from a header line
+# (matching parser.SECTION_PATTERN semantics).  Used to compare against
+# exact section words {"A", "ASCII"} instead of checking only the first
+# character after ~, which caused divergence when headers like ~A_DEFINITION
+# entered ASCII mode in the reader but were excluded by parser._pre_scan.
+_SECTION_WORD_RE = re.compile(r"^~([A-Za-z]\S*)")
+
+
+def _get_section_word(stripped: str) -> str:
+    """Extract the section word from a section header line.
+
+    Returns the uppercased section word (e.g. "A", "ASCII", "A_DEFINITION")
+    or an empty string if the line is not a valid section header.
+    """
+    match = _SECTION_WORD_RE.match(stripped)
+    return match.group(1).upper() if match else ""
+
+
+def _is_ascii_section(stripped: str) -> bool:
+    """Check if a section header targets the ASCII data (~A / ~ASCII) section.
+
+    Aligned with parser._pre_scan which uses ``section_word in {"A", "ASCII"}``.
+    """
+    return _get_section_word(stripped) in {"A", "ASCII"}
 
 
 def _is_section_header(stripped: str) -> bool:
@@ -114,8 +147,7 @@ def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int) -
         las_file: LASFile object with curves_order already populated.
         data_line_count: Number of data lines (from pre-scan).
     """
-    curve_count = len(las_file.curves_order)
-    if curve_count == 0:
+    if len(las_file.curves_order) == 0:
         # F32: Warn when data is present but no curves are defined,
         # so malformed files don't silently lose data.
         warnings.warn(
@@ -125,20 +157,30 @@ def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int) -
         )
         return
 
+    # F-ITER2-SEC-M02 + F-ITER2-SEC-M03: Deduplicate curves BEFORE bounds
+    # checks and wrap detection.  Previously, _detect_actual_wrap and the
+    # outer MAX_TOTAL_ELEMENTS check used pre-dedup curve_count, causing
+    # false wrap detection and false rejection for files with duplicate
+    # curves near the boundary.  _read_normal and _read_wrapped also call
+    # _deduplicate_curves internally; the second call is a no-op when
+    # curves are already unique.
+    _deduplicate_curves(las_file)
+    curve_count = len(las_file.curves_order)
+
     if curve_count > MAX_CURVES:
         raise LASParseError(
             f"Curve count ({curve_count}) exceeds maximum allowed ({MAX_CURVES}). "
             f"The file may be malformed or corrupt."
         )
 
-    # Combined bound: protect against combination attacks where individual
-    # curve_count and data_line_count checks pass but product exhausts memory.
-    if curve_count * data_line_count > MAX_TOTAL_ELEMENTS:
-        raise LASParseError(
-            f"Total allocation ({curve_count} curves x {data_line_count} lines = "
-            f"{curve_count * data_line_count} elements) exceeds maximum allowed "
-            f"({MAX_TOTAL_ELEMENTS}). The file may be malformed or corrupt."
-        )
+    # F-D2-M03: Removed the outer MAX_TOTAL_ELEMENTS check that ran before
+    # wrap detection.  For WRAP=YES files, data_line_count counts individual
+    # lines (not depth steps), so a wrapped file with 100 curves and 10M
+    # lines (100K depth steps) would falsely be rejected as 1B elements
+    # when it's actually ~10M.  Both _read_normal and _read_wrapped
+    # have their own wrapped-aware bounds checks.  For WRAP=NO, this
+    # simply eliminates a redundant check (the same bounds guard runs
+    # inside _read_normal).
 
     wrap_mode = las_file.version.wrap.upper() == "YES"
     delimiter = las_file.version.delimiter_char
@@ -176,8 +218,14 @@ def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " "
         stripped = line.strip()
 
         if _is_section_header(stripped):
-            if stripped[1].upper() == "A":
+            if _is_ascii_section(stripped):
                 in_ascii = True
+            else:
+                # F-ITER2-D2-M05: Reset in_ascii on non-A section headers.
+                # Without this, _detect_actual_wrap would never exit an empty
+                # ~A section and would scan lines from subsequent sections
+                # (e.g. ~O) as wrap-detection input, producing false results.
+                in_ascii = False
             continue
 
         if not in_ascii or not stripped or stripped.startswith("#"):
@@ -333,8 +381,10 @@ def _read_normal(
         # F-20: Align section detection with parser.py's SECTION_PATTERN
         # (~[A-Za-z]).  Lines starting with ~ but without an alphabetic
         # section letter (e.g. bare ~, ~~~, etc.) are ignored.
+        # F-ITER2-D2-M04: Use _is_ascii_section to check for exact ~A/~ASCII
+        # match (aligned with parser._pre_scan), not just the first character.
         if _is_section_header(stripped):
-            if stripped[1].upper() == "A":
+            if _is_ascii_section(stripped):
                 in_ascii = True
             else:
                 if in_ascii:
@@ -432,7 +482,7 @@ def _read_wrapped(
     for line in lines:
         stripped = line.strip()
         if _is_section_header(stripped):
-            if stripped[1].upper() == "A":
+            if _is_ascii_section(stripped):
                 _count_in_ascii = True
             elif _count_in_ascii:
                 break  # End of ~A section
@@ -477,8 +527,9 @@ def _read_wrapped(
         # F-20: Align section detection with parser.py's SECTION_PATTERN
         # (~[A-Za-z]).  Only treat lines as section headers when the
         # character after ~ is alphabetic.
+        # F-ITER2-D2-M04: Use _is_ascii_section for exact match.
         if _is_section_header(stripped):
-            if stripped[1].upper() == "A":
+            if _is_ascii_section(stripped):
                 in_ascii = True
             else:
                 if in_ascii:
@@ -550,7 +601,7 @@ def _read_wrapped(
                     )
                 depth_had_extra = False  # This line handled the extra-values case
 
-            for val_str in values:
+            for i, val_str in enumerate(values):
                 counter += 1
 
                 if counter >= curve_count:
@@ -577,6 +628,16 @@ def _read_wrapped(
                     # Break to discard any extra values on this line
                     # (prevents silent misalignment if a line has
                     # more values than expected).
+                    # F-D2-M01: Warn when extra values remain on this
+                    # line after step completion (previously silent).
+                    if i + 1 < len(values):
+                        warnings.warn(
+                            f"Wrapped mode: step complete with "
+                            f"{len(values) - i - 1} extra value(s) "
+                            f"discarded on this line. Line content: "
+                            f"'{stripped[:80]}'",
+                            stacklevel=2,
+                        )
                     counter = 0
                     depth_line = True
                     depth_had_extra = False

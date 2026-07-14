@@ -7,11 +7,20 @@ instead of print statements.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def _scalars_equal(a: Any, b: Any) -> bool:
+    """Compare two scalars, treating NaN == NaN as equal."""
+    if isinstance(a, float) and isinstance(b, float):
+        if math.isnan(a) and math.isnan(b):
+            return True
+    return bool(a == b)
 
 
 def compare_las_dicts(
@@ -92,7 +101,7 @@ def compare_las_dicts(
                             type(val2[in_key]).__name__,
                         )
                         return False
-                    elif val1[in_key] != val2[in_key]:
+                    elif not _scalars_equal(val1[in_key], val2[in_key]):
                         logger.warning(
                             "Mismatch at '%s.%s': %r vs %r",
                             key,
@@ -101,7 +110,7 @@ def compare_las_dicts(
                             val2[in_key],
                         )
                         return False
-                except TypeError:
+                except (TypeError, IndexError, KeyError):
                     logger.warning(
                         "Type mismatch at '%s.%s': cannot compare %s with %s",
                         key,
@@ -158,7 +167,7 @@ def compare_las_dicts(
                             )
                             return False
         else:
-            if val1 != val2:
+            if not _scalars_equal(val1, val2):
                 logger.warning("Mismatch at '%s': %r vs %r", key, val1, val2)
                 return False
 

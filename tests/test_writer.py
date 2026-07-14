@@ -19,7 +19,13 @@ from pylasdev.models import (
     ParameterZone,
     VersionSection,
 )
-from pylasdev.writer import _format_fixed_precision, _format_number, _sanitize_las_value
+from pylasdev.writer import (
+    _format_data_rows,
+    _format_fixed_precision,
+    _format_number,
+    _sanitize_las_value,
+    _section_type_to_prefix,
+)
 
 
 class TestWriteLASFile:
@@ -1125,3 +1131,184 @@ class TestWriteLASFile:
         content = temp_file.read_text()
         assert "~OTHER" not in content
         assert "~Other" not in content
+
+
+class TestSectionTypeToPrefix:
+    """F-T2-M02/F-ITER2-T2-M04: Tests for _section_type_to_prefix."""
+
+    def test_known_types(self) -> None:
+        """Known section types return their mapped prefix."""
+        assert _section_type_to_prefix("LOG_DATA") == "A"
+        assert _section_type_to_prefix("CORE_DATA") == "CORE_DATA"
+        assert _section_type_to_prefix("DRILLING_DATA") == "DRILLING_DATA"
+        assert _section_type_to_prefix("INCLINOMETRY_DATA") == "INCLINOMETRY_DATA"
+        assert _section_type_to_prefix("TOPS_DATA") == "TOPS_DATA"
+        assert _section_type_to_prefix("TEST_DATA") == "TEST_DATA"
+        assert _section_type_to_prefix("PERFORATIONS_DATA") == "PERFORATIONS_DATA"
+
+    def test_user_defined_data_type(self) -> None:
+        """User-defined section types ending with ``_DATA`` return their
+        own name as the prefix for roundtrip fidelity (F-T2-M02)."""
+        assert _section_type_to_prefix("CUSTOM_DATA") == "CUSTOM_DATA"
+        assert _section_type_to_prefix("MY_DATA") == "MY_DATA"
+        assert _section_type_to_prefix("XYZ_DATA") == "XYZ_DATA"
+
+    def test_unknown_type_falls_back_to_a(self) -> None:
+        """Completely unknown section types (not ending with ``_DATA``
+        and not in the known map) fall back to ``"A"`` (F-ITER2-T2-M04)."""
+        assert _section_type_to_prefix("UNKNOWN") == "A"
+        assert _section_type_to_prefix("SOMETHING") == "A"
+        assert _section_type_to_prefix("") == "A"
+
+
+class TestFormatNumberNaNInf:
+    """F-T2-M06: Test _format_number NaN/Inf defensive path.
+
+    The NaN/Inf guard at _format_number:486-489 catches values that
+    slip past the primary guard in _format_data_rows. When null_value
+    is provided, it outputs that value; otherwise it formats the
+    NaN/Inf directly.
+    """
+
+    def test_nan_with_null_value(self) -> None:
+        """NaN passed directly to _format_number outputs null_value."""
+        result = _format_number(float("nan"), ".8g", null_value=-999.25)
+        assert result == "-999.25"
+
+    def test_inf_with_null_value(self) -> None:
+        """Inf passed directly to _format_number outputs null_value."""
+        result = _format_number(float("inf"), ".8g", null_value=-999.25)
+        assert result == "-999.25"
+
+    def test_nan_without_null_value(self) -> None:
+        """NaN without null_value falls through to format(float('nan'), '.8g')."""
+        result = _format_number(float("nan"), ".8g")
+        # format(float('nan'), '.8g') produces 'nan'
+        assert "nan" in result.lower()
+
+    def test_inf_without_null_value(self) -> None:
+        """Inf without null_value falls through to format(float('inf'), '.8g')."""
+        result = _format_number(float("inf"), ".8g")
+        assert "inf" in result.lower()
+
+    def test_negative_inf_with_null_value(self) -> None:
+        """-Inf with null_value outputs null_value."""
+        result = _format_number(float("-inf"), ".8g", null_value=-999.25)
+        assert result == "-999.25"
+
+
+class TestFormatDataRowsVariableLength:
+    """F-T2-M03: Test variable-length array padding in _format_data_rows.
+
+    When curves in a data section have different lengths, the writer
+    derives the row count from the longest curve and pads shorter
+    curves with null_value. The per-curve variable-length support
+    handles LAS 3.0 sections where curves are populated from
+    different data sections.
+    """
+
+    def test_unequal_length_curves_padded_with_null(self) -> None:
+        """Curve with 3 values, other with 2 — shorter gets padded."""
+        data = {
+            "DEPT": np.array([100.0, 101.0, 102.0]),
+            "DT": np.array([50.0, 51.0]),
+        }
+        rows = _format_data_rows(
+            ["DEPT", "DT"],
+            data,
+            {},
+            null_value=-999.25,
+            delimiter=" ",
+            precision=".8g",
+        )
+        assert len(rows) == 3
+        # Row 0: both values present
+        assert "50" in rows[0]
+        # Row 2: DT padded with null_value
+        assert "-999.25" in rows[2]
+
+    def test_single_long_curve_others_short(self) -> None:
+        """One curve 5 values, others 1 — all padded to 5 rows."""
+        data = {
+            "DEPT": np.array([100.0, 101.0, 102.0, 103.0, 104.0]),
+            "DT": np.array([50.0]),
+            "GR": np.array([75.0]),
+        }
+        rows = _format_data_rows(
+            ["DEPT", "DT", "GR"],
+            data,
+            {},
+            null_value=-999.25,
+            delimiter=" ",
+            precision=".8g",
+        )
+        assert len(rows) == 5
+        # Row 0: all values present
+        parts = rows[0].split()
+        assert len(parts) == 3
+        # Row 4: DEPT=104, DT=-999.25, GR=-999.25
+        parts4 = rows[4].split()
+        assert "-999.25" in parts4[1] or "-999.25000000" in parts4[1]
+        assert "-999.25" in parts4[2] or "-999.25000000" in parts4[2]
+
+    def test_empty_data_returns_empty_lines(self) -> None:
+        """Empty data dict with 0 rows returns empty list."""
+        rows = _format_data_rows(
+            ["DEPT"],
+            {},  # no data
+            {},
+            null_value=-999.25,
+            delimiter=" ",
+        )
+        assert rows == []
+
+
+class TestLOGDataWithSectionCurves:
+    """F-ITER2-T2-M03: Test LOG_DATA DataSection with populated section_curves.
+
+    When a LOG_DATA DataSection has truthy ``section_curves``, the
+    writer's ``curves_to_emit`` branch (writer.py:222-226) uses them
+    instead of the global ``las_file.curves``. This branch has zero
+    test coverage — all existing tests use empty/falsy values.
+    """
+
+    def test_log_data_with_section_curves_written(self, tmp_path: Path) -> None:
+        """LOG_DATA section with section_curves writes curve definitions
+        from the section, not the global curve list."""
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+
+        # Global curves (different from section_curves)
+        las.curves_order = ["DEPT", "DT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
+        las.curves.append(CurveDefinition(mnemonic="DT", unit="US/M", data_format="F"))
+        las.logs["DEPT"] = np.array([100.0])
+        las.logs["DT"] = np.array([50.0])
+
+        # Section-specific curves for LOG_DATA
+        section_curves = [
+            CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"),
+            CurveDefinition(mnemonic="GR", unit="GAPI", data_format="F"),
+        ]
+        section = DataSection(
+            name="CURVE",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "GR"],
+            section_curves=section_curves,
+            data={
+                "DEPT": np.array([100.0]),
+                "GR": np.array([75.0]),
+            },
+        )
+        las.data_sections.append(section)
+
+        temp_file = tmp_path / "log_section_curves.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        # ~CURVE section should contain section-specific curves (DEPT, GR)
+        # not the globals (DEPT, DT)
+        assert "~CURVE INFORMATION" in content
+        assert "GR.GAPI" in content
+        assert "DT.US/M" not in content

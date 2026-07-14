@@ -180,13 +180,24 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
     #   2 content lines before data: count + header.
     if len(first_tokens) == 1:
         try:
-            int(first_tokens[0])
+            col_count = int(first_tokens[0])
         except ValueError:
             pass
         else:
             if len(content_entries) >= 2:
                 second_tokens = content_entries[1][1].split()
+                # F-ITER2-D3-M05: Primary check — any non-float token in the
+                # second line means it's a header (text column names).
                 if any(not _is_float_token(t) for t in second_tokens):
+                    return ("dug", 2)
+                # F-ITER2-D3-M05: Secondary heuristic — when ALL second-line
+                # tokens parse as floats (e.g. numeric column names "100 200 300"),
+                # check if the integer count from the first line matches the
+                # token count on the second line.  Column-count == header-token-count
+                # is a strong signal of DUG format even with all-numeric headers.
+                # Without this, the function falls through and misdetects as
+                # headerless, silently losing all columns.
+                if col_count == len(second_tokens):
                     return ("dug", 2)
 
     # Pattern B: multi-word title, integer column count, header.
@@ -252,7 +263,13 @@ def read_dev_file(
         delimiter=delimiter,
         normalize_aliases=normalize_aliases,
     )
-    return dev.to_dict()
+    # to_dict() now includes metadata keys (source_file, encoding,
+    # column_order) that are strings/lists, not numpy arrays.  Strip
+    # them here to maintain the documented contract: "Dictionary mapping
+    # column names to numpy arrays."
+    _metadata_keys = {"encoding", "source_file", "column_order"}
+    result = dev.to_dict()
+    return {k: v for k, v in result.items() if k not in _metadata_keys}
 
 
 def read_dev_file_as_object(

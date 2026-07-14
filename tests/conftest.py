@@ -28,7 +28,12 @@ def all_las_files() -> list[Path]:
 
 @pytest.fixture
 def all_dev_files() -> list[Path]:
-    """All DEV test files in test_data/."""
+    """All DEV test files in test_data/.
+
+    NOTE: Only one real .dev file (sample.dev) exists in test_data/.
+    More DUG Insight exports and headerless DEV files are needed
+    for comprehensive format coverage (F-T2-M05).
+    """
     if TEST_DATA_DIR.exists():
         return sorted(TEST_DATA_DIR.glob("*.dev"))
     return []

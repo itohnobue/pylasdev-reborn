@@ -67,10 +67,11 @@ class TestReadWithEncoding:
 
         Uses explicit encoding because short test files (< 50 KB) are
         too small for chardet to distinguish single-byte Cyrillic
-        encodings (cp866 vs cp1251).  With cp866 now ordered first in
-        the fallback chain, chardet's default path returns cp866 which
-        decodes cp1251 bytes as garbled characters.  Explicit encoding
-        removes the ambiguity.
+        encodings (cp1251 vs cp866).  chardet's default path may return
+        either encoding for short samples; quality-based selection
+        (_decode_best_quality) picks the correct encoding regardless
+        of the fallback chain order.  Explicit encoding removes the
+        ambiguity.
         """
         test_file = tmp_path / "test.las"
         russian_text = "\u041f\u0440\u0438\u0432\u0435\u0442"  # "Привет"
@@ -81,9 +82,10 @@ class TestReadWithEncoding:
     def test_read_cp866(self, tmp_path: Path) -> None:
         """Test reading CP866 encoded file (Russian DOS).
 
-        With cp866 now ordered before cp1251 in the fallback chain (CORR-F29),
-        cp866-encoded Russian text decodes correctly regardless of whether
-        chardet detects the encoding or the fallback chain is used.
+        With cp1251 now ordered before cp866 in the fallback chain (CORR-F29),
+        cp866-encoded Russian text is still decoded correctly via
+        quality-based selection (_decode_best_quality), which picks the
+        encoding producing the best decode quality regardless of order.
         """
         test_file = tmp_path / "test.las"
         russian_text = "\u041f\u0420\u0418\u0412\u0415\u0422"  # "ПРИВЕТ"

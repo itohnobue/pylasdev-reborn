@@ -527,12 +527,11 @@ class TestDevFile:
         np.testing.assert_array_equal(dev.columns["TVD"], np.array([0.0, 99.0]))
 
     def test_dev_file_from_dict_roundtrip(self) -> None:
-        """Test DevFile.from_dict(to_dict()) preserves column data.
+        """Test DevFile.from_dict(to_dict()) preserves column data and metadata.
 
-        Note: to_dict() only returns column arrays (backward compat),
-        so metadata like source_file and encoding are NOT preserved
-        through a to_dict() → from_dict() roundtrip. Use a rich dict
-        with metadata keys to preserve those.
+        to_dict() now includes metadata keys (source_file, encoding,
+        column_order) alongside column arrays.  from_dict() correctly
+        restores them.
         """
         dev = DevFile()
         dev.columns["MD"] = np.array([0.0, 100.0, 200.0])
@@ -546,8 +545,8 @@ class TestDevFile:
         # Column data is preserved
         np.testing.assert_array_equal(dev2.columns["MD"], dev.columns["MD"])
         np.testing.assert_array_equal(dev2.columns["TVD"], dev.columns["TVD"])
-        # Metadata from to_dict() is NOT in the output dict, so defaults apply
-        assert dev2.encoding == "utf-8"  # default, not from to_dict()
-        assert dev2.source_file == ""  # default
-        # column_order inferred from dict insertion order
+        # Metadata from to_dict() is now preserved through roundtrip
+        assert dev2.encoding == "utf-8"
+        assert dev2.source_file == "test.dev"
+        # column_order from to_dict() is restored (or inferred from dict order)
         assert dev2.column_order == ["MD", "TVD"]

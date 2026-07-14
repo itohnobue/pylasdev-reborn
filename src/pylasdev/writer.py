@@ -186,18 +186,23 @@ def _write_well_section(las_file: LASFile) -> list[str]:
         unit = _sanitize_las_value(las_file.well.units.get(key, ""))
         unit_dot = f".{unit}" if unit else "."
         val = _sanitize_las_value(value)
+        # Emit CWLS well descriptions if present (F-D3-H01 fix).
+        desc = _sanitize_las_value(las_file.well.descriptions.get(key, ""))
+        desc_str = f"  {desc}" if desc else ""
         if is_las12:
             # F-03: LAS 1.2 CWLS spec places numeric well fields (STRT,
             # STOP, STEP, NULL) BEFORE the colon.  Non-numeric fields
             # keep the lasio convention (value AFTER colon) for backward
             # compatibility with files that use that convention.
-            if key in {"STRT", "STOP", "STEP", "NULL"}:
-                lines.append(f" {_sanitize_las_value(key)}{unit_dot}   {val}  :")
+            # F-ITER2-D3-M06: case-insensitive check for well field names
+            # because from_dict() stores keys as-is without uppercasing.
+            if key.upper() in {"STRT", "STOP", "STEP", "NULL"}:
+                lines.append(f" {_sanitize_las_value(key)}{unit_dot}   {val}  :{desc_str}")
             else:
-                lines.append(f" {_sanitize_las_value(key)}{unit_dot}    : {val}")
+                lines.append(f" {_sanitize_las_value(key)}{unit_dot}    : {val}{desc_str}")
         else:
             # LAS 2.0+: MNEM.UNIT VALUE  :
-            lines.append(f" {_sanitize_las_value(key)}{unit_dot}   {val}  :")
+            lines.append(f" {_sanitize_las_value(key)}{unit_dot}   {val}  :{desc_str}")
     lines.append("")
     return lines
 
@@ -327,8 +332,11 @@ def _section_type_to_prefix(section_type: str) -> str:
         return known
     # User-defined section types following the _DATA convention
     # use their own name as the header prefix for roundtrip fidelity.
+    # F-ITER2-SEC-M04: Sanitize the user-provided type name to prevent
+    # section-header injection via from_dict() with malicious section_type
+    # values containing newlines or control characters.
     if section_type.endswith("_DATA"):
-        return section_type
+        return _sanitize_las_value(section_type)
     return "A"
 
 
@@ -373,6 +381,13 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
             # (e.g., one Core_Definition for both Core[1] and Core[2]).
             if is_las30 and section.section_type != "LOG_DATA" and section.section_curves:
                 def_prefix = _SECTION_TYPE_TO_DEFINITION_PREFIX.get(section.section_type)
+                # F-D3-M01: Auto-derive Definition prefix for user-defined _DATA
+                # section types not in the hardcoded mapping.  Strip _DATA suffix
+                # and title-case the root (e.g., "CUSTOM_DATA" → "Custom").
+                if def_prefix is None and section.section_type.endswith("_DATA"):
+                    root = section.section_type[: -len("_DATA")]
+                    root = _sanitize_las_value(root)
+                    def_prefix = root.title().replace("_", "")
                 if def_prefix and def_prefix not in emitted_defs:
                     emitted_defs.add(def_prefix)
                     lines.append(f"~{def_prefix}_Definition")
@@ -528,4 +543,15 @@ def _format_fixed_precision(value: float, precision: str) -> str:
     # Ensure at least sig_digits places (for values > 1)
     decimal_places = max(decimal_places, sig_digits)
 
-    return format(value, f".{decimal_places}f")
+    result = format(value, f".{decimal_places}f")
+    # F-D3-M02: Precision loss for values < 1e-38.  When value is non-zero
+    # but the capped decimal places produce all zeros (e.g., 1e-40 → 30
+    # decimal places of zeros), fall back to exponent notation to preserve
+    # the actual value rather than writing literal zero.
+    if value != 0.0:
+        # Check if fixed-point representation lost all significant digits:
+        # all characters except the leading minus and decimal point are '0'.
+        stripped = result.lstrip("-")
+        if all(c == "0" or c == "." for c in stripped):
+            return format(value, f".{sig_digits}e")
+    return result

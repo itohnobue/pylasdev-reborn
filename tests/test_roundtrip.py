@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from pylasdev import read_las_file, write_las_file
 
@@ -196,3 +197,17 @@ class TestRoundTrip:
         assert restored.curves[1].unit == "US/M"
         assert restored.curves[1].api_code == "123"
         assert restored.curves[1].description == "SONIC"
+
+
+class TestDEVRoundtripSkipped:
+    """DEV roundtrip tests — skipped until DEV writer is implemented.
+
+    F-T2-M04: No DEV writer exists.  ``write_dev_file`` is needed before
+    DEV roundtrip tests can be meaningful.
+    F-T3-M02: DEV roundtrip is untested as a result.
+    """
+
+    @pytest.mark.skip(reason="F-T2-M04: DEV writer not implemented")
+    def test_dev_roundtrip_skipped(self) -> None:
+        """DEV read → write → read roundtrip — not yet testable."""
+        pass
