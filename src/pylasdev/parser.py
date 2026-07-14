@@ -142,6 +142,7 @@ _DATA_SECTION_WORDS = {
     "TEST_DATA",              # Test data section (written form)
     "PERFORATIONS",           # Perforations data section
     "PERFORATIONS_DATA",      # Perforations data section (written form)
+    "LOG",                     # LAS 3.0 shorthand ~Log alias for ~Log_Data / ~Ascii
     "LOG_DATA",               # Explicit log data section
 }
 
@@ -168,6 +169,7 @@ _SECTION_TYPE_MAP: dict[str, str] = {
     "TEST_DATA": "TEST_DATA",
     "PERFORATIONS": "PERFORATIONS_DATA",
     "PERFORATIONS_DATA": "PERFORATIONS_DATA",
+    "LOG": "LOG_DATA",
     "LOG_DATA": "LOG_DATA",
 }
 
@@ -319,10 +321,30 @@ class LASParser:
         if self.las_file.version.is_las30:
             self._process_ascii_data()
 
+        # Validate mandatory LAS 2.0 well fields (STRT, STOP, STEP, NULL).
+        # LAS 2.0 requires these fields; missing fields are a spec compliance
+        # gap.  The library handles missing fields gracefully (using defaults),
+        # so this is a warning, not an error.
+        is_las20 = self.las_file.version.vers.startswith("2.")
+        if is_las20 and self._version_found:
+            _mandatory_fields = ["STRT", "STOP", "STEP", "NULL"]
+            for field in _mandatory_fields:
+                if field not in self.las_file.well.entries:
+                    warnings.warn(
+                        f"LAS 2.0 file missing mandatory well field: {field}",
+                        stacklevel=2,
+                    )
+
         return self.las_file
 
     def _pre_scan(self, lines: list[str]) -> None:
-        """Pre-scan to count ASCII data lines."""
+        """Pre-scan to count ASCII data lines.
+
+        Only counts lines in ~A / ~ASCII sections, matching the data reader's
+        behavior: _read_normal breaks on any non-~A section header.  Counting
+        lines in non-~A sections (e.g. ~Core, ~Drilling) would inflate the
+        pre-allocation estimate.
+        """
         in_ascii = False
         count = 0
 
@@ -331,14 +353,10 @@ class LASParser:
             match = SECTION_PATTERN.match(stripped)
             if match:
                 section_word = match.group(1).upper()
-                # F-03: Use same matching logic as dispatch:
-                # matching known types, user-defined *_Data sections, and
-                # indexed sections (e.g., ~Core[1], ~Inclinometry[2]).
-                in_ascii = (
-                    section_word in _DATA_SECTION_WORDS
-                    or section_word.endswith("_DATA")
-                    or _is_indexed_data_section(section_word)
-                )
+                # Only count lines in ~A / ~ASCII sections — these are the
+                # only sections the data reader processes as data.  Other
+                # section types cause a break in _read_normal.
+                in_ascii = section_word in {"A", "ASCII"}
                 continue
             if (
                 in_ascii

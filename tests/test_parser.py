@@ -1069,3 +1069,154 @@ class TestLAS30AsciiDataBranches:
         assert las.data_sections[0].data["DEPT"][1] == 101.0
         assert las.data_sections[0].data["DT"][1] == 51.0
         assert las.data_sections[0].data["GR"][1] == 75.0
+
+    # --- F-H1: LAS 3.0 ~Log alias handling ---
+    def test_las30_log_section_alias(self) -> None:
+        """~Log is a spec-defined shorthand alias for ~Ascii / ~Log_Data."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M       : DEPTH {F}
+ DT.US/M      : SONIC {F}
+~Log
+100.0,50.0
+101.0,51.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.data_sections) == 1
+        assert las.data_sections[0].section_type == "LOG_DATA"
+        assert las.data_sections[0].data["DEPT"][0] == 100.0
+        assert las.data_sections[0].data["DT"][0] == 50.0
+
+    # --- F-H2: LAS 2.0 mandatory well field warnings ---
+    def test_las20_missing_mandatory_well_field_warning(self) -> None:
+        """LAS 2.0 files missing STRT, STOP, STEP, NULL should warn."""
+        content = """~VERSION INFORMATION
+ VERS.   2.0  : CWLS LOG ASCII STANDARD
+ WRAP.   NO   :
+~WELL INFORMATION
+ STRT.M  1670.0000  :
+ STOP.M  1680.0000  :
+~CURVE INFORMATION
+ DEPT.M   : DEPTH
+~A
+100.0
+101.0
+"""
+        parser = LASParser()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            parser.parse(content)
+            mandatory_warnings = [
+                x for x in w
+                if "LAS 2.0 file missing mandatory well field" in str(x.message)
+            ]
+            # Both STEP and NULL are missing
+            assert len(mandatory_warnings) == 2
+            warning_texts = [str(x.message) for x in mandatory_warnings]
+            assert any("STEP" in t for t in warning_texts)
+            assert any("NULL" in t for t in warning_texts)
+
+    def test_las20_all_mandatory_fields_no_warning(self) -> None:
+        """LAS 2.0 files with all mandatory fields should not warn."""
+        content = """~VERSION INFORMATION
+ VERS.   2.0  : CWLS LOG ASCII STANDARD
+ WRAP.   NO   :
+~WELL INFORMATION
+ STRT.M  1670.0000  :
+ STOP.M  1680.0000  :
+ STEP.M     0.1000  :
+ NULL.   -999.25  :
+~CURVE INFORMATION
+ DEPT.M   : DEPTH
+~A
+100.0
+101.0
+"""
+        parser = LASParser()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            parser.parse(content)
+            mandatory_warnings = [
+                x for x in w
+                if "LAS 2.0 file missing mandatory well field" in str(x.message)
+            ]
+            assert len(mandatory_warnings) == 0
+
+    def test_las12_no_mandatory_field_warning(self) -> None:
+        """LAS 1.2 files should not trigger the LAS 2.0 mandatory field check."""
+        content = """~VERSION INFORMATION
+ VERS.   1.2  : CWLS LOG ASCII STANDARD
+ WRAP.   NO   :
+~WELL INFORMATION
+ STRT.M    : 1670.0000
+ STOP.M    : 1680.0000
+ STEP.M    : 0.1000
+ NULL.    : -999.25
+~CURVE INFORMATION
+ DEPT.M   : DEPTH
+~A
+100.0
+101.0
+"""
+        parser = LASParser()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            parser.parse(content)
+            mandatory_warnings = [
+                x for x in w
+                if "LAS 2.0 file missing mandatory well field" in str(x.message)
+            ]
+            assert len(mandatory_warnings) == 0
+
+    # --- F-M2: Pre-scan only counts ~A/~ASCII sections ---
+    def test_pre_scan_ignores_non_ascii_sections(self) -> None:
+        """Pre-scan should only count lines in ~A/~ASCII data sections."""
+        content = """~VERSION INFORMATION
+ VERS.   2.0  :
+ WRAP.   NO   :
+~CURVE INFORMATION
+ DEPT.M   :
+ DT.US/M  :
+~A
+100.0  50.0
+100.1  51.0
+~Core
+550.0  1.0
+551.0  1.0
+"""
+        parser = LASParser()
+        parser.parse(content)
+        # Only 2 data lines in ~A section, not 4 (the 2 in ~Core are excluded)
+        assert parser._data_line_count == 2
+
+    def test_pre_scan_las30_counts_all_data_sections(self) -> None:
+        """For LAS 3.0, pre-scan counting doesn't matter (parser uses actual_count),
+        but ~A/~ASCII are still the only ones counted by pre_scan."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.   -999.25 :
+~CURVE INFORMATION
+ DEPT.M  : DEPTH {F}
+ DT.US/M : SONIC {F}
+~A
+100.0,50.0
+101.0,51.0
+~Core
+550.0,1.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        # Pre-scan only counts ~A sections — Core section lines are excluded
+        assert parser._data_line_count == 2
+        # But LAS 3.0 parser processes Core section data too (via _process_ascii_data)
+        # and uses actual_count, not _data_line_count
+        assert len(las.data_sections) == 2

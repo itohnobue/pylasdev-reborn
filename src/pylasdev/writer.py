@@ -444,7 +444,7 @@ def _format_data_rows(
             if arr is None or i >= len(arr):
                 row_values.append(_format_number(null_value, precision, null_value))
             elif is_string:
-                row_values.append(str(arr[i]))
+                row_values.append(_sanitize_las_value(str(arr[i])))
             else:
                 val = arr[i]
                 if np.isnan(val) or np.isinf(val):

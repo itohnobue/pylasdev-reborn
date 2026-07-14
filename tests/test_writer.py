@@ -1035,3 +1035,57 @@ class TestWriteLASFile:
         assert "e" not in result.lower()
         assert result.startswith("0.")
         assert len(result.split(".")[1]) == 19
+
+    # --- F-C1: String data injection prevention ---
+    def test_string_data_injection_sanitized(self, tmp_path: Path) -> None:
+        """String data values containing section-header-like content are sanitized.
+
+        A string curve value containing ``\\n~VERSION`` would be emitted as a
+        raw line break causing the reader to detect a fake section header.
+        After the fix, ``_sanitize_las_value()`` strips newlines from string
+        data values before emission, preventing section injection.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "CDES"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
+        las.curves.append(CurveDefinition(mnemonic="CDES", unit="", data_format="S"))
+
+        section = DataSection(
+            name="CURVE",
+            curves_order=["DEPT", "CDES"],
+            data={"DEPT": np.array([100.0, 101.0])},
+        )
+        las.data_sections.append(section)
+
+        # String data with embedded newline and section-header-like pattern
+        section.string_data["CDES"] = np.array(
+            ["normal\n~VERSION INFORMATION\nhijacked", "clean"], dtype=np.str_
+        )
+
+        temp_file = tmp_path / "injection_test.las"
+        write_las_file(temp_file, las)
+        content = temp_file.read_text()
+
+        # The injected raw newline must NOT appear in the data section.
+        # The newline after "~A CURVE | CURVE" is the normal section header line
+        # break.  Data lines should not contain raw newlines that would split
+        # the file into fake section headers.
+        data_section = content.split("~A CURVE | CURVE")[1]
+        # Count newlines in the data section: one per data row + trailing newline
+        data_lines = [line for line in data_section.split("\n") if line.strip()]
+        # With 2 rows and no injection: 2 data lines
+        # With injection: newline chars in string_data split into extra lines
+        assert len(data_lines) == 2, (
+            f"Expected 2 data lines, got {len(data_lines)}: {data_lines}"
+        )
+        # The sanitized string value should be on a single data line
+        first_data_line = data_lines[0]
+        assert "100" in first_data_line
+        # Sanitization replaces newlines with spaces — the injected content
+        # is preserved but made safe
+        assert "normal" in first_data_line
+        assert "hijacked" in first_data_line
+        # The second data line is clean
+        assert "101" in data_lines[1]

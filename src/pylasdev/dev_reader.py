@@ -26,6 +26,45 @@ from .models import DevFile
 
 logger = logging.getLogger(__name__)
 
+# Lightweight DEV column name alias mapping for common variants found in
+# deviation survey files.  Unlike the full mnem_base.py database (2000+
+# LAS curve aliases), this mapping is DEV-specific and covers the most
+# common column name variants encountered in the wild.
+_DEV_ALIASES: dict[str, str] = {
+    # Measured depth variants
+    "MDKB": "MD",
+    "MDSS": "MD",
+    "MDRKB": "MD",
+    # True vertical depth variants
+    "TVDKB": "TVD",
+    "TVDSS": "TVD",
+    "TVDBML": "TVD",
+    # Inclination variants
+    "INCL": "INC",
+    # Azimuth variants
+    "AZIM": "AZI",
+    # Easting (X) variants
+    "UTMX": "X",
+    # Northing (Y) variants
+    "UTMY": "Y",
+}
+
+
+def _normalize_dev_column(name: str) -> str:
+    """Normalize a DEV column name through the alias mapping.
+
+    Performs case-insensitive lookup: the input name is uppercased,
+    matched against the alias table, and the canonical name is returned.
+    Names not in the alias table are returned unchanged.
+
+    Args:
+        name: Raw column name from the header line.
+
+    Returns:
+        Canonical column name if an alias exists, otherwise the original.
+    """
+    return _DEV_ALIASES.get(name.upper(), name)
+
 
 def _deduplicate_dev_columns(names: list[str]) -> list[str]:
     """Deduplicate DEV column names with cross-base collision detection.
@@ -173,6 +212,7 @@ def read_dev_file(
     encoding: str | None = None,
     max_file_size: int | None = None,
     delimiter: str | None = None,
+    normalize_aliases: bool = True,
 ) -> dict[str, Any]:
     """Read a DEV (deviation survey) file and return data dictionary.
 
@@ -186,6 +226,8 @@ def read_dev_file(
         delimiter: Column delimiter.  ``None`` (default) auto-detects
             comma vs whitespace from the header line.  Pass ``" "`` for
             whitespace-only, ``","`` for comma-delimited files.
+        normalize_aliases: If ``True`` (default), apply DEV-specific alias
+            normalization to column names (e.g. ``MDKB`` → ``MD``).
 
     Returns:
         Dictionary mapping column names to numpy arrays.
@@ -196,7 +238,7 @@ def read_dev_file(
         LASEncodingError: If the explicit encoding parameter fails to decode
             the file.
     """
-    dev = read_dev_file_as_object(file_path, encoding=encoding, max_file_size=max_file_size, delimiter=delimiter)
+    dev = read_dev_file_as_object(file_path, encoding=encoding, max_file_size=max_file_size, delimiter=delimiter, normalize_aliases=normalize_aliases)
     return dev.to_dict()
 
 
@@ -205,6 +247,7 @@ def read_dev_file_as_object(
     encoding: str | None = None,
     max_file_size: int | None = None,
     delimiter: str | None = None,
+    normalize_aliases: bool = True,
 ) -> DevFile:
     """Read a DEV file and return DevFile dataclass (new API).
 
@@ -219,6 +262,8 @@ def read_dev_file_as_object(
         delimiter: Column delimiter.  ``None`` (default) auto-detects
             comma vs whitespace from the header line.  Pass ``" "`` for
             whitespace-only, ``","`` for comma-delimited files.
+        normalize_aliases: If ``True`` (default), apply DEV-specific alias
+            normalization to column names (e.g. ``MDKB`` → ``MD``).
 
     Returns:
         DevFile dataclass with full parsed data.
@@ -398,6 +443,10 @@ def read_dev_file_as_object(
                         "Empty header line in DUG-format DEV file. "
                         "Expected column names on the third content line."
                     )
+                # Apply alias normalization before deduplication so that
+                # variants like MDKB and MD are recognized as duplicates.
+                if normalize_aliases:
+                    names = [_normalize_dev_column(n) for n in names]
                 # Deduplicate column names.
                 names = _deduplicate_dev_columns(names)
                 if len(names) > MAX_CURVES:
@@ -444,6 +493,10 @@ def read_dev_file_as_object(
                         "Empty header line in DEV file. "
                         "Expected column names on the first content line."
                     )
+                # Apply alias normalization before deduplication so that
+                # variants like MDKB and MD are recognized as duplicates.
+                if normalize_aliases:
+                    names = [_normalize_dev_column(n) for n in names]
                 # Deduplicate column names.
                 names = _deduplicate_dev_columns(names)
                 if len(names) > MAX_CURVES:

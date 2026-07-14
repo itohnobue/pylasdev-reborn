@@ -498,7 +498,7 @@ class TestDugFormat:
         test_file = tmp_path / "dug_basic.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        data = read_dev_file(test_file)
+        data = read_dev_file(test_file, normalize_aliases=False)
         assert list(data.keys()) == ["MDKB", "TVDSS", "X", "Y"]
         assert len(data["MDKB"]) == 3
         assert data["MDKB"][0] == 0.0
@@ -853,3 +853,97 @@ class TestFormatAutoDetection:
         data = read_dev_file(test_file)
         assert list(data.keys()) == ["MD", "TVD", "X", "Y"]
         assert data["MD"][0] == 0.0
+
+    # --- F-M4: DEV column name alias normalization ---
+    def test_alias_normalization_basic(self, tmp_path: Path) -> None:
+        """MDKB, TVDSS, INCL, AZIM, UTMX, UTMY are normalized to canonical names."""
+        content = (
+            "MDKB TVDSS INCL AZIM UTMX UTMY\n"
+            "0.0 0.0 40.0 50.0 100.0 200.0\n"
+        )
+        test_file = tmp_path / "alias_test.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "INC", "AZI", "X", "Y"]
+        assert data["MD"][0] == 0.0
+        assert data["TVD"][0] == 0.0
+        assert data["INC"][0] == 40.0
+        assert data["AZI"][0] == 50.0
+        assert data["X"][0] == 100.0
+        assert data["Y"][0] == 200.0
+
+    def test_alias_normalization_disabled(self, tmp_path: Path) -> None:
+        """When normalize_aliases=False, column names are used as-is."""
+        content = (
+            "MDKB TVDSS X Y\n"
+            "0.0 -20.0 39844.5 24589.3\n"
+        )
+        test_file = tmp_path / "no_alias.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file, normalize_aliases=False)
+        assert list(data.keys()) == ["MDKB", "TVDSS", "X", "Y"]
+        assert data["MDKB"][0] == 0.0
+        assert data["TVDSS"][0] == -20.0
+
+    def test_alias_normalization_with_duplicates(self, tmp_path: Path) -> None:
+        """Normalization merges columns that map to the same canonical name."""
+        content = (
+            "MDKB MD TVDSS TVD X Y\n"
+            "0.0 0.0 -20.0 -20.0 39844.5 24589.3\n"
+        )
+        test_file = tmp_path / "alias_dup.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # MDKB and MD both normalize to MD → second gets renamed to MD_2
+        # TVDSS and TVD both normalize to TVD → second gets renamed to TVD_2
+        assert data["MD"][0] == 0.0
+        assert data["MD_2"][0] == 0.0
+        assert data["TVD"][0] == -20.0
+        assert data["TVD_2"][0] == -20.0
+        assert data["X"][0] == 39844.5
+
+    def test_alias_normalization_unknown_names_preserved(self, tmp_path: Path) -> None:
+        """Column names not in the alias table are left unchanged."""
+        content = (
+            "UNKNOWN_COL CUSTOM_NAME MD TVD\n"
+            "0.0 1.0 2.0 3.0\n"
+        )
+        test_file = tmp_path / "alias_unknown.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert "UNKNOWN_COL" in data
+        assert "CUSTOM_NAME" in data
+        assert "MD" in data
+        assert "TVD" in data
+
+    def test_alias_normalization_dug_format(self, tmp_path: Path) -> None:
+        """Alias normalization works with DUG format files."""
+        content = (
+            "Survey Title\n"
+            "4\n"
+            "MDKB TVDSS X Y\n"
+            "0.0 -20.0 39844.5 24589.3\n"
+        )
+        test_file = tmp_path / "alias_dug.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "X", "Y"]
+        assert data["MD"][0] == 0.0
+        assert data["TVD"][0] == -20.0
+
+    def test_alias_normalization_as_object(self, tmp_path: Path) -> None:
+        """Alias normalization works via read_dev_file_as_object API."""
+        content = (
+            "MDKB TVDSS X Y\n"
+            "0.0 0.0 100.0 200.0\n"
+        )
+        test_file = tmp_path / "alias_obj.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        dev = read_dev_file_as_object(test_file)
+        assert dev.column_order == ["MD", "TVD", "X", "Y"]
