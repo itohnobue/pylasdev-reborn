@@ -113,7 +113,9 @@ class TestRoundTrip:
                 )
 
     # --- T9/G-12: LAS 3.0 structured sections roundtrip value verification ---
-    def test_roundtrip_structured_sections_values(self, test_data_dir: Path, tmp_path: Path) -> None:
+    def test_roundtrip_structured_sections_values(
+        self, test_data_dir: Path, tmp_path: Path
+    ) -> None:
         """Test that LAS 3.0 structured data sections roundtrip preserves
         data VALUES, not just shapes.
 
@@ -148,9 +150,7 @@ class TestRoundTrip:
             for curve in orig_sec["curves_order"]:
                 if curve not in orig_data:
                     continue
-                assert curve in rt_data, (
-                    f"curve {curve} missing in roundtrip data for section {i}"
-                )
+                assert curve in rt_data, f"curve {curve} missing in roundtrip data for section {i}"
                 assert orig_data[curve].shape == rt_data[curve].shape, (
                     f"Shape mismatch for {curve} in section {i}: "
                     f"{orig_data[curve].shape} vs {rt_data[curve].shape}"

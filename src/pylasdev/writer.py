@@ -154,7 +154,9 @@ def _write_version_section(las_file: LASFile) -> list[str]:
             stacklevel=3,
         )
         actual_wrap = "NO"
-    wrap_desc = "ONE LINE PER DEPTH STEP" if actual_wrap == "NO" else "MULTIPLE LINES PER DEPTH STEP"
+    wrap_desc = (
+        "ONE LINE PER DEPTH STEP" if actual_wrap == "NO" else "MULTIPLE LINES PER DEPTH STEP"
+    )
     lines.append(f" WRAP.   {actual_wrap}  : {wrap_desc}")
     if is_las30:
         dlm_desc = "DELIMITING CHARACTER BETWEEN DATA COLUMNS"
@@ -307,8 +309,22 @@ _SECTION_TYPE_TO_DEFINITION_PREFIX: dict[str, str] = {
 
 
 def _section_type_to_prefix(section_type: str) -> str:
-    """Convert a DataSection.section_type to the LAS header prefix."""
-    return _SECTION_TYPE_TO_PREFIX.get(section_type, "A")
+    """Convert a DataSection.section_type to the LAS header prefix.
+
+    Known types (LOG_DATA → "A", CORE_DATA → "CORE_DATA", etc.) use the
+    standard mapped prefix.  User-defined types ending with ``_DATA``
+    (e.g., ``"CUSTOM_DATA"`` from a ``~Custom_Data`` section) use the
+    type name itself as the prefix, preserving the original section
+    identity on roundtrip.
+    """
+    known = _SECTION_TYPE_TO_PREFIX.get(section_type)
+    if known is not None:
+        return known
+    # User-defined section types following the _DATA convention
+    # use their own name as the header prefix for roundtrip fidelity.
+    if section_type.endswith("_DATA"):
+        return section_type
+    return "A"
 
 
 def _format_curve_line(curve: CurveDefinition, is_las30: bool) -> str:
@@ -350,14 +366,8 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
             # names on re-read.  Without this, all data sections get the
             # global curve set on roundtrip.  Only emit once per section type
             # (e.g., one Core_Definition for both Core[1] and Core[2]).
-            if (
-                is_las30
-                and section.section_type != "LOG_DATA"
-                and section.section_curves
-            ):
-                def_prefix = _SECTION_TYPE_TO_DEFINITION_PREFIX.get(
-                    section.section_type
-                )
+            if is_las30 and section.section_type != "LOG_DATA" and section.section_curves:
+                def_prefix = _SECTION_TYPE_TO_DEFINITION_PREFIX.get(section.section_type)
                 if def_prefix and def_prefix not in emitted_defs:
                     emitted_defs.add(def_prefix)
                     lines.append(f"~{def_prefix}_Definition")

@@ -1113,8 +1113,7 @@ class TestLAS30AsciiDataBranches:
             warnings.simplefilter("always")
             parser.parse(content)
             mandatory_warnings = [
-                x for x in w
-                if "LAS 2.0 file missing mandatory well field" in str(x.message)
+                x for x in w if "LAS 2.0 file missing mandatory well field" in str(x.message)
             ]
             # Both STEP and NULL are missing
             assert len(mandatory_warnings) == 2
@@ -1143,8 +1142,7 @@ class TestLAS30AsciiDataBranches:
             warnings.simplefilter("always")
             parser.parse(content)
             mandatory_warnings = [
-                x for x in w
-                if "LAS 2.0 file missing mandatory well field" in str(x.message)
+                x for x in w if "LAS 2.0 file missing mandatory well field" in str(x.message)
             ]
             assert len(mandatory_warnings) == 0
 
@@ -1169,8 +1167,7 @@ class TestLAS30AsciiDataBranches:
             warnings.simplefilter("always")
             parser.parse(content)
             mandatory_warnings = [
-                x for x in w
-                if "LAS 2.0 file missing mandatory well field" in str(x.message)
+                x for x in w if "LAS 2.0 file missing mandatory well field" in str(x.message)
             ]
             assert len(mandatory_warnings) == 0
 

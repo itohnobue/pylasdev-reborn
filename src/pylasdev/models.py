@@ -94,7 +94,9 @@ class WellSection:
 
     entries: dict[str, str] = field(default_factory=dict)
     units: dict[str, str] = field(default_factory=dict)
-    descriptions: dict[str, str] = field(default_factory=dict)  # CWLS description text for well fields
+    descriptions: dict[str, str] = field(
+        default_factory=dict
+    )  # CWLS description text for well fields
 
     def to_dict(self) -> dict[str, str]:
         """Convert to legacy dict format."""
@@ -240,7 +242,9 @@ class DataSection:
     curves_order: list[str] = field(default_factory=list)
     data: dict[str, NDArray[np.float64]] = field(default_factory=dict)
     string_data: dict[str, NDArray[np.str_]] = field(default_factory=dict)  # For {S} format curves
-    section_curves: list[CurveDefinition] = field(default_factory=list)  # Per-section curve definitions
+    section_curves: list[CurveDefinition] = field(
+        default_factory=list
+    )  # Per-section curve definitions
 
     def to_dict(self) -> dict[str, Any]:
         """Convert DataSection to dict for serialization."""

@@ -238,7 +238,13 @@ def read_dev_file(
         LASEncodingError: If the explicit encoding parameter fails to decode
             the file.
     """
-    dev = read_dev_file_as_object(file_path, encoding=encoding, max_file_size=max_file_size, delimiter=delimiter, normalize_aliases=normalize_aliases)
+    dev = read_dev_file_as_object(
+        file_path,
+        encoding=encoding,
+        max_file_size=max_file_size,
+        delimiter=delimiter,
+        normalize_aliases=normalize_aliases,
+    )
     return dev.to_dict()
 
 
@@ -406,9 +412,7 @@ def read_dev_file_as_object(
                 # Store first data row.
                 for k in range(len(names)):
                     try:
-                        dev.columns[names[k]][current_line] = _to_finite_float(
-                            values[k], np.nan
-                        )
+                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
                     except IndexError:
                         dev.columns[names[k]][current_line] = np.nan
                 current_line += 1
@@ -424,9 +428,7 @@ def read_dev_file_as_object(
                     )
                 for k in range(min(len(values), len(names))):
                     try:
-                        dev.columns[names[k]][current_line] = _to_finite_float(
-                            values[k], np.nan
-                        )
+                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
                     except IndexError:
                         dev.columns[names[k]][current_line] = np.nan
                 current_line += 1
@@ -477,9 +479,7 @@ def read_dev_file_as_object(
                     )
                 for k in range(min(len(values), len(names))):
                     try:
-                        dev.columns[names[k]][current_line] = _to_finite_float(
-                            values[k], np.nan
-                        )
+                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
                     except IndexError:
                         dev.columns[names[k]][current_line] = np.nan
                 current_line += 1
@@ -527,9 +527,7 @@ def read_dev_file_as_object(
                     )
                 for k in range(min(len(values), len(names))):
                     try:
-                        dev.columns[names[k]][current_line] = _to_finite_float(
-                            values[k], np.nan
-                        )
+                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
                     except IndexError:
                         dev.columns[names[k]][current_line] = np.nan
                 current_line += 1

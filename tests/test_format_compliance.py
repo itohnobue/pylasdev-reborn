@@ -58,8 +58,7 @@ class TestFormatCompliance:
         # Extract data section (after ~A header)
         data_section = content.split("~A")[-1]
         data_lines = [
-            line for line in data_section.splitlines()
-            if line.strip() and not line.startswith("#")
+            line for line in data_section.splitlines() if line.strip() and not line.startswith("#")
         ]
         # Data lines (after header) must not contain exponent notation
         for line in data_lines[1:]:  # Skip header line
@@ -128,17 +127,13 @@ class TestFormatCompliance:
         content = temp_file.read_text()
 
         # 1. Section header ~VERSION must appear on its own line
-        assert re.search(r"^~VERSION", content, re.MULTILINE), (
-            "Missing ~VERSION section header"
-        )
+        assert re.search(r"^~VERSION", content, re.MULTILINE), "Missing ~VERSION section header"
 
         # 2. VERS line: value ("2.0") must appear BEFORE the colon.
         #    Correct:  VERS.   2.0  : CWLS LOG ASCII STANDARD
         #    Malformed: VERS.   : 2.0
         vers_match = re.search(r"VERS\.\s+([\d.]+)\s+:", content)
-        assert vers_match is not None, (
-            "VERS line malformed: value must appear BEFORE the colon"
-        )
+        assert vers_match is not None, "VERS line malformed: value must appear BEFORE the colon"
         assert vers_match.group(1) == "2.0", (
             f"VERS value should be 2.0, got {vers_match.group(1)!r}"
         )
@@ -173,8 +168,7 @@ class TestFormatCompliance:
         content = temp_file.read_text()
         data_section = content.split("~A")[-1]
         data_lines = [
-            line for line in data_section.splitlines()
-            if line.strip() and not line.startswith("#")
+            line for line in data_section.splitlines() if line.strip() and not line.startswith("#")
         ]
         # Data lines (after curve header) should have 3 space-separated values
         for line in data_lines[1:]:  # Skip header
@@ -240,8 +234,7 @@ class TestFormatCompliance:
         else:
             data_section = content
         data_lines = [
-            line for line in data_section.splitlines()
-            if line.strip() and not line.startswith("#")
+            line for line in data_section.splitlines() if line.strip() and not line.startswith("#")
         ]
         for line in data_lines[1:]:
             assert not re.search(r"[0-9][eE][+\-]?[0-9]", line), (
@@ -266,8 +259,7 @@ class TestFormatCompliance:
         content = temp_file.read_text()
         data_section = content.split("~A")[-1]
         data_lines = [
-            line for line in data_section.splitlines()
-            if line.strip() and not line.startswith("#")
+            line for line in data_section.splitlines() if line.strip() and not line.startswith("#")
         ]
         for line in data_lines[1:]:
             assert not re.search(r"[0-9][eE][+\-]?[0-9]", line), (
@@ -324,9 +316,7 @@ class TestFormatCompliance:
         curve_names = [f"C{i:02d}" for i in range(30)]
         logs: dict[str, np.ndarray] = {}
         for i, name in enumerate(curve_names):
-            logs[name] = np.array(
-                [123456.789 + i * 10, 234567.890 + i * 10], dtype=np.float64
-            )
+            logs[name] = np.array([123456.789 + i * 10, 234567.890 + i * 10], dtype=np.float64)
 
         data: dict[str, Any] = {
             "version": {"VERS": "1.2", "WRAP": "NO", "DLM": "SPACE"},
@@ -349,8 +339,7 @@ class TestFormatCompliance:
         # Extract data section after ~A
         data_section = content.split("~A")[-1]
         data_lines = [
-            line for line in data_section.splitlines()
-            if line.strip() and not line.startswith("#")
+            line for line in data_section.splitlines() if line.strip() and not line.startswith("#")
         ]
         # Skip header line (curve names)
         data_lines = data_lines[1:]
@@ -437,9 +426,7 @@ class TestFormatCompliance:
             warnings.simplefilter("always")
             write_las_file(temp_file, las)
             wrap_warnings = [x for x in w if "WRAP=YES" in str(x.message)]
-            assert len(wrap_warnings) == 0, (
-                "Unexpected WRAP=YES warning for LAS 3.0 with WRAP=NO"
-            )
+            assert len(wrap_warnings) == 0, "Unexpected WRAP=YES warning for LAS 3.0 with WRAP=NO"
 
         content = temp_file.read_text()
         assert "WRAP.   NO" in content

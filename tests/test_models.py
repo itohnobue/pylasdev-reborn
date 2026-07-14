@@ -444,12 +444,8 @@ class TestLASFile:
         assert c3.array_info is None
 
         # Verify numeric data is preserved
-        np.testing.assert_array_equal(
-            rt_section.data["CORET"], np.array([1.0, 2.0])
-        )
-        np.testing.assert_array_equal(
-            rt_section.data["COREB"], np.array([3.0, 4.0])
-        )
+        np.testing.assert_array_equal(rt_section.data["CORET"], np.array([1.0, 2.0]))
+        np.testing.assert_array_equal(rt_section.data["COREB"], np.array([3.0, 4.0]))
 
     def test_section_curves_empty_roundtrip(self) -> None:
         """Test DataSection with empty section_curves survives roundtrip.

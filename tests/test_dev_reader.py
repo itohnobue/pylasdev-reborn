@@ -505,18 +505,14 @@ class TestDugFormat:
         assert data["TVDSS"][0] == -20.06
         assert data["X"][2] == 39844.30
         np.testing.assert_array_equal(
-            data["MDKB"], [0.0, 1000.0, 2000.0],
+            data["MDKB"],
+            [0.0, 1000.0, 2000.0],
         )
 
     def test_dug_format_as_object(self, tmp_path: Path) -> None:
         """Parse DUG format via read_dev_file_as_object."""
         content = (
-            "Well-42 Survey\n"
-            "3\n"
-            "MD INC AZI\n"
-            "0.00 0.00 0.00\n"
-            "100.00 1.50 45.00\n"
-            "200.00 3.20 48.00\n"
+            "Well-42 Survey\n3\nMD INC AZI\n0.00 0.00 0.00\n100.00 1.50 45.00\n200.00 3.20 48.00\n"
         )
         test_file = tmp_path / "dug_obj.dev"
         test_file.write_text(content, encoding="utf-8")
@@ -525,10 +521,12 @@ class TestDugFormat:
         assert dev.column_order == ["MD", "INC", "AZI"]
         assert len(dev.columns["MD"]) == 3
         np.testing.assert_array_equal(
-            dev.columns["MD"], [0.0, 100.0, 200.0],
+            dev.columns["MD"],
+            [0.0, 100.0, 200.0],
         )
         np.testing.assert_array_equal(
-            dev.columns["INC"], [0.0, 1.5, 3.2],
+            dev.columns["INC"],
+            [0.0, 1.5, 3.2],
         )
 
     def test_dug_format_with_comments(self, tmp_path: Path) -> None:
@@ -555,11 +553,7 @@ class TestDugFormat:
 
     def test_dug_format_no_data(self, tmp_path: Path) -> None:
         """DUG format with header but no data rows."""
-        content = (
-            "Survey\n"
-            "4\n"
-            "MD TVD X Y\n"
-        )
+        content = "Survey\n4\nMD TVD X Y\n"
         test_file = tmp_path / "dug_no_data.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -575,11 +569,7 @@ class TestDugFormat:
         line 3 — which is all-numeric, defeating DUG detection.  The
         file is then parsed as simple format (first line = column names).
         """
-        content = (
-            "Survey\n"
-            "3\n"
-            "0.0 0.0 0.0\n"
-        )
+        content = "Survey\n3\n0.0 0.0 0.0\n"
         test_file = tmp_path / "dug_no_header.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -618,11 +608,7 @@ class TestHeaderlessFormat:
 
     def test_headerless_format_basic(self, tmp_path: Path) -> None:
         """Parse a basic headerless file with multiple columns."""
-        content = (
-            "0.00 0.00 0.00\n"
-            "100.00 1.50 45.00\n"
-            "200.00 3.20 48.00\n"
-        )
+        content = "0.00 0.00 0.00\n100.00 1.50 45.00\n200.00 3.20 48.00\n"
         test_file = tmp_path / "noheader_basic.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -630,13 +616,16 @@ class TestHeaderlessFormat:
         assert list(data.keys()) == ["col_0", "col_1", "col_2"]
         assert len(data["col_0"]) == 3
         np.testing.assert_array_equal(
-            data["col_0"], [0.0, 100.0, 200.0],
+            data["col_0"],
+            [0.0, 100.0, 200.0],
         )
         np.testing.assert_array_equal(
-            data["col_1"], [0.0, 1.5, 3.2],
+            data["col_1"],
+            [0.0, 1.5, 3.2],
         )
         np.testing.assert_array_equal(
-            data["col_2"], [0.0, 45.0, 48.0],
+            data["col_2"],
+            [0.0, 45.0, 48.0],
         )
 
     def test_headerless_format_as_object(self, tmp_path: Path) -> None:
@@ -649,7 +638,8 @@ class TestHeaderlessFormat:
         assert dev.column_order == ["col_0", "col_1"]
         assert len(dev.columns["col_0"]) == 3
         np.testing.assert_array_equal(
-            dev.columns["col_0"], [0.0, 100.0, 200.0],
+            dev.columns["col_0"],
+            [0.0, 100.0, 200.0],
         )
 
     def test_headerless_single_column(self, tmp_path: Path) -> None:
@@ -661,17 +651,13 @@ class TestHeaderlessFormat:
         data = read_dev_file(test_file)
         assert list(data.keys()) == ["col_0"]
         np.testing.assert_array_equal(
-            data["col_0"], [0.0, 100.0, 200.0],
+            data["col_0"],
+            [0.0, 100.0, 200.0],
         )
 
     def test_headerless_with_comments(self, tmp_path: Path) -> None:
         """Headerless file with comment lines."""
-        content = (
-            "# Some comments\n"
-            "# More\n"
-            "0.0 100.0\n"
-            "50.0 150.0\n"
-        )
+        content = "# Some comments\n# More\n0.0 100.0\n50.0 150.0\n"
         test_file = tmp_path / "noheader_comments.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -682,10 +668,7 @@ class TestHeaderlessFormat:
 
     def test_headerless_with_scientific_notation(self, tmp_path: Path) -> None:
         """Headerless file with scientific notation values."""
-        content = (
-            "1.0e2 2.5E-3 3.0D+01\n"
-            "4.0e2 5.5E-3 6.0D+01\n"
-        )
+        content = "1.0e2 2.5E-3 3.0D+01\n4.0e2 5.5E-3 6.0D+01\n"
         test_file = tmp_path / "noheader_sci.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -725,10 +708,7 @@ class TestHeaderlessFormat:
 
     def test_headerless_with_negative_values(self, tmp_path: Path) -> None:
         """Headerless file with negative values (TVDSS negative)."""
-        content = (
-            "0.00 -20.06 39844.56\n"
-            "1000.00 1020.02 39844.47\n"
-        )
+        content = "0.00 -20.06 39844.56\n1000.00 1020.02 39844.47\n"
         test_file = tmp_path / "noheader_neg.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -748,11 +728,7 @@ class TestFormatAutoDetection:
 
     def test_simple_header_format_still_works(self, tmp_path: Path) -> None:
         """Ensure simple header format is not broken by new detection."""
-        content = (
-            "MD TVD X Y\n"
-            "0.0 0.0 100.0 200.0\n"
-            "100.0 99.0 101.0 201.0\n"
-        )
+        content = "MD TVD X Y\n0.0 0.0 100.0 200.0\n100.0 99.0 101.0 201.0\n"
         test_file = tmp_path / "simple_regr.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -769,12 +745,7 @@ class TestFormatAutoDetection:
         must be detected from index 1, not the hardcoded index 2 used
         by Pattern B.
         """
-        content = (
-            "4\n"
-            "MD, TVD, X, Y\n"
-            "0.0, 0.0, 100.0, 200.0\n"
-            "100.0, 99.0, 101.0, 201.0\n"
-        )
+        content = "4\nMD, TVD, X, Y\n0.0, 0.0, 100.0, 200.0\n100.0, 99.0, 101.0, 201.0\n"
         test_file = tmp_path / "dug_pat_a_comma.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -800,10 +771,7 @@ class TestFormatAutoDetection:
         as headerless.  Both lines are data rows with auto-generated
         column names.
         """
-        content = (
-            "100\n"
-            "50.0\n"
-        )
+        content = "100\n50.0\n"
         test_file = tmp_path / "numeric_header.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -841,12 +809,7 @@ class TestFormatAutoDetection:
 
     def test_delimiter_auto_detection_dug_comma(self, tmp_path: Path) -> None:
         """Comma-delimited DUG format auto-detects comma from header line."""
-        content = (
-            "Survey\n"
-            "4\n"
-            "MD, TVD, X, Y\n"
-            "0.0, 0.0, 100.0, 200.0\n"
-        )
+        content = "Survey\n4\nMD, TVD, X, Y\n0.0, 0.0, 100.0, 200.0\n"
         test_file = tmp_path / "dug_comma.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -857,10 +820,7 @@ class TestFormatAutoDetection:
     # --- F-M4: DEV column name alias normalization ---
     def test_alias_normalization_basic(self, tmp_path: Path) -> None:
         """MDKB, TVDSS, INCL, AZIM, UTMX, UTMY are normalized to canonical names."""
-        content = (
-            "MDKB TVDSS INCL AZIM UTMX UTMY\n"
-            "0.0 0.0 40.0 50.0 100.0 200.0\n"
-        )
+        content = "MDKB TVDSS INCL AZIM UTMX UTMY\n0.0 0.0 40.0 50.0 100.0 200.0\n"
         test_file = tmp_path / "alias_test.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -875,10 +835,7 @@ class TestFormatAutoDetection:
 
     def test_alias_normalization_disabled(self, tmp_path: Path) -> None:
         """When normalize_aliases=False, column names are used as-is."""
-        content = (
-            "MDKB TVDSS X Y\n"
-            "0.0 -20.0 39844.5 24589.3\n"
-        )
+        content = "MDKB TVDSS X Y\n0.0 -20.0 39844.5 24589.3\n"
         test_file = tmp_path / "no_alias.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -889,10 +846,7 @@ class TestFormatAutoDetection:
 
     def test_alias_normalization_with_duplicates(self, tmp_path: Path) -> None:
         """Normalization merges columns that map to the same canonical name."""
-        content = (
-            "MDKB MD TVDSS TVD X Y\n"
-            "0.0 0.0 -20.0 -20.0 39844.5 24589.3\n"
-        )
+        content = "MDKB MD TVDSS TVD X Y\n0.0 0.0 -20.0 -20.0 39844.5 24589.3\n"
         test_file = tmp_path / "alias_dup.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -907,10 +861,7 @@ class TestFormatAutoDetection:
 
     def test_alias_normalization_unknown_names_preserved(self, tmp_path: Path) -> None:
         """Column names not in the alias table are left unchanged."""
-        content = (
-            "UNKNOWN_COL CUSTOM_NAME MD TVD\n"
-            "0.0 1.0 2.0 3.0\n"
-        )
+        content = "UNKNOWN_COL CUSTOM_NAME MD TVD\n0.0 1.0 2.0 3.0\n"
         test_file = tmp_path / "alias_unknown.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -922,12 +873,7 @@ class TestFormatAutoDetection:
 
     def test_alias_normalization_dug_format(self, tmp_path: Path) -> None:
         """Alias normalization works with DUG format files."""
-        content = (
-            "Survey Title\n"
-            "4\n"
-            "MDKB TVDSS X Y\n"
-            "0.0 -20.0 39844.5 24589.3\n"
-        )
+        content = "Survey Title\n4\nMDKB TVDSS X Y\n0.0 -20.0 39844.5 24589.3\n"
         test_file = tmp_path / "alias_dug.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -938,10 +884,7 @@ class TestFormatAutoDetection:
 
     def test_alias_normalization_as_object(self, tmp_path: Path) -> None:
         """Alias normalization works via read_dev_file_as_object API."""
-        content = (
-            "MDKB TVDSS X Y\n"
-            "0.0 0.0 100.0 200.0\n"
-        )
+        content = "MDKB TVDSS X Y\n0.0 0.0 100.0 200.0\n"
         test_file = tmp_path / "alias_obj.dev"
         test_file.write_text(content, encoding="utf-8")
 

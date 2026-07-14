@@ -321,8 +321,7 @@ class TestWriteLASFile:
 
         # Get data lines (skip header line with curve names)
         data_lines = [
-            line for line in data_section.splitlines()
-            if line.strip() and not line.startswith("#")
+            line for line in data_section.splitlines() if line.strip() and not line.startswith("#")
         ]
         # Skip the first line (curve names header)
         data_lines = data_lines[1:]
@@ -331,14 +330,10 @@ class TestWriteLASFile:
 
         # Each data line must use tab characters as separators
         for line in data_lines:
-            assert "\t" in line, (
-                f"Expected tab-separated data line, got: {line!r}"
-            )
+            assert "\t" in line, f"Expected tab-separated data line, got: {line!r}"
             # The tab separator must produce the correct number of columns
             parts = line.split("\t")
-            assert len(parts) == 3, (
-                f"Expected 3 tab-separated values, got {len(parts)}: {line!r}"
-            )
+            assert len(parts) == 3, f"Expected 3 tab-separated values, got {len(parts)}: {line!r}"
 
         # Verify roundtrip: re-read and check data values
         reread = read_las_file(temp_file)
@@ -965,8 +960,7 @@ class TestWriteLASFile:
         # Get data lines after ~A header
         data_section = content.split("~A")[-1]
         data_lines = [
-            line for line in data_section.splitlines()
-            if line.strip() and not line.startswith("#")
+            line for line in data_section.splitlines() if line.strip() and not line.startswith("#")
         ]
         # With 3 curves, non-wrapped mode: 1 header line + 2 data lines = 3 lines total
         assert len(data_lines) >= 2  # at least the data lines
@@ -1085,9 +1079,7 @@ class TestWriteLASFile:
         data_lines = [line for line in data_section.split("\n") if line.strip()]
         # With 2 rows and no injection: 2 data lines
         # With injection: newline chars in string_data split into extra lines
-        assert len(data_lines) == 2, (
-            f"Expected 2 data lines, got {len(data_lines)}: {data_lines}"
-        )
+        assert len(data_lines) == 2, f"Expected 2 data lines, got {len(data_lines)}: {data_lines}"
         # The sanitized string value should be on a single data line
         first_data_line = data_lines[0]
         assert "100" in first_data_line

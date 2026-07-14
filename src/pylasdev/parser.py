@@ -129,29 +129,37 @@ EMPTY_PATTERN = re.compile(r"^\s*$")
 # Definition sections (Core_Definition, Drilling_Definition, etc.) are
 # routed to _parse_curve since they define curves for their data type.
 _DATA_SECTION_WORDS = {
-    "A", "ASCII",            # Standard log data
-    "CORE",                   # Core data section
-    "CORE_DATA",              # Core data section (written form)
-    "DRILLING",               # Drilling data section
-    "DRILLING_DATA",          # Drilling data section (written form)
-    "INCLINOMETRY",           # Inclinometry data section
-    "INCLINOMETRY_DATA",      # Inclinometry data section (written form)
-    "TOPS",                   # Tops data section
-    "TOPS_DATA",              # Tops data section (written form)
-    "TEST",                   # Test data section
-    "TEST_DATA",              # Test data section (written form)
-    "PERFORATIONS",           # Perforations data section
-    "PERFORATIONS_DATA",      # Perforations data section (written form)
-    "LOG",                     # LAS 3.0 shorthand ~Log alias for ~Log_Data / ~Ascii
-    "LOG_DATA",               # Explicit log data section
+    "A",
+    "ASCII",  # Standard log data
+    "CORE",  # Core data section
+    "CORE_DATA",  # Core data section (written form)
+    "DRILLING",  # Drilling data section
+    "DRILLING_DATA",  # Drilling data section (written form)
+    "INCLINOMETRY",  # Inclinometry data section
+    "INCLINOMETRY_DATA",  # Inclinometry data section (written form)
+    "TOPS",  # Tops data section
+    "TOPS_DATA",  # Tops data section (written form)
+    "TEST",  # Test data section
+    "TEST_DATA",  # Test data section (written form)
+    "PERFORATIONS",  # Perforations data section
+    "PERFORATIONS_DATA",  # Perforations data section (written form)
+    "LOG",  # LAS 3.0 shorthand ~Log alias for ~Log_Data / ~Ascii
+    "LOG_DATA",  # Explicit log data section
 }
 
 # LAS 3.0 data section types that support index notation (e.g., ~Core[1]).
 # Used to match bracketed sections like ~Inclinometry[1], ~Drilling[2], etc.
-_INDEXED_DATA_TYPES = frozenset({
-    "CORE", "DRILLING", "INCLINOMETRY",
-    "TOPS", "TEST", "PERFORATIONS", "LOG_DATA",
-})
+_INDEXED_DATA_TYPES = frozenset(
+    {
+        "CORE",
+        "DRILLING",
+        "INCLINOMETRY",
+        "TOPS",
+        "TEST",
+        "PERFORATIONS",
+        "LOG_DATA",
+    }
+)
 
 # LAS 3.0 section type to canonical DataSection.section_type mapping.
 _SECTION_TYPE_MAP: dict[str, str] = {
@@ -183,7 +191,7 @@ def _is_indexed_data_section(section_word: str) -> bool:
     if bracket_idx < 0:
         return False
     # Verify the part after [ is digits followed by ]
-    rest = section_word[bracket_idx + 1:]
+    rest = section_word[bracket_idx + 1 :]
     if not rest.endswith("]"):
         return False
     index_str = rest[:-1]
@@ -383,12 +391,12 @@ class LASParser:
             pipe_idx = section_rest.find("|")
             if pipe_idx >= 0:
                 # Split section name at pipe; pipe target follows.
-                pipe_target = section_rest[pipe_idx + 1:].strip()
+                pipe_target = section_rest[pipe_idx + 1 :].strip()
                 section_rest = section_rest[:pipe_idx].strip()
             elif "|" in section_word:
                 # Edge case: no space before pipe (e.g., "~Core|Definition")
                 pipe_idx_w = section_word.find("|")
-                pipe_target = (section_word[pipe_idx_w + 1:] + " " + section_rest).strip()
+                pipe_target = (section_word[pipe_idx_w + 1 :] + " " + section_rest).strip()
                 section_word = section_word[:pipe_idx_w].strip()
                 section_rest = ""
 
@@ -467,7 +475,9 @@ class LASParser:
                 if section_word in {"A", "ASCII"} or section_word.endswith("_DATA"):
                     section_name = section_rest
                 else:
-                    section_name = f"{section_word} {section_rest}".strip() if section_rest else section_word
+                    section_name = (
+                        f"{section_word} {section_rest}".strip() if section_rest else section_word
+                    )
                 # M-03: Save the previous data section type BEFORE overwriting.
                 # When two consecutive data sections appear (e.g., ~A then
                 # ~Core[1]),_process_ascii_data() for the PREVIOUS section
@@ -496,13 +506,27 @@ class LASParser:
                 else:
                     stype = _SECTION_TYPE_MAP.get(section_word)
                     if stype is None:
-                        warnings.warn(
-                            f"Unrecognized data section type '~{section_word}', "
-                            f"defaulting to LOG_DATA.",
-                            UserWarning,
-                            stacklevel=2,
-                        )
-                        stype = "LOG_DATA"
+                        # User-defined _DATA-suffixed sections (e.g.,
+                        # ~Custom_Data) are structurally valid LAS 3.0 data
+                        # sections.  Preserve the original section word as
+                        # the type so the writer can reconstruct the correct
+                        # header prefix on roundtrip.
+                        if section_word.endswith("_DATA"):
+                            stype = section_word
+                            warnings.warn(
+                                f"Unrecognized data section type '~{section_word}', "
+                                f"preserving as '{stype}'.",
+                                UserWarning,
+                                stacklevel=2,
+                            )
+                        else:
+                            warnings.warn(
+                                f"Unrecognized data section type '~{section_word}', "
+                                f"defaulting to LOG_DATA.",
+                                UserWarning,
+                                stacklevel=2,
+                            )
+                            stype = "LOG_DATA"
                     self._current_data_section_type = stype
                 # F-08: Handle pipe-delimited definition association.
                 # "| CURVE" means use the main curve block (before
@@ -526,8 +550,7 @@ class LASParser:
                     # G-02: No pipe — try to match data section type
                     # to a _Definition (e.g., CORE_DATA → CORE_DEFINITION).
                     def_prefix = (
-                        self._current_data_section_type.replace("_DATA", "")
-                        + "_DEFINITION"
+                        self._current_data_section_type.replace("_DATA", "") + "_DEFINITION"
                     )
                     if def_prefix in self._definition_curve_ranges:
                         start, end = self._definition_curve_ranges[def_prefix]
@@ -963,9 +986,7 @@ class LASParser:
         # per-section curves from later Definition sections.
         if self._section_curve_end_idx is not None:
             section_curves = list(
-                self.las_file.curves[
-                    self._section_curve_start_idx : self._section_curve_end_idx
-                ]
+                self.las_file.curves[self._section_curve_start_idx : self._section_curve_end_idx]
             )
         else:
             section_curves = list(self.las_file.curves[self._section_curve_start_idx :])
