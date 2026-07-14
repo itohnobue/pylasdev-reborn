@@ -522,7 +522,7 @@ class TestDataReaderEdgeCases:
         assert "DEPT" in data["logs"]
 
         # Should fail with tiny limit
-        with pytest.raises(ValueError, match="exceeds maximum"):
+        with pytest.raises(LASReadError, match="Cannot read file"):
             read_las_file(test_file, max_file_size=10)
 
     # --- TEST-02: Non-numeric data triggers ValueError handler in _read_normal ---

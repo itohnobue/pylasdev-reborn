@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from pylasdev.exceptions import LASParseError
-from pylasdev.parser import LASParser
+from pylasdev.parser import LASParser, _is_indexed_data_section
 
 
 class TestLASParser:
@@ -1217,3 +1217,65 @@ class TestLAS30AsciiDataBranches:
         # But LAS 3.0 parser processes Core section data too (via _process_ascii_data)
         # and uses actual_count, not _data_line_count
         assert len(las.data_sections) == 2
+
+
+class TestIndexedDataSectionNegativeBranches:
+    """F-02/T-02: Tests for _is_indexed_data_section negative branches.
+
+    Exercises the error-detection paths at parser.py:196 (missing closing
+    bracket) and parser.py:199 (non-numeric index).
+    """
+
+    def test_valid_indexed_section_returns_true(self) -> None:
+        """Test that valid indexed sections return True.
+
+        The parser passes section_word.upper() to this function (parser.py:385),
+        so the base must match the uppercase keys in _INDEXED_DATA_TYPES.
+        """
+        assert _is_indexed_data_section("CORE[1]") is True
+        assert _is_indexed_data_section("INCLINOMETRY[2]") is True
+        assert _is_indexed_data_section("DRILLING[42]") is True
+        assert _is_indexed_data_section("TOPS[0]") is True
+
+    def test_non_numeric_index_returns_false(self) -> None:
+        """Test that a non-numeric index returns False.
+
+        Exercises parser.py:199 — ``index_str.isdigit()`` → False path.
+        The parser uppercases section_word before calling, so we test
+        with the same convention.
+        """
+        assert _is_indexed_data_section("CORE[abc]") is False
+        assert _is_indexed_data_section("INCLINOMETRY[x]") is False
+        assert _is_indexed_data_section("DRILLING[n1]") is False
+
+    def test_missing_closing_bracket_returns_false(self) -> None:
+        """Test that missing closing bracket returns False.
+
+        Exercises parser.py:196 — ``rest.endswith("]")`` → False path.
+        """
+        assert _is_indexed_data_section("CORE[1") is False
+        assert _is_indexed_data_section("INCLINOMETRY[2") is False
+
+    def test_no_bracket_returns_false(self) -> None:
+        """Test that a known type without any bracket returns False.
+
+        Exercises parser.py:191 — ``bracket_idx < 0`` → False path.
+        """
+        assert _is_indexed_data_section("CORE") is False
+        assert _is_indexed_data_section("INCLINOMETRY") is False
+
+    def test_unknown_type_with_valid_bracket_returns_false(self) -> None:
+        """Test that an unknown base type with valid bracket returns False.
+
+        Exercises parser.py:200-201 — ``base not in _INDEXED_DATA_TYPES``
+        → False path.
+        """
+        assert _is_indexed_data_section("UNKNOWN[1]") is False
+        assert _is_indexed_data_section("XYZ[42]") is False
+
+    def test_empty_bracket_returns_false(self) -> None:
+        """Test that empty brackets return False.
+
+        The index_str is empty, which means ``isdigit()`` returns False.
+        """
+        assert _is_indexed_data_section("CORE[]") is False

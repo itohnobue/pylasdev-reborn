@@ -157,7 +157,8 @@ class TestReadDEVFile:
         """Test that max_file_size parameter rejects oversized DEV files.
 
         Exercises dev_reader.py:69-76 — the max_file_size guard via
-        read_with_encoding.
+        read_with_encoding.  F-04 (SF-04 fix) wraps ValueError from
+        read_with_encoding into DEVReadError.
         """
         content = "MD TVD\n0.0 0.0\n100.0 99.0\n"
         test_file = tmp_path / "size.dev"
@@ -167,15 +168,15 @@ class TestReadDEVFile:
         data = read_dev_file(test_file, max_file_size=10_000_000)
         assert "MD" in data
 
-        # Should fail with tiny limit
-        with pytest.raises(ValueError, match="exceeds maximum"):
+        # Should fail with tiny limit — now wrapped as DEVReadError (F-04)
+        with pytest.raises(DEVReadError, match="Cannot read file"):
             read_dev_file(test_file, max_file_size=10)
 
         # Also test read_dev_file_as_object with max_file_size
         dev = read_dev_file_as_object(test_file, max_file_size=10_000_000)
         assert isinstance(dev, DevFile)
 
-        with pytest.raises(ValueError, match="exceeds maximum"):
+        with pytest.raises(DEVReadError, match="Cannot read file"):
             read_dev_file_as_object(test_file, max_file_size=10)
 
     # --- F-49: Header-only DEV file ---
@@ -716,12 +717,49 @@ class TestHeaderlessFormat:
         assert data["col_1"][0] == -20.06
         assert data["col_1"][1] == 1020.02
 
-    def test_headerless_empty_file_raises_error(self) -> None:
-        """Empty file without content lines should still parse (0 lines)."""
-        # Empty files without content return empty arrays
-        # This is covered by the existing header-only test pattern
-        pass
+    def test_headerless_empty_file_returns_empty_data(self, tmp_path: Path) -> None:
+        """Test that an empty DEV file (zero content entries) returns empty data.
 
+        Exercises dev_reader.py:163-164 — the empty content_entries path
+        where _detect_dev_format returns ("simple", 1).  With no content
+        lines in either pass, the reader produces an empty DevFile.
+        """
+        test_file = tmp_path / "empty.dev"
+        test_file.write_text("", encoding="utf-8")
+
+        # read_dev_file should return an empty dict
+        data = read_dev_file(test_file)
+        assert isinstance(data, dict)
+        assert len(data) == 0
+
+        # read_dev_file_as_object should return an empty DevFile
+        dev = read_dev_file_as_object(test_file)
+        assert isinstance(dev, DevFile)
+        assert dev.column_order == []
+        assert len(dev.columns) == 0
+        assert dev.source_file != ""
+        assert dev.encoding != ""
+
+    def test_whitespace_only_dev_file(self, tmp_path: Path) -> None:
+        """Test that a whitespace-only DEV file returns empty data.
+
+        Whitespace-only lines are stripped to empty strings and skipped
+        by the content scanner (line 315), producing empty content_entries
+        just like an empty file.
+        """
+        test_file = tmp_path / "whitespace.dev"
+        test_file.write_text("   \n\t\n   \n", encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert isinstance(data, dict)
+        assert len(data) == 0
+
+        dev = read_dev_file_as_object(test_file)
+        assert isinstance(dev, DevFile)
+        assert dev.column_order == []
+        assert len(dev.columns) == 0
+        assert dev.source_file != ""
+        assert dev.encoding != ""
 
 class TestFormatAutoDetection:
     """F-02: Format auto-detection edge cases and correctness tests."""

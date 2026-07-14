@@ -106,6 +106,22 @@ class TestReadWithEncoding:
         _enc, content = read_with_encoding(test_file, encoding="latin-1")
         assert text in content
 
+    def test_read_cp1252(self, tmp_path: Path) -> None:
+        """Test reading CP1252 encoded file (Western European Windows).
+
+        CP1252 is in FALLBACK_ENCODINGS (encoding.py:36) but is unreachable
+        via the fallback chain because cp866 (preceding in the chain) can
+        decode all 256 byte values.  This test exercises the explicit
+        ``encoding="cp1252"`` parameter path.
+
+        Uses Western European accented characters: é, ñ, ü, ç, À.
+        """
+        test_file = tmp_path / "test.las"
+        text = "T\u00eate en fran\u00e7ais: \u00e9t\u00e9, h\u00f4tel, \u00f1"
+        test_file.write_bytes(text.encode("cp1252"))
+        _enc, content = read_with_encoding(test_file, encoding="cp1252")
+        assert text in content
+
     def test_fallback_chain_exists(self) -> None:
         """Test that fallback encodings are defined."""
         assert len(FALLBACK_ENCODINGS) >= 4

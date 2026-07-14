@@ -43,7 +43,7 @@ def read_las_file(
         mnem_base: Optional dictionary for curve name normalization.
         encoding: Optional encoding override. If None, auto-detected.
         max_file_size: Optional maximum file size in bytes. If the file
-            exceeds this limit, a ValueError is raised.
+            exceeds this limit, a LASReadError is raised.
 
     Returns:
         Dictionary with keys: version, well, parameters, parameter_details,
@@ -51,11 +51,11 @@ def read_las_file(
         Well values are strings. Log values are numpy arrays.
 
     Raises:
-        LASReadError: If file cannot be found or is not a regular file.
+        LASReadError: If file cannot be found, is not a regular file, or
+            exceeds max_file_size.
         LASEncodingError: If file encoding cannot be determined.
         LASParseError: If file content cannot be parsed (e.g. missing
             required ~V section).
-        ValueError: If file exceeds max_file_size.
 
     Warns:
         UserWarning: If LAS version is > 3.0 (unsupported but attempted).
@@ -90,17 +90,17 @@ def read_las_file_as_object(
         mnem_base: Optional dictionary for curve name normalization.
         encoding: Optional encoding override.
         max_file_size: Optional maximum file size in bytes. If the file
-            exceeds this limit, a ValueError is raised.
+            exceeds this limit, a LASReadError is raised.
 
     Returns:
         LASFile dataclass with full parsed data.
 
     Raises:
-        LASReadError: If file cannot be found or is not a regular file.
+        LASReadError: If file cannot be found, is not a regular file, or
+            exceeds max_file_size.
         LASEncodingError: If file encoding cannot be determined.
         LASParseError: If file content cannot be parsed (e.g. missing
             required ~V section).
-        ValueError: If file exceeds max_file_size.
 
     Warns:
         UserWarning: If LAS version is > 3.0 (unsupported but attempted).
@@ -116,6 +116,8 @@ def read_las_file_as_object(
     try:
         detected_encoding, content = read_with_encoding(file_path, encoding, max_file_size)
     except OSError as e:
+        raise LASReadError(f"Cannot read file: {file_path}") from e
+    except ValueError as e:
         raise LASReadError(f"Cannot read file: {file_path}") from e
 
     parser = LASParser(mnem_base)

@@ -222,7 +222,7 @@ def read_dev_file(
         file_path: Path to DEV file.
         encoding: Optional encoding override.
         max_file_size: Optional maximum file size in bytes. If the file
-            exceeds this limit, a ValueError is raised.
+            exceeds this limit, a DEVReadError is raised.
         delimiter: Column delimiter.  ``None`` (default) auto-detects
             comma vs whitespace from the header line.  Pass ``" "`` for
             whitespace-only, ``","`` for comma-delimited files.
@@ -233,8 +233,8 @@ def read_dev_file(
         Dictionary mapping column names to numpy arrays.
 
     Raises:
-        DEVReadError: If file cannot be read or parsed.
-        ValueError: If file exceeds max_file_size.
+        DEVReadError: If file cannot be read, parsed, or exceeds
+            max_file_size.
         LASEncodingError: If the explicit encoding parameter fails to decode
             the file.
     """
@@ -264,7 +264,7 @@ def read_dev_file_as_object(
         file_path: Path to DEV file.
         encoding: Optional encoding override.
         max_file_size: Optional maximum file size in bytes. If the file
-            exceeds this limit, a ValueError is raised.
+            exceeds this limit, a DEVReadError is raised.
         delimiter: Column delimiter.  ``None`` (default) auto-detects
             comma vs whitespace from the header line.  Pass ``" "`` for
             whitespace-only, ``","`` for comma-delimited files.
@@ -275,8 +275,8 @@ def read_dev_file_as_object(
         DevFile dataclass with full parsed data.
 
     Raises:
-        DEVReadError: If file cannot be read or parsed.
-        ValueError: If file exceeds max_file_size.
+        DEVReadError: If file cannot be read, parsed, or exceeds
+            max_file_size.
         LASEncodingError: If the explicit encoding parameter fails to decode
             the file.
 
@@ -301,6 +301,8 @@ def read_dev_file_as_object(
     try:
         detected_encoding, content = read_with_encoding(file_path, encoding, max_file_size)
     except OSError as e:
+        raise DEVReadError(f"Cannot read file: {file_path}") from e
+    except ValueError as e:
         raise DEVReadError(f"Cannot read file: {file_path}") from e
 
     lines = content.splitlines()
