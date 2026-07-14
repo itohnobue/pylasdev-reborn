@@ -761,6 +761,7 @@ class TestHeaderlessFormat:
         assert dev.source_file != ""
         assert dev.encoding != ""
 
+
 class TestFormatAutoDetection:
     """F-02: Format auto-detection edge cases and correctness tests."""
 

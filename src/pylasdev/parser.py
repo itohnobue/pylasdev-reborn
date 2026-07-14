@@ -735,9 +735,13 @@ class LASParser:
                 except ValueError:
                     # Value is non-numeric — use swap (lasio convention).
                     actual_value = description
+                    # In lasio convention, the pre-colon text is the description.
+                    self.las_file.well.descriptions[mnemonic] = value
                 else:
                     # Value IS numeric — spec format, use value group.
                     actual_value = value
+                    # In spec format, the post-colon text is the description.
+                    self.las_file.well.descriptions[mnemonic] = description
             else:
                 # Non-numeric field — detect CWLS vs lasio convention.
                 # CWLS spec:   MNEM.UNIT VALUE : DESCRIPTION
@@ -1194,7 +1198,7 @@ class LASParser:
                     val = _to_finite_float(val_str, null_value)
                     arr = numeric_arrays[i]  # type: ignore[assignment]
                     if arr is None:
-                        raise LASParseError(
+                        raise RuntimeError(
                             f"Internal error: numeric array '{i}' was not pre-allocated"
                         )
                     arr[idx] = val

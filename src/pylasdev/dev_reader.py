@@ -7,6 +7,7 @@ and proper encoding handling.
 from __future__ import annotations
 
 import logging
+import re
 import warnings
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,12 @@ from .data_reader import (
 from .encoding import read_with_encoding
 from .exceptions import DEVReadError, LASEncodingError  # noqa: F401
 from .models import DevFile
+
+# Characters that Python's splitlines() treats as line breaks beyond \n and \r.
+# When present in file content, they cause splitlines() to produce fake section
+# headers and corrupt parsed data.  This is the same regex used by reader.py
+# and parser.py for symmetry across all read paths.
+_SPLITLINES_CHARS_RE = re.compile(r"[\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
 
 logger = logging.getLogger(__name__)
 
@@ -305,7 +312,11 @@ def read_dev_file_as_object(
     except ValueError as e:
         raise DEVReadError(f"Cannot read file: {file_path}") from e
 
-    lines = content.splitlines()
+    # Sanitize control characters that Python's splitlines() treats as line
+    # breaks before splitting.  This is the same protection used by reader.py
+    # and parser.py — without it, embedded control characters can produce fake
+    # lines and corrupt data boundaries.
+    lines = _SPLITLINES_CHARS_RE.sub(" ", content).splitlines()
 
     # --- Gather first few content lines for format detection ---
     # Scan past comments and empty lines to collect up to 3 content-bearing

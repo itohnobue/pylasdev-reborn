@@ -1089,3 +1089,39 @@ class TestWriteLASFile:
         assert "hijacked" in first_data_line
         # The second data line is clean
         assert "101" in data_lines[1]
+
+    # --- M-13: LAS 3.0 ~Other deprecation warning test ---
+    def test_las30_other_section_deprecation_warning(self, tmp_path: Path) -> None:
+        """Test that LAS 3.0 files with ~Other content emit a deprecation warning.
+
+        LAS 3.0 deprecates the ~Other section — content must go into
+        user-defined Parameter or Column Data sections instead.  When
+        writing a LAS 3.0 file with other content, a UserWarning is
+        emitted and the ~Other section is NOT written to the output.
+        """
+        import warnings
+
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="SPACE")
+        las.well["NULL"] = "-999.25"
+        las.other = "This content should trigger a deprecation warning.\n"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        temp_file = tmp_path / "las30_other.las"
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            write_las_file(temp_file, las)
+            other_warnings = [
+                x for x in w if "~Other" in str(x.message) and "deprecates" in str(x.message)
+            ]
+            assert len(other_warnings) >= 1, (
+                "Expected deprecation warning about ~Other section in LAS 3.0"
+            )
+
+        # ~Other section must NOT appear in the written file
+        content = temp_file.read_text()
+        assert "~OTHER" not in content
+        assert "~Other" not in content

@@ -158,7 +158,12 @@ def _write_version_section(las_file: LASFile) -> list[str]:
         "ONE LINE PER DEPTH STEP" if actual_wrap == "NO" else "MULTIPLE LINES PER DEPTH STEP"
     )
     lines.append(f" WRAP.   {actual_wrap}  : {wrap_desc}")
-    if is_las30:
+    # DLM is defined in LAS 2.0 and 3.0 specs.  LAS 1.2 does not use
+    # DLM and always defaults to SPACE.  When DLM is not SPACE (e.g.,
+    # COMMA or TAB), emit the DLM line so the file declares the correct
+    # delimiter — otherwise a re-read would default to SPACE, corrupting
+    # comma- or tab-delimited data.
+    if las_file.version.dlm.upper() != "SPACE":
         dlm_desc = "DELIMITING CHARACTER BETWEEN DATA COLUMNS"
         lines.append(
             f" DLM .                        {_sanitize_las_value(las_file.version.dlm)} : {dlm_desc}"
