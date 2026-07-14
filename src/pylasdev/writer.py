@@ -139,21 +139,23 @@ def _write_version_section(las_file: LASFile) -> list[str]:
     lines.append("~VERSION INFORMATION")
     vers_desc = "CWLS LOG ASCII STANDARD -VERSION 3.0" if is_las30 else "CWLS LOG ASCII STANDARD"
     lines.append(f" VERS.   {_sanitize_las_value(las_file.version.vers)}  : {vers_desc}")
-    # F-05: Write the actual WRAP value from the model instead of hardcoding "NO".
-    # If the writer cannot produce wrapped output (we always write one line per
-    # depth step), emit a warning when WRAP=YES is preserved verbatim.
+    # F-05 / F-01: The writer cannot produce wrapped output (we always write
+    # one line per depth step).  If the source has WRAP=YES, override it to
+    # NO so the header declaration matches the actual data layout.  Emit a
+    # warning to inform the user of the override.
     actual_wrap = las_file.version.wrap.upper() if las_file.version.wrap else "NO"
-    wrap_desc = "ONE LINE PER DEPTH STEP" if actual_wrap == "NO" else "MULTIPLE LINES PER DEPTH STEP"
-    lines.append(f" WRAP.   {actual_wrap}  : {wrap_desc}")
     if actual_wrap == "YES":
         import warnings
 
         warnings.warn(
-            "WRAP=YES preserved in output VERS section, but the writer "
+            "WRAP=YES overridden to WRAP=NO because the writer "
             "always produces ONE LINE PER DEPTH STEP (non-wrapped) output. "
-            "The data WILL be non-wrapped regardless of the header declaration.",
+            "The data WILL be non-wrapped regardless of the original declaration.",
             stacklevel=3,
         )
+        actual_wrap = "NO"
+    wrap_desc = "ONE LINE PER DEPTH STEP" if actual_wrap == "NO" else "MULTIPLE LINES PER DEPTH STEP"
+    lines.append(f" WRAP.   {actual_wrap}  : {wrap_desc}")
     if is_las30:
         dlm_desc = "DELIMITING CHARACTER BETWEEN DATA COLUMNS"
         lines.append(

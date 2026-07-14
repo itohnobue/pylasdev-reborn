@@ -696,8 +696,14 @@ class LASParser:
         #   (b) lasio conv.: MNEM.UNIT DESCRIPTION : VALUE
         # For numeric well fields (STRT, STOP, STEP, NULL) we can detect
         # the convention by checking whether the value group is numeric.
-        # For non-numeric fields we keep the lasio convention swap for
-        # backward compatibility with existing lasio-format test data.
+        # For non-numeric fields we use a heuristic: if the value group
+        # contains whitespace (multi-word → likely an actual value, not
+        # a descriptive label) or the description starts with '#'
+        # (comment marker), treat as CWLS format.  Otherwise use lasio
+        # convention for backward compatibility.
+        # Both the value and description are preserved in the model
+        # (WellSection.entries and WellSection.descriptions) for
+        # roundtrip fidelity.
         if is_las12 and description:
             if mnemonic in {"STRT", "STOP", "STEP", "NULL"}:
                 # Try value-before-colon first (spec format).
@@ -710,9 +716,25 @@ class LASParser:
                     # Value IS numeric — spec format, use value group.
                     actual_value = value
             else:
-                # Non-numeric field — keep swap for lasio convention
-                # files (e.g., COMP. COMPANY : # ANY OIL COMPANY LTD.).
-                actual_value = description
+                # Non-numeric field — detect CWLS vs lasio convention.
+                # CWLS spec:   MNEM.UNIT VALUE : DESCRIPTION
+                #   e.g. COMP.    ANY OIL     :  Company Name
+                # lasio conv:  MNEM.UNIT DESCRIPTION : VALUE
+                #   e.g. COMP.    COMPANY     :  TestCo
+                # Heuristic: CWLS values are typically multi-word
+                # (contain whitespace), while lasio description
+                # markers are single-word labels.  If the pre-colon
+                # value contains whitespace, treat as CWLS format.
+                # Otherwise default to lasio convention for backward
+                # compatibility.
+                if " " in value:
+                    # CWLS convention: pre-colon text is the value.
+                    actual_value = value
+                    self.las_file.well.descriptions[mnemonic] = description
+                else:
+                    # lasio convention: post-colon text is the value.
+                    actual_value = description
+                    self.las_file.well.descriptions[mnemonic] = value
         else:
             # LAS 2.0+: MNEM.UNIT VALUE : DESCRIPTION
             # or LAS 1.2 with no description (e.g., STRT.M 1670.0000:)

@@ -409,8 +409,10 @@ class TestFormatCompliance:
         content = temp_file.read_text()
         assert "~VERSION" in content
         assert "3.0" in content
-        # The WRAP value in output must be preserved (even though spec forbids it)
-        assert "WRAP.   YES" in content
+        # The WRAP value in output must be overridden to NO (F-01 fix:
+        # writer cannot produce wrapped output, so header must match data)
+        assert "WRAP.   NO" in content
+        assert "WRAP.   YES" not in content
         # Data should be written in non-wrapped format (one line per depth step)
         assert "100" in content
 

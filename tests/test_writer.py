@@ -67,7 +67,12 @@ class TestWriteLASFile:
         assert "2.0" in content
 
     def test_write_always_wrap_no(self, tmp_path: Path) -> None:
-        """Test that WRAP is written as the value from the model (NO → NO, YES → YES)."""
+        """Test that WRAP=YES is overridden to WRAP=NO in output.
+
+        The writer cannot produce wrapped output (always one line per depth
+        step). When the model has WRAP=YES, the writer emits a warning and
+        writes WRAP=NO to keep the header consistent with the data layout.
+        """
         data: dict[str, Any] = {
             "version": {"VERS": "2.0", "WRAP": "YES", "DLM": "SPACE"},
             "well": {"NULL": "-999.25"},
@@ -79,8 +84,10 @@ class TestWriteLASFile:
         write_las_file(temp_file, data)
 
         content = temp_file.read_text()
-        # WRAP value is preserved from the model (was hardcoded to "NO" before F-05 fix)
-        assert "WRAP.   YES" in content
+        # WRAP=YES is overridden to WRAP=NO since the writer cannot produce
+        # wrapped output (F-01: header-data consistency fix)
+        assert "WRAP.   NO" in content
+        assert "WRAP.   YES" not in content
 
     def test_write_well_info(self, sample_las_data: dict, tmp_path: Path) -> None:
         """Test that well info entries are written."""
@@ -963,8 +970,9 @@ class TestWriteLASFile:
         ]
         # With 3 curves, non-wrapped mode: 1 header line + 2 data lines = 3 lines total
         assert len(data_lines) >= 2  # at least the data lines
-        # Verify WRAP value is preserved in output (header says YES even though data isn't wrapped)
-        assert "WRAP.   YES" in content
+        # Verify WRAP is overridden to NO (F-01: header-data consistency fix)
+        assert "WRAP.   NO" in content
+        assert "WRAP.   YES" not in content
 
     # --- F-S6-M4: _format_fixed_precision unit tests ---
 

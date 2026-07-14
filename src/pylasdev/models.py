@@ -94,6 +94,7 @@ class WellSection:
 
     entries: dict[str, str] = field(default_factory=dict)
     units: dict[str, str] = field(default_factory=dict)
+    descriptions: dict[str, str] = field(default_factory=dict)  # CWLS description text for well fields
 
     def to_dict(self) -> dict[str, str]:
         """Convert to legacy dict format."""
@@ -290,6 +291,7 @@ class LASFile:
             "version": self.version.to_dict(),
             "well": self.well.to_dict(),
             "well_units": dict(self.well.units) if self.well.units else {},
+            "well_descriptions": dict(self.well.descriptions) if self.well.descriptions else {},
             "parameters": params_dict,
             "parameter_details": [p.to_dict() for p in self.parameters],
             "curves": [c.to_dict() for c in self.curves],
@@ -334,6 +336,11 @@ class LASFile:
         well_units = data.get("well_units") or {}
         for key, unit in well_units.items():
             las_file.well.units[key] = _safe_str(unit)
+
+        # Restore well descriptions if present (from v1.8+ roundtrip data)
+        well_descriptions = data.get("well_descriptions") or {}
+        for key, desc in well_descriptions.items():
+            las_file.well.descriptions[key] = _safe_str(desc)
 
         curves_order = data.get("curves_order", [])
         las_file.curves_order = list(curves_order)

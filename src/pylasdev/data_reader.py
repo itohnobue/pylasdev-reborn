@@ -494,7 +494,11 @@ def _read_wrapped(
             values = [v.strip() for v in stripped.split(delimiter, maxsplit=MAX_TOKENS_PER_LINE)]
 
         if depth_line:
-            # Depth line: single value = depth for this step
+            # Depth line: single value = depth for this step.
+            # Reset the extra-values flag at each depth step boundary
+            # so stale flags from a previous step never persist into
+            # the pathological-misalignment check for this step.
+            depth_had_extra = False
             if len(values) > 1:
                 warnings.warn(
                     f"Wrapped mode: depth line has {len(values)} values, expected 1. "
@@ -575,6 +579,7 @@ def _read_wrapped(
                     # more values than expected).
                     counter = 0
                     depth_line = True
+                    depth_had_extra = False
                     break
 
             # F11: After overflow (extra values on data line were
@@ -588,6 +593,7 @@ def _read_wrapped(
             if counter >= curve_count and not depth_line:
                 depth_line = True
                 counter = 0
+                depth_had_extra = False
 
     # Validate array lengths — pad incomplete last depth step
     max_len = max((len(dl) for dl in data_lists), default=0)
