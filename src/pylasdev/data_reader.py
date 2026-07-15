@@ -94,7 +94,15 @@ def _get_null_value(
         Null value as a float.
     """
     try:
-        return float(well.get("NULL", default))
+        null_value = float(well.get("NULL", default))
+        # F-04: Reject non-finite sentinel values (NaN, Inf, -Inf) which
+        # float() accepts without error.  These propagate through numpy
+        # arrays → corrupted statistics → writer outputs "nan" (invalid LAS).
+        if not np.isfinite(null_value):
+            raise LASParseError(
+                f"NULL value must be a finite number, got {null_value!r}"
+            )
+        return null_value
     except (ValueError, TypeError):
         return default_float
 

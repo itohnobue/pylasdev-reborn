@@ -333,6 +333,11 @@ class LASFile:
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data).__name__}")
 
+        # F-06: Deferred imports to avoid circular dependencies
+        # (models.py ← parser.py/data_reader.py which import from models.py).
+        from .data_reader import MAX_CURVES
+        from .parser import MAX_DATA_SECTIONS, MAX_OTHER_LINES, MAX_PARAMETERS
+
         las_file = cls()
 
         version = data.get("version") or {}
@@ -360,6 +365,12 @@ class LASFile:
 
         # Restore curve metadata if available (new format), otherwise create minimal CurveDefinition
         curves_data = data.get("curves", [])
+        # F-06: Resource-exhaustion guard — match parser's MAX_CURVES check.
+        if len(curves_data) > MAX_CURVES:
+            raise ValueError(
+                f"Number of curves ({len(curves_data)}) exceeds maximum "
+                f"allowed ({MAX_CURVES})"
+            )
         if curves_data and isinstance(curves_data, list) and isinstance(curves_data[0], dict):
             for curve_dict in curves_data:
                 array_info = None
@@ -383,10 +394,42 @@ class LASFile:
                 )
         else:
             # Legacy format: only curve names available
+            # F-06: Resource-exhaustion guard for legacy curves_order path.
+            if len(curves_order) > MAX_CURVES:
+                raise ValueError(
+                    f"Number of curves ({len(curves_order)}) exceeds maximum "
+                    f"allowed ({MAX_CURVES})"
+                )
             for curve_name in curves_order:
                 las_file.curves.append(CurveDefinition(mnemonic=curve_name))
 
+        # F-02: Cross-validate curves_order and curves for consistency.
+        # Both are built from separate dict keys independently; a mismatched
+        # input dict can produce silently inconsistent state.  from_dict is
+        # called on untrusted data via write_las_file (public API).
+        _curve_count = len(las_file.curves)
+        if len(las_file.curves_order) != _curve_count:
+            raise ValueError(
+                f"curves_order length ({len(las_file.curves_order)}) does not "
+                f"match curves length ({_curve_count})"
+            )
+        for _i, (_order_name, _curve) in enumerate(
+            zip(las_file.curves_order, las_file.curves, strict=True)
+        ):
+            if _order_name != _curve.mnemonic:
+                raise ValueError(
+                    f"curves_order[{_i}] = {_order_name!r} does not match "
+                    f"curves[{_i}].mnemonic = {_curve.mnemonic!r}"
+                )
+
         params = data.get("parameters") or []
+        # F-06: Resource-exhaustion guard for parameters.
+        _param_count = len(params)
+        if _param_count > MAX_PARAMETERS:
+            raise ValueError(
+                f"Number of parameters ({_param_count}) exceeds maximum "
+                f"allowed ({MAX_PARAMETERS})"
+            )
         if isinstance(params, dict):
             # Legacy format: {mnemonic: value}
             # Check for parameter_details first to preserve full metadata
@@ -406,12 +449,25 @@ class LASFile:
             for param_dict in params:
                 las_file.parameters.append(_create_parameter_entry(param_dict))
 
+        # F-06: Resource-exhaustion guard for other section content.
+        _other_raw = str(data.get("other", ""))
+        if len(_other_raw) > MAX_OTHER_LINES:
+            raise ValueError(
+                f"Other section length ({len(_other_raw)} chars) exceeds "
+                f"maximum allowed ({MAX_OTHER_LINES})"
+            )
         las_file.other = _safe_str(data.get("other"), "")
         las_file.encoding = _safe_str(data.get("encoding"), "utf-8")
         las_file.source_file = _safe_str(data.get("source_file"), "")
 
         # Restore LAS 3.0 data sections
         ds_data = data.get("data_sections", [])
+        # F-06: Resource-exhaustion guard for data sections.
+        if len(ds_data) > MAX_DATA_SECTIONS:
+            raise ValueError(
+                f"Number of data sections ({len(ds_data)}) exceeds maximum "
+                f"allowed ({MAX_DATA_SECTIONS})"
+            )
         for ds_dict in ds_data:
             if not isinstance(ds_dict, dict):
                 continue
@@ -467,6 +523,12 @@ class LASFile:
             las_file.string_data[name] = np.array(arr, dtype=np.str_)
 
         logs = data.get("logs", {})
+        # F-06: Resource-exhaustion guard for logs.
+        if len(logs) > MAX_CURVES:
+            raise ValueError(
+                f"Number of log curves ({len(logs)}) exceeds maximum "
+                f"allowed ({MAX_CURVES})"
+            )
         for name, arr in logs.items():
             try:
                 las_file.logs[name] = np.array(arr, dtype=np.float64)

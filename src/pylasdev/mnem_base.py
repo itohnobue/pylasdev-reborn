@@ -1308,8 +1308,10 @@ MNEM_BASE: dict[str, str] = {
     "RD1": "RD",
     "RD2": "RD",
     "RD3": "RD",
-    "RES": "LIT",
-    "RES1": "LIT",
+    # F-03: "RES"/"RES1" removed — they collided with resistivity entries
+    # "Res": "RS" / "res": "RS" / "Res1": "RS" (lines 1408-1410, 1698) via
+    # the parser's first-wins uppercased-key semantics.  Resistivity uses of
+    # Res.* are far more common in well-log files than lithology RES.
     "RESGG": "LIT",
     "REZ": "CALI",
     "REZ1": "CALI",

@@ -739,20 +739,26 @@ class LASParser:
                             _prev_def_name,
                             self._current_definition_name,
                         )
+                    # F-01: Use _prev_curve_start/_prev_curve_end instead of
+                    # self._section_curve_start_idx/_end_idx, which may have
+                    # been overwritten by pipe handling (lines 602-657) for
+                    # the new section.  The prev locals were captured at
+                    # lines 456-457 BEFORE pipe handler ran.
                     self._definition_curve_ranges[_prev_def_name] = (
-                        self._section_curve_start_idx,
-                        self._section_curve_end_idx
-                        if self._section_curve_end_idx is not None
+                        _prev_curve_start,
+                        _prev_curve_end
+                        if _prev_curve_end is not None
                         else len(self.las_file.curves),
                     )
                 elif self._current_section == "C" and _prev_def_name is None:
                     # H-01: Non-_Definition ~C section — save under sentinel
                     # key so consecutive non-_Definition ~C sections don't
                     # silently lose curve scoping.
+                    # F-01: Same as above — use preserved locals.
                     self._definition_curve_ranges["__MAIN__"] = (
-                        self._section_curve_start_idx,
-                        self._section_curve_end_idx
-                        if self._section_curve_end_idx is not None
+                        _prev_curve_start,
+                        _prev_curve_end
+                        if _prev_curve_end is not None
                         else len(self.las_file.curves),
                     )
 
@@ -1228,6 +1234,10 @@ class LASParser:
                 # stays consistent with the locally-deduped data.
                 if is_first_section:
                     global_idx = self._section_curve_start_idx + i
+                    # F-05: Sync original_mnemonic on global curve list
+                    # to match _rename_duplicate_curve in data_reader.py:327-328.
+                    if not self.las_file.curves[global_idx].original_mnemonic:
+                        self.las_file.curves[global_idx].original_mnemonic = name
                     self.las_file.curves[global_idx].mnemonic = new_name
                     self.las_file.curves_order[global_idx] = new_name
             elif name in output_names:
@@ -1255,6 +1265,10 @@ class LASParser:
                 output_names.add(new_name)
                 if is_first_section:
                     global_idx = self._section_curve_start_idx + i
+                    # F-05: Sync original_mnemonic on global curve list
+                    # to match _rename_duplicate_curve in data_reader.py:327-328.
+                    if not self.las_file.curves[global_idx].original_mnemonic:
+                        self.las_file.curves[global_idx].original_mnemonic = name
                     self.las_file.curves[global_idx].mnemonic = new_name
                     self.las_file.curves_order[global_idx] = new_name
             else:
