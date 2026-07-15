@@ -297,6 +297,9 @@ class LASParser:
         # etc.) were encountered during parsing for cross-validation against
         # the VERS header value.
         self._las30_sections_seen: bool = False
+        # F-P06: Raw well entries are buffered when ~W appears before ~V so
+        # they can be re-processed with the correct version after ~V is parsed.
+        self._deferred_well_entries: list[dict[str, str]] = []
 
     @property
     def data_line_count(self) -> int:
@@ -331,6 +334,11 @@ class LASParser:
 
         for line in lines:
             self._parse_line(line)
+
+        # F-P06: Re-process well entries parsed before ~V was known.
+        # If the version turns out to be LAS 1.2, overwrite buffered
+        # entries with the correct value/description swap.
+        self._replay_deferred_well()
 
         # Validation: a valid LAS file must have a ~V section
         if not self._version_found and content.strip():
@@ -619,17 +627,19 @@ class LASParser:
                         self._section_curve_end_idx = end
                     else:
                         # Unrecognized pipe target (not "CURVE"/"C" and
-                        # not a known _Definition).  Curve indices retain
-                        # stale values from the previous section, which may
-                        # route data to the wrong curves.
+                        # not a known _Definition).  Reset curve indices
+                        # to safe defaults so subsequent data routing
+                        # doesn't use stale values from a previous section.
                         source_info = f" in {self.source_file}" if self.source_file else ""
                         logger.warning(
                             "Unrecognized pipe target '| %s' for section '~%s'%s — "
-                            "curve indices may be incorrect.",
+                            "curve indices reset to defaults.",
                             pipe_target,
                             section_word,
                             source_info,
                         )
+                        self._section_curve_start_idx = 0
+                        self._section_curve_end_idx = 0
                 elif self._current_data_section_type != "LOG_DATA":
                     # G-02: No pipe — try to match data section type
                     # to a _Definition (e.g., CORE_DATA → CORE_DEFINITION).
@@ -823,7 +833,94 @@ class LASParser:
         elif mnemonic == "WRAP":
             self.las_file.version.wrap = value.upper()
         elif mnemonic == "DLM":
-            self.las_file.version.dlm = value
+            dlm_upper = value.upper()
+            if dlm_upper in {"SPACE", "TAB", "COMMA"}:
+                self.las_file.version.dlm = dlm_upper
+            else:
+                warnings.warn(
+                    f"Unknown DLM value '{value}'. Expected SPACE, TAB, or COMMA. "
+                    f"Defaulting to SPACE.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self.las_file.version.dlm = "SPACE"
+
+    def _store_well_entry(
+        self, mnemonic: str, unit: str, value: str, description: str, is_las12: bool
+    ) -> None:
+        """Store a well entry with version-appropriate value/description handling.
+
+        Extracted from _parse_well to support deferred well processing when
+        ~W appears before ~V (the version check is deferred until ~V is parsed).
+        """
+        if is_las12 and description:
+            if mnemonic in {"STRT", "STOP", "STEP", "NULL"}:
+                if self._well_format == "cwls":
+                    actual_value = value
+                    self.las_file.well.descriptions[mnemonic] = description
+                elif self._well_format == "lasio":
+                    actual_value = description
+                    self.las_file.well.descriptions[mnemonic] = value
+                else:
+                    try:
+                        float(value.replace("D", "E").replace("d", "e"))
+                    except ValueError:
+                        actual_value = description
+                        self.las_file.well.descriptions[mnemonic] = value
+                    else:
+                        actual_value = value
+                        self.las_file.well.descriptions[mnemonic] = description
+            else:
+                if self._well_format == "cwls":
+                    actual_value = value
+                    self.las_file.well.descriptions[mnemonic] = description
+                elif self._well_format == "lasio":
+                    actual_value = description
+                    self.las_file.well.descriptions[mnemonic] = value
+                elif " " in value:
+                    actual_value = value
+                    self.las_file.well.descriptions[mnemonic] = description
+                else:
+                    logger.warning(
+                        "Cannot distinguish CWLS from lasio convention for "
+                        "well field '%s' with single-word pre-colon value "
+                        "'%s'. Defaulting to lasio (swapped) interpretation. "
+                        "If data appears wrong, set well_format='cwls' to "
+                        "force CWLS convention.",
+                        mnemonic,
+                        value,
+                    )
+                    actual_value = description
+                    self.las_file.well.descriptions[mnemonic] = value
+        else:
+            actual_value = value
+
+        self.las_file.well[mnemonic] = actual_value
+        if unit:
+            self.las_file.well.units[mnemonic] = unit
+
+    def _replay_deferred_well(self) -> None:
+        """Re-process well entries that were parsed before ~V was known.
+
+        When ~W appears before ~V, entries are buffered and processed with
+        default LAS 2.0+ interpretation.  If the version turns out to be
+        LAS 1.2, re-process entries with the correct swap logic.
+        """
+        if not self._deferred_well_entries:
+            return
+        is_las12 = self.las_file.version.vers.startswith("1.")
+        if not is_las12:
+            self._deferred_well_entries.clear()
+            return
+        for entry in self._deferred_well_entries:
+            self._store_well_entry(
+                mnemonic=entry["mnemonic"],
+                unit=entry["unit"],
+                value=entry["value"],
+                description=entry["description"],
+                is_las12=True,
+            )
+        self._deferred_well_entries.clear()
 
     def _parse_well(self, line: str) -> None:
         """Parse ~W (well information) section line.
@@ -855,97 +952,29 @@ class LASParser:
         )
 
         is_las12 = self.las_file.version.vers.startswith("1.")
-        # LAS 1.2 well sections use two conventions in the wild:
-        #   (a) CWLS spec:  MNEM.UNIT VALUE : DESCRIPTION
-        #   (b) lasio conv.: MNEM.UNIT DESCRIPTION : VALUE
-        # For numeric well fields (STRT, STOP, STEP, NULL) we can detect
-        # the convention by checking whether the value group is numeric.
-        # For non-numeric fields we use a heuristic: if the value group
-        # contains whitespace (multi-word → likely an actual value, not
-        # a descriptive label) or the description starts with '#'
-        # (comment marker), treat as CWLS format.  Otherwise use lasio
-        # convention for backward compatibility.
-        # Both the value and description are preserved in the model
-        # (WellSection.entries and WellSection.descriptions) for
-        # roundtrip fidelity.
-        if is_las12 and description:
-            if mnemonic in {"STRT", "STOP", "STEP", "NULL"}:
-                if self._well_format == "cwls":
-                    # CWLS: pre-colon is always the value.
-                    actual_value = value
-                    self.las_file.well.descriptions[mnemonic] = description
-                elif self._well_format == "lasio":
-                    # lasio: post-colon is always the value.
-                    actual_value = description
-                    self.las_file.well.descriptions[mnemonic] = value
-                else:
-                    # Auto-detect. Try value-before-colon first (spec format).
-                    # Handle Fortran D-exponent notation (e.g., "1.0D+03")
-                    # used by some scientific software.  Python's float()
-                    # only understands E/e exponents.
-                    try:
-                        float(value.replace("D", "E").replace("d", "e"))
-                    except ValueError:
-                        # Value is non-numeric — use swap (lasio convention).
-                        actual_value = description
-                        # In lasio convention, the pre-colon text is the description.
-                        self.las_file.well.descriptions[mnemonic] = value
-                    else:
-                        # Value IS numeric — spec format, use value group.
-                        actual_value = value
-                        # In spec format, the post-colon text is the description.
-                        self.las_file.well.descriptions[mnemonic] = description
-            else:
-                # Non-numeric field — detect CWLS vs lasio convention.
-                # CWLS spec:   MNEM.UNIT VALUE : DESCRIPTION
-                #   e.g. COMP.    ANY OIL     :  Company Name
-                # lasio conv:  MNEM.UNIT DESCRIPTION : VALUE
-                #   e.g. COMP.    COMPANY     :  TestCo
-                # Explicit well_format overrides always take priority.
-                # For "auto", use the whitespace heuristic: multi-word
-                # pre-colon text indicates CWLS convention; otherwise
-                # default to lasio for backward compatibility.
-                #
-                # NOTE: The "auto" heuristic cannot distinguish single-word
-                # CWLS values (e.g., "OIL") from single-word lasio
-                # labels (e.g., "COMPANY").  For files known to use
-                # CWLS format, set well_format="cwls" to force CWLS
-                # interpretation for all non-numeric fields.
-                if self._well_format == "cwls":
-                    # Explicit CWLS: pre-colon text is the value.
-                    actual_value = value
-                    self.las_file.well.descriptions[mnemonic] = description
-                elif self._well_format == "lasio":
-                    # Explicit lasio: post-colon text is the value.
-                    actual_value = description
-                    self.las_file.well.descriptions[mnemonic] = value
-                elif " " in value:
-                    # Auto: multi-word pre-colon text → CWLS convention.
-                    actual_value = value
-                    self.las_file.well.descriptions[mnemonic] = description
-                else:
-                    # Auto: single-word pre-colon text — cannot distinguish
-                    # CWLS from lasio convention.  Default to lasio (swap)
-                    # interpretation for backward compatibility.
-                    logger.warning(
-                        "Cannot distinguish CWLS from lasio convention for "
-                        "well field '%s' with single-word pre-colon value "
-                        "'%s'. Defaulting to lasio (swapped) interpretation. "
-                        "If data appears wrong, set well_format='cwls' to "
-                        "force CWLS convention.",
-                        mnemonic,
-                        value,
-                    )
-                    actual_value = description
-                    self.las_file.well.descriptions[mnemonic] = value
-        else:
-            # LAS 2.0+: MNEM.UNIT VALUE : DESCRIPTION
-            # or LAS 1.2 with no description (e.g., STRT.M 1670.0000:)
-            actual_value = value
 
-        self.las_file.well[mnemonic] = actual_value
-        if unit:
-            self.las_file.well.units[mnemonic] = unit
+        # F-P06: When ~W appears before ~V, the version defaults to "2.0" and
+        # is_las12 is False, skipping the LAS 1.2 convention swap.  Buffer raw
+        # entries so they can be re-processed with the correct version after
+        # ~V is parsed.
+        if not self._version_found:
+            self._deferred_well_entries.append({
+                "mnemonic": mnemonic,
+                "unit": unit,
+                "value": value,
+                "description": description,
+            })
+            if len(self._deferred_well_entries) == 1:
+                warnings.warn(
+                    "~W (Well) section encountered before ~V (Version) "
+                    "section. Well data interpretation may be incorrect "
+                    "for LAS 1.2 files. Entries will be re-evaluated "
+                    "once the version is known.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        self._store_well_entry(mnemonic, unit, value, description, is_las12)
 
     def _parse_curve(self, line: str) -> None:
         """Parse ~C (curve information) section line.

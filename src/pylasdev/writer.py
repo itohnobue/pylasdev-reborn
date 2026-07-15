@@ -504,13 +504,34 @@ def _format_data_rows(
         return lines
 
     warned_long = False  # Deduplicate long-line warnings per section
+    warned_space_str = False  # Deduplicate space-in-string warnings per section
     for i in range(num_rows):
         row_values: list[str] = []
         for arr, is_string in curve_arrays:
             if arr is None or i >= len(arr):
                 row_values.append(_format_number(null_value, precision, null_value))
             elif is_string:
-                row_values.append(_sanitize_las_value(str(arr[i])))
+                val = _sanitize_las_value(str(arr[i]))
+                # F-W05: SPACE delimiter + string data with spaces causes
+                # roundtrip corruption — the reader splits on any whitespace,
+                # turning one string value into multiple tokens. Replace
+                # internal spaces with underscores and warn once per section.
+                if delimiter == " " and " " in val:
+                    if not warned_space_str:
+                        import warnings
+
+                        warnings.warn(
+                            "String curve data contains spaces while using "
+                            "SPACE delimiter. Internal spaces will be "
+                            "replaced with underscores to prevent data "
+                            "corruption on re-read. Consider switching to "
+                            "COMMA or TAB delimiter for files with string "
+                            "curves.",
+                            stacklevel=4,
+                        )
+                        warned_space_str = True
+                    val = val.replace(" ", "_")
+                row_values.append(val)
             else:
                 val = arr[i]
                 if np.isnan(val) or np.isinf(val):

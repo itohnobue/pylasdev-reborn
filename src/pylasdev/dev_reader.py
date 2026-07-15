@@ -190,14 +190,27 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 # second line means it's a header (text column names).
                 if any(not _is_float_token(t) for t in second_tokens):
                     return ("dug", 2)
-                # F-ITER2-D3-M05: Secondary heuristic — when ALL second-line
-                # tokens parse as floats (e.g. numeric column names "100 200 300"),
-                # check if the integer count from the first line matches the
-                # token count on the second line.  Column-count == header-token-count
-                # is a strong signal of DUG format even with all-numeric headers.
-                # Without this, the function falls through and misdetects as
-                # headerless, silently losing all columns.
+                # Secondary heuristic — when ALL second-line tokens parse as
+                # floats (e.g. numeric column names "100 200 300"), check if
+                # the integer count from the first line matches the token count
+                # on the second line.  Column-count == header-token-count is a
+                # strong signal of DUG format even with all-numeric headers.
                 if col_count == len(second_tokens):
+                    return ("dug", 2)
+                # F-DV01: Count-mismatch fallback — when the second line is
+                # all-float but the count doesn't match the first line's
+                # integer, it's still DUG format (not headerless) as long as
+                # there are 3+ content entries (i.e. data lines exist beyond
+                # the header).  Without >=3 guard a 2-line file like
+                # "100\\n50.0\\n" is too ambiguous — it stays headerless.
+                # F-01: Require len(second_tokens) > 1 to prevent single-column
+                # headerless files (e.g. "100\\n200\\n300\\n") from being
+                # misdetected as DUG format.  A DUG file with only 1 column is
+                # extremely unusual and would be caught by the col_count ==
+                # len(second_tokens) check above anyway.
+                if len(second_tokens) > 1 and len(content_entries) >= 3 and all(
+                    _is_float_token(t) for t in second_tokens
+                ):
                     return ("dug", 2)
 
     # Pattern B: multi-word title, integer column count, header.

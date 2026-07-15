@@ -5,6 +5,7 @@ Supports LAS 1.2, 2.0, and 3.0 formats.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -335,7 +336,7 @@ class LASFile:
 
         # F-06: Deferred imports to avoid circular dependencies
         # (models.py ← parser.py/data_reader.py which import from models.py).
-        from .data_reader import MAX_CURVES
+        from .data_reader import MAX_CURVES, MAX_DATA_LINES, MAX_TOTAL_ELEMENTS
         from .parser import MAX_DATA_SECTIONS, MAX_OTHER_LINES, MAX_PARAMETERS
 
         las_file = cls()
@@ -474,6 +475,14 @@ class LASFile:
             ds_string_data = {}
             for name, arr in ds_dict.get("string_data", {}).items():
                 ds_string_data[name] = np.array(arr, dtype=np.str_)
+                # F-03: Per-array size guard for data section string_data arrays.
+                if len(ds_string_data[name]) > MAX_DATA_LINES:
+                    ds_name = ds_dict.get("name", "<unknown>")
+                    raise ValueError(
+                        f"String data array length ({len(ds_string_data[name])}) "
+                        f"for '{name}' in section '{ds_name}' exceeds maximum "
+                        f"allowed ({MAX_DATA_LINES})"
+                    )
             ds_section_curves = []
             for sc_dict in ds_dict.get("section_curves", []):
                 sc_array_info = None
@@ -505,6 +514,14 @@ class LASFile:
                     raise ValueError(
                         f"Cannot convert data for section '{ds_name}', curve '{k}': {e}"
                     ) from e
+                # F-M02: Per-array size guard for data section arrays.
+                if len(ds_data[k]) > MAX_DATA_LINES:
+                    ds_name = ds_dict.get("name", "<unknown>")
+                    raise ValueError(
+                        f"Array length ({len(ds_data[k])}) for curve '{k}' in "
+                        f"section '{ds_name}' exceeds maximum allowed "
+                        f"({MAX_DATA_LINES})"
+                    )
             ds = DataSection(
                 name=ds_dict.get("name", ""),
                 section_type=ds_dict.get("section_type", "LOG_DATA"),
@@ -514,6 +531,17 @@ class LASFile:
                 section_curves=ds_section_curves,
             )
             las_file.data_sections.append(ds)
+            # F-M15: Cross-array length validation within this data section.
+            if len(ds.data) > 1:
+                _ds_len = {name: len(arr) for name, arr in ds.data.items()}
+                if len(set(_ds_len.values())) > 1:
+                    warnings.warn(
+                        f"Data section '{ds.name}' has inconsistent array "
+                        f"lengths: {_ds_len}. Data may be silently padded or "
+                        f"truncated by the LAS writer.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
 
         # Restore LAS 3.0 string data (top-level, backward compat
         # with data serialized before string_data was moved to
@@ -521,6 +549,13 @@ class LASFile:
         sd = data.get("string_data", {})
         for name, arr in sd.items():
             las_file.string_data[name] = np.array(arr, dtype=np.str_)
+            # F-M02: Per-array size guard for string_data arrays.
+            if len(las_file.string_data[name]) > MAX_DATA_LINES:
+                raise ValueError(
+                    f"Array length ({len(las_file.string_data[name])}) for "
+                    f"string curve '{name}' exceeds maximum allowed "
+                    f"({MAX_DATA_LINES})"
+                )
 
         logs = data.get("logs", {})
         # F-06: Resource-exhaustion guard for logs.
@@ -536,6 +571,34 @@ class LASFile:
                 raise ValueError(
                     f"Cannot convert log data for curve '{name}' to numeric array: {e}"
                 ) from e
+            # F-M02: Per-array size guard for log arrays.
+            if len(las_file.logs[name]) > MAX_DATA_LINES:
+                raise ValueError(
+                    f"Array length ({len(las_file.logs[name])}) for log "
+                    f"'{name}' exceeds maximum allowed ({MAX_DATA_LINES})"
+                )
+
+        # F-M15: Cross-array length validation for top-level log arrays.
+        if len(las_file.logs) > 1:
+            _log_len = {name: len(arr) for name, arr in las_file.logs.items()}
+            if len(set(_log_len.values())) > 1:
+                warnings.warn(
+                    f"Log arrays have inconsistent lengths: {_log_len}. "
+                    f"Data may be silently padded or truncated by the LAS writer.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        # F-M02: Total element count guard across all log curves.
+        if las_file.logs:
+            _log_rows = max(len(arr) for arr in las_file.logs.values())
+            _log_total = len(las_file.logs) * _log_rows
+            if _log_total > MAX_TOTAL_ELEMENTS:
+                raise ValueError(
+                    f"Total log allocation ({len(las_file.logs)} curves x "
+                    f"{_log_rows} rows = {_log_total} elements) exceeds maximum "
+                    f"allowed ({MAX_TOTAL_ELEMENTS})"
+                )
 
         return las_file
 
@@ -608,9 +671,20 @@ class DevFile:
         Returns:
             DevFile with columns populated from the dict.
         """
+        from .data_reader import MAX_CURVES, MAX_DATA_LINES, MAX_TOTAL_ELEMENTS
+
         dev = cls()
         # Separate column arrays from metadata keys
         metadata_keys = {"encoding", "source_file", "column_order"}
+
+        # F-M01: Resource-exhaustion guard — bound column count.
+        _column_keys = [k for k in data if k not in metadata_keys]
+        if len(_column_keys) > MAX_CURVES:
+            raise ValueError(
+                f"Number of columns ({len(_column_keys)}) exceeds maximum "
+                f"allowed ({MAX_CURVES})"
+            )
+
         for key, value in data.items():
             if key in metadata_keys:
                 if key == "encoding":
@@ -621,6 +695,24 @@ class DevFile:
                     dev.column_order = list(value)
             else:
                 dev.columns[key] = np.array(value, dtype=np.float64)
+                # F-M01: Per-array size guard for DevFile columns.
+                if len(dev.columns[key]) > MAX_DATA_LINES:
+                    raise ValueError(
+                        f"Column '{key}' length ({len(dev.columns[key])}) exceeds "
+                        f"maximum allowed ({MAX_DATA_LINES})"
+                    )
+
+        # F-M01: Total element count guard across all columns.
+        if dev.columns:
+            _dev_rows = max(len(arr) for arr in dev.columns.values())
+            _dev_total = len(dev.columns) * _dev_rows
+            if _dev_total > MAX_TOTAL_ELEMENTS:
+                raise ValueError(
+                    f"Total allocation ({len(dev.columns)} columns x "
+                    f"{_dev_rows} rows = {_dev_total} elements) exceeds "
+                    f"maximum allowed ({MAX_TOTAL_ELEMENTS})"
+                )
+
         # If column_order wasn't in the dict, infer from Python 3.7+ dict order
         if not dev.column_order:
             dev.column_order = list(dev.columns.keys())
