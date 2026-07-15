@@ -293,6 +293,10 @@ class LASParser:
         # Maps definition name (e.g. "CORE_DEFINITION") → (start_idx, end_idx).
         self._definition_curve_ranges: dict[str, tuple[int, int]] = {}
         self._current_definition_name: str | None = None
+        # M-PA4: Track whether LAS 3.0 typed data sections (~Core, ~Drilling,
+        # etc.) were encountered during parsing for cross-validation against
+        # the VERS header value.
+        self._las30_sections_seen: bool = False
 
     @property
     def data_line_count(self) -> int:
@@ -367,6 +371,21 @@ class LASParser:
                         stacklevel=2,
                     )
 
+        # M-PA4: Cross-validate VERS against encountered section types.
+        # When LAS 3.0 typed data sections (~Core, ~Drilling, etc.) are
+        # found but is_las30 is False (VERS does not start with "3"), the
+        # parser silently discards data in those sections.  Warn the user
+        # and advise correcting the VERS header.
+        if self._las30_sections_seen and not self.las_file.version.is_las30:
+            logger.warning(
+                "LAS 3.0 structured data sections (~Core, ~Drilling, "
+                "~Inclinometry, etc.) found but VERS is '%s' (not a 3.x "
+                "version). LAS 3.0 data handling is DISABLED — data in "
+                "typed sections has been silently discarded. Set VERS to "
+                "a 3.x value to enable LAS 3.0 processing.",
+                self.las_file.version.vers,
+            )
+
         return self.las_file
 
     def _pre_scan(self, lines: list[str]) -> None:
@@ -437,6 +456,29 @@ class LASParser:
             _prev_curve_start = self._section_curve_start_idx
             _prev_curve_end = self._section_curve_end_idx
 
+            # H-03: Save the previous _Definition's curve range BEFORE the
+            # data section classification block so pipe target lookups
+            # (line 567) can find the freshly-saved entry.  Without this,
+            # the lookup runs before the save at line 665, producing false
+            # "unrecognized pipe target" warnings and silent data corruption
+            # when ~C (or _Definition) → data section transitions occur.
+            # H-01: Also save non-_Definition ~C section ranges under a
+            # sentinel key so consecutive non-_Definition ~C sections don't
+            # silently lose curve scoping.
+            _prev_def_name = self._current_definition_name
+            if self._current_section == "C":
+                start = self._section_curve_start_idx
+                end = (
+                    self._section_curve_end_idx
+                    if self._section_curve_end_idx is not None
+                    else len(self.las_file.curves)
+                )
+                if _prev_def_name is not None:
+                    self._definition_curve_ranges[_prev_def_name] = (start, end)
+                else:
+                    # H-01: Non-_Definition ~C section — save under sentinel.
+                    self._definition_curve_ranges["__MAIN__"] = (start, end)
+
             # Classify section_word for dispatch.
             # Standard sections (V, W, C, P, O, A) — also accept full
             # section-word names (VERSION, WELL, CURVE, PARAMETER, OTHER, ASCII).
@@ -493,6 +535,11 @@ class LASParser:
                 # Also matches: user-defined ~{Root}_Data sections (F-03)
                 # and indexed sections like ~Core[1], ~Inclinometry[2] (F-03).
                 new_section = "A"
+                # M-PA4: Track LAS 3.0 typed data sections for
+                # cross-validation against VERS.  Only non-standard
+                # (non-~A/~ASCII) data sections indicate LAS 3.0 intent.
+                if section_word not in ("A", "ASCII"):
+                    self._las30_sections_seen = True
                 # For standard 'A' or 'ASCII' sections and written-form *_DATA
                 # sections (e.g., ~DRILLING_DATA DRILLING), use only the rest
                 # as the section name (backward-compatible).
@@ -575,9 +622,7 @@ class LASParser:
                         # not a known _Definition).  Curve indices retain
                         # stale values from the previous section, which may
                         # route data to the wrong curves.
-                        source_info = (
-                            f" in {self.source_file}" if self.source_file else ""
-                        )
+                        source_info = f" in {self.source_file}" if self.source_file else ""
                         logger.warning(
                             "Unrecognized pipe target '| %s' for section '~%s'%s — "
                             "curve indices may be incorrect.",
@@ -595,6 +640,21 @@ class LASParser:
                         start, end = self._definition_curve_ranges[def_prefix]
                         self._section_curve_start_idx = start
                         self._section_curve_end_idx = end
+                    elif "__MAIN__" in self._definition_curve_ranges:
+                        # H-01: No matching _Definition found — fall back
+                        # to the main non-_Definition curve range.
+                        start, end = self._definition_curve_ranges["__MAIN__"]
+                        self._section_curve_start_idx = start
+                        self._section_curve_end_idx = end
+                elif "__MAIN__" in self._definition_curve_ranges:
+                    # H-01: LOG_DATA section with no pipe — fall back to
+                    # the main non-_Definition curve range to avoid
+                    # silently losing curve scoping when the previous
+                    # section was a typed data section with different
+                    # curve indices.
+                    start, end = self._definition_curve_ranges["__MAIN__"]
+                    self._section_curve_start_idx = start
+                    self._section_curve_end_idx = end
             else:
                 # Unknown section type — accumulate lines as free-form text (like ~O).
                 new_section = None
@@ -658,12 +718,38 @@ class LASParser:
                 # When entering ~C (including _Definition sections), mark the
                 # current curve list position for per-section curve scoping.
 
-                # G-02: Before overwriting _section_curve_start_idx for the new
-                # ~C section, save the previous _Definition's curve range so
-                # later data sections can look up the correct range even when
-                # consecutive _Definitions overwrite the active tracking.
-                if self._current_section == "C" and self._current_definition_name is not None:
-                    self._definition_curve_ranges[self._current_definition_name] = (
+                # G-02/H-03: Before overwriting _section_curve_start_idx for
+                # the new ~C section, save the previous _Definition's curve
+                # range so later data sections can look up the correct range.
+                # Uses _prev_def_name (captured BEFORE classification) to
+                # avoid using a freshly-overwritten _current_definition_name
+                # when consecutive _Definition sections are parsed.
+                if self._current_section == "C" and _prev_def_name is not None:
+                    # Guard: verify the definition name hasn't been changed
+                    # by a consecutive _Definition overwrite during
+                    # classification.
+                    if (
+                        self._current_definition_name is not None
+                        and self._current_definition_name != _prev_def_name
+                    ):
+                        logger.warning(
+                            "Definition name mismatch during curve range save: "
+                            "previous='%s', current='%s'. Using previous for "
+                            "range storage.",
+                            _prev_def_name,
+                            self._current_definition_name,
+                        )
+                    self._definition_curve_ranges[_prev_def_name] = (
+                        self._section_curve_start_idx,
+                        self._section_curve_end_idx
+                        if self._section_curve_end_idx is not None
+                        else len(self.las_file.curves),
+                    )
+                elif self._current_section == "C" and _prev_def_name is None:
+                    # H-01: Non-_Definition ~C section — save under sentinel
+                    # key so consecutive non-_Definition ~C sections don't
+                    # silently lose curve scoping.
+                    self._definition_curve_ranges["__MAIN__"] = (
                         self._section_curve_start_idx,
                         self._section_curve_end_idx
                         if self._section_curve_end_idx is not None
@@ -832,7 +918,18 @@ class LASParser:
                     actual_value = value
                     self.las_file.well.descriptions[mnemonic] = description
                 else:
-                    # Auto: single-word pre-colon text → lasio convention.
+                    # Auto: single-word pre-colon text — cannot distinguish
+                    # CWLS from lasio convention.  Default to lasio (swap)
+                    # interpretation for backward compatibility.
+                    logger.warning(
+                        "Cannot distinguish CWLS from lasio convention for "
+                        "well field '%s' with single-word pre-colon value "
+                        "'%s'. Defaulting to lasio (swapped) interpretation. "
+                        "If data appears wrong, set well_format='cwls' to "
+                        "force CWLS convention.",
+                        mnemonic,
+                        value,
+                    )
                     actual_value = description
                     self.las_file.well.descriptions[mnemonic] = value
         else:
@@ -967,6 +1064,12 @@ class LASParser:
             if "description" in match.groupdict() and match.group("description")
             else ""
         )
+
+        # M-PB2: Strip LAS 3.0 format specifiers from parameter
+        # descriptions, mirroring _parse_curve logic (lines 877-899).
+        # ParameterEntry has no data_format field, so format info is
+        # discarded (can be re-derived from the original file if needed).
+        description = FORMAT_SPEC_PATTERN.sub("", description).strip()
 
         # LAS 3.0: Check for zone association in description
         zone: ParameterZone | None = None

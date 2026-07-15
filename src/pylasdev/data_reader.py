@@ -16,12 +16,6 @@ import numpy as np
 from .exceptions import LASParseError
 from .models import LASFile, WellSection
 
-# F-ITER2-SEC-M06: Null byte and control character sanitization regex
-# for string data values (mirrors writer._CONTROL_CHARS_RE).
-# Null bytes (\x00) are stripped to prevent asymmetry with the writer
-# and to avoid corruption in string-format curves.
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85\u2028\u2029]")
-
 logger = logging.getLogger(__name__)
 
 # Maximum bounds for array allocations to prevent memory exhaustion
@@ -374,6 +368,7 @@ def _read_normal(
     current_line = 0
     warned_extra = False  # Track extra-column warning per file
     warned_short = False  # F-11: Track short-row warning per file
+    discarded_lines = 0  # Track silently-discarded lines from pre-scan undercount
 
     for line in lines:
         stripped = line.strip()
@@ -428,6 +423,7 @@ def _read_normal(
         # undercounts data lines (e.g., due to section-header detection
         # mismatch — G-05).  Mirroring _read_wrapped guards at lines ~490.
         if current_line >= data_line_count:
+            discarded_lines += 1
             continue
 
         for i in range(min(len(values), curve_count)):
@@ -439,6 +435,16 @@ def _read_normal(
                 curve_arrays[i][current_line] = null_value
 
         current_line += 1
+
+    # Warn when pre-scan undercounted data lines, causing data discard.
+    if discarded_lines > 0:
+        logger.warning(
+            "Pre-scan undercount: %d data line(s) discarded because the "
+            "actual data exceeds the %d lines declared by the pre-scan. "
+            "Las file data may be truncated.",
+            discarded_lines,
+            data_line_count,
+        )
 
     # F36: Trim arrays when ~A section ended early (fewer data lines than
     # declared). Pre-allocated np.zeros tail would otherwise expose 0.0
@@ -617,11 +623,7 @@ def _read_wrapped(
                     )
                     break
 
-                try:
-                    data_lists[counter].append(_to_finite_float(val_str, null_value))
-                except IndexError:
-                    if counter < curve_count:
-                        data_lists[counter].append(null_value)
+                data_lists[counter].append(_to_finite_float(val_str, null_value))
 
                 if counter == curve_count - 1:
                     # All curves for this depth step are complete.

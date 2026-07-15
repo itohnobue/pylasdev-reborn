@@ -331,9 +331,7 @@ class LASFile:
         single backwards-compatible code path.
         """
         if not isinstance(data, dict):
-            raise TypeError(
-                f"Expected dict, got {type(data).__name__}"
-            )
+            raise TypeError(f"Expected dict, got {type(data).__name__}")
 
         las_file = cls()
 
@@ -441,11 +439,21 @@ class LASFile:
                         array_info=sc_array_info,
                     )
                 )
+            ds_data_raw = ds_dict.get("data", {})
+            ds_data = {}
+            for k, v in ds_data_raw.items():
+                try:
+                    ds_data[k] = np.array(v, dtype=np.float64)
+                except (ValueError, TypeError) as e:
+                    ds_name = ds_dict.get("name", "<unknown>")
+                    raise ValueError(
+                        f"Cannot convert data for section '{ds_name}', curve '{k}': {e}"
+                    ) from e
             ds = DataSection(
                 name=ds_dict.get("name", ""),
                 section_type=ds_dict.get("section_type", "LOG_DATA"),
                 curves_order=list(ds_dict.get("curves_order", [])),
-                data={k: np.array(v, dtype=np.float64) for k, v in ds_dict.get("data", {}).items()},
+                data=ds_data,
                 string_data=ds_string_data,
                 section_curves=ds_section_curves,
             )

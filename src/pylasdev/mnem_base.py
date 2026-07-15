@@ -702,7 +702,7 @@ MNEM_BASE: dict[str, str] = {
     "KPOO": "KNG",
     "KPOP": "KNG",
     "KPOPLAST": "KNG",
-    "KPOR": "KNG",
+    "KPOR": "KP",
     "KPORN": "KP",
     "KPOS": "KNG",
     "KPOYMK": "KNG",

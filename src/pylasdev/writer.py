@@ -33,6 +33,11 @@ _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85\u2028\u2029
 # LAS section header and could split the file if injected verbatim.
 _LEADING_SECTION_RE = re.compile(r"^~([A-Za-z])")
 
+# LAS 1.2 spec mandates a maximum line length of 256 characters.
+# LAS 2.0+ has no line-length limit.  We warn when LAS 1.2 data rows
+# exceed this limit but do NOT truncate (truncation would cause data loss).
+MAX_LINE_LENGTH_LAS12: int = 256
+
 
 def _sanitize_las_value(value: str) -> str:
     """Sanitize a string for safe inclusion in LAS output.
@@ -116,7 +121,7 @@ def write_las_file(
 
     try:
         file_path.write_text(content, encoding=encoding)
-    except OSError as e:
+    except (OSError, UnicodeError) as e:
         raise LASWriteError(f"Cannot write to {file_path}: {e}") from e
 
 
@@ -138,7 +143,10 @@ def _write_version_section(las_file: LASFile) -> list[str]:
     is_las30 = las_file.is_las30
     lines.append("~VERSION INFORMATION")
     vers_desc = "CWLS LOG ASCII STANDARD -VERSION 3.0" if is_las30 else "CWLS LOG ASCII STANDARD"
-    lines.append(f" VERS.   {_sanitize_las_value(las_file.version.vers)}  : {vers_desc}")
+    # Guard against empty vers field (analogous to wrap guard below).
+    # An empty vers produces a malformed version line with an empty value.
+    vers = las_file.version.vers or "2.0"
+    lines.append(f" VERS.   {_sanitize_las_value(vers)}  : {vers_desc}")
     # F-05 / F-01: The writer cannot produce wrapped output (we always write
     # one line per depth step).  If the source has WRAP=YES, override it to
     # NO so the header declaration matches the actual data layout.  Emit a
@@ -182,6 +190,23 @@ def _write_well_section(las_file: LASFile) -> list[str]:
     lines: list[str] = []
     is_las12 = las_file.version.vers.startswith("1.")
     lines.append("~WELL INFORMATION")
+
+    # Validate mandatory well fields — emit warnings for missing fields
+    # so that programmatically-constructed LAS files don't silently produce
+    # semantically non-compliant output.  No exception raised; consistent
+    # with the parser's read-time validation pattern.
+    mandatory_fields = {"STRT", "STOP", "STEP", "NULL"}
+    present_fields = {k.upper() for k in las_file.well.entries}
+    for field in mandatory_fields:
+        if field not in present_fields:
+            import warnings
+
+            warnings.warn(
+                f"Missing mandatory well field: {field}. "
+                "The output file may be semantically non-compliant.",
+                stacklevel=4,
+            )
+
     for key, value in las_file.well.entries.items():
         unit = _sanitize_las_value(las_file.well.units.get(key, ""))
         unit_dot = f".{unit}" if unit else "."
@@ -366,6 +391,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
     null_value = _get_null_value(las_file.well)
     delimiter = las_file.version.delimiter_char
     is_las30 = las_file.is_las30
+    is_las12 = las_file.version.vers.startswith("1.")
 
     if las_file.data_sections:
         # LAS 3.0: Multiple data sections with typed headers.
@@ -410,6 +436,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
                     null_value,
                     delimiter,
                     precision,
+                    is_las12=is_las12,
                 )
             )
     else:
@@ -425,6 +452,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
                     null_value,
                     delimiter,
                     precision,
+                    is_las12=is_las12,
                 )
             )
     return lines
@@ -437,12 +465,17 @@ def _format_data_rows(
     null_value: float,
     delimiter: str,
     precision: str = ".8g",
+    is_las12: bool = False,
 ) -> list[str]:
     """Format data rows for a section — handles both legacy and LAS 3.0 sections.
 
     Builds one line per depth step with delimiter-separated values.
     String curves are emitted as-is; numeric curves use configurable formatting.
     Missing values are filled with the null_value. NaN values are output as null.
+
+    When *is_las12* is True, warns if any data row exceeds the LAS 1.2
+    256-character line limit.  Lines are NOT truncated — truncation would
+    cause data loss.
     """
     lines: list[str] = []
     if not curve_names:
@@ -470,6 +503,7 @@ def _format_data_rows(
     if num_rows == 0:
         return lines
 
+    warned_long = False  # Deduplicate long-line warnings per section
     for i in range(num_rows):
         row_values: list[str] = []
         for arr, is_string in curve_arrays:
@@ -483,7 +517,20 @@ def _format_data_rows(
                     row_values.append(_format_number(null_value, precision, null_value))
                 else:
                     row_values.append(_format_number(val, precision, null_value))
-        lines.append(delimiter.join(row_values))
+        line = delimiter.join(row_values)
+        if is_las12 and len(line) > MAX_LINE_LENGTH_LAS12:
+            if not warned_long:
+                import warnings
+
+                warnings.warn(
+                    f"Data line exceeds LAS 1.2 256-character limit "
+                    f"(length: {len(line)}).  Lines are NOT truncated "
+                    f"to avoid data loss.  Subsequent violations in this "
+                    f"section will not be reported.",
+                    stacklevel=4,
+                )
+                warned_long = True
+        lines.append(line)
     return lines
 
 

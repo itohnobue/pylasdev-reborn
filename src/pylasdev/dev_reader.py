@@ -349,6 +349,14 @@ def read_dev_file_as_object(
 
     format_type, skip_content_lines = _detect_dev_format(content_entries)
 
+    if format_type == "headerless":
+        logger.warning(
+            "Auto-detected headerless format for %s. "
+            "Numeric column names may have been consumed as data. "
+            "If the file has a header row, consider explicit format specification.",
+            file_path,
+        )
+
     # --- Auto-detect delimiter ---
     if delimiter is None:
         # Use the actual header line for delimiter detection:
@@ -406,6 +414,7 @@ def read_dev_file_as_object(
     content_seen = 0
     current_line = 0
     warned_extra = False  # Track extra-column warning per file
+    warned_short = False  # Track short-row warning per file
 
     for line in lines:
         stripped = line.strip()
@@ -453,6 +462,14 @@ def read_dev_file_as_object(
                     logger.warning(
                         "Data line has %d values but only %d columns declared "
                         "in the header. Extra columns are discarded.",
+                        len(values),
+                        len(names),
+                    )
+                if len(values) < len(names) and not warned_short:
+                    warned_short = True
+                    logger.warning(
+                        "Data line has %d values but %d columns declared "
+                        "in the header. Missing values are filled with NaN.",
                         len(values),
                         len(names),
                     )
@@ -507,6 +524,14 @@ def read_dev_file_as_object(
                         len(values),
                         len(names),
                     )
+                if len(values) < len(names) and not warned_short:
+                    warned_short = True
+                    logger.warning(
+                        "Data line has %d values but %d columns declared "
+                        "in the header. Missing values are filled with NaN.",
+                        len(values),
+                        len(names),
+                    )
                 for k in range(min(len(values), len(names))):
                     try:
                         dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
@@ -552,6 +577,14 @@ def read_dev_file_as_object(
                     logger.warning(
                         "Data line has %d values but only %d columns declared "
                         "in the header. Extra columns are discarded.",
+                        len(values),
+                        len(names),
+                    )
+                if len(values) < len(names) and not warned_short:
+                    warned_short = True
+                    logger.warning(
+                        "Data line has %d values but %d columns declared "
+                        "in the header. Missing values are filled with NaN.",
                         len(values),
                         len(names),
                     )
