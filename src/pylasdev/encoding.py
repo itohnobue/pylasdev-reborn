@@ -126,6 +126,10 @@ def _decode_best_quality(
     Raises:
         LASEncodingError: If no encoding in the list can decode the bytes.
     """
+    # F-88: Store only the sample in candidates to avoid memory
+    # amplification.  Storing full decoded content for up to 6
+    # candidate encodings consumes up to ~7x file size peak memory.
+    # After selecting the winning encoding, re-decode the full content.
     candidates: list[tuple[str, str, float]] = []
 
     # Try detected encoding first (may be utf-8 from failed detection)
@@ -135,7 +139,7 @@ def _decode_best_quality(
             content = content.lstrip("\ufeff")
             sample = content[:_MIN_VALIDATION_CHARS]
             ratio = sum(1 for c in sample if c.isalnum() or c == "_") / max(len(sample), 1)
-            candidates.append((detected, content, ratio))
+            candidates.append((detected, sample, ratio))
         except UnicodeDecodeError:
             pass
 
@@ -146,7 +150,7 @@ def _decode_best_quality(
             content = content.lstrip("\ufeff")
             sample = content[:_MIN_VALIDATION_CHARS]
             ratio = sum(1 for c in sample if c.isalnum() or c == "_") / max(len(sample), 1)
-            candidates.append((enc, content, ratio))
+            candidates.append((enc, sample, ratio))
         except UnicodeDecodeError:
             continue
 
@@ -156,15 +160,49 @@ def _decode_best_quality(
         )
 
     # Select the encoding with the highest word-character ratio.
-    # F-061: When ratios are equal, use a secondary preference for
-    # Western European encodings (cp1252, latin-1) over Cyrillic
-    # encodings (cp1251, cp866).  Without this, stable sort preserves
-    # FALLBACK_ENCODINGS insertion order, which puts cp1251 before
-    # cp1252 — causing mojibake for Western European files where both
-    # encodings produce the same word-char ratio.
+    # F-24: When ratios are equal, use a content-based tiebreaker to
+    # distinguish Cyrillic from Western European content.  Previous
+    # approach (F-24) checked candidates[0]'s decoded output for
+    # Cyrillic code points (U+0400-U+04FF) — but when chardet fails
+    # (the default with chardet 7.x), candidates[0] is always cp1251,
+    # which maps Western accented bytes to Cyrillic code points
+    # (e.g. 0xE9 = é → U+0439 = й), producing false positives for
+    # Western European files and causing mojibake.
+    #
+    # Robust approach: byte-frequency analysis on the raw bytes.
+    # The top-10 most common Russian letters (о, е, а, и, н, т, с,  # noqa: RUF003
+    # р, в, л) collectively account for ~35 % of Russian text.  In  # noqa: RUF003
+    # cp1251 these map to the byte set {0xE0, 0xE2, 0xE5, 0xE8,
+    # 0xEB, 0xED, 0xEE, 0xF0, 0xF1, 0xF2}.  In cp1252 Western
+    # European text those same bytes map to infrequent accented
+    # letters (à, â, å, è, ë, í, î, ð, ñ, ò) at only 2-5 %
+    # combined frequency.  A threshold of 10 % provides a wide
+    # safety margin — Russian files score 25-40 %, Western files
+    # score 2-5 %.
+    #
+    # For cp866-encoded Russian, the most common letters (а-п) map  # noqa: RUF003
+    # to 0xA0-0xAF, which overlaps less with our cp1251-targeted
+    # set.  However cp866 is the secondary Cyrillic encoding in
+    # the FALLBACK_ENCODINGS list and already wins the ratio
+    # comparison against its cp1251-decoded mojibake — the
+    # tiebreaker is only needed when ratios are equal, which
+    # primarily occurs between cp1251 and cp1252.
+    _CYRILLIC_ENCS = frozenset({"cp1251", "cp866"})
     _WESTERN = frozenset({"cp1252", "latin-1"})
-    candidates.sort(key=lambda x: (-x[2], 0 if x[0] in _WESTERN else 1))
-    best_enc, best_content, best_ratio = candidates[0]
+    _RUSSIAN_COMMON_BYTES = frozenset({
+        0xE0, 0xE2, 0xE5, 0xE8, 0xEB, 0xED, 0xEE, 0xF0, 0xF1, 0xF2,
+    })
+    _raw_sample = raw_bytes[:_MIN_VALIDATION_CHARS]
+    _russian_byte_count = sum(1 for b in _raw_sample if b in _RUSSIAN_COMMON_BYTES)
+    _russian_byte_freq = _russian_byte_count / max(len(_raw_sample), 1)
+    _is_cyrillic = _russian_byte_freq >= 0.10
+    _preferred = _CYRILLIC_ENCS if _is_cyrillic else _WESTERN
+    candidates.sort(key=lambda x: (-x[2], 0 if x[0] in _preferred else 1))
+    best_enc, _best_sample, best_ratio = candidates[0]
+
+    # F-88: After selecting the winning encoding, re-decode the full
+    # content from raw_bytes rather than returning the stored sample.
+    best_content = raw_bytes.decode(best_enc).lstrip("\ufeff")
 
     # UTF-8 preference: when UTF-8 decodes successfully and its word-char
     # ratio is close to the best candidate's (within 2%), prefer UTF-8.
@@ -180,7 +218,9 @@ def _decode_best_quality(
             if enc_candidate[0] == "utf-8":
                 utf8_ratio = enc_candidate[2]
                 if best_ratio - utf8_ratio < 0.02:
-                    best_enc, best_content, best_ratio = enc_candidate
+                    best_enc = enc_candidate[0]
+                    best_content = raw_bytes.decode(best_enc).lstrip("\ufeff")
+                    best_ratio = utf8_ratio
                 break
 
     if len(candidates) > 1 and best_enc != candidates[1][0]:
@@ -236,6 +276,12 @@ def read_with_encoding(
     # with no bound, potentially OOM on large or malformed files.
     if max_file_size is None:
         max_file_size = DEFAULT_MAX_FILE_SIZE
+    # F-95: Guard against negative or zero max_file_size which would
+    # silently bypass the resource exhaustion check below.
+    elif max_file_size <= 0:
+        raise ValueError(
+            f"max_file_size must be positive or None, got {max_file_size}"
+        )
 
     file_size = file_path.stat().st_size
     if file_size > max_file_size:
@@ -258,7 +304,11 @@ def read_with_encoding(
     if encoding is not None:
         try:
             content = raw_bytes.decode(encoding)
-        except UnicodeDecodeError as e:
+        except (UnicodeDecodeError, LookupError) as e:
+            # F-94: Invalid encoding names (e.g. "nonexistent-enc")
+            # raise LookupError from Python's codecs machinery, which
+            # previously bypassed the pylasdev exception hierarchy.
+            # Wrap in LASEncodingError for consistent error reporting.
             raise LASEncodingError(
                 f"Failed to decode {file_path} with encoding '{encoding}': {e}"
             ) from e

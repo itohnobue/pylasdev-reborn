@@ -546,7 +546,7 @@ class LASParser:
                     self._current_definition_name = None
             elif section_word in {"P", "PARAMETER", "PARAMETERS"} or section_word.endswith(
                 "_PARAMETER"
-            ):
+            ) or section_word.endswith("_PARAMETERS"):
                 # F-M-01: LAS 3.0 typed parameter sections (e.g.,
                 # ~Core_Parameter, ~Drilling_Parameter) route to the
                 # parameter parser like standard ~P/~Parameter sections.
@@ -826,6 +826,14 @@ class LASParser:
         if COMMENT_PATTERN.match(line) or EMPTY_PATTERN.match(line):
             return
 
+        # F-83: Lines starting with ~ that bypassed SECTION_PATTERN
+        # (e.g., ~., ~#, ~/ — tilde followed by non-letter) are not
+        # valid data lines.  Route them to _other_lines so they don't
+        # produce corrupt rows in data sections.
+        if line.strip().startswith("~"):
+            self._append_other_line(line)
+            return
+
         if self._current_section:
             handler_name = self.SECTION_HANDLERS.get(self._current_section)
             if handler_name:
@@ -858,7 +866,6 @@ class LASParser:
 
     def _parse_version(self, line: str) -> None:
         """Parse ~V (version) section line."""
-        self._version_found = True
         match = self._match_data_line(line)
         if not match:
             logger.warning(
@@ -867,6 +874,12 @@ class LASParser:
                 line.strip()[:120],
             )
             return
+
+        # F-10: Set _version_found only after a valid data line match,
+        # not unconditionally before validation.  Setting it before the
+        # match caused spurious "missing mandatory well field" warnings
+        # for non-matching lines in the ~V section.
+        self._version_found = True
 
         mnemonic = match.group("mnemonic").upper().strip()
         value = match.group("value").strip()
@@ -896,6 +909,17 @@ class LASParser:
         Extracted from _parse_well to support deferred well processing when
         ~W appears before ~V (the version check is deferred until ~V is parsed).
         """
+        # F-37-upgrade: Guard against unbounded well entry accumulation.
+        # models.py:from_dict() has 3 MAX_WELL_ENTRIES checks (in
+        # _validate_single_section, _validate_top_level, and per-section
+        # string_data); the parser path had zero protection.
+        if len(self.las_file.well.entries) >= MAX_PARAMETERS:
+            raise LASParseError(
+                f"Well entry count ({len(self.las_file.well.entries) + 1}) exceeds "
+                f"maximum allowed ({MAX_PARAMETERS}). "
+                f"The file may be malformed or corrupt."
+            )
+
         if is_las12 and description:
             # F-004/F-005 structural fix: hoist _well_format above the
             # numeric/non-numeric split.  Previously the cwls/lasio

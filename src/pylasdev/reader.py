@@ -128,7 +128,7 @@ def read_las_file_as_object(
         detected_encoding, content = read_with_encoding(file_path, encoding, max_file_size)
     except OSError as e:
         raise LASReadError(f"Cannot read file: {file_path}") from e
-    except ValueError as e:
+    except (ValueError, LookupError) as e:
         raise LASReadError(f"Cannot read file: {file_path}") from e
 
     parser = LASParser(mnem_base, well_format=well_format)

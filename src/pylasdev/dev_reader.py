@@ -238,17 +238,57 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
         second_tokens = content_entries[1][1].split()
         if len(second_tokens) == 1:
             try:
-                int(second_tokens[0])
+                col_count = int(second_tokens[0])
             except ValueError:
                 pass
             else:
                 third_tokens = content_entries[2][1].split()
+                # Primary check — any non-float token in the third line
+                # means it's a header (text column names).
                 if third_tokens and any(not _is_float_token(t) for t in third_tokens):
+                    return ("dug", 3)
+                # F-21: Port Pattern A's count-match and count-mismatch
+                # fallback heuristics to Pattern B.  When all third-line
+                # tokens parse as floats (all-numeric column names), the
+                # integer count from line 2 matching the token count on
+                # line 3 is a strong signal of DUG format.  Requires 4+
+                # content entries (1+ data lines) to avoid 3-line false
+                # positives.
+                if len(content_entries) >= 4 and col_count == len(third_tokens):
+                    return ("dug", 3)
+                # Count-mismatch fallback — when the third line is all-float
+                # but the count doesn't match, it's still DUG format as long
+                # as there are 4+ content entries (data lines beyond the
+                # header) AND the third line has more than 1 token.
+                if len(third_tokens) > 1 and len(content_entries) >= 4 and all(
+                    _is_float_token(t) for t in third_tokens
+                ):
                     return ("dug", 3)
 
     # Headerless format: every token on the first content line parses as
     # a float (no column names present).  No content lines to skip.
+    # F-92: When ALL tokens on the first content line parse as floats,
+    # check if they also parse as integers (indicating integer column
+    # names like "100 200 300" rather than decimal data).  When the
+    # second content line has matching column count AND the first line
+    # has 2+ integer-like tokens, treat as simple format with numeric
+    # column names.  Single-column and decimal-token cases remain
+    # headerless (too ambiguous for heuristic disambiguation).
     if first_tokens and all(_is_float_token(t) for t in first_tokens):
+        # Only apply heuristic for multi-column files with integer-like
+        # column names.  Decimal tokens (0.00, -20.06, 1.0e2) remain
+        # headerless — they look like data, not column names.
+        if len(first_tokens) >= 2:
+            first_ints = [
+                t for t in first_tokens
+                if t.replace("D", "E").replace("d", "e").count(".") == 0
+                and "e" not in t.lower().replace("d", "e")
+            ]
+            if len(first_ints) == len(first_tokens):
+                if len(content_entries) >= 2:
+                    second_tokens = content_entries[1][1].split()
+                    if len(second_tokens) == len(first_tokens):
+                        return ("simple", 1)
         return ("headerless", 0)
 
     return ("simple", 1)
@@ -355,7 +395,7 @@ def read_dev_file_as_object(
         detected_encoding, content = read_with_encoding(file_path, encoding, max_file_size)
     except OSError as e:
         raise DEVReadError(f"Cannot read file: {file_path}") from e
-    except ValueError as e:
+    except (ValueError, LookupError) as e:
         raise DEVReadError(f"Cannot read file: {file_path}") from e
 
     # Sanitize control characters that Python's splitlines() treats as line
@@ -381,8 +421,11 @@ def read_dev_file_as_object(
     if format_type == "headerless":
         logger.warning(
             "Auto-detected headerless format for %s. "
-            "Numeric column names may have been consumed as data. "
-            "If the file has a header row, consider explicit format specification.",
+            "The first data line has all-numeric tokens.  "
+            "A matching column count on the second line would cause "
+            "the file to be treated as simple format (numeric column "
+            "names as headers).  If the file has a header row, "
+            "consider explicit format specification.",
             file_path,
         )
 

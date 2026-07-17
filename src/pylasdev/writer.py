@@ -28,10 +28,12 @@ from .models import CurveDefinition, LASFile
 # splitlines() but are not caught by \n/\r replacement.
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85\u2028\u2029]")
 
-# Pattern to detect section-header-like leading content after sanitization.
-# A value starting with ~ followed by an alphabetic character mimics a
-# LAS section header and could split the file if injected verbatim.
-_LEADING_SECTION_RE = re.compile(r"^~([A-Za-z])")
+# F-86: Previous pattern ^~([A-Za-z]) only matched a leading tilde.
+# Values like "\t~Version" or "  ~Curve" bypassed section-header
+# sanitization because leading whitespace prevented the regex match.
+# Extended to ^\s*~([A-Za-z]) — the \s* consumes leading whitespace
+# and the replacement \1 strips both the whitespace and tilde.
+_LEADING_SECTION_RE = re.compile(r"^\s*~([A-Za-z])")
 
 # LAS 1.2 spec mandates a maximum line length of 256 characters.
 # LAS 2.0+ has no line-length limit.  We warn when LAS 1.2 data rows
@@ -68,6 +70,12 @@ def _sanitize_las_value(value: str) -> str:
     # If the value now starts with ~ followed by a letter, remove the leading ~
     # to prevent it from being interpreted as a section header
     value = _LEADING_SECTION_RE.sub(r"\1", value, count=1)
+    # F-87: The parser skips #-prefixed lines as comments in data sections.
+    # A value starting with # would be silently dropped on re-read, creating
+    # data loss.  Prefix with _ to preserve it while preventing comment
+    # injection — the parser treats _# as a normal value character.
+    if value.startswith("#"):
+        value = "_" + value
     return value
 
 
@@ -121,7 +129,7 @@ def write_las_file(
 
     try:
         file_path.write_text(content, encoding=encoding)
-    except (OSError, UnicodeError) as e:
+    except (OSError, UnicodeError, LookupError) as e:
         raise LASWriteError(f"Cannot write to {file_path}: {e}") from e
 
 
@@ -412,6 +420,21 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
     is_las30 = las_file.is_las30
     is_las12 = las_file.version.vers.startswith("1.")
 
+    # F-04: LAS 1.2 only supports SPACE delimiter per spec.  The header
+    # correctly suppresses non-SPACE DLM emission for LAS 1.2 (see
+    # _write_version_section L172-176) but data rows used the non-SPACE
+    # delimiter from delimiter_char, creating a header/data mismatch
+    # that would corrupt roundtrip re-reads.  Force SPACE and warn.
+    if is_las12 and delimiter != " ":
+        import warnings
+
+        warnings.warn(
+            f"LAS 1.2 does not support the '{las_file.version.dlm}' delimiter. "
+            "Forcing SPACE delimiter for data rows to match the header section.",
+            stacklevel=3,
+        )
+        delimiter = " "
+
     if las_file.data_sections:
         # LAS 3.0: Multiple data sections with typed headers.
         emitted_defs: set[str] = set()
@@ -419,12 +442,12 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
             section_prefix = _section_type_to_prefix(section.section_type)
             section_name = f" {_sanitize_las_value(section.name)}" if section.name else ""
 
-            # For non-LOG_DATA sections: emit per-section Definition section
-            # so that the parser can correctly re-associate per-section curve
-            # names on re-read.  Without this, all data sections get the
-            # global curve set on roundtrip.  Only emit once per section type
-            # (e.g., one Core_Definition for both Core[1] and Core[2]).
-            if is_las30 and section.section_type != "LOG_DATA" and section.section_curves:
+            # F-16: Compute definition prefix for non-LOG_DATA LAS 3.0
+            # sections.  Used for both the _Definition section header and
+            # the pipe notation on the data section header so the parser
+            # can re-associate per-section curves on re-read.
+            def_prefix: str | None = None
+            if is_las30 and section.section_type != "LOG_DATA":
                 def_prefix = _SECTION_TYPE_TO_DEFINITION_PREFIX.get(section.section_type)
                 # F-D3-M01: Auto-derive Definition prefix for user-defined _DATA
                 # section types not in the hardcoded mapping.  Strip _DATA suffix
@@ -433,6 +456,13 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
                     root = section.section_type[: -len("_DATA")]
                     root = _sanitize_las_value(root)
                     def_prefix = root.title().replace("_", "")
+
+            # For non-LOG_DATA sections: emit per-section Definition section
+            # so that the parser can correctly re-associate per-section curve
+            # names on re-read.  Without this, all data sections get the
+            # global curve set on roundtrip.  Only emit once per section type
+            # (e.g., one Core_Definition for both Core[1] and Core[2]).
+            if is_las30 and section.section_type != "LOG_DATA" and section.section_curves:
                 if def_prefix and def_prefix not in emitted_defs:
                     emitted_defs.add(def_prefix)
                     lines.append(f"~{def_prefix}_Definition")
@@ -440,11 +470,17 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
                         lines.append(_format_curve_line(curve, is_las30))
                     lines.append("")  # blank line after definition
 
-            # LOG_DATA sections associate to the main curve block via
-            # "| CURVE" pipe notation so the parser scopes curves
-            # to only the global ~CURVE set on re-read.
+            # Data section header with pipe notation for curve association.
+            # LOG_DATA sections reference "| CURVE" so the parser scopes
+            # curves to only the global ~CURVE set on re-read.  Non-LOG_DATA
+            # sections reference "| {Name}_Definition" for per-section curve
+            # reassociation (F-16).
             if section.section_type == "LOG_DATA" and is_las30:
                 lines.append(f"~{section_prefix}{section_name} | CURVE")
+            elif is_las30 and section.section_type != "LOG_DATA" and def_prefix:
+                lines.append(
+                    f"~{section_prefix}{section_name} | {def_prefix}_Definition"
+                )
             else:
                 lines.append(f"~{section_prefix}{section_name}")
             lines.extend(

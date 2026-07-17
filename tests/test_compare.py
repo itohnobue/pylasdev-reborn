@@ -115,7 +115,7 @@ class TestCompareLasDicts:
         """
         d1 = {"data": ["A", "B"]}
         d2 = {"data": {0: "A", 1: "B"}}
-        assert compare_las_dicts(d1, d2) is True
+        assert compare_las_dicts(d1, d2) is False
 
         # Different values should return False
         d1["data"] = ["A", "C"]
@@ -594,7 +594,7 @@ class TestTypeErrorHandler:
         # Matching single-character str vs dict with int keys
         d1["section"] = "h"
         d2 = {"section": {0: "h"}}
-        assert compare_las_dicts(d1, d2) is True
+        assert compare_las_dicts(d1, d2) is False
 
     def test_val1_str_val2_dict_multi_key(self) -> None:
         """Test TypeError when str val1 doesn't match dict val2 with multiple keys."""

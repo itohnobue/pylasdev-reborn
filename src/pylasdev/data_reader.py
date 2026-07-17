@@ -8,6 +8,7 @@ and O(n) performance (vs O(n^2) numpy.append bug in original).
 from __future__ import annotations
 
 import logging
+import math
 import re
 import warnings
 
@@ -539,7 +540,11 @@ def _read_wrapped(
     # of counting single-value lines overcounts depth steps when curve
     # values legitimately appear one per line, causing false rejection.
     if curve_count > 0:
-        depth_steps = max(1, _count // curve_count)
+        # F-54-upgrade: Use math.ceil instead of integer division to avoid
+        # undercounting depth steps in wrapped mode.  Integer division
+        # _count // curve_count can undercount by up to curve_count-1
+        # steps, allowing malicious files to bypass the resource guard.
+        depth_steps = max(1, math.ceil(_count / curve_count))
         if curve_count * depth_steps > MAX_TOTAL_ELEMENTS:
             raise LASParseError(
                 f"Total allocation ({curve_count} curves x ~{depth_steps} depth steps ≈ "
@@ -556,6 +561,7 @@ def _read_wrapped(
     depth_line = True  # First data line is always a depth line
     counter = 0  # Tracks position within non-depth curves
     depth_had_extra = False  # F-06: track pathologically-malformed depth lines
+    total_elements = 0  # F-54-upgrade: dynamic element counter for wrapped mode
 
     for line in lines:
         stripped = line.strip()
@@ -600,6 +606,13 @@ def _read_wrapped(
                 data_lists[0].append(_to_finite_float(values[0], null_value))
             except IndexError:
                 data_lists[0].append(null_value)
+            total_elements += 1
+            if total_elements > MAX_TOTAL_ELEMENTS:
+                raise LASParseError(
+                    f"Total elements ({total_elements}) exceeds maximum allowed "
+                    f"({MAX_TOTAL_ELEMENTS}) in wrapped mode. "
+                    f"The file may be malformed or corrupt."
+                )
             depth_line = False
             counter = 0
         else:
@@ -654,6 +667,13 @@ def _read_wrapped(
                     break
 
                 data_lists[counter].append(_to_finite_float(val_str, null_value))
+                total_elements += 1
+                if total_elements > MAX_TOTAL_ELEMENTS:
+                    raise LASParseError(
+                        f"Total elements ({total_elements}) exceeds maximum allowed "
+                        f"({MAX_TOTAL_ELEMENTS}) in wrapped mode. "
+                        f"The file may be malformed or corrupt."
+                    )
 
                 if counter == curve_count - 1:
                     # All curves for this depth step are complete.

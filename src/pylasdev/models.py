@@ -5,6 +5,7 @@ Supports LAS 1.2, 2.0, and 3.0 formats.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -64,6 +65,32 @@ def _validate_iterable_of_dicts(
                 f"{context_name}[{i}] must be a dict, got {type(item).__name__}"
             )
     return items
+
+
+def _resolve_dict_entry(
+    data: dict[str, Any],
+    key: str,
+    expected_type: type[Any] | tuple[type[Any], ...],
+    default_factory: Callable[[], Any],
+) -> Any:
+    """Extract *key* from *data* with type validation.
+
+    Returns *default_factory()* when *key* is missing or its value is ``None``.
+    Raises ``TypeError`` when the value is present but not an instance of
+    *expected_type*.  Replaces the ``data.get(key) or default`` pattern used
+    previously, which confused falsy values with missing keys.
+
+    This helper eliminates the truthiness-based dispatch class of bugs that
+    prior fix rounds repeatedly attempted (and failed) to eliminate.
+    """
+    value = data.get(key)
+    if value is None:
+        return default_factory()
+    if not isinstance(value, expected_type):
+        raise TypeError(
+            f"{key}: expected {expected_type}, got {type(value).__name__}"
+        )
+    return value
 
 
 @dataclass
@@ -366,14 +393,14 @@ class LASFile:
 
         las_file = cls()
 
-        version = data.get("version") or {}
+        version = _resolve_dict_entry(data, "version", dict, dict)
         las_file.version = VersionSection(
             vers=_safe_str(version.get("VERS"), "2.0"),
             wrap=_safe_str(version.get("WRAP"), "NO"),
             dlm=_safe_str(version.get("DLM"), "SPACE"),
         )
 
-        well = data.get("well") or {}
+        well = _resolve_dict_entry(data, "well", dict, dict)
         # F-057: Bound check — parser has MAX_DEFERRED_WELL_ENTRIES on its
         # well re-processing path; from_dict previously had no bound at all.
         if len(well) > MAX_WELL_ENTRIES:
@@ -384,7 +411,7 @@ class LASFile:
         for key, value in well.items():
             las_file.well[key] = _safe_str(value)
         # Restore well units if present (from v1.7+ roundtrip data)
-        well_units = data.get("well_units") or {}
+        well_units = _resolve_dict_entry(data, "well_units", dict, dict)
         if len(well_units) > MAX_WELL_ENTRIES:
             raise ValueError(
                 f"Number of well unit entries ({len(well_units)}) exceeds "
@@ -394,7 +421,7 @@ class LASFile:
             las_file.well.units[key] = _safe_str(unit)
 
         # Restore well descriptions if present (from v1.8+ roundtrip data)
-        well_descriptions = data.get("well_descriptions") or {}
+        well_descriptions = _resolve_dict_entry(data, "well_descriptions", dict, dict)
         if len(well_descriptions) > MAX_WELL_ENTRIES:
             raise ValueError(
                 f"Number of well description entries ({len(well_descriptions)}) "
@@ -425,32 +452,42 @@ class LASFile:
                 f"Number of curves ({len(curves_data)}) exceeds maximum "
                 f"allowed ({MAX_CURVES})"
             )
-        if curves_data and isinstance(curves_data, list):
-            # F-012: Validate every element is a dict, not just curves_data[0].
-            # Non-dict elements crash at curve_dict.get() downstream.
-            _validate_iterable_of_dicts(curves_data, "curves")
-            for curve_dict in curves_data:
-                array_info = None
-                if "array_info" in curve_dict and isinstance(curve_dict["array_info"], dict):
-                    ai = curve_dict["array_info"]
-                    array_info = ArrayElementInfo(
-                        base_name=ai.get("base_name", ""),
-                        index=ai.get("index", 0),
-                        time_offset=ai.get("time_offset"),
+        if isinstance(curves_data, list):
+            if curves_data:
+                # F-012: Validate every element is a dict, not just curves_data[0].
+                # Non-dict elements crash at curve_dict.get() downstream.
+                _validate_iterable_of_dicts(curves_data, "curves")
+                for curve_dict in curves_data:
+                    array_info = None
+                    if "array_info" in curve_dict and isinstance(curve_dict["array_info"], dict):
+                        ai = curve_dict["array_info"]
+                        array_info = ArrayElementInfo(
+                            base_name=ai.get("base_name", ""),
+                            index=ai.get("index", 0),
+                            time_offset=ai.get("time_offset"),
+                        )
+                    las_file.curves.append(
+                        CurveDefinition(
+                            mnemonic=_safe_str(curve_dict.get("mnemonic", "")),
+                            unit=_safe_str(curve_dict.get("unit", "")),
+                            api_code=_safe_str(curve_dict.get("api_code", "")),
+                            description=_safe_str(curve_dict.get("description", "")),
+                            original_mnemonic=_safe_str(curve_dict.get("original_mnemonic", "")),
+                            data_format=_safe_str(curve_dict.get("data_format", "")),
+                            array_info=array_info,
+                        )
                     )
-                las_file.curves.append(
-                    CurveDefinition(
-                        mnemonic=_safe_str(curve_dict.get("mnemonic", "")),
-                        unit=_safe_str(curve_dict.get("unit", "")),
-                        api_code=_safe_str(curve_dict.get("api_code", "")),
-                        description=_safe_str(curve_dict.get("description", "")),
-                        original_mnemonic=_safe_str(curve_dict.get("original_mnemonic", "")),
-                        data_format=_safe_str(curve_dict.get("data_format", "")),
-                        array_info=array_info,
-                    )
-                )
-        else:
-            # Legacy format: only curve names available
+        elif curves_data:
+            # F-02: Truthy non-list value (e.g. dict, string) — reject
+            # explicitly instead of silently falling to the legacy branch
+            # and losing curve metadata.
+            raise TypeError(
+                f"curves must be a list, got {type(curves_data).__name__}"
+            )
+
+        # Legacy format: only curve names available
+        # (reached when curves_data is empty list or falsy)
+        if not las_file.curves:
             # F-06: Resource-exhaustion guard for legacy curves_order path.
             if len(curves_order) > MAX_CURVES:
                 raise ValueError(
@@ -479,7 +516,7 @@ class LASFile:
                     f"curves[{_i}].mnemonic = {_curve.mnemonic!r}"
                 )
 
-        params = data.get("parameters") or []
+        params = _resolve_dict_entry(data, "parameters", (dict, list), list)
         # F-06: Resource-exhaustion guard for parameters.
         _param_count = len(params)
         if _param_count > MAX_PARAMETERS:
@@ -517,6 +554,10 @@ class LASFile:
             _validate_iterable_of_dicts(params, "parameters")
             for param_dict in params:
                 las_file.parameters.append(_create_parameter_entry(param_dict))
+        else:
+            raise TypeError(
+                f"parameters must be a dict or list, got {type(params).__name__}"
+            )
 
         # F-06: Resource-exhaustion guard for other section content.
         _other_raw = str(data.get("other", ""))
@@ -573,6 +614,23 @@ class LASFile:
                         f"String data array length ({len(ds_string_data[name])}) "
                         f"for '{name}' in section '{ds_name}' exceeds maximum "
                         f"allowed ({MAX_DATA_LINES})"
+                    )
+            # F-91: Per-section string_data total element count guard.
+            # ds_data has this check (below) and top-level las_file.logs
+            # has it; string_data was the sole unguarded path.  Many
+            # short per-array entries can pass the entry-count and
+            # per-array length guards without triggering them — only a
+            # product check catches this class of allocation DoS.
+            if ds_string_data:
+                _sds_rows = max(len(arr) for arr in ds_string_data.values())
+                _sds_total = len(ds_string_data) * _sds_rows
+                if _sds_total > MAX_TOTAL_ELEMENTS:
+                    ds_name = ds_dict.get("name", "<unknown>")
+                    raise ValueError(
+                        f"Total string data allocation in section '{ds_name}' "
+                        f"({len(ds_string_data)} curves x {_sds_rows} rows = "
+                        f"{_sds_total} elements) exceeds maximum allowed "
+                        f"({MAX_TOTAL_ELEMENTS})"
                     )
             ds_section_curves = []
             _sc_raw = ds_dict.get("section_curves", [])
@@ -735,6 +793,20 @@ class LASFile:
                     f"Array length ({len(las_file.string_data[name])}) for "
                     f"string curve '{name}' exceeds maximum allowed "
                     f"({MAX_DATA_LINES})"
+                )
+        # F-13: Top-level string_data total element count guard.
+        # logs has this check (below); string_data was the sole unguarded
+        # top-level path.  As with F-91 (per-section), many short arrays
+        # can pass per-array and entry-count guards without a product check.
+        if las_file.string_data:
+            _str_rows = max(len(arr) for arr in las_file.string_data.values())
+            _str_total = len(las_file.string_data) * _str_rows
+            if _str_total > MAX_TOTAL_ELEMENTS:
+                raise ValueError(
+                    f"Total string data allocation "
+                    f"({len(las_file.string_data)} curves x {_str_rows} rows = "
+                    f"{_str_total} elements) exceeds maximum allowed "
+                    f"({MAX_TOTAL_ELEMENTS})"
                 )
 
         logs = data.get("logs", {})

@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 def _scalars_equal(a: Any, b: Any) -> bool:
     """Compare two scalars, treating NaN == NaN as equal."""
-    if isinstance(a, float) and isinstance(b, float):
+    if isinstance(a, (float, np.floating)) and isinstance(b, (float, np.floating)):
         if math.isnan(a) and math.isnan(b):
             return True
     return bool(a == b)
@@ -72,6 +72,18 @@ def compare_las_dicts(
                     if only_in_second:
                         logger.warning("Keys '%s'.%s only in second dict", key, only_in_second)
                     return False
+
+            # F-27: When val2 is a dict but val1 is not, detect the type
+            # mismatch before the inner loop begins.  Without this guard,
+            # an empty dict val2 produces zero inner-loop iterations and
+            # the mismatch is silently missed.
+            if not isinstance(val1, dict):
+                logger.warning(
+                    "Type mismatch at '%s': %s vs dict",
+                    key,
+                    type(val1).__name__,
+                )
+                return False
 
             for in_key in val2:
                 if isinstance(val1, dict) and in_key not in val1:
@@ -331,15 +343,54 @@ def _compare_data_sections(
                         )
                         return False
             elif isinstance(v2, list):
-                if v1 != v2:
-                    logger.warning(
-                        "List mismatch at 'data_sections[%d].%s': %r vs %r",
-                        i,
-                        k,
-                        v1,
-                        v2,
-                    )
-                    return False
+                # F-28: List comparison may contain numpy arrays that raise
+                # ValueError on v1 != v2 ("truth value of an array is ambiguous").
+                # Use try/except with element-by-element ndarray fallback, matching
+                # the pattern in compare_las_dicts() at the parent list handler.
+                try:
+                    if v1 != v2:
+                        logger.warning(
+                            "List mismatch at 'data_sections[%d].%s': %r vs %r",
+                            i,
+                            k,
+                            v1,
+                            v2,
+                        )
+                        return False
+                except (ValueError, TypeError):
+                    if not isinstance(v1, list):
+                        logger.warning(
+                            "Type mismatch at 'data_sections[%d].%s': %s vs list",
+                            i,
+                            k,
+                            type(v1).__name__,
+                        )
+                        return False
+                    if len(v1) != len(v2):
+                        logger.warning(
+                            "List length mismatch at 'data_sections[%d].%s': %d vs %d",
+                            i,
+                            k,
+                            len(v1),
+                            len(v2),
+                        )
+                        return False
+                    for idx, (a, b) in enumerate(zip(v1, v2, strict=False)):
+                        if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+                            if not _compare_arrays(
+                                a, b, f"data_sections[{i}].{k}[{idx}]", None, rtol, atol
+                            ):
+                                return False
+                        elif a != b:
+                            logger.warning(
+                                "List[%d] mismatch at 'data_sections[%d].%s': %r vs %r",
+                                idx,
+                                i,
+                                k,
+                                a,
+                                b,
+                            )
+                            return False
             else:
                 if v1 != v2:
                     logger.warning(
