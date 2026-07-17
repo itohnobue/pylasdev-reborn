@@ -251,7 +251,19 @@ def _write_well_section(las_file: LASFile) -> list[str]:
             if key.upper() in {"STRT", "STOP", "STEP", "NULL"}:
                 lines.append(f" {_sanitize_las_value(key)}{unit_dot}   {val}  :{desc_str}")
             else:
-                lines.append(f" {_sanitize_las_value(key)}{unit_dot}    : {val}{desc_str}")
+                # F-03: Non-mandatory LAS 1.2 well fields use CWLS convention:
+                # DESCRIPTION before colon, VALUE after colon.
+                # The parser's _store_well_entry (parser.py:934-942) expects
+                #   MNEM.UNIT  DESC : VALUE
+                # for non-mandatory fields across all well_format modes
+                # (cwls, lasio, auto).  Placing value before colon with
+                # description appended after (the previous behaviour) causes
+                # roundtrip data corruption — description is lost and value
+                # accumulates description text on re-read.
+                if desc:
+                    lines.append(f" {_sanitize_las_value(key)}{unit_dot}   {desc}  : {val}")
+                else:
+                    lines.append(f" {_sanitize_las_value(key)}{unit_dot}    : {val}")
         else:
             # LAS 2.0+: MNEM.UNIT VALUE  :
             lines.append(f" {_sanitize_las_value(key)}{unit_dot}   {val}  :{desc_str}")
@@ -613,6 +625,14 @@ def _format_data_rows(
                         warned_delim_str = True
                     replacement = ";" if delimiter == "," else " "
                     val = val.replace(delimiter, replacement)
+                # F-21: Empty string after sanitization causes column misalignment
+                # with SPACE delimiter.  " ".join(["a", "", "b"]) produces "a  b"
+                # (two consecutive spaces).  On re-read, str.split() collapses to
+                # ["a", "b"] — one column permanently lost.  Replace with "-"
+                # (traditional LAS placeholder for missing data).  COMMA/TAB
+                # delimiters are unaffected — empty fields survive split(",").
+                if not val and delimiter == " ":
+                    val = "-"
                 row_values.append(val)
             else:
                 val = arr[i]
@@ -650,8 +670,14 @@ def _format_number(value: float, precision: str = ".8g", null_value: float | Non
     """
     if np.isnan(value) or np.isinf(value):
         if null_value is not None:
-            return format(null_value, precision)
+            return _format_null_sentinel(null_value, precision)
         return format(float(value), precision)
+    # F-22: Null sentinel formatted with user-specified g-format precision
+    # loses identity (e.g., format(-999.25, ".4g") → "-999.2").  On re-read,
+    # -999.2 ≠ -999.25 → treated as real data instead of null.
+    # Use repr() which produces the shortest identity-preserving string.
+    if null_value is not None and value == null_value:
+        return _format_null_sentinel(null_value, precision)
     if value == int(value):
         result = format(int(value), precision)
     else:
@@ -661,6 +687,25 @@ def _format_number(value: float, precision: str = ".8g", null_value: float | Non
     # fixed-point precision that preserves significant digits.
     if "e" in result.lower():
         result = _format_fixed_precision(value, precision)
+    return result
+
+
+def _format_null_sentinel(null_value: float, user_precision: str) -> str:
+    """Format a null-value sentinel preserving its exact float identity.
+
+    User-specified g-format precision (e.g., ``".4g"``) can truncate the
+    last significant digits of the null sentinel (e.g., -999.25 → "-999.2").
+    On re-read, the truncated value no longer matches the NULL declaration
+    in the well section and is treated as real data.
+
+    Uses ``repr()`` for an exact decimal representation.  Falls back to
+    ``_format_fixed_precision()`` when ``repr()`` produces exponent
+    notation (extremely large or small null sentinel values, unlikely
+    in practice).
+    """
+    result = repr(null_value)
+    if "e" in result.lower():
+        result = _format_fixed_precision(null_value, user_precision)
     return result
 
 

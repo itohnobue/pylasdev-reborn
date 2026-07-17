@@ -325,7 +325,6 @@ class LASParser:
         # F-34: Track section headers encountered (in order) for cross-section
         # consistency validation: duplicate detection and LAS 3.0 ordering check.
         self._section_sequence: list[str] = []
-        self._section_names_seen: set[str] = set()
 
     @property
     def data_line_count(self) -> int:
@@ -902,7 +901,7 @@ class LASParser:
                 self.las_file.version.dlm = "SPACE"
 
     def _store_well_entry(
-        self, mnemonic: str, unit: str, value: str, description: str, is_las12: bool
+        self, mnemonic: str, unit: str, value: str, description: str | None, is_las12: bool
     ) -> None:
         """Store a well entry with version-appropriate value/description handling.
 
@@ -920,7 +919,12 @@ class LASParser:
                 f"The file may be malformed or corrupt."
             )
 
-        if is_las12 and description:
+        # F-07: Use `description is not None` instead of truthiness check.
+        # A colon-bearing line with empty post-colon text produces
+        # description="" (falsy but not None), which must still trigger
+        # the LAS 1.2 CWLS/lasio swap.  VALUE_ONLY_PATTERN (no colon)
+        # produces description=None, correctly skipping the swap.
+        if is_las12 and description is not None:
             # F-004/F-005 structural fix: hoist _well_format above the
             # numeric/non-numeric split.  Previously the cwls/lasio
             # branches were duplicated identically in both blocks (lines
@@ -1070,11 +1074,16 @@ class LASParser:
         mnemonic = match.group("mnemonic").upper().strip()
         unit = match.group("unit") or ""
         value = match.group("value").strip()
-        description = (
-            match.group("description").strip()
-            if "description" in match.groupdict() and match.group("description")
-            else ""
-        )
+        # F-07: Distinguish "no colon in line" (VALUE_ONLY_PATTERN) from
+        # "colon present but post-colon text is empty" (DATA_LINE_PATTERN
+        # with empty description group).  Both previously produced `""`,
+        # making the `if is_las12 and description:` gate at line 923
+        # skip LAS 1.2 swap logic for colon-bearing empty-description
+        # lines, incorrectly storing pre-colon text as the value.
+        if "description" in match.groupdict():
+            description = match.group("description").strip() or ""
+        else:
+            description = None  # VALUE_ONLY_PATTERN — no colon in line
 
         is_las12 = self.las_file.version.vers.startswith("1.")
 
@@ -1097,7 +1106,7 @@ class LASParser:
                 "mnemonic": mnemonic,
                 "unit": unit,
                 "value": value,
-                "description": description,
+                "description": description,  # type: ignore[dict-item]
             })
             if len(self._deferred_well_entries) == 1:
                 warnings.warn(
@@ -1566,11 +1575,16 @@ class LASParser:
             if COMMENT_PATTERN.match(line) or EMPTY_PATTERN.match(line):
                 continue
 
-            # Split by delimiter
+            # Split by delimiter.
+            # F-I2-M01: Strip the line before splitting with TAB/COMMA
+            # delimiters to avoid leading whitespace producing an empty
+            # first token and column shift.  SPACE mode is unaffected
+            # (str.split(None) strips implicitly).  Consistent with
+            # data_reader.py which strips before all delimiter splits.
             if delimiter == " ":
                 values = line.split(maxsplit=MAX_TOKENS_PER_LINE)
             else:
-                values = line.split(delimiter, maxsplit=MAX_TOKENS_PER_LINE)
+                values = line.strip().split(delimiter, maxsplit=MAX_TOKENS_PER_LINE)
 
             # Warn about extra columns being silently discarded
             if len(values) > num_curves and not warned_extra:

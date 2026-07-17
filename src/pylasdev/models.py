@@ -445,7 +445,10 @@ class LASFile:
         las_file.curves_order = list(curves_order)
 
         # Restore curve metadata if available (new format), otherwise create minimal CurveDefinition
-        curves_data = data.get("curves", [])
+        # F-16: Use _resolve_dict_entry — data.get("curves", []) returns
+        # None when "curves" exists with value None, bypassing the default
+        # and crashing at len(None).  Same pattern at 6 other sites below.
+        curves_data = _resolve_dict_entry(data, "curves", list, list)
         # F-06: Resource-exhaustion guard — match parser's MAX_CURVES check.
         if len(curves_data) > MAX_CURVES:
             raise ValueError(
@@ -571,7 +574,7 @@ class LASFile:
         las_file.source_file = _safe_str(data.get("source_file"), "")
 
         # Restore LAS 3.0 data sections
-        ds_data = data.get("data_sections", [])
+        ds_data = _resolve_dict_entry(data, "data_sections", list, list)
         # F-06: Resource-exhaustion guard for data sections.
         if len(ds_data) > MAX_DATA_SECTIONS:
             raise ValueError(
@@ -585,7 +588,7 @@ class LASFile:
         ds_data = _validate_iterable_of_dicts(ds_data, "data_sections")
         for ds_dict in ds_data:
             ds_string_data = {}
-            _ds_string_raw = ds_dict.get("string_data", {})
+            _ds_string_raw = _resolve_dict_entry(ds_dict, "string_data", dict, dict)
             # F-24: Per-section string_data entry count guard.  Every other
             # iterable dict in from_dict() has a count guard (curves_data →
             # MAX_CURVES, ds_data → MAX_CURVES, logs → MAX_CURVES, etc.);
@@ -633,7 +636,7 @@ class LASFile:
                         f"({MAX_TOTAL_ELEMENTS})"
                     )
             ds_section_curves = []
-            _sc_raw = ds_dict.get("section_curves", [])
+            _sc_raw = _resolve_dict_entry(ds_dict, "section_curves", list, list)
             # F-19: Resource-exhaustion guard for section_curves — match
             # the same MAX_CURVES check used for top-level curves_data and
             # curves_order.  The parser path has this guard (parser.py:1344);
@@ -668,7 +671,7 @@ class LASFile:
                         array_info=sc_array_info,
                     )
                 )
-            ds_data_raw = ds_dict.get("data", {})
+            ds_data_raw = _resolve_dict_entry(ds_dict, "data", dict, dict)
             # F2-21: Per-section entry count guard.  Outer MAX_DATA_SECTIONS
             # guards section count; per-array MAX_DATA_LINES guards element
             # count.  Per-section curve entry count was unguarded — 1 section
@@ -681,6 +684,15 @@ class LASFile:
                 )
             ds_data = {}
             for k, v in ds_data_raw.items():
+                # F-I2-M02: None guard — np.array(None, dtype=np.float64)
+                # silently produces nan.  String paths already reject None
+                # (lines 603-608, 785-788); numeric paths lacked this guard.
+                if v is None:
+                    ds_name = ds_dict.get("name", "<unknown>")
+                    raise ValueError(
+                        f"Numeric data for curve '{k}' in section "
+                        f"'{ds_name}' is None"
+                    )
                 try:
                     ds_data[k] = np.atleast_1d(np.array(v, dtype=np.float64))
                 except (ValueError, TypeError) as e:
@@ -747,6 +759,17 @@ class LASFile:
                             f"'{ds_name}' does not match section_curves[{_i}].mnemonic "
                             f"= {_sc.mnemonic!r}"
                         )
+            # F-14: Per-section curves_order bound.  When section_curves is
+            # empty the length cross-validation above gates out, leaving
+            # _ds_curves_order unbounded.  Every other iterable in from_dict
+            # has a count guard — this was the sole unguarded path.
+            if len(_ds_curves_order) > MAX_CURVES:
+                ds_name = ds_dict.get("name", "<unknown>")
+                raise ValueError(
+                    f"Number of curves_order entries ({len(_ds_curves_order)}) "
+                    f"in section '{ds_name}' exceeds maximum allowed "
+                    f"({MAX_CURVES})"
+                )
             ds = DataSection(
                 name=ds_dict.get("name", ""),
                 section_type=ds_dict.get("section_type", "LOG_DATA"),
@@ -771,7 +794,7 @@ class LASFile:
         # Restore LAS 3.0 string data (top-level, backward compat
         # with data serialized before string_data was moved to
         # per-section DataSection objects).
-        sd = data.get("string_data", {})
+        sd = _resolve_dict_entry(data, "string_data", dict, dict)
         # F-24: Top-level string_data entry count guard — same gap as
         # the per-section path fixed above.
         if len(sd) > MAX_CURVES:
@@ -809,7 +832,7 @@ class LASFile:
                     f"({MAX_TOTAL_ELEMENTS})"
                 )
 
-        logs = data.get("logs", {})
+        logs = _resolve_dict_entry(data, "logs", dict, dict)
         # F-06: Resource-exhaustion guard for logs.
         if len(logs) > MAX_CURVES:
             raise ValueError(
@@ -817,6 +840,12 @@ class LASFile:
                 f"allowed ({MAX_CURVES})"
             )
         for name, arr in logs.items():
+            # F-I2-M02: None guard — np.array(None, dtype=np.float64)
+            # silently produces nan, consistent with string data guards.
+            if arr is None:
+                raise ValueError(
+                    f"Log data for curve '{name}' is None"
+                )
             try:
                 las_file.logs[name] = np.atleast_1d(np.array(arr, dtype=np.float64))
             except (ValueError, TypeError) as e:
@@ -968,6 +997,12 @@ class DevFile:
                     else:
                         dev.column_order = list(value)
             else:
+                # F-I2-M02: None guard — np.array(None, dtype=np.float64)
+                # silently produces nan, consistent with string data guards.
+                if value is None:
+                    raise ValueError(
+                        f"Numeric data for column '{key}' is None"
+                    )
                 try:
                     dev.columns[key] = np.atleast_1d(np.array(value, dtype=np.float64))
                 except (ValueError, TypeError) as e:

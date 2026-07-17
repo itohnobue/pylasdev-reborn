@@ -181,8 +181,71 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
     # header and silently losing the first data row.
     if "," in content_entries[0][1]:
         comma_tokens = [t.strip() for t in content_entries[0][1].split(",") if t.strip()]
-        if comma_tokens and all(_is_float_token(t) for t in comma_tokens):
-            return ("headerless", 0)
+        if comma_tokens:
+            float_tokens = [t for t in comma_tokens if _is_float_token(t)]
+            all_float = len(float_tokens) == len(comma_tokens)
+            mostly_float = (
+                len(float_tokens) >= 2
+                and len(float_tokens) >= len(comma_tokens) - 1
+            )
+
+            if all_float:
+                if len(comma_tokens) >= 2:
+                    # F-I2-M03: Port integer-like heuristic from whitespace
+                    # path (lines 277-292).  When all comma-separated tokens
+                    # are integer-like (no decimal point, no e/d notation),
+                    # they may be numeric column names rather than data.
+                    # Check the second line for corroboration.
+                    first_ints = [
+                        t
+                        for t in comma_tokens
+                        if t.replace("D", "E").replace("d", "e").count(".") == 0
+                        and "e" not in t.lower().replace("d", "e")
+                    ]
+                    all_integer_like = len(first_ints) == len(comma_tokens)
+                    # Real headers contain alphabetic characters.  Tokens
+                    # like "MD", "TVD" are genuine headers, not data.
+                    has_alpha = any(c.isalpha() for t in comma_tokens for c in t)
+
+                    if has_alpha and not (all_float and not all_integer_like):
+                        # At least one token has letters — genuine header.
+                        # Fall through to whitespace-based format detection.
+                        # Skip the pass when all tokens are floats that are
+                        # NOT integer-like (decimal points or scientific
+                        # notation chars like e/E/d/D which match isalpha()
+                        # as false positives). In that case the tokens are
+                        # legitimate numeric data, not text headers.
+                        pass
+                    elif all_integer_like:
+                        # All integer-like, no alphabetic: could be numeric
+                        # column names (e.g. "100,200,300") or headerless
+                        # data.  Check second line for matching column count.
+                        if len(content_entries) >= 2:
+                            second_comma_tokens = [
+                                t.strip()
+                                for t in content_entries[1][1].split(",")
+                                if t.strip()
+                            ]
+                            if len(second_comma_tokens) == len(comma_tokens):
+                                return ("simple", 1)
+                        # No second line or mismatch — ambiguous.
+                        # Treat as headerless data (safer default).
+                        return ("headerless", 0)
+                    else:
+                        # Non-integer float tokens (e.g. "1.5,2.3,3.7")
+                        # are definitely data, not column names.
+                        return ("headerless", 0)
+                else:
+                    # Single-column all-float comma token — headerless data.
+                    return ("headerless", 0)
+            elif mostly_float:
+                # F-23: Mostly numeric with at most 1 non-float token
+                # (e.g., sentinel "na", "NULL", "err", "N/A").  A single
+                # non-float sentinel in an otherwise numeric row shouldn't
+                # cause the entire file to be treated as having a header.
+                return ("headerless", 0)
+            # Otherwise: too many non-float tokens for this to be headerless
+            # data.  Fall through to whitespace-based format detection.
 
     # DUG Insight format detection — two patterns.
     #
@@ -456,6 +519,15 @@ def read_dev_file_as_object(
                 delimiter = " "
         else:
             delimiter = " "
+
+    # Guard against empty delimiter — str.split("") raises ValueError.
+    # The auto-detection above always produces "," or " " but a caller
+    # may pass delimiter="" explicitly, bypassing the is-None check.
+    if not delimiter:
+        raise DEVReadError(
+            "Delimiter must be a non-empty string (e.g., ' ' for "
+            "whitespace, ',' for comma). Received an empty string."
+        )
 
     # --- Pass 1: Count data lines ---
     # skip_content_lines is returned by _detect_dev_format:

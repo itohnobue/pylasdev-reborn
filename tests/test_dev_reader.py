@@ -685,6 +685,34 @@ class TestHeaderlessFormat:
         assert data["col_1"][0] == 0.0025  # 2.5E-3
         assert data["col_2"][0] == 30.0  # 3.0D+01
 
+    def test_headerless_comma_scientific_notation(self, tmp_path: Path) -> None:
+        """F-PR-03: Comma-delimited headerless DEV with scientific notation.
+
+        Regression test: scientific-notation characters (e/E/d/D) match
+        str.isalpha(), causing has_alpha=True false positive. Without the
+        fix, the comma-delimited path falls through to whitespace-based
+        detection and the first data row is consumed as column names.
+        """
+        content = "1e5,2e6,3e7\n4.0,5.0,6.0\n7.0,8.0,9.0\n"
+        test_file = tmp_path / "noheader_comma_sci.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["col_0", "col_1", "col_2"]
+        assert len(data["col_0"]) == 3
+        # First row: 1e5=100000, 2e6=2000000, 3e7=30000000
+        assert data["col_0"][0] == 100000.0
+        assert data["col_1"][0] == 2000000.0
+        assert data["col_2"][0] == 30000000.0
+        # Second row
+        assert data["col_0"][1] == 4.0
+        assert data["col_1"][1] == 5.0
+        assert data["col_2"][1] == 6.0
+        # Third row
+        assert data["col_0"][2] == 7.0
+        assert data["col_1"][2] == 8.0
+        assert data["col_2"][2] == 9.0
+
     def test_headerless_single_line(self, tmp_path: Path) -> None:
         """Headerless file with a single data line."""
         content = "0.0 100.0 200.0\n"
