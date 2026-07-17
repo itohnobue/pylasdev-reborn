@@ -169,6 +169,18 @@ def compare_las_dicts(
                         if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
                             if not _compare_arrays(a, b, f"{key}[{idx}]", None, rtol, atol):
                                 return False
+                        elif isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+                            # F2-008: Mixed ndarray/scalar — ndarray comparison
+                            # produces an array of bools whose __bool__() raises
+                            # ValueError. Treat as type mismatch.
+                            logger.warning(
+                                "Type mismatch at '%s[%d]': %s vs %s",
+                                key,
+                                idx,
+                                type(a).__name__,
+                                type(b).__name__,
+                            )
+                            return False
                         elif a != b:
                             logger.warning(
                                 "List[%d] mismatch at '%s': %r vs %r",
@@ -206,8 +218,8 @@ def _compare_arrays(
         )
         return False
 
-    if arr1.size != arr2.size:
-        logger.warning("Array size mismatch at '%s': %d vs %d", label, arr1.size, arr2.size)
+    if arr1.shape != arr2.shape:
+        logger.warning("Array shape mismatch at '%s': %s vs %s", label, arr1.shape, arr2.shape)
         return False
 
     # F-4: np.allclose() fails on string/object arrays (e.g. string_data).
@@ -216,9 +228,19 @@ def _compare_arrays(
         if not np.array_equal(arr1, arr2):
             logger.warning("Array values mismatch at '%s'", label)
             return False
-    elif not np.allclose(arr1, arr2, rtol=rtol, atol=atol, equal_nan=True):
-        logger.warning("Array values mismatch at '%s'", label)
-        return False
+    else:
+        try:
+            if not np.allclose(arr1, arr2, rtol=rtol, atol=atol, equal_nan=True):
+                logger.warning("Array values mismatch at '%s'", label)
+                return False
+        except ValueError:
+            # F2-009: np.allclose raises ValueError when arrays have
+            # incompatible broadcast shapes (e.g., same .size but
+            # different .shape that cannot broadcast).  The .shape
+            # guard above catches most cases; this try/except is
+            # defense-in-depth for any remaining edge cases.
+            logger.warning("Array values mismatch at '%s'", label)
+            return False
 
     return True
 
@@ -381,6 +403,19 @@ def _compare_data_sections(
                                 a, b, f"data_sections[{i}].{k}[{idx}]", None, rtol, atol
                             ):
                                 return False
+                        elif isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+                            # F2-008: Mixed ndarray/scalar — ndarray comparison
+                            # produces an array of bools whose __bool__() raises
+                            # ValueError. Treat as type mismatch.
+                            logger.warning(
+                                "Type mismatch at 'data_sections[%d].%s[%d]': %s vs %s",
+                                i,
+                                k,
+                                idx,
+                                type(a).__name__,
+                                type(b).__name__,
+                            )
+                            return False
                         elif a != b:
                             logger.warning(
                                 "List[%d] mismatch at 'data_sections[%d].%s': %r vs %r",

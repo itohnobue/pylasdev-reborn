@@ -7,6 +7,7 @@ and O(n) performance (vs O(n^2) numpy.append bug in original).
 
 from __future__ import annotations
 
+import csv
 import logging
 import math
 import re
@@ -224,10 +225,17 @@ def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int) -
 
 
 def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " ") -> bool:
-    """Detect if data is actually wrapped by checking the first data line.
+    """Detect if data is actually wrapped by checking the first data line(s).
 
     In true wrapped mode, the first data line has only 1 value (the depth).
     In non-wrapped mode (even if WRAP=YES header), each line has >= curve_count values.
+
+    For space-delimited files, the check is: first line value count < curve_count.
+    For non-space delimiters (COMMA, TAB), a different heuristic is needed because
+    trailing empty values can be omitted (per CSV convention), making non-wrapped
+    lines appear shorter than curve_count.  In that case, we check whether the
+    first data line has >1 values (non-wrapped) or exactly 1 value (wrapped depth).
+    When curve_count is 1, both wrapped and non-wrapped modes are equivalent.
 
     Args:
         lines: File content split into lines.
@@ -256,14 +264,32 @@ def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " "
         if not in_ascii or not stripped or stripped.startswith("#"):
             continue
 
-        # First data line found — count values using DLM-aware split.
+        # Data line found — split using DLM-aware approach.
+        # F2-015: Use csv.reader for COMMA/TAB delimiters so values containing
+        # the delimiter inside quotes are NOT incorrectly split.
         if delimiter == " ":
             values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
         else:
-            values = [v.strip() for v in stripped.split(delimiter, maxsplit=MAX_TOKENS_PER_LINE)]
-        # In proper wrapped mode, first line has only the depth value (1 value).
-        # If it has as many or more values as curves, it's non-wrapped.
-        return len(values) < curve_count
+            reader = csv.reader(
+                [stripped], delimiter=delimiter, quoting=csv.QUOTE_MINIMAL
+            )
+            row = next(reader)
+            # Safety cap: prevent unbounded token count from malformed input,
+            # matching the maxsplit behavior of str.split.
+            values = row[: MAX_TOKENS_PER_LINE + 1]
+
+        # F-023: For non-space delimiters (COMMA, TAB), trailing empty values
+        # can be omitted per CSV convention, making the first line appear
+        # shorter than curve_count.  Use a different heuristic: a wrapped
+        # depth line always has exactly 1 value; if the first data line has
+        # >1 values, it's non-wrapped regardless of curve_count.
+        if delimiter != " ":
+            # A depth-only line in wrapped mode has exactly 1 value.
+            # Multiple values on the first data line → non-wrapped.
+            return len(values) <= 1
+        else:
+            # Space delimiter: traditional heuristic.
+            return len(values) < curve_count
 
     return True  # No data found, default to wrapped
 
@@ -420,10 +446,20 @@ def _read_normal(
         if not in_ascii or not stripped or stripped.startswith("#"):
             continue
 
+        # F2-015: Use csv.reader for COMMA/TAB delimiters so values
+        # containing the delimiter inside double-quotes are NOT incorrectly
+        # split (e.g., "Run 1, Tool A" stays as one token with COMMA
+        # delimiter).  csv.QUOTE_MINIMAL handles CSV-style quoting.
         if delimiter == " ":
             values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
         else:
-            values = [v.strip() for v in stripped.split(delimiter, maxsplit=MAX_TOKENS_PER_LINE)]
+            reader = csv.reader(
+                [stripped], delimiter=delimiter, quoting=csv.QUOTE_MINIMAL
+            )
+            row = next(reader)
+            # Safety cap: prevent unbounded token count from malformed input,
+            # matching the maxsplit behavior of str.split.
+            values = row[: MAX_TOKENS_PER_LINE + 1]
 
         # Warn about extra columns being silently discarded
         if len(values) > curve_count and not warned_extra:
@@ -475,6 +511,20 @@ def _read_normal(
             "Las file data may be truncated.",
             discarded_lines,
             data_line_count,
+        )
+
+    # F-024: Warn when pre-scan overcounted data lines (fewer actual data
+    # lines in the ~A section than declared).  Unlike the undercount case
+    # (data loss), this preserves data but indicates a pre-scan discrepancy
+    # — e.g. a multi-section file where _pre_scan counts lines across all
+    # sections but _read_normal only consumes those in the first ~A section.
+    if current_line < data_line_count:
+        logger.warning(
+            "Pre-scan overcount: declared %d data lines but only %d actual "
+            "data lines found in ~A section. Arrays will be trimmed to "
+            "actual line count.",
+            data_line_count,
+            current_line,
         )
 
     # F36: Trim arrays when ~A section ended early (fewer data lines than
@@ -581,10 +631,20 @@ def _read_wrapped(
         if not in_ascii or not stripped or stripped.startswith("#"):
             continue
 
+        # F2-015: Use csv.reader for COMMA/TAB delimiters so values
+        # containing the delimiter inside double-quotes are NOT incorrectly
+        # split (e.g., "Run 1, Tool A" stays as one token with COMMA
+        # delimiter).  csv.QUOTE_MINIMAL handles CSV-style quoting.
         if delimiter == " ":
             values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
         else:
-            values = [v.strip() for v in stripped.split(delimiter, maxsplit=MAX_TOKENS_PER_LINE)]
+            reader = csv.reader(
+                [stripped], delimiter=delimiter, quoting=csv.QUOTE_MINIMAL
+            )
+            row = next(reader)
+            # Safety cap: prevent unbounded token count from malformed input,
+            # matching the maxsplit behavior of str.split.
+            values = row[: MAX_TOKENS_PER_LINE + 1]
 
         if depth_line:
             # Depth line: single value = depth for this step.

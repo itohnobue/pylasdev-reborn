@@ -6,6 +6,7 @@ and proper encoding handling.
 
 from __future__ import annotations
 
+import csv
 import logging
 import re
 import warnings
@@ -42,18 +43,28 @@ _DEV_ALIASES: dict[str, str] = {
     "MDKB": "MD",
     "MDSS": "MD",
     "MDRKB": "MD",
+    "DEPTH": "MD",      # Petrel / common industry alias
+    "DPT": "MD",         # Petrel depth
     # True vertical depth variants
     "TVDKB": "TVD",
     "TVDSS": "TVD",
     "TVDBML": "TVD",
     # Inclination variants
     "INCL": "INC",
+    "DEVI": "INC",       # Petrel deviation
+    "DIP": "INC",         # Petrel dip
     # Azimuth variants
     "AZIM": "AZI",
+    "AZ": "AZI",          # Petrel azimuth
+    "AZM": "AZI",         # Petrel azimuth (abbreviated)
     # Easting (X) variants
     "UTMX": "X",
+    "EW": "X",            # Petrel east-west
+    "DX": "X",            # Petrel X offset
     # Northing (Y) variants
     "UTMY": "Y",
+    "NS": "Y",            # Petrel north-south
+    "DY": "Y",            # Petrel Y offset
 }
 
 
@@ -151,6 +162,57 @@ def _is_float_token(token: str) -> bool:
         return False
 
 
+# --- *COLUMNS keyword helpers (F-012) ---
+
+
+def _is_columns_header(tokens: list[str]) -> bool:
+    """Check whether a list of tokens starts with the *COLUMNS keyword.
+
+    Recognises the Petra / CPS *COLUMNS format where column names are
+    prefixed with ``*`` and the first token is the literal keyword
+    ``*COLUMNS`` (case-insensitive).
+    """
+    return bool(tokens) and tokens[0].upper().startswith("*COLUMNS")
+
+
+def _parse_columns_tokens(tokens: list[str]) -> list[str]:
+    """Extract column names from a *COLUMNS-format header line.
+
+    Strips the ``*COLUMNS`` keyword token, removes the ``*`` prefix from
+    every remaining token, and filters out any empty names that result
+    (e.g. from a trailing ``*``).
+    """
+    return [t.lstrip("*") for t in tokens[1:] if t.lstrip("*")]
+
+
+# --- Delimited-line splitting with quoting support (F2-015) ---
+
+
+def _split_delimited_line(
+    line: str,
+    delimiter: str,
+    max_tokens: int = MAX_TOKENS_PER_LINE,
+) -> list[str]:
+    """Split a delimited line with CSV quoting / escaping support.
+
+    Uses Python's :mod:`csv` module so that double-quoted fields
+    containing the delimiter character are kept intact rather than
+    being split into separate (wrong) columns.
+
+    Args:
+        line:       The stripped content line to split.
+        delimiter:  Single-character delimiter (e.g. ``","``).
+        max_tokens: Safety cap on the number of tokens returned.
+
+    Returns:
+        List of individual field values with leading / trailing
+        whitespace stripped from each.
+    """
+    reader = csv.reader([line], delimiter=delimiter, skipinitialspace=True)
+    tokens: list[str] = next(reader, [])
+    return [v.strip() for v in tokens[:max_tokens]]
+
+
 def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int]:
     """Detect DEV file format from first few content lines.
 
@@ -168,6 +230,13 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
         skip before data starts (used by Pass 1 counting).
     """
     if not content_entries:
+        return ("simple", 1)
+
+    # F-012: *COLUMNS keyword format (Petra / CPS variant).
+    # The first content line starts with the literal keyword *COLUMNS
+    # followed by *-prefixed column names.  Treat this as a simple
+    # header format — column-name stripping is done in Pass 2.
+    if content_entries[0][1].upper().startswith("*COLUMNS"):
         return ("simple", 1)
 
     first_tokens = content_entries[0][1].split()
@@ -570,7 +639,7 @@ def read_dev_file_as_object(
         if delimiter == " ":
             values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
         else:
-            values = [v.strip() for v in stripped.split(delimiter, maxsplit=MAX_TOKENS_PER_LINE)]
+            values = _split_delimited_line(stripped, delimiter)
 
         if format_type == "headerless":
             if content_seen == 1:
@@ -630,10 +699,14 @@ def read_dev_file_as_object(
                 continue
             elif content_seen == skip_content_lines:
                 # Header line — parse column names.
-                # Filter out empty strings from trailing delimiters (e.g.,
-                # "MD,TVD," → ["MD","TVD",""]) so empty column names are
-                # rejected instead of creating dev.columns[""].
-                names = [v for v in values if v]
+                # Handle *COLUMNS keyword format (Petra/CPS variant)
+                if _is_columns_header(values):
+                    names = _parse_columns_tokens(values)
+                else:
+                    # Filter out empty strings from trailing delimiters (e.g.,
+                    # "MD,TVD," → ["MD","TVD",""]) so empty column names are
+                    # rejected instead of creating dev.columns[""].
+                    names = [v for v in values if v]
                 if not names:
                     raise DEVReadError(
                         "Empty header line in DUG-format DEV file. "
@@ -689,10 +762,14 @@ def read_dev_file_as_object(
         else:  # simple header format
             if content_seen == 1:
                 # First non-comment line = column names.
-                # Filter out empty strings from trailing delimiters (e.g.,
-                # "MD,TVD," → ["MD","TVD",""]) so empty column names are
-                # rejected instead of creating dev.columns[""].
-                names = [v for v in values if v]
+                # Handle *COLUMNS keyword format (Petra/CPS variant)
+                if _is_columns_header(values):
+                    names = _parse_columns_tokens(values)
+                else:
+                    # Filter out empty strings from trailing delimiters (e.g.,
+                    # "MD,TVD," → ["MD","TVD",""]) so empty column names are
+                    # rejected instead of creating dev.columns[""].
+                    names = [v for v in values if v]
                 if not names:
                     raise DEVReadError(
                         "Empty header line in DEV file. "

@@ -22,6 +22,10 @@ from .exceptions import LASWriteError
 from .models import CurveDefinition, LASFile
 
 # Control characters except space and tab (which are valid LAS whitespace).
+# Tab (\x09) is handled separately in _sanitize_las_value — it is replaced
+# with a space to prevent mis-tokenization on re-read.  A tab inside an
+# identifier acts as a field separator for str.split(), corrupting the
+# parsed structure.
 # Matches \x00-\x08, \x0B, \x0C, \x0E-\x1F, \x7F (DEL), \x85 (NEL),
 # \u2028 (LINE SEPARATOR), and \u2029 (PARAGRAPH SEPARATOR).
 # The Unicode line break characters are treated as line breaks by Python's
@@ -65,6 +69,11 @@ def _sanitize_las_value(value: str) -> str:
         .replace("\u2029", " ")
         .replace("\x85", " ")
     )
+    # F2-005: Replace tab characters with spaces.  While tab is valid
+    # LAS whitespace between fields, a tab inside an identifier or
+    # value causes mis-tokenization on re-read (str.split() treats
+    # tab as a field separator, corrupting the parsed structure).
+    value = value.replace("\t", " ")
     # Strip control characters
     value = _CONTROL_CHARS_RE.sub("", value)
     # If the value now starts with ~ followed by a letter, remove the leading ~
@@ -77,6 +86,33 @@ def _sanitize_las_value(value: str) -> str:
     if value.startswith("#"):
         value = "_" + value
     return value
+
+
+def _validate_precision(precision: str) -> None:
+    """Validate the precision format specifier for numeric output.
+
+    Rejects format codes that produce non-decimal output (x, o, b, c, d)
+    which would silently corrupt LAS data with hex/octal/binary/character
+    representations, or crash when applied to floating-point values.
+
+    Accepted formats: '.N', '.Ng', '.Nf', '.Ne', '.NE', '.NF', '.NG',
+    '.Nn', '.N%' where N is one or more digits.
+
+    Raises:
+        ValueError: If the precision string is not a valid float-compatible
+            format specifier.
+    """
+    # Must start with '.' followed by digits, optionally ending with a
+    # float-compatible presentation type (e, E, f, F, g, G, n, %).
+    # Integer-specific codes (b, c, d, o, x, X) are rejected.
+    # No type code at all defaults to g-type for floats (safe).
+    if not re.match(r"^\.\d+([eEfFgGn%])?$", precision):
+        raise ValueError(
+            f"Invalid precision format specifier: '{precision}'. "
+            f"Expected a format like '.8g', '.6f', or '.10e'. "
+            f"Non-numeric format codes (x, o, b, c, d) are not supported "
+            f"for LAS numeric data output."
+        )
 
 
 def write_las_file(
@@ -104,6 +140,14 @@ def write_las_file(
     Raises:
         LASWriteError: If file cannot be written.
     """
+    # F2-004: Validate the precision format spec before any processing.
+    # Non-numeric format codes (x, o, b, c, d) produce hex/octal/binary/
+    # character output or crash when applied to floating-point values.
+    try:
+        _validate_precision(precision)
+    except ValueError as e:
+        raise LASWriteError(f"Invalid precision format: {e}") from e
+
     file_path = Path(file_path)
 
     if isinstance(las_data, dict):
@@ -284,8 +328,10 @@ def _write_curve_section(las_file: LASFile) -> list[str]:
 
     if is_las30 and las_file.data_sections:
         # Use the LOG_DATA section's curve definitions for the main ~C block.
+        # F2-006: Normalize section_type to uppercase — from_dict does not
+        # normalize, so programmatically constructed files may have lowercase.
         log_section = next(
-            (ds for ds in las_file.data_sections if ds.section_type == "LOG_DATA"),
+            (ds for ds in las_file.data_sections if ds.section_type.upper() == "LOG_DATA"),
             None,
         )
         curves_to_emit = (
@@ -391,6 +437,10 @@ def _section_type_to_prefix(section_type: str) -> str:
     type name itself as the prefix, preserving the original section
     identity on roundtrip.
     """
+    # F2-006: Normalize to uppercase for case-insensitive matching.
+    # from_dict does not normalize section_type, so programmatically
+    # constructed LASFile objects may have lowercase section_type values.
+    section_type = section_type.upper()
     known = _SECTION_TYPE_TO_PREFIX.get(section_type)
     if known is not None:
         return known
@@ -401,6 +451,18 @@ def _section_type_to_prefix(section_type: str) -> str:
     # values containing newlines or control characters.
     if section_type.endswith("_DATA"):
         return _sanitize_las_value(section_type)
+    # F-008: Warn about unknown section types — they fall back to the
+    # ASCII data section header "A" for backward compatibility, but the
+    # caller should be informed that the section type is not recognized.
+    import warnings
+
+    warnings.warn(
+        f"Unknown section type '{section_type}'. "
+        f"Falling back to ASCII data section header 'A'. "
+        f"Known types: {', '.join(sorted(_SECTION_TYPE_TO_PREFIX.keys()))}. "
+        f"Custom types must end with '_DATA'.",
+        stacklevel=3,
+    )
     return "A"
 
 
@@ -451,7 +513,12 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
         # LAS 3.0: Multiple data sections with typed headers.
         emitted_defs: set[str] = set()
         for section in las_file.data_sections:
-            section_prefix = _section_type_to_prefix(section.section_type)
+            # F2-006: Normalize section_type to uppercase — from_dict does
+            # not normalize, so programmatically constructed LASFile objects
+            # may have lowercase section_type values (e.g., "log_data").
+            # Normalize once at the top of the loop for all comparisons.
+            sec_type = section.section_type.upper()
+            section_prefix = _section_type_to_prefix(sec_type)
             section_name = f" {_sanitize_las_value(section.name)}" if section.name else ""
 
             # F-16: Compute definition prefix for non-LOG_DATA LAS 3.0
@@ -459,13 +526,13 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
             # the pipe notation on the data section header so the parser
             # can re-associate per-section curves on re-read.
             def_prefix: str | None = None
-            if is_las30 and section.section_type != "LOG_DATA":
-                def_prefix = _SECTION_TYPE_TO_DEFINITION_PREFIX.get(section.section_type)
+            if is_las30 and sec_type != "LOG_DATA":
+                def_prefix = _SECTION_TYPE_TO_DEFINITION_PREFIX.get(sec_type)
                 # F-D3-M01: Auto-derive Definition prefix for user-defined _DATA
                 # section types not in the hardcoded mapping.  Strip _DATA suffix
                 # and title-case the root (e.g., "CUSTOM_DATA" → "Custom").
-                if def_prefix is None and section.section_type.endswith("_DATA"):
-                    root = section.section_type[: -len("_DATA")]
+                if def_prefix is None and sec_type.endswith("_DATA"):
+                    root = sec_type[: -len("_DATA")]
                     root = _sanitize_las_value(root)
                     def_prefix = root.title().replace("_", "")
 
@@ -474,7 +541,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
             # names on re-read.  Without this, all data sections get the
             # global curve set on roundtrip.  Only emit once per section type
             # (e.g., one Core_Definition for both Core[1] and Core[2]).
-            if is_las30 and section.section_type != "LOG_DATA" and section.section_curves:
+            if is_las30 and sec_type != "LOG_DATA" and section.section_curves:
                 if def_prefix and def_prefix not in emitted_defs:
                     emitted_defs.add(def_prefix)
                     lines.append(f"~{def_prefix}_Definition")
@@ -487,9 +554,14 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
             # curves to only the global ~CURVE set on re-read.  Non-LOG_DATA
             # sections reference "| {Name}_Definition" for per-section curve
             # reassociation (F-16).
-            if section.section_type == "LOG_DATA" and is_las30:
+            # F-010: Only emit the pipe reference when the corresponding
+            # Definition section was actually written above (tracked via
+            # emitted_defs).  Without this guard, a section with a valid
+            # def_prefix but empty section_curves would emit a phantom
+            # pipe reference to a non-existent Definition section.
+            if sec_type == "LOG_DATA" and is_las30:
                 lines.append(f"~{section_prefix}{section_name} | CURVE")
-            elif is_las30 and section.section_type != "LOG_DATA" and def_prefix:
+            elif is_las30 and sec_type != "LOG_DATA" and def_prefix and def_prefix in emitted_defs:
                 lines.append(
                     f"~{section_prefix}{section_name} | {def_prefix}_Definition"
                 )
@@ -578,7 +650,13 @@ def _format_data_rows(
             if arr is None or i >= len(arr):
                 row_values.append(_format_number(null_value, precision, null_value))
             elif is_string:
-                val = _sanitize_las_value(str(arr[i]))
+                raw_val = str(arr[i])
+                # F2-005: Check the raw value for the delimiter character
+                # BEFORE calling _sanitize_las_value.  _sanitize_las_value
+                # now replaces tabs with spaces, so the original tab would
+                # be masked from the delimiter-aware check below.
+                raw_has_delim = delimiter in raw_val
+                val = _sanitize_las_value(raw_val)
                 # F2-29/F2-30/F2-31 + F-W05: Delimiter-aware string data
                 # sanitization.  When the active delimiter character (or
                 # any whitespace for SPACE delimiter) appears in a string
@@ -606,9 +684,15 @@ def _format_data_rows(
                             )
                             warned_delim_str = True
                         val = re.sub(r"\s", "_", val)
-                elif delimiter in val:
+                elif raw_has_delim:
                     # COMMA or TAB delimiter: the delimiter character itself
                     # in the value creates a phantom field boundary on re-read.
+                    # F2-005: raw_has_delim is checked on the raw value
+                    # because _sanitize_las_value may have already handled
+                    # the delimiter character (e.g., tab → space).  The
+                    # replacement is applied to val (which already has the
+                    # tab replaced by space, so the str.replace is a no-op
+                    # for tab; for comma it works as before).
                     if not warned_delim_str:
                         import warnings
 

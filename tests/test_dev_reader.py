@@ -265,11 +265,11 @@ class TestDevDedup:
     def test_duplicate_column_names_get_suffix(self, tmp_path: Path) -> None:
         """Duplicate DEV columns receive _N suffixes.
 
-        Input columns: ["DEPTH", "GR", "GR"]
-        Expected: ["DEPTH", "GR", "GR_2"] — first duplicate starts at _2
+        Input columns: ["A", "GR", "GR"]
+        Expected: ["A", "GR", "GR_2"] — first duplicate starts at _2
         (matching the LAS _deduplicate_curves convention).
         """
-        content = "DEPTH GR GR\n100.0 10.0 20.0\n"
+        content = "A GR GR\n100.0 10.0 20.0\n"
         test_file = tmp_path / "dup.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -279,8 +279,8 @@ class TestDevDedup:
             # Should warn about the duplicate
             assert any("Duplicate DEV column name" in str(x.message) for x in w)
 
-        assert list(data.keys()) == ["DEPTH", "GR", "GR_2"]
-        np.testing.assert_array_equal(data["DEPTH"], [100.0])
+        assert list(data.keys()) == ["A", "GR", "GR_2"]
+        np.testing.assert_array_equal(data["A"], [100.0])
         np.testing.assert_array_equal(data["GR"], [10.0])
         np.testing.assert_array_equal(data["GR_2"], [20.0])
 

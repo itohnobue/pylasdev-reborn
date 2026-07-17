@@ -31,16 +31,34 @@ def _create_parameter_entry(param_dict: dict[str, Any]) -> ParameterEntry:
     """
     zone = None
     if "zone" in param_dict and isinstance(param_dict["zone"], dict):
+        _zone_index = param_dict["zone"].get("zone_index")
+        # F-026: Type validation for zone_index — raw dict values
+        # pass through without type checking, violating the int | None
+        # contract on ParameterZone.zone_index.
+        if _zone_index is not None and not isinstance(_zone_index, int):
+            raise TypeError(
+                f"zone_index: expected int or None, "
+                f"got {type(_zone_index).__name__}"
+            )
         zone = ParameterZone(
             zone_name=_safe_str(param_dict["zone"].get("zone_name")),
-            zone_index=param_dict["zone"].get("zone_index"),
+            zone_index=_zone_index,
+        )
+    _array_index = param_dict.get("array_index")
+    # F-025: Type validation for array_index — raw dict values
+    # pass through without type checking, violating the int | None
+    # contract on ParameterEntry.array_index.
+    if _array_index is not None and not isinstance(_array_index, int):
+        raise TypeError(
+            f"array_index: expected int or None, "
+            f"got {type(_array_index).__name__}"
         )
     return ParameterEntry(
         mnemonic=_safe_str(param_dict.get("mnemonic", "")),
         unit=_safe_str(param_dict.get("unit", "")),
         value=_safe_str(param_dict.get("value", "")),
         description=_safe_str(param_dict.get("description", "")),
-        array_index=param_dict.get("array_index"),
+        array_index=_array_index,
         zone=zone,
     )
 
@@ -465,9 +483,11 @@ class LASFile:
                     if "array_info" in curve_dict and isinstance(curve_dict["array_info"], dict):
                         ai = curve_dict["array_info"]
                         array_info = ArrayElementInfo(
-                            base_name=ai.get("base_name", ""),
-                            index=ai.get("index", 0),
-                            time_offset=ai.get("time_offset"),
+                            base_name=_safe_str(ai.get("base_name")),
+                            index=_resolve_dict_entry(ai, "index", int, lambda: 0),
+                            # F2-002: Validate time_offset — int(offset) in
+                            # writer.py crashes on non-numeric values.
+                            time_offset=_resolve_dict_entry(ai, "time_offset", (int, float), lambda: None),
                         )
                     las_file.curves.append(
                         CurveDefinition(
@@ -656,9 +676,11 @@ class LASFile:
                 if "array_info" in sc_dict and isinstance(sc_dict["array_info"], dict):
                     ai = sc_dict["array_info"]
                     sc_array_info = ArrayElementInfo(
-                        base_name=ai.get("base_name", ""),
-                        index=ai.get("index", 0),
-                        time_offset=ai.get("time_offset"),
+                        base_name=_safe_str(ai.get("base_name")),
+                        index=_resolve_dict_entry(ai, "index", int, lambda: 0),
+                        # F2-002: Validate time_offset — int(offset) in
+                        # writer.py crashes on non-numeric values.
+                        time_offset=_resolve_dict_entry(ai, "time_offset", (int, float), lambda: None),
                     )
                 ds_section_curves.append(
                     CurveDefinition(
@@ -790,6 +812,16 @@ class LASFile:
                         f"Data section '{ds.name}' has inconsistent array "
                         f"lengths: {_ds_len}"
                     )
+            # F-004: Cross-array length validation for string_data within
+            # this data section (PRIOR_FIX_ATTEMPT in b47eea6/24c4f5c only
+            # covered numeric data — string_data was missed on both levels).
+            if len(ds.string_data) > 1:
+                _sds_len = {name: len(arr) for name, arr in ds.string_data.items()}
+                if len(set(_sds_len.values())) > 1:
+                    raise ValueError(
+                        f"Data section '{ds.name}' has inconsistent "
+                        f"string_data array lengths: {_sds_len}"
+                    )
 
         # Restore LAS 3.0 string data (top-level, backward compat
         # with data serialized before string_data was moved to
@@ -887,6 +919,19 @@ class LASFile:
                     f"Log arrays have inconsistent lengths: {_log_len}"
                 )
 
+        # F-004: Cross-array length validation for top-level string_data
+        # arrays.  Prior fix rounds (b47eea6, 24c4f5c) added this check
+        # for numeric logs but missed string_data at both the per-section
+        # and top-level paths.
+        if len(las_file.string_data) > 1:
+            _str_len = {
+                name: len(arr) for name, arr in las_file.string_data.items()
+            }
+            if len(set(_str_len.values())) > 1:
+                raise ValueError(
+                    f"String data arrays have inconsistent lengths: {_str_len}"
+                )
+
         # F-M02: Total element count guard across all log curves.
         if las_file.logs:
             _log_rows = max(len(arr) for arr in las_file.logs.values())
@@ -969,6 +1014,9 @@ class DevFile:
         Returns:
             DevFile with columns populated from the dict.
         """
+        if not isinstance(data, dict):
+            raise TypeError(f"Expected dict, got {type(data).__name__}")
+
         from .data_reader import MAX_CURVES, MAX_DATA_LINES, MAX_TOTAL_ELEMENTS
 
         dev = cls()
@@ -1025,6 +1073,17 @@ class DevFile:
                     f"Total allocation ({len(dev.columns)} columns x "
                     f"{_dev_rows} rows = {_dev_total} elements) exceeds "
                     f"maximum allowed ({MAX_TOTAL_ELEMENTS})"
+                )
+
+        # F-006: Cross-array length validation for DevFile columns.
+        # Inconsistent-length columns produce silently corrupted output
+        # if accepted — different columns with different row counts
+        # represent invalid DEV survey data.
+        if len(dev.columns) > 1:
+            _col_len = {name: len(arr) for name, arr in dev.columns.items()}
+            if len(set(_col_len.values())) > 1:
+                raise ValueError(
+                    f"DevFile columns have inconsistent lengths: {_col_len}"
                 )
 
         # If column_order wasn't in the dict, infer from Python 3.7+ dict order

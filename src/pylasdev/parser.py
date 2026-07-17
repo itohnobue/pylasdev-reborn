@@ -11,6 +11,7 @@ Supports LAS 1.2, 2.0, and 3.0 formats.
 
 from __future__ import annotations
 
+import csv
 import logging
 import re
 import warnings
@@ -886,7 +887,17 @@ class LASParser:
         if mnemonic == "VERS":
             self.las_file.version.vers = value
         elif mnemonic == "WRAP":
-            self.las_file.version.wrap = value.upper()
+            wrap_upper = value.upper()
+            if wrap_upper in {"YES", "NO"}:
+                self.las_file.version.wrap = wrap_upper
+            else:
+                warnings.warn(
+                    f"Unknown WRAP value '{value}'. Expected YES or NO. "
+                    f"Defaulting to NO.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self.las_file.version.wrap = "NO"
         elif mnemonic == "DLM":
             dlm_upper = value.upper()
             if dlm_upper in {"SPACE", "TAB", "COMMA"}:
@@ -1031,23 +1042,20 @@ class LASParser:
     def _replay_deferred_well(self) -> None:
         """Re-process well entries that were parsed before ~V was known.
 
-        When ~W appears before ~V, entries are buffered and processed with
-        default LAS 2.0+ interpretation.  If the version turns out to be
-        LAS 1.2, re-process entries with the correct swap logic.
+        When ~W appears before ~V, entries are buffered without being stored.
+        Once ~V is parsed, all deferred entries are re-processed with the
+        correct version-based swap logic (LAS 1.2 vs 2.0+).
         """
         if not self._deferred_well_entries:
             return
         is_las12 = self.las_file.version.vers.startswith("1.")
-        if not is_las12:
-            self._deferred_well_entries.clear()
-            return
         for entry in self._deferred_well_entries:
             self._store_well_entry(
                 mnemonic=entry["mnemonic"],
                 unit=entry["unit"],
                 value=entry["value"],
                 description=entry["description"],
-                is_las12=True,
+                is_las12=is_las12,
             )
         self._deferred_well_entries.clear()
 
@@ -1117,6 +1125,12 @@ class LASParser:
                     UserWarning,
                     stacklevel=2,
                 )
+            # F-003: Deferred entries are stored only via _replay_deferred_well
+            # after ~V is known.  Do NOT call _store_well_entry here — the prior
+            # fix (commit b47eea6) added the buffer but left the unconditional
+            # store below, causing entries to be stored twice (once with wrong
+            # is_las12, once with correct in replay).
+            return
 
         self._store_well_entry(mnemonic, unit, value, description, is_las12)
 
@@ -1155,7 +1169,10 @@ class LASParser:
         array_time_offset: float | None = None
         format_match = FORMAT_SPEC_PATTERN.search(description)
         if format_match:
-            data_format = format_match.group("format")
+            # F2-001: Normalize to uppercase so all downstream case-sensitive
+            # comparisons (string_curves at L1485, _KNOWN_CURVE_FORMATS at L1498,
+            # and array-time-offset check at L1172) work regardless of input case.
+            data_format = format_match.group("format").upper()
             if data_format == "A" and format_match.group("offset"):
                 try:
                     array_time_offset = float(format_match.group("offset"))
@@ -1555,9 +1572,11 @@ class LASParser:
                 string_data_lists[i] = []
             else:
                 arr = np.zeros(actual_count, dtype=np.float64)
-                if is_first_section:
-                    self.las_file.logs[curve.mnemonic] = arr
                 data_section.data[curve.mnemonic] = arr
+                # F2-014: las_file.logs assigned via defensive copy after data
+                # fill to avoid shared mutable ndarray between LASFile.logs
+                # and DataSection.data — in-place mutations were silently
+                # corrupting both views.
 
         # Fill arrays by index (no list accumulation overhead for numerics)
         numeric_arrays = [
@@ -1581,10 +1600,22 @@ class LASParser:
             # first token and column shift.  SPACE mode is unaffected
             # (str.split(None) strips implicitly).  Consistent with
             # data_reader.py which strips before all delimiter splits.
+            # F2-015: Use csv.reader for TAB/COMMA delimiters so values
+            # containing the delimiter inside double-quotes are NOT
+            # incorrectly split (e.g., "Run 1, Tool A" stays as one token
+            # with COMMA delimiter).  csv.QUOTE_MINIMAL handles CSV-style
+            # quoting: fields are quoted only when they contain the
+            # delimiter, quotechar, or line terminator.
             if delimiter == " ":
                 values = line.split(maxsplit=MAX_TOKENS_PER_LINE)
             else:
-                values = line.strip().split(delimiter, maxsplit=MAX_TOKENS_PER_LINE)
+                reader = csv.reader(
+                    [line.strip()], delimiter=delimiter, quoting=csv.QUOTE_MINIMAL
+                )
+                row = next(reader)
+                # Safety cap: prevent unbounded token count from malformed
+                # input, matching the maxsplit behavior of str.split.
+                values = row[: MAX_TOKENS_PER_LINE + 1]
 
             # Warn about extra columns being silently discarded
             if len(values) > num_curves and not warned_extra:
@@ -1634,13 +1665,29 @@ class LASParser:
 
             idx += 1
 
+        # F2-014: Copy filled numeric arrays from data_section.data to
+        # las_file.logs for independent views.  The allocation above only
+        # assigned to data_section.data; the fill loop wrote values via
+        # numeric_arrays (which references data_section.data).  Now copy
+        # the fully-populated arrays so in-place mutations on one view do
+        # not silently corrupt the other.
+        if is_first_section:
+            for curve in section_curves:
+                if curve.mnemonic in data_section.data:
+                    self.las_file.logs[curve.mnemonic] = (
+                        data_section.data[curve.mnemonic].copy()
+                    )
+
         # Convert string data lists to numpy arrays
         for i, curve in enumerate(section_curves):
             if i in string_data_lists:
                 string_arr = np.array(string_data_lists[i], dtype=np.str_)
                 data_section.string_data[curve.mnemonic] = string_arr
                 if is_first_section:
-                    self.las_file.string_data[curve.mnemonic] = string_arr
+                    # F2-014: Defensive copy — prevents shared-reference
+                    # mutation between LASFile.string_data and
+                    # DataSection.string_data.
+                    self.las_file.string_data[curve.mnemonic] = string_arr.copy()
 
         # Store data section (LAS 3.0)
         self.las_file.data_sections.append(data_section)

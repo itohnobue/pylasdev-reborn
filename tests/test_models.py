@@ -783,6 +783,148 @@ class TestLASFile:
         with pytest.raises(TypeError, match="must be a dict"):
             LASFile.from_dict(data)
 
+    # --- F-004: per-section string_data cross-array length ---
+
+    def test_from_dict_per_section_string_data_inconsistent(self) -> None:
+        """F-004: Per-section string_data with inconsistent array lengths raises ValueError.
+
+        The per-section path (models.py:818-824) validates that all string_data
+        arrays within a single DataSection have the same length.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "data_sections": [
+                {
+                    "name": "LOG",
+                    "section_type": "LOG_DATA",
+                    "curves_order": ["DEPT"],
+                    "data": {"DEPT": np.array([100.0])},
+                    "string_data": {
+                        "STR1": np.array(["a", "b"]),
+                        "STR2": np.array(["c"]),
+                    },
+                }
+            ],
+        }
+        with pytest.raises(ValueError, match=r"inconsistent.*string_data"):
+            LASFile.from_dict(data)
+
+    # --- F-004: top-level string_data cross-array length ---
+
+    def test_from_dict_top_level_string_data_inconsistent(self) -> None:
+        """F-004: Top-level string_data with inconsistent array lengths raises ValueError.
+
+        The top-level path (models.py:926-933) validates that all arrays in
+        the top-level string_data dict have the same length.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "string_data": {
+                "STR1": np.array(["a", "b"]),
+                "STR2": np.array(["c"]),
+            },
+        }
+        with pytest.raises(ValueError, match="inconsistent lengths"):
+            LASFile.from_dict(data)
+
+    # --- F-025: non-int array_index ---
+
+    def test_from_dict_non_int_array_index_raises(self) -> None:
+        """F-025: Non-int array_index in parameter entry raises TypeError.
+
+        _create_parameter_entry (models.py:47-55) validates that array_index
+        is int or None.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "parameters": [
+                {
+                    "mnemonic": "RUN[1]",
+                    "value": "1",
+                    "array_index": "not_an_int",
+                },
+            ],
+        }
+        with pytest.raises(TypeError, match="array_index: expected int or None"):
+            LASFile.from_dict(data)
+
+    # --- F-026: non-int zone_index ---
+
+    def test_from_dict_non_int_zone_index_raises(self) -> None:
+        """F-026: Non-int zone_index in parameter zone raises TypeError.
+
+        _create_parameter_entry (models.py:34-42) validates that zone_index
+        is int or None.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "parameters": [
+                {
+                    "mnemonic": "MATR",
+                    "value": "SAND",
+                    "zone": {
+                        "zone_name": "RUN",
+                        "zone_index": "not_an_int",
+                    },
+                },
+            ],
+        }
+        with pytest.raises(TypeError, match="zone_index: expected int or None"):
+            LASFile.from_dict(data)
+
+    # --- F2-002: non-numeric time_offset ---
+
+    def test_from_dict_non_numeric_time_offset_raises(self) -> None:
+        """F2-002: Non-numeric time_offset in curve array_info raises TypeError.
+
+        _resolve_dict_entry (models.py:88-111) validates time_offset against
+        (int, float) at both curve sites (lines 490, 683).
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["NMR[1]"],
+            "curves": [
+                {
+                    "mnemonic": "NMR[1]",
+                    "array_info": {
+                        "base_name": "NMR",
+                        "index": 1,
+                        "time_offset": "not_numeric",
+                    },
+                },
+            ],
+            "logs": {"NMR[1]": np.array([100.0])},
+        }
+        with pytest.raises(TypeError, match="time_offset: expected"):
+            LASFile.from_dict(data)
+
+    # --- F2-003: non-dict input to from_dict ---
+
+    def test_from_dict_rejects_non_dict_input(self) -> None:
+        """F2-003: LASFile.from_dict() raises TypeError for non-dict input.
+
+        models.py:400-401 validates the top-level data argument.
+        """
+        with pytest.raises(TypeError, match="Expected dict, got"):
+            LASFile.from_dict("not_a_dict")
+
 
 class TestDevFile:
     """Tests for DevFile dataclass."""
@@ -905,3 +1047,28 @@ class TestDevFile:
         }
         with pytest.raises(ValueError, match="Cannot convert data for column"):
             DevFile.from_dict(data)
+
+    # --- F-006: DevFile columns cross-array length ---
+
+    def test_dev_file_from_dict_inconsistent_column_lengths(self) -> None:
+        """F-006: DevFile columns with inconsistent lengths raises ValueError.
+
+        models.py:1078-1086 validates that all column arrays in DevFile have
+        the same length.
+        """
+        data: dict[str, Any] = {
+            "MD": np.array([0.0, 100.0, 200.0]),
+            "TVD": np.array([0.0, 99.0]),
+        }
+        with pytest.raises(ValueError, match="inconsistent lengths"):
+            DevFile.from_dict(data)
+
+    # --- F2-003: non-dict input to DevFile.from_dict ---
+
+    def test_dev_file_from_dict_rejects_non_dict_input(self) -> None:
+        """F2-003: DevFile.from_dict() raises TypeError for non-dict input.
+
+        models.py:1017-1018 validates the top-level data argument.
+        """
+        with pytest.raises(TypeError, match="Expected dict, got"):
+            DevFile.from_dict(42)
