@@ -54,6 +54,15 @@ MAX_PARAMETERS = 100_000
 # from malformed files.  Overridable at module level.
 MAX_OTHER_LINES = 1_000_000
 
+# F-35: Maximum deferred well entries.  Every other accumulator in parser.py
+# has a MAX_* guard (_ascii_data_lines, las_file.curves, las_file.parameters,
+# _other_lines, _current_data_section_idx).  _deferred_well_entries had no
+# bound, enabling unbounded memory growth from malicious ~W-before-~V files
+# without a ~V section.  Well sections are inherently small (20-80 entries
+# in practice); this guard provides defense-in-depth against attacks.
+# Overridable at module level.
+MAX_DEFERRED_WELL_ENTRIES = MAX_PARAMETERS
+
 # F-32 + G-17: Characters that Python's splitlines() treats as line breaks
 # beyond \\n and \\r.  When present in file content, they cause splitlines()
 # to produce fake section headers and corrupt parsed data.  The writer's
@@ -152,11 +161,17 @@ _DATA_SECTION_WORDS = {
 _INDEXED_DATA_TYPES = frozenset(
     {
         "CORE",
+        "CORE_DATA",
         "DRILLING",
+        "DRILLING_DATA",
         "INCLINOMETRY",
+        "INCLINOMETRY_DATA",
         "TOPS",
+        "TOPS_DATA",
         "TEST",
+        "TEST_DATA",
         "PERFORATIONS",
+        "PERFORATIONS_DATA",
         "LOG",
         "LOG_DATA",
     }
@@ -300,6 +315,10 @@ class LASParser:
         # F-P06: Raw well entries are buffered when ~W appears before ~V so
         # they can be re-processed with the correct version after ~V is parsed.
         self._deferred_well_entries: list[dict[str, str]] = []
+        # F-34: Track section headers encountered (in order) for cross-section
+        # consistency validation: duplicate detection and LAS 3.0 ordering check.
+        self._section_sequence: list[str] = []
+        self._section_names_seen: set[str] = set()
 
     @property
     def data_line_count(self) -> int:
@@ -393,6 +412,9 @@ class LASParser:
                 "a 3.x value to enable LAS 3.0 processing.",
                 self.las_file.version.vers,
             )
+
+        # F-34: Cross-section consistency validation.
+        self._validate_cross_section_consistency()
 
         return self.las_file
 
@@ -778,6 +800,12 @@ class LASParser:
 
                 self._current_section = new_section
                 self._current_section_name = section_name.strip() if section_name else section_word
+                # F-34: Track section sequence for cross-section validation.
+                section_label = (
+                    f"{new_section}:{section_name}" if section_name.strip()
+                    else new_section
+                )
+                self._section_sequence.append(section_label)
                 return
 
         if COMMENT_PATTERN.match(line) or EMPTY_PATTERN.match(line):
@@ -893,7 +921,12 @@ class LASParser:
                     actual_value = description
                     self.las_file.well.descriptions[mnemonic] = value
         else:
+            # LAS 2.0+: MNEM.UNIT VALUE : DESCRIPTION (unambiguous — no
+            # CWLS/lasio swap needed).  Also handles LAS 1.2 entries
+            # without a description field (no colon in the line).
             actual_value = value
+            if description:
+                self.las_file.well.descriptions[mnemonic] = description
 
         self.las_file.well[mnemonic] = actual_value
         if unit:
@@ -958,6 +991,16 @@ class LASParser:
         # entries so they can be re-processed with the correct version after
         # ~V is parsed.
         if not self._version_found:
+            # F-35: Guard against unbounded deferred-well-entry accumulation.
+            # Every other accumulator in parser.py has a MAX_* guard; this was
+            # the sole unguarded buffer.  Malicious ~W-before-~V files without
+            # a ~V section could grow this list without bound.
+            if len(self._deferred_well_entries) >= MAX_DEFERRED_WELL_ENTRIES:
+                raise LASParseError(
+                    f"Deferred well entry count ({len(self._deferred_well_entries) + 1}) "
+                    f"exceeds maximum allowed ({MAX_DEFERRED_WELL_ENTRIES}). "
+                    f"The file may be malformed or corrupt."
+                )
             self._deferred_well_entries.append({
                 "mnemonic": mnemonic,
                 "unit": unit,
@@ -1199,6 +1242,24 @@ class LASParser:
         if not self._ascii_data_lines:
             return
 
+        # F2-03: LAS 3.0 WRAP=YES is unsupported — each line is treated
+        # as a complete depth step, but wrapped mode spreads a single
+        # depth step across multiple lines.  Processing wrapped LAS 3.0
+        # data as unwrapped produces phantom rows and silently corrupts
+        # the data.  The writer already overrides WRAP to NO on output
+        # (writer.py:155-164); this is the input-side guard.
+        if self.las_file.version.wrap.upper() == "YES":
+            logger.warning(
+                "LAS 3.0 WRAP=YES is unsupported by pylasdev — "
+                "wrapped-mode data processing is not implemented in "
+                "the LAS 3.0 parser.  The file will be read as "
+                "unwrapped (WRAP=NO).  Each line is assumed to be one "
+                "complete depth step — if the file is genuinely "
+                "wrapped, the parsed data will be silently incorrect.  "
+                "Consider converting the file to unwrapped format "
+                "(one line per depth step) before parsing."
+            )
+
         # Get delimiter character
         delimiter = self.las_file.version.delimiter_char
 
@@ -1306,7 +1367,28 @@ class LASParser:
                 output_names.add(name)
 
         # Determine which curves are string type
-        string_curves = {i: c.data_format == "S" for i, c in enumerate(section_curves)}
+        string_curves = {i: c.data_format in ("S", "A") for i, c in enumerate(section_curves)}
+
+        # F2-05: Validate curve format types — unrecognized formats silently
+        # produce null data when routed through _to_finite_float().  Known
+        # numeric format types are F (float), E (exponential), D (Fortran
+        # double), and S (string).  The empty string (no format specifier)
+        # defaults to numeric.  Non-numeric formats ({DEG}, date templates
+        # like {DD/MM/YYYY}) route through float() and produce null_value
+        # for every data point without any warning.
+        _KNOWN_CURVE_FORMATS: frozenset[str] = frozenset({"F", "E", "D", "S", "A", ""})
+        for curve in section_curves:
+            fmt = curve.data_format
+            if fmt and fmt not in _KNOWN_CURVE_FORMATS:
+                logger.warning(
+                    "Curve '%s' has unsupported format specifier '{%s}'. "
+                    "Non-numeric format types (e.g., {DEG}, date "
+                    "templates) cannot be converted to float in the LAS "
+                    "3.0 parser and will produce null values for every "
+                    "data point.",
+                    curve.mnemonic,
+                    fmt,
+                )
 
         # Get null value (shared utility, used by parser, data_reader, writer)
         null_value = _get_null_value(self.las_file.well)
@@ -1321,8 +1403,12 @@ class LASParser:
 
         num_curves = len(section_curves)
 
-        # Count actual data lines (excluding comments) for array sizing.
-        actual_count = sum(1 for line in self._ascii_data_lines if not COMMENT_PATTERN.match(line))
+        # Count actual data lines (excluding comments and blank lines) for array sizing.
+        actual_count = sum(
+            1
+            for line in self._ascii_data_lines
+            if not COMMENT_PATTERN.match(line) and not EMPTY_PATTERN.match(line)
+        )
 
         # F-26: Global aggregate limit across ALL data sections.
         # Each section passes per-section bounds (MAX_DATA_LINES, MAX_CURVES,
@@ -1376,8 +1462,11 @@ class LASParser:
         warned_extra = False  # Track extra-column warning per section
         warned_short = False  # F-11: Track short-row warning per section
         for line in self._ascii_data_lines:
-            # Skip comment lines
-            if COMMENT_PATTERN.match(line):
+            # Skip comment lines and blank/whitespace-only lines.
+            # F-32: EMPTY_PATTERN was defined at module level but never
+            # used in this loop — blank lines split to [''] and produce
+            # a full row of null_value entries, silently inflating data.
+            if COMMENT_PATTERN.match(line) or EMPTY_PATTERN.match(line):
                 continue
 
             # Split by delimiter
@@ -1444,3 +1533,59 @@ class LASParser:
 
         # Store data section (LAS 3.0)
         self.las_file.data_sections.append(data_section)
+
+    def _validate_cross_section_consistency(self) -> None:
+        """Validate cross-section consistency (F-34).
+
+        Three dimensions checked:
+        (1) Curve count vs data column count for each data section.
+        (2) LAS 3.0 section ordering — data sections before curve
+            definitions have no curves to reference.
+        (3) Duplicate section headers.
+        """
+        # (1) Curve count vs data column count per data section.
+        for ds in self.las_file.data_sections:
+            declared = len(ds.section_curves)
+            actual_cols = len(ds.data) + len(ds.string_data)
+            if actual_cols != declared and declared > 0:
+                logger.warning(
+                    "Data section '%s': section has %d data columns "
+                    "but %d curves declared. Data count mismatch may "
+                    "indicate corrupt or misaligned data.",
+                    ds.name,
+                    actual_cols,
+                    declared,
+                )
+
+        # (2) LAS 3.0 section ordering — data sections before curves.
+        if self.las_file.version.is_las30:
+            data_before_curves = False
+            curve_seen = False
+            for label in self._section_sequence:
+                letter = label[0]  # First char is the section letter code
+                if letter == "A" and not curve_seen:
+                    data_before_curves = True
+                    break
+                if letter == "C":
+                    curve_seen = True
+            if data_before_curves:
+                logger.warning(
+                    "LAS 3.0 file contains data sections before curve "
+                    "definition sections. Data sections without preceding "
+                    "curve definitions will have no curves to reference "
+                    "and may produce empty or truncated output."
+                )
+
+        # (3) Duplicate section headers.
+        name_counts: dict[str, int] = {}
+        for label in self._section_sequence:
+            name_counts[label] = name_counts.get(label, 0) + 1
+        for label, count in name_counts.items():
+            if count > 1:
+                logger.warning(
+                    "Duplicate section header '~%s' encountered %d times. "
+                    "Repeated sections may indicate a malformed file or "
+                    "cause data from earlier instances to be overwritten.",
+                    label,
+                    count,
+                )

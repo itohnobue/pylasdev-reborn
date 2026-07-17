@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pytest
 
 from pylasdev.models import (
     ArrayElementInfo,
@@ -476,6 +477,261 @@ class TestLASFile:
         rt_section = las2.data_sections[0]
         assert rt_section.section_curves == []
 
+    # --- F-01 fix: MAX_PARAMETERS guard on parameter_details ---
+
+    def test_from_dict_parameter_details_max_guard(self, monkeypatch) -> None:
+        """LASFile.from_dict() enforces MAX_PARAMETERS on parameter_details (F-01 fix).
+
+        parameter_details was the sole unguarded iterable in from_dict().
+        The fix adds a len check matching the existing params guard at L428.
+        """
+        # Use a small limit for testing
+        monkeypatch.setattr("pylasdev.parser.MAX_PARAMETERS", 5)
+
+        big_details = [
+            {"mnemonic": f"PARAM_{i}", "value": str(i)} for i in range(6)
+        ]
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100"},
+            "curves_order": ["DEPT"],
+            "parameters": {"_": "_"},  # non-empty dict triggers the dict branch
+            "parameter_details": big_details,
+            "logs": {"DEPT": np.array([100.0])},
+        }
+        with pytest.raises(ValueError, match="Number of parameter details"):
+            LASFile.from_dict(data)
+
+    # --- F2-17 fix: dict.get() None bypass in CurveDefinition ---
+
+    def test_from_dict_curve_none_in_get_guarded(self) -> None:
+        """LASFile.from_dict() handles None values in curve dict fields (F2-17 fix).
+
+        curve_dict.get("mnemonic", "") returned stored None when key existed
+        with value None. The fix wraps all string fields with _safe_str().
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100"},
+            "curves_order": [""],  # _safe_str(None) → "" matches this
+            "curves": [
+                {"mnemonic": None, "unit": None, "description": None}
+            ],
+            "logs": {"": np.array([100.0])},
+        }
+        las = LASFile.from_dict(data)
+        # _safe_str(None) → "" for all string fields
+        assert las.curves[0].mnemonic == ""
+        assert las.curves[0].unit == ""
+        assert las.curves[0].description == ""
+
+    def test_from_dict_section_curve_none_in_get_guarded(self) -> None:
+        """DataSection section_curves fields guarded against None (F2-17 fix, 2nd site).
+
+        mnemonic uses a matching value ("DEPT") so the F-23 cross-validation
+        between curves_order and section_curves passes.  unit and data_format
+        use None to exercise the _safe_str() guard.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "data_sections": [
+                {
+                    "name": "LOG",
+                    "section_type": "LOG_DATA",
+                    "curves_order": ["DEPT"],
+                    "data": {"DEPT": np.array([100.0])},
+                    "section_curves": [
+                        {"mnemonic": "DEPT", "unit": None, "data_format": None}
+                    ],
+                }
+            ],
+        }
+        las = LASFile.from_dict(data)
+        assert len(las.data_sections) == 1
+        sc = las.data_sections[0].section_curves[0]
+        assert sc.mnemonic == "DEPT"
+        assert sc.unit == ""
+        assert sc.data_format == ""
+
+    # --- F-23 fix: cross-validation between section curves_order and section_curves ---
+
+    def test_from_dict_section_cross_validation_mismatch_count(self) -> None:
+        """F-23: Mismatched curve count raises ValueError in per-section validation.
+
+        curves_order has 2 entries but section_curves has 1 — should raise.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "data_sections": [
+                {
+                    "name": "LOG",
+                    "section_type": "LOG_DATA",
+                    "curves_order": ["DEPT", "DT"],
+                    "data": {"DEPT": np.array([100.0]), "DT": np.array([50.0])},
+                    "section_curves": [
+                        {"mnemonic": "DEPT"},
+                    ],
+                }
+            ],
+        }
+        with pytest.raises(ValueError, match="does not match section_curves"):
+            LASFile.from_dict(data)
+
+    def test_from_dict_section_cross_validation_mismatch_name(self) -> None:
+        """F-23: Mismatched mnemonic raises ValueError in per-section validation.
+
+        curves_order says "DT" but section_curves says "DEPT" at same index.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "data_sections": [
+                {
+                    "name": "LOG",
+                    "section_type": "LOG_DATA",
+                    "curves_order": ["DT"],
+                    "data": {"DT": np.array([50.0])},
+                    "section_curves": [
+                        {"mnemonic": "DEPT"},
+                    ],
+                }
+            ],
+        }
+        with pytest.raises(ValueError, match="does not match section_curves"):
+            LASFile.from_dict(data)
+
+    # --- F-24 fix: string_data count guard ---
+
+    def test_from_dict_string_data_max_guard_per_section(self, monkeypatch) -> None:
+        """F-24: Per-section string_data count is bounded by MAX_CURVES."""
+        monkeypatch.setattr("pylasdev.data_reader.MAX_CURVES", 3)
+
+        # Build 4 string data entries — exceeds MAX_CURVES=3
+        str_curves = {f"STR_{i}": np.array(["a"]) for i in range(4)}
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "data_sections": [
+                {
+                    "name": "LOG",
+                    "section_type": "LOG_DATA",
+                    "curves_order": ["DEPT"],
+                    "data": {"DEPT": np.array([100.0])},
+                    "string_data": str_curves,
+                }
+            ],
+        }
+        with pytest.raises(ValueError, match="Number of string data curves"):
+            LASFile.from_dict(data)
+
+    def test_from_dict_string_data_max_guard_top_level(self, monkeypatch) -> None:
+        """F-24: Top-level string_data count is bounded by MAX_CURVES."""
+        monkeypatch.setattr("pylasdev.data_reader.MAX_CURVES", 3)
+
+        str_curves = {f"STR_{i}": np.array(["a"]) for i in range(4)}
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "string_data": str_curves,
+        }
+        with pytest.raises(ValueError, match="Number of string data curves"):
+            LASFile.from_dict(data)
+
+    # --- F-25 fix: ValueError instead of UserWarning for inconsistent arrays ---
+
+    def test_from_dict_inconsistent_log_lengths_raises(self) -> None:
+        """F-25: Inconsistent log array lengths raise ValueError.
+
+        Previously a suppressible UserWarning; now a hard ValueError matching
+        the severity of other validation checks in from_dict().
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100", "STOP": "200"},
+            "curves_order": ["DEPT", "DT"],
+            "logs": {
+                "DEPT": np.array([100.0, 101.0, 102.0]),
+                "DT": np.array([50.0, 51.0]),  # 2 entries vs 3
+            },
+        }
+        with pytest.raises(ValueError, match="inconsistent lengths"):
+            LASFile.from_dict(data)
+
+    def test_from_dict_inconsistent_data_section_lengths_raises(self) -> None:
+        """F-25: Inconsistent data section array lengths raise ValueError."""
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "data_sections": [
+                {
+                    "name": "LOG",
+                    "section_type": "LOG_DATA",
+                    "curves_order": ["DEPT", "DT"],
+                    "data": {
+                        "DEPT": np.array([100.0, 101.0, 102.0]),
+                        "DT": np.array([50.0, 51.0]),  # 2 entries vs 3
+                    },
+                }
+            ],
+        }
+        with pytest.raises(ValueError, match="inconsistent array"):
+            LASFile.from_dict(data)
+
+    # --- F2-25 fix: isinstance guard before _create_parameter_entry ---
+
+    def test_from_dict_parameter_details_non_dict_element(self) -> None:
+        """F2-25: Non-dict element in parameter_details raises TypeError."""
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "parameters": {"_": "_"},
+            "parameter_details": [
+                {"mnemonic": "OK", "value": "1"},
+                None,  # Non-dict element
+            ],
+        }
+        with pytest.raises(TypeError, match="must be a dict"):
+            LASFile.from_dict(data)
+
+    def test_from_dict_params_list_non_dict_element(self) -> None:
+        """F2-25: Non-dict element in params list raises TypeError."""
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "parameters": [
+                {"mnemonic": "OK", "value": "1"},
+                "not_a_dict",  # Non-dict element
+            ],
+        }
+        with pytest.raises(TypeError, match="must be a dict"):
+            LASFile.from_dict(data)
+
 
 class TestDevFile:
     """Tests for DevFile dataclass."""
@@ -550,3 +806,51 @@ class TestDevFile:
         assert dev2.source_file == "test.dev"
         # column_order from to_dict() is restored (or inferred from dict order)
         assert dev2.column_order == ["MD", "TVD"]
+
+    # --- F-03 fix: column_order=None should not crash ---
+
+    def test_dev_file_from_dict_column_order_none(self) -> None:
+        """DevFile.from_dict() handles column_order=None (F-03 fix).
+
+        list(None) previously raised TypeError. The fix treats None as
+        an empty column_order and infers from dict order.
+        """
+        data: dict[str, Any] = {
+            "MD": np.array([0.0, 100.0]),
+            "column_order": None,
+        }
+        dev = DevFile.from_dict(data)
+        # None should produce an empty list; fallback at L726 infers from keys
+        assert dev.column_order == ["MD"]
+
+    # --- F-04 fix: column_order as a string should not corrupt ---
+
+    def test_dev_file_from_dict_column_order_string(self) -> None:
+        """DevFile.from_dict() handles column_order as a string (F-04 fix).
+
+        list("MD,TVD") previously produced ['M','D',',','T','V','D'].
+        The fix wraps a string value in a single-element list.
+        """
+        data: dict[str, Any] = {
+            "MD": np.array([0.0, 100.0]),
+            "TVD": np.array([0.0, 99.0]),
+            "column_order": "MD,TVD",
+        }
+        dev = DevFile.from_dict(data)
+        # String is wrapped in list; "MD,TVD" stays as a single element
+        assert dev.column_order == ["MD,TVD"]
+
+    # --- F2-19 fix: non-numeric values should raise clean ValueError ---
+
+    def test_dev_file_from_dict_non_numeric_column(self) -> None:
+        """DevFile.from_dict() raises ValueError for non-numeric columns (F2-19 fix).
+
+        np.array(["abc"], dtype=np.float64) previously raised an unhandled
+        ValueError from numpy. The fix wraps it in a try/except and re-raises
+        a clean ValueError with context.
+        """
+        data: dict[str, Any] = {
+            "MD": np.array(["abc", "def"]),
+        }
+        with pytest.raises(ValueError, match="Cannot convert data for column"):
+            DevFile.from_dict(data)

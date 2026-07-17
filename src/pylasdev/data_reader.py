@@ -75,6 +75,31 @@ def _is_section_header(stripped: str) -> bool:
     )
 
 
+def _parse_float_with_d_notation(value_str: str) -> float:
+    """Convert a string to float, handling Fortran D-notation.
+
+    Some scientific software writes numbers in D-exponent format
+    (e.g., ``"-999.25D0"``) instead of standard E-notation.  Python's
+    ``float()`` only understands E/e exponents; this helper replaces
+    D/d with E/e before conversion.
+
+    This is a shared helper used by both :func:`_get_null_value` (for
+    the NULL sentinel value in the well section) and :func:`_to_finite_float`
+    (for data values in the ASCII section).
+
+    Args:
+        value_str: String to convert (e.g. ``"-999.25D0"``).
+
+    Returns:
+        Float value.
+
+    Raises:
+        ValueError: If the string cannot be parsed as a float after
+            D→E conversion.
+    """
+    return float(value_str.replace("D", "E").replace("d", "e"))
+
+
 def _get_null_value(
     well: WellSection | dict[str, str],
     default: str = "-999.25",
@@ -94,7 +119,7 @@ def _get_null_value(
         Null value as a float.
     """
     try:
-        null_value = float(well.get("NULL", default))
+        null_value = _parse_float_with_d_notation(well.get("NULL", default))
         # F-04: Reject non-finite sentinel values (NaN, Inf, -Inf) which
         # float() accepts without error.  These propagate through numpy
         # arrays → corrupted statistics → writer outputs "nan" (invalid LAS).
@@ -129,10 +154,7 @@ def _to_finite_float(value_str: str, null_value: float) -> float:
     if not value_str:
         return null_value
     try:
-        # Handle Fortran D-exponent notation (e.g., "1.0D+03") used by
-        # some scientific software.  Python's float() only understands
-        # E/e exponents; replace D/d with E/e before conversion.
-        val = float(value_str.replace("D", "E").replace("d", "e"))
+        val = _parse_float_with_d_notation(value_str)
     except ValueError:
         return null_value
     if not np.isfinite(val):

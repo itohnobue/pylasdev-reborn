@@ -1100,6 +1100,62 @@ class TestFortranDExponent:
         assert data["logs"]["DT"][0] == 1000.0
         assert data["logs"]["DT"][1] == 500.0
 
+    def test_d_exponent_null_value_parsed_correctly(self, tmp_path: Path) -> None:
+        """F-06: Test that Fortran D-notation in NULL field is handled.
+
+        When the ~W section has NULL. -999.25D0 (Fortran D-notation),
+        _get_null_value should parse it correctly via the shared
+        _parse_float_with_d_notation helper instead of falling back
+        to the hardcoded default.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            # D-notation NULL value: Fortran-style exponent
+            " NULL.    -999.25D0       : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A  DEPT  DT\n"
+            # "BAD" should be replaced by the parsed null value (-999.25),
+            # NOT by the hardcoded default -999.25. Since D0 → E0 = 1,
+            # -999.25D0 = -999.25, which is the same value.
+            # The key assertion: it's the value from the file, not a fallback.
+            "100.0  BAD\n"
+        )
+        test_file = tmp_path / "d_null.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        # -999.25D0 = -999.25 * 10^0 = -999.25
+        assert data["logs"]["DT"][0] == -999.25
+
+    def test_d_exponent_null_value_different_value(self, tmp_path: Path) -> None:
+        """F-06: Test that a non-default D-notation NULL value is used correctly.
+
+        NULL. -99.99D0 with BAD data → DT should be -99.99, NOT the
+        hardcoded default -999.25. This verifies the D-notation path
+        actually produces the correct value.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -99.99D0       : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A  DEPT  DT\n"
+            "100.0  BAD\n"
+        )
+        test_file = tmp_path / "d_null_99.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        # -99.99D0 = -99.99, not -999.25
+        assert data["logs"]["DT"][0] == -99.99
+
 
 class TestWrappedPathologicalMisalignment:
     """T6/G-09: _read_wrapped pathological misalignment path."""
@@ -1852,3 +1908,63 @@ class TestLAS30StructuredDataValues:
             perfs_section.string_data["PERFT_2"],
             np.array(["BIG HOLE", "BIG HOLE", "BIG HOLE"]),
         )
+
+
+class TestGetNullValue:
+    """F-06: Direct unit tests for _get_null_value Fortran D-notation handling."""
+
+    def test_standard_null_value(self) -> None:
+        """Standard -999.25 null value parses correctly."""
+        from pylasdev.data_reader import _get_null_value
+
+        well = {"NULL": "-999.25"}
+        result = _get_null_value(well)
+        assert result == -999.25
+
+    def test_d_notation_null_value_uppercase(self) -> None:
+        """Fortran D-notation NULL (uppercase D) parses correctly."""
+        from pylasdev.data_reader import _get_null_value
+
+        well = {"NULL": "-999.25D0"}
+        result = _get_null_value(well)
+        assert result == -999.25
+
+    def test_d_notation_null_value_lowercase(self) -> None:
+        """Fortran D-notation NULL (lowercase d) parses correctly."""
+        from pylasdev.data_reader import _get_null_value
+
+        well = {"NULL": "-999.25d0"}
+        result = _get_null_value(well)
+        assert result == -999.25
+
+    def test_d_notation_with_exponent(self) -> None:
+        """Fortran D-notation with explicit exponent (+03) parses correctly."""
+        from pylasdev.data_reader import _get_null_value
+
+        well = {"NULL": "1.0D+03"}
+        result = _get_null_value(well)
+        assert result == 1000.0
+
+    def test_d_notation_negative_exponent(self) -> None:
+        """Fortran D-notation with negative exponent (D-02) parses correctly."""
+        from pylasdev.data_reader import _get_null_value
+
+        well = {"NULL": "3.14D-02"}
+        result = _get_null_value(well)
+        assert result == 0.0314
+
+    def test_d_notation_falls_back_on_invalid(self) -> None:
+        """Invalid D-notation value falls back to default_float."""
+        from pylasdev.data_reader import _get_null_value
+
+        well = {"NULL": "NOT_A_NUMBER"}
+        result = _get_null_value(well)
+        assert result == -999.25
+
+    def test_missing_null_key_returns_default(self) -> None:
+        """Missing NULL key returns default_float."""
+        from pylasdev.data_reader import _get_null_value
+
+        well: dict[str, str] = {}
+        result = _get_null_value(well)
+        assert result == -999.25

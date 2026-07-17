@@ -5,7 +5,6 @@ Supports LAS 1.2, 2.0, and 3.0 formats.
 
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -362,6 +361,17 @@ class LASFile:
             las_file.well.descriptions[key] = _safe_str(desc)
 
         curves_order = data.get("curves_order", [])
+        # F-21: Guard against non-list iterables.  list(string) silently
+        # creates a list of single characters (e.g. "DEPT,DT,GR" → 10
+        # single-char mnemonics), passing all downstream cross-validation
+        # because both curves_order and curves get corrupted the same way.
+        if curves_order is None:
+            curves_order = []
+        elif isinstance(curves_order, str):
+            raise ValueError(
+                f"curves_order must be a list, got str: "
+                f"{curves_order!r}"
+            )
         las_file.curves_order = list(curves_order)
 
         # Restore curve metadata if available (new format), otherwise create minimal CurveDefinition
@@ -384,12 +394,12 @@ class LASFile:
                     )
                 las_file.curves.append(
                     CurveDefinition(
-                        mnemonic=curve_dict.get("mnemonic", ""),
-                        unit=curve_dict.get("unit", ""),
-                        api_code=curve_dict.get("api_code", ""),
-                        description=curve_dict.get("description", ""),
-                        original_mnemonic=curve_dict.get("original_mnemonic", ""),
-                        data_format=curve_dict.get("data_format", ""),
+                        mnemonic=_safe_str(curve_dict.get("mnemonic", "")),
+                        unit=_safe_str(curve_dict.get("unit", "")),
+                        api_code=_safe_str(curve_dict.get("api_code", "")),
+                        description=_safe_str(curve_dict.get("description", "")),
+                        original_mnemonic=_safe_str(curve_dict.get("original_mnemonic", "")),
+                        data_format=_safe_str(curve_dict.get("data_format", "")),
                         array_info=array_info,
                     )
                 )
@@ -437,7 +447,20 @@ class LASFile:
             # on roundtrip (e.g. array_index, zone, unit, description).
             param_details = data.get("parameter_details")
             if param_details and isinstance(param_details, list):
+                if len(param_details) > MAX_PARAMETERS:
+                    raise ValueError(
+                        f"Number of parameter details ({len(param_details)}) exceeds maximum "
+                        f"allowed ({MAX_PARAMETERS})"
+                    )
                 for param_dict in param_details:
+                    # F2-25: Guard against non-dict elements in the list.
+                    # _create_parameter_entry assumes dict argument; passing
+                    # None/int/string causes TypeError on "zone" in param_dict.
+                    if not isinstance(param_dict, dict):
+                        raise TypeError(
+                            f"Parameter detail entry must be a dict, "
+                            f"got {type(param_dict).__name__}"
+                        )
                     las_file.parameters.append(_create_parameter_entry(param_dict))
             else:
                 # Pure legacy: only params dict, no details available
@@ -448,6 +471,13 @@ class LASFile:
         elif isinstance(params, list):
             # New format: [{"mnemonic": ..., "value": ..., ...}, ...]
             for param_dict in params:
+                # F2-25: Guard against non-dict elements in the list.
+                # Same check as the param_details path above.
+                if not isinstance(param_dict, dict):
+                    raise TypeError(
+                        f"Parameter entry must be a dict, "
+                        f"got {type(param_dict).__name__}"
+                    )
                 las_file.parameters.append(_create_parameter_entry(param_dict))
 
         # F-06: Resource-exhaustion guard for other section content.
@@ -473,8 +503,28 @@ class LASFile:
             if not isinstance(ds_dict, dict):
                 continue
             ds_string_data = {}
-            for name, arr in ds_dict.get("string_data", {}).items():
-                ds_string_data[name] = np.array(arr, dtype=np.str_)
+            _ds_string_raw = ds_dict.get("string_data", {})
+            # F-24: Per-section string_data entry count guard.  Every other
+            # iterable dict in from_dict() has a count guard (curves_data →
+            # MAX_CURVES, ds_data → MAX_CURVES, logs → MAX_CURVES, etc.);
+            # string_data was the sole unguarded iterable.
+            if len(_ds_string_raw) > MAX_CURVES:
+                ds_name = ds_dict.get("name", "<unknown>")
+                raise ValueError(
+                    f"Number of string data curves ({len(_ds_string_raw)}) "
+                    f"in section '{ds_name}' exceeds maximum allowed ({MAX_CURVES})"
+                )
+            for name, arr in _ds_string_raw.items():
+                # F-22: Guard against None — np.array(None, dtype=np.str_)
+                # creates a 0-d array containing the string "None", which
+                # then passes the downstream len() check as a silent bug.
+                if arr is None:
+                    ds_name = ds_dict.get("name", "<unknown>")
+                    raise ValueError(
+                        f"String data for curve '{name}' in section "
+                        f"'{ds_name}' is None"
+                    )
+                ds_string_data[name] = np.atleast_1d(np.array(arr, dtype=np.str_))
                 # F-03: Per-array size guard for data section string_data arrays.
                 if len(ds_string_data[name]) > MAX_DATA_LINES:
                     ds_name = ds_dict.get("name", "<unknown>")
@@ -484,7 +534,18 @@ class LASFile:
                         f"allowed ({MAX_DATA_LINES})"
                     )
             ds_section_curves = []
-            for sc_dict in ds_dict.get("section_curves", []):
+            _sc_raw = ds_dict.get("section_curves", [])
+            # F-19: Resource-exhaustion guard for section_curves — match
+            # the same MAX_CURVES check used for top-level curves_data and
+            # curves_order.  The parser path has this guard (parser.py:1344);
+            # from_dict() was the sole unguarded path.
+            if len(_sc_raw) > MAX_CURVES:
+                ds_name = ds_dict.get("name", "<unknown>")
+                raise ValueError(
+                    f"Number of section curves ({len(_sc_raw)}) in section "
+                    f"'{ds_name}' exceeds maximum allowed ({MAX_CURVES})"
+                )
+            for sc_dict in _sc_raw:
                 sc_array_info = None
                 if "array_info" in sc_dict and isinstance(sc_dict["array_info"], dict):
                     ai = sc_dict["array_info"]
@@ -495,20 +556,30 @@ class LASFile:
                     )
                 ds_section_curves.append(
                     CurveDefinition(
-                        mnemonic=sc_dict.get("mnemonic", ""),
-                        unit=sc_dict.get("unit", ""),
-                        api_code=sc_dict.get("api_code", ""),
-                        description=sc_dict.get("description", ""),
-                        original_mnemonic=sc_dict.get("original_mnemonic", ""),
-                        data_format=sc_dict.get("data_format", ""),
+                        mnemonic=_safe_str(sc_dict.get("mnemonic", "")),
+                        unit=_safe_str(sc_dict.get("unit", "")),
+                        api_code=_safe_str(sc_dict.get("api_code", "")),
+                        description=_safe_str(sc_dict.get("description", "")),
+                        original_mnemonic=_safe_str(sc_dict.get("original_mnemonic", "")),
+                        data_format=_safe_str(sc_dict.get("data_format", "")),
                         array_info=sc_array_info,
                     )
                 )
             ds_data_raw = ds_dict.get("data", {})
+            # F2-21: Per-section entry count guard.  Outer MAX_DATA_SECTIONS
+            # guards section count; per-array MAX_DATA_LINES guards element
+            # count.  Per-section curve entry count was unguarded — 1 section
+            # x 200K single-element arrays passes all existing guards.
+            if len(ds_data_raw) > MAX_CURVES:
+                ds_name = ds_dict.get("name", "<unknown>")
+                raise ValueError(
+                    f"Number of data curves ({len(ds_data_raw)}) in section "
+                    f"'{ds_name}' exceeds maximum allowed ({MAX_CURVES})"
+                )
             ds_data = {}
             for k, v in ds_data_raw.items():
                 try:
-                    ds_data[k] = np.array(v, dtype=np.float64)
+                    ds_data[k] = np.atleast_1d(np.array(v, dtype=np.float64))
                 except (ValueError, TypeError) as e:
                     ds_name = ds_dict.get("name", "<unknown>")
                     raise ValueError(
@@ -522,33 +593,97 @@ class LASFile:
                         f"section '{ds_name}' exceeds maximum allowed "
                         f"({MAX_DATA_LINES})"
                     )
+            # F-20: Per-section total element count guard — only top-level
+            # las_file.logs had this check (below); data_section arrays were
+            # unguarded.  Attack: 1,000 sections x 1 curve x 10M lines =
+            # 80 GB, passing all per-array and per-section count guards.
+            if ds_data:
+                _ds_rows = max(len(arr) for arr in ds_data.values())
+                _ds_total = len(ds_data) * _ds_rows
+                if _ds_total > MAX_TOTAL_ELEMENTS:
+                    ds_name = ds_dict.get("name", "<unknown>")
+                    raise ValueError(
+                        f"Total allocation in section '{ds_name}' "
+                        f"({len(ds_data)} curves x {_ds_rows} rows = "
+                        f"{_ds_total} elements) exceeds maximum allowed "
+                        f"({MAX_TOTAL_ELEMENTS})"
+                    )
+            _ds_curves_order = ds_dict.get("curves_order", [])
+            # F2-22: Guard against non-list iterables for per-section
+            # curves_order — same bug as top-level F-21.
+            if _ds_curves_order is None:
+                _ds_curves_order = []
+            elif isinstance(_ds_curves_order, str):
+                ds_name = ds_dict.get("name", "<unknown>")
+                raise ValueError(
+                    f"curves_order in section '{ds_name}' must be a list, "
+                    f"got str: {_ds_curves_order!r}"
+                )
+            # F-23: Cross-validate per-section curves_order with section_curves,
+            # matching the top-level cross-validation pattern.  from_dict builds
+            # these from independent dict keys; mismatched input would produce
+            # silently inconsistent DataSection state.
+            # Only validate when section_curves is non-empty — empty
+            # section_curves means the section inherits curve definitions
+            # from the top-level LASFile.curves (valid LAS 3.0 pattern).
+            if ds_section_curves:
+                _sc_count = len(ds_section_curves)
+                if len(_ds_curves_order) != _sc_count:
+                    ds_name = ds_dict.get("name", "<unknown>")
+                    raise ValueError(
+                        f"curves_order length ({len(_ds_curves_order)}) in section "
+                        f"'{ds_name}' does not match section_curves length ({_sc_count})"
+                    )
+                for _i, (_order_name, _sc) in enumerate(
+                    zip(_ds_curves_order, ds_section_curves, strict=True)
+                ):
+                    if _order_name != _sc.mnemonic:
+                        ds_name = ds_dict.get("name", "<unknown>")
+                        raise ValueError(
+                            f"curves_order[{_i}] = {_order_name!r} in section "
+                            f"'{ds_name}' does not match section_curves[{_i}].mnemonic "
+                            f"= {_sc.mnemonic!r}"
+                        )
             ds = DataSection(
                 name=ds_dict.get("name", ""),
                 section_type=ds_dict.get("section_type", "LOG_DATA"),
-                curves_order=list(ds_dict.get("curves_order", [])),
+                curves_order=list(_ds_curves_order),
                 data=ds_data,
                 string_data=ds_string_data,
                 section_curves=ds_section_curves,
             )
             las_file.data_sections.append(ds)
-            # F-M15: Cross-array length validation within this data section.
+            # F-25: Cross-array length validation within this data section.
+            # Inconsistent-length arrays produce silently corrupted output if
+            # accepted — different curves with different sample counts in the
+            # same data section represent invalid LAS data (see F-25).
             if len(ds.data) > 1:
                 _ds_len = {name: len(arr) for name, arr in ds.data.items()}
                 if len(set(_ds_len.values())) > 1:
-                    warnings.warn(
+                    raise ValueError(
                         f"Data section '{ds.name}' has inconsistent array "
-                        f"lengths: {_ds_len}. Data may be silently padded or "
-                        f"truncated by the LAS writer.",
-                        UserWarning,
-                        stacklevel=2,
+                        f"lengths: {_ds_len}"
                     )
 
         # Restore LAS 3.0 string data (top-level, backward compat
         # with data serialized before string_data was moved to
         # per-section DataSection objects).
         sd = data.get("string_data", {})
+        # F-24: Top-level string_data entry count guard — same gap as
+        # the per-section path fixed above.
+        if len(sd) > MAX_CURVES:
+            raise ValueError(
+                f"Number of string data curves ({len(sd)}) exceeds "
+                f"maximum allowed ({MAX_CURVES})"
+            )
         for name, arr in sd.items():
-            las_file.string_data[name] = np.array(arr, dtype=np.str_)
+            # F-22: Guard against None — same bug as per-section
+            # string_data above.
+            if arr is None:
+                raise ValueError(
+                    f"String data for curve '{name}' is None"
+                )
+            las_file.string_data[name] = np.atleast_1d(np.array(arr, dtype=np.str_))
             # F-M02: Per-array size guard for string_data arrays.
             if len(las_file.string_data[name]) > MAX_DATA_LINES:
                 raise ValueError(
@@ -566,7 +701,7 @@ class LASFile:
             )
         for name, arr in logs.items():
             try:
-                las_file.logs[name] = np.array(arr, dtype=np.float64)
+                las_file.logs[name] = np.atleast_1d(np.array(arr, dtype=np.float64))
             except (ValueError, TypeError) as e:
                 raise ValueError(
                     f"Cannot convert log data for curve '{name}' to numeric array: {e}"
@@ -578,15 +713,15 @@ class LASFile:
                     f"'{name}' exceeds maximum allowed ({MAX_DATA_LINES})"
                 )
 
-        # F-M15: Cross-array length validation for top-level log arrays.
+        # F-25: Cross-array length validation for top-level log arrays.
+        # Inconsistent-length arrays produce silently corrupted output if
+        # accepted — different curves with different sample counts represent
+        # invalid data (see F-25).
         if len(las_file.logs) > 1:
             _log_len = {name: len(arr) for name, arr in las_file.logs.items()}
             if len(set(_log_len.values())) > 1:
-                warnings.warn(
-                    f"Log arrays have inconsistent lengths: {_log_len}. "
-                    f"Data may be silently padded or truncated by the LAS writer.",
-                    UserWarning,
-                    stacklevel=2,
+                raise ValueError(
+                    f"Log arrays have inconsistent lengths: {_log_len}"
                 )
 
         # F-M02: Total element count guard across all log curves.
@@ -692,9 +827,19 @@ class DevFile:
                 elif key == "source_file":
                     dev.source_file = _safe_str(value)
                 elif key == "column_order":
-                    dev.column_order = list(value)
+                    if value is None:
+                        dev.column_order = []
+                    elif isinstance(value, str):
+                        dev.column_order = [value]
+                    else:
+                        dev.column_order = list(value)
             else:
-                dev.columns[key] = np.array(value, dtype=np.float64)
+                try:
+                    dev.columns[key] = np.atleast_1d(np.array(value, dtype=np.float64))
+                except (ValueError, TypeError) as e:
+                    raise ValueError(
+                        f"Cannot convert data for column '{key}' to numeric array: {e}"
+                    ) from e
                 # F-M01: Per-array size guard for DevFile columns.
                 if len(dev.columns[key]) > MAX_DATA_LINES:
                     raise ValueError(

@@ -195,7 +195,11 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 # the integer count from the first line matches the token count
                 # on the second line.  Column-count == header-token-count is a
                 # strong signal of DUG format even with all-numeric headers.
-                if col_count == len(second_tokens):
+                # F-08: Require >= 3 content entries before activating the
+                # count-match heuristic.  Without this guard a 2-line file
+                # like "4\\n100.0 200.0 300.0 400.0\\n" is misdetected as
+                # DUG, skip_content_lines=2, zero data lines → total data loss.
+                if len(content_entries) >= 3 and col_count == len(second_tokens):
                     return ("dug", 2)
                 # F-DV01: Count-mismatch fallback — when the second line is
                 # all-float but the count doesn't match the first line's
@@ -499,7 +503,10 @@ def read_dev_file_as_object(
                 continue
             elif content_seen == skip_content_lines:
                 # Header line — parse column names.
-                names = values
+                # Filter out empty strings from trailing delimiters (e.g.,
+                # "MD,TVD," → ["MD","TVD",""]) so empty column names are
+                # rejected instead of creating dev.columns[""].
+                names = [v for v in values if v]
                 if not names:
                     raise DEVReadError(
                         "Empty header line in DUG-format DEV file. "
@@ -555,7 +562,10 @@ def read_dev_file_as_object(
         else:  # simple header format
             if content_seen == 1:
                 # First non-comment line = column names.
-                names = values
+                # Filter out empty strings from trailing delimiters (e.g.,
+                # "MD,TVD," → ["MD","TVD",""]) so empty column names are
+                # rejected instead of creating dev.columns[""].
+                names = [v for v in values if v]
                 if not names:
                     raise DEVReadError(
                         "Empty header line in DEV file. "

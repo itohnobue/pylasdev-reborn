@@ -996,3 +996,162 @@ class TestExplicitDelimiterParameter:
         assert "MD TVD X" in data
         # Data token "0.0 0.0 100.0" is not parseable as float → NaN
         assert np.isnan(data["MD TVD X"][0])
+
+    # --- F-08: 2-line DUG count-match heuristic no longer fires ---
+    def test_two_line_file_not_misdetected_as_dug(self, tmp_path: Path) -> None:
+        """F-08: A 2-line file with integer count + all-numeric second line
+        must NOT be detected as DUG via the count-match heuristic.
+
+        Before the fix, "4\\n100.0 200.0 300.0 400.0\\n" triggered:
+        col_count (4) == len(second_tokens) (4) → ("dug", 2) →
+        skip_content_lines=2 → zero data lines → total data loss.
+
+        After the fix, the count-match heuristic requires >= 3 content
+        entries, so the 2-line file correctly falls through to headerless
+        detection and produces data instead of an empty result.  The
+        column count is 1 (first row "4" has one token), and the second
+        row's extra tokens are discarded with a warning.
+        """
+        content = "4\n100.0 200.0 300.0 400.0\n"
+        test_file = tmp_path / "f08_twoline.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Critical: should NOT be empty (was the bug — total data loss)
+        assert len(data) > 0, "2-line file should NOT produce zero columns"
+        # Detected as headerless: first row "4" → 1 column, col_0
+        assert "col_0" in data
+        assert len(data["col_0"]) == 2, "Should have 2 data rows"
+        assert data["col_0"][0] == 4.0
+        # Second row's extra values discarded (only 1 column declared)
+        assert data["col_0"][1] == 100.0
+
+    # --- F-10: F-DV01 count-mismatch fallback test coverage ---
+    def test_dv01_count_mismatch_fallback(self, tmp_path: Path) -> None:
+        """F-10: F-DV01 count-mismatch fallback (dev_reader.py:215-218).
+
+        Trigger: first line is a single integer (col_count), second line
+        has all-float tokens with a DIFFERENT count than col_count, and
+        3+ content entries exist.  This activates the fallback which
+        treats the second line as a DUG header with numeric column names.
+        """
+        # col_count=3 but second line has 4 float tokens (mismatch)
+        # 3+ content entries → fallback activates, returns ("dug", 2)
+        # Second line becomes header: columns ["1.0", "2.0", "3.0", "4.0"]
+        content = (
+            "3\n"
+            "1.0 2.0 3.0 4.0\n"
+            "100.0 200.0 300.0 400.0\n"
+            "500.0 600.0 700.0 800.0\n"
+        )
+        test_file = tmp_path / "dv01_fallback.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Detected as DUG with numeric column names
+        assert "1.0" in data
+        assert "2.0" in data
+        assert "3.0" in data
+        assert "4.0" in data
+        assert len(data["1.0"]) == 2  # 2 data rows
+        assert data["1.0"][0] == 100.0
+        assert data["1.0"][1] == 500.0
+        assert data["2.0"][0] == 200.0
+        assert data["3.0"][0] == 300.0
+        assert data["4.0"][0] == 400.0
+
+    # --- F-10 variant: F-DV01 with 2.0e1-style float tokens ---
+    def test_dv01_fallback_with_scientific_notation_headers(self, tmp_path: Path) -> None:
+        """F-10: F-DV01 fallback with scientific-notation numeric header tokens.
+
+        Verifies the fallback works when second-line tokens use scientific
+        notation (e.g. 1.0e2).  The _is_float_token() function handles
+        e/E/d/D notation.
+        """
+        content = (
+            "2\n"
+            "1.0e2 2.0E-1 3.14159\n"
+            "100.0 200.0 300.0\n"
+            "400.0 500.0 600.0\n"
+        )
+        test_file = tmp_path / "dv01_sci.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # col_count=2, 3 tokens on second line, all float → fallback
+        # Column names are the float strings as-is
+        assert "1.0e2" in data
+        assert "2.0E-1" in data
+        assert "3.14159" in data
+        assert len(data["1.0e2"]) == 2
+        assert data["1.0e2"][0] == 100.0
+        assert data["2.0E-1"][0] == 200.0
+        assert data["3.14159"][0] == 300.0
+
+
+class TestEmptyColumnNames:
+    """F2-11: Empty column names from trailing delimiters are rejected.
+
+    Before the fix, "MD,TVD,".split(",") → ["MD","TVD",""] and the
+    empty string passed through normalization, dedup, and allocation,
+    creating dev.columns[""] = array.  After the fix, empty strings
+    are filtered out so they are silently dropped.
+    """
+
+    def test_trailing_comma_no_data(self, tmp_path: Path) -> None:
+        """Trailing comma in header should be ignored (header-only file)."""
+        # Before fix: "MD,TVD," → ["MD","TVD",""] → columns: MD, TVD, ""
+        content = "MD,TVD,\n"
+        test_file = tmp_path / "f2_11_trail_no_data.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Only 2 valid columns, empty string filtered out
+        assert list(data.keys()) == ["MD", "TVD"]
+        assert len(data["MD"]) == 0
+
+    def test_trailing_comma_with_data(self, tmp_path: Path) -> None:
+        """Trailing comma in header with data rows works correctly."""
+        content = "MD,TVD,\n0.0,0.0,\n100.0,99.0,\n200.0,198.0,\n"
+        test_file = tmp_path / "f2_11_trail_data.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Only 2 valid columns
+        assert list(data.keys()) == ["MD", "TVD"]
+        assert len(data["MD"]) == 3
+        assert data["MD"][0] == 0.0
+        assert data["MD"][2] == 200.0
+        assert data["TVD"][2] == 198.0
+
+    def test_trailing_comma_dug_format(self, tmp_path: Path) -> None:
+        """Trailing comma in DUG format header is filtered."""
+        content = "Survey\n3\nMD,TVD,X,\n0.0,0.0,100.0,\n100.0,99.0,101.0,\n"
+        test_file = tmp_path / "f2_11_dug_trail.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "X"]
+        assert len(data["MD"]) == 2
+        assert data["MD"][0] == 0.0
+
+    def test_trailing_space_in_comma_header(self, tmp_path: Path) -> None:
+        """Trailing space after a comma is stripped (v.strip() handles it)."""
+        content = "MD, TVD, \n0.0, 0.0, \n"
+        test_file = tmp_path / "f2_11_space_trail.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD"]
+        assert len(data["MD"]) == 1
+
+    def test_no_trailing_delimiter_still_works(self, tmp_path: Path) -> None:
+        """Normal comma-delimited files without trailing delimiter still work."""
+        content = "MD,TVD,X\n0.0,0.0,100.0\n100.0,99.0,101.0\n"
+        test_file = tmp_path / "f2_11_normal.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "X"]
+        assert len(data["MD"]) == 2
+        assert data["MD"][0] == 0.0

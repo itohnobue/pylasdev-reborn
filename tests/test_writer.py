@@ -1132,6 +1132,205 @@ class TestWriteLASFile:
         assert "~OTHER" not in content
         assert "~Other" not in content
 
+    # --- F-26: Well section mandatory field ordering ---
+    def test_well_section_mandatory_field_ordering(self, tmp_path: Path) -> None:
+        """Verify that STRT, STOP, STEP, NULL appear first in well section.
+
+        The CWLS spec requires these four mandatory fields to appear
+        before other well information fields. The writer must reorder
+        the output regardless of dict insertion order.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="2.0")
+        # Insert fields in non-spec order to verify reordering
+        las.well["COMP"] = "TestCompany"
+        las.well["NULL"] = "-999.25"
+        las.well["STRT"] = "100.0"
+        las.well["WELL"] = "Well-X"
+        las.well["STOP"] = "200.0"
+        las.well["FLD"] = "OilField"
+        las.well["STEP"] = "1.0"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        temp_file = tmp_path / "well_order.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        # Extract well section content between ~WELL and next section
+        well_start = content.index("~WELL")
+        well_end = content.index("~CURVE")
+        well_section = content[well_start:well_end]
+
+        # Find positions of mandatory fields — they must appear before COMP/WELL/FLD
+        strt_pos = well_section.index("STRT")
+        stop_pos = well_section.index("STOP")
+        step_pos = well_section.index("STEP")
+        null_pos = well_section.index("NULL")
+        comp_pos = well_section.index("COMP")
+
+        # All four mandatory fields must appear before COMP
+        assert strt_pos < comp_pos, "STRT must appear before COMP"
+        assert stop_pos < comp_pos, "STOP must appear before COMP"
+        assert step_pos < comp_pos, "STEP must appear before COMP"
+        assert null_pos < comp_pos, "NULL must appear before COMP"
+
+    # --- F2-29: SPACE delimiter + tab in string data ---
+    def test_string_data_space_delimiter_with_tab(self, tmp_path: Path) -> None:
+        """Tab in string data with SPACE delimiter must be sanitized.
+
+        The SPACE delimiter reader uses str.split() which treats tabs
+        as whitespace separators. Embedded tabs must be replaced with
+        underscores to prevent one value splitting into multiple tokens.
+        """
+        import warnings
+
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="SPACE")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "CDES"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
+        las.curves.append(CurveDefinition(mnemonic="CDES", unit="", data_format="S"))
+
+        section = DataSection(
+            name="CURVE",
+            curves_order=["DEPT", "CDES"],
+            data={"DEPT": np.array([100.0, 101.0])},
+        )
+        las.data_sections.append(section)
+        # String data with embedded tab character
+        section.string_data["CDES"] = np.array(
+            ["LIMESTONE\tFRACTURED", "DOLOMITE"], dtype=np.str_
+        )
+
+        temp_file = tmp_path / "space_delim_tab.las"
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            write_las_file(temp_file, las)
+            delim_warnings = [
+                x for x in w if "whitespace" in str(x.message)
+            ]
+            assert len(delim_warnings) >= 1, (
+                "Expected warning about whitespace in string data with SPACE delimiter"
+            )
+
+        content = temp_file.read_text()
+        # The tab must be replaced with underscore, not left as raw tab
+        data_section = content.split("~A CURVE | CURVE")[1]
+        assert "\t" not in data_section, "Raw tab must NOT appear in data section"
+        assert "LIMESTONE_FRACTURED" in content, "Tab should be replaced with underscore"
+
+        # Verify roundtrip: re-read does not corrupt
+        reread = read_las_file(temp_file)
+        assert "CDES" in reread.get("string_data", {})
+        # The re-read value has the tab replaced by underscore
+        assert "LIMESTONE_FRACTURED" in str(reread["string_data"]["CDES"][0])
+
+    # --- F2-30: COMMA delimiter + comma in string data ---
+    def test_string_data_comma_delimiter_with_comma(self, tmp_path: Path) -> None:
+        """Comma in string data with COMMA delimiter must be sanitized.
+
+        The COMMA delimiter reader splits on commas. Embedded commas
+        must be replaced with semicolons to prevent one value
+        fragmenting into multiple tokens.
+        """
+        import warnings
+
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "CDES"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
+        las.curves.append(CurveDefinition(mnemonic="CDES", unit="", data_format="S"))
+
+        section = DataSection(
+            name="CURVE",
+            curves_order=["DEPT", "CDES"],
+            data={"DEPT": np.array([100.0, 101.0])},
+        )
+        las.data_sections.append(section)
+        # String data with embedded comma
+        section.string_data["CDES"] = np.array(
+            ["SANDSTONE, FINE GRAINED", "DOLOMITE"], dtype=np.str_
+        )
+
+        temp_file = tmp_path / "comma_delim_comma.las"
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            write_las_file(temp_file, las)
+            delim_warnings = [
+                x for x in w if "delimiter character (COMMA)" in str(x.message)
+            ]
+            assert len(delim_warnings) >= 1, (
+                "Expected warning about COMMA delimiter in string data"
+            )
+
+        content = temp_file.read_text()
+        # Find the data section — for LAS 3.0 with data_sections
+        data_section = content.split("~A CURVE | CURVE")[1]
+        # The first data line should have the comma replaced with semicolon
+        first_line = next(ln for ln in data_section.splitlines() if ln.strip())
+        assert "SANDSTONE; FINE GRAINED" in first_line, (
+            f"Comma should be replaced with semicolon, got: {first_line!r}"
+        )
+        assert "SANDSTONE, FINE GRAINED" not in first_line
+
+        # Verify roundtrip
+        reread = read_las_file(temp_file)
+        assert "CDES" in reread.get("string_data", {})
+        assert "SANDSTONE; FINE GRAINED" in str(reread["string_data"]["CDES"][0])
+
+    # --- F2-31: TAB delimiter + tab in string data ---
+    def test_string_data_tab_delimiter_with_tab(self, tmp_path: Path) -> None:
+        """Tab in string data with TAB delimiter must be sanitized.
+
+        The TAB delimiter reader splits on tab characters. Embedded tabs
+        must be replaced with spaces to prevent one value fragmenting
+        into multiple tokens.
+        """
+        import warnings
+
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="TAB")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "CDES"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
+        las.curves.append(CurveDefinition(mnemonic="CDES", unit="", data_format="S"))
+
+        section = DataSection(
+            name="CURVE",
+            curves_order=["DEPT", "CDES"],
+            data={"DEPT": np.array([100.0, 101.0])},
+        )
+        las.data_sections.append(section)
+        # String data with embedded tab
+        section.string_data["CDES"] = np.array(
+            ["SANDSTONE\tLAMINATED", "DOLOMITE"], dtype=np.str_
+        )
+
+        temp_file = tmp_path / "tab_delim_tab.las"
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            write_las_file(temp_file, las)
+            delim_warnings = [
+                x for x in w if "delimiter character (TAB)" in str(x.message)
+            ]
+            assert len(delim_warnings) >= 1, (
+                "Expected warning about TAB delimiter in string data"
+            )
+
+        content = temp_file.read_text()
+        # The embedded tab should be replaced with space
+        assert "SANDSTONE LAMINATED" in content, (
+            "Tab should be replaced with space"
+        )
+
+        # Verify roundtrip does not corrupt
+        reread = read_las_file(temp_file)
+        assert "CDES" in reread.get("string_data", {})
+        assert "SANDSTONE LAMINATED" in str(reread["string_data"]["CDES"][0])
+
 
 class TestSectionTypeToPrefix:
     """F-T2-M02/F-ITER2-T2-M04: Tests for _section_type_to_prefix."""

@@ -207,7 +207,24 @@ def _write_well_section(las_file: LASFile) -> list[str]:
                 stacklevel=4,
             )
 
-    for key, value in las_file.well.entries.items():
+    # F-26: Reorder mandatory well fields (STRT, STOP, STEP, NULL)
+    # to appear first per CWLS spec, followed by remaining fields in
+    # original dict insertion order.  Do not drop any fields.
+    mandatory_order = ["STRT", "STOP", "STEP", "NULL"]
+    ordered_keys: list[str] = []
+    # First pass: collect mandatory fields that are present, in spec order.
+    for mandatory in mandatory_order:
+        for key in las_file.well.entries:
+            if key.upper() == mandatory and key not in ordered_keys:
+                ordered_keys.append(key)
+                break
+    # Second pass: remaining fields in original insertion order.
+    for key in las_file.well.entries:
+        if key not in ordered_keys:
+            ordered_keys.append(key)
+
+    for key in ordered_keys:
+        value = las_file.well.entries[key]
         unit = _sanitize_las_value(las_file.well.units.get(key, ""))
         unit_dot = f".{unit}" if unit else "."
         val = _sanitize_las_value(value)
@@ -504,7 +521,7 @@ def _format_data_rows(
         return lines
 
     warned_long = False  # Deduplicate long-line warnings per section
-    warned_space_str = False  # Deduplicate space-in-string warnings per section
+    warned_delim_str = False  # Deduplicate delimiter-in-string warnings per section
     for i in range(num_rows):
         row_values: list[str] = []
         for arr, is_string in curve_arrays:
@@ -512,25 +529,52 @@ def _format_data_rows(
                 row_values.append(_format_number(null_value, precision, null_value))
             elif is_string:
                 val = _sanitize_las_value(str(arr[i]))
-                # F-W05: SPACE delimiter + string data with spaces causes
-                # roundtrip corruption — the reader splits on any whitespace,
-                # turning one string value into multiple tokens. Replace
-                # internal spaces with underscores and warn once per section.
-                if delimiter == " " and " " in val:
-                    if not warned_space_str:
+                # F2-29/F2-30/F2-31 + F-W05: Delimiter-aware string data
+                # sanitization.  When the active delimiter character (or
+                # any whitespace for SPACE delimiter) appears in a string
+                # value, it must be replaced to prevent roundtrip corruption.
+                # The reader splits on the delimiter, so embedded delimiter
+                # characters create phantom field boundaries on re-read.
+                if delimiter == " ":
+                    # SPACE delimiter: the reader (str.split()) splits on
+                    # any Unicode whitespace (including \xa0, \u2000-\u200a,
+                    # \u202f, \u205f, \u3000), not just ASCII space and tab.
+                    if re.search(r"\s", val):
+                        if not warned_delim_str:
+                            import warnings
+
+                            warnings.warn(
+                                "String curve data contains whitespace "
+                                "characters while using SPACE delimiter. "
+                                "Internal whitespace (including Unicode "
+                                "whitespace such as non-breaking spaces) "
+                                "will be replaced with underscores to "
+                                "prevent data corruption on re-read. "
+                                "Consider switching to COMMA or TAB "
+                                "delimiter for files with string curves.",
+                                stacklevel=4,
+                            )
+                            warned_delim_str = True
+                        val = re.sub(r"\s", "_", val)
+                elif delimiter in val:
+                    # COMMA or TAB delimiter: the delimiter character itself
+                    # in the value creates a phantom field boundary on re-read.
+                    if not warned_delim_str:
                         import warnings
 
+                        delim_name = "COMMA" if delimiter == "," else "TAB"
+                        replacement = ";" if delimiter == "," else " "
                         warnings.warn(
-                            "String curve data contains spaces while using "
-                            "SPACE delimiter. Internal spaces will be "
-                            "replaced with underscores to prevent data "
-                            "corruption on re-read. Consider switching to "
-                            "COMMA or TAB delimiter for files with string "
-                            "curves.",
+                            f"String curve data contains the active "
+                            f"delimiter character ({delim_name}). The "
+                            f"delimiter will be replaced with "
+                            f"{'semicolons' if delimiter == ',' else 'spaces'} "
+                            f"to prevent data corruption on re-read.",
                             stacklevel=4,
                         )
-                        warned_space_str = True
-                    val = val.replace(" ", "_")
+                        warned_delim_str = True
+                    replacement = ";" if delimiter == "," else " "
+                    val = val.replace(delimiter, replacement)
                 row_values.append(val)
             else:
                 val = arr[i]

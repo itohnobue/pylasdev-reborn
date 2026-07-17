@@ -1446,3 +1446,125 @@ class TestValueOnlyPattern:
         las = parser.parse(content)
         assert las.well["STRT"] == "1670.0"
         assert las.well["COMP"] == "TestCo"
+
+    # ── F-07: LAS 2.0+ well descriptions ──────────────────────────
+
+    def test_well_descriptions_preserved_las20(self) -> None:
+        """F-07: LAS 2.0+ well descriptions should be preserved."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   1670.0  : START DEPTH\n"
+            " STOP.M   1660.0  : STOP DEPTH\n"
+            " COMP.    OILCO   : Oil Company Name\n"
+            " WELL.    Well#1  : Test Well Name\n"
+        )
+        parser = LASParser()
+        las = parser.parse(content)
+        assert las.well.descriptions["STRT"] == "START DEPTH"
+        assert las.well.descriptions["STOP"] == "STOP DEPTH"
+        assert las.well.descriptions["COMP"] == "Oil Company Name"
+        assert las.well.descriptions["WELL"] == "Test Well Name"
+
+    def test_well_descriptions_roundtrip_las20(self) -> None:
+        """F-07: LAS 2.0+ well descriptions survive roundtrip through writer."""
+        from pylasdev import write_las_file
+
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   1670.0  : START DEPTH\n"
+            " STOP.M   1660.0  : STOP DEPTH\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            " COMP.    OILCO   : Oil Company Name\n"
+        )
+        parser = LASParser()
+        las = parser.parse(content)
+        assert las.well.descriptions["COMP"] == "Oil Company Name"
+
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".las", delete=False, mode="w"
+        ) as tf:
+            write_las_file(tf.name, las)
+            out_path = Path(tf.name)
+
+        re_read = parser.parse(out_path.read_text())
+        assert re_read.well.descriptions["COMP"] == "Oil Company Name"
+        out_path.unlink()
+
+    def test_well_no_description_no_error(self) -> None:
+        """F-07: LAS 2.0+ well entries without descriptions (no colon) should not crash."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  :\n"
+            " WRAP.   NO   :\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   1670.0\n"  # no colon
+            " STOP.M   1660.0\n"
+            " COMP.    TestCo\n"
+        )
+        parser = LASParser()
+        las = parser.parse(content)
+        assert las.well["STRT"] == "1670.0"
+        assert "STRT" not in las.well.descriptions  # no description → not stored
+
+    # ── F2-03: WRAP=YES warning in LAS 3.0 ──────────────────────
+
+    def test_las30_wrap_yes_warns(self, caplog) -> None:
+        """F2-03: LAS 3.0 WRAP=YES should log a warning."""
+        import logging
+
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth\n"
+            "~ASCII\n"
+            " 1670.0\n"  # at least one data line so _process_ascii_data runs
+        )
+        parser = LASParser()
+        with caplog.at_level(logging.WARNING):
+            parser.parse(content)
+        assert any(
+            "WRAP=YES" in record.message for record in caplog.records
+        ), f"Expected WRAP=YES warning, got: {[r.message for r in caplog.records]}"
+
+    def test_las30_wrap_no_silent(self, caplog) -> None:
+        """F2-03: LAS 3.0 WRAP=NO should NOT produce a WRAP=YES warning."""
+        import logging
+
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth\n"
+            "~ASCII\n"
+            " 1670.0\n"  # at least one data line so _process_ascii_data runs
+        )
+        parser = LASParser()
+        with caplog.at_level(logging.WARNING):
+            parser.parse(content)
+        assert not any(
+            "WRAP=YES" in record.message for record in caplog.records
+        ), f"Unexpected WRAP=YES warning: {[r.message for r in caplog.records]}"
+
+    # ── F-05: Indexed _DATA sections ────────────────────────────
+
+    def test_indexed_data_section_with_data_suffix(self) -> None:
+        """F-05: ~Core_Data[1] should be recognized as an indexed data section."""
+        assert _is_indexed_data_section("CORE_DATA[1]") is True
+        assert _is_indexed_data_section("DRILLING_DATA[2]") is True
+        assert _is_indexed_data_section("INCLINOMETRY_DATA[1]") is True
+        assert _is_indexed_data_section("TOPS_DATA[3]") is True
+        assert _is_indexed_data_section("TEST_DATA[1]") is True
+        assert _is_indexed_data_section("PERFORATIONS_DATA[2]") is True
+        assert _is_indexed_data_section("LOG_DATA[1]") is True
