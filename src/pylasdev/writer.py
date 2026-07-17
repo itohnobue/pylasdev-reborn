@@ -141,6 +141,8 @@ def _write_version_section(las_file: LASFile) -> list[str]:
     """Write ~V Version section."""
     lines: list[str] = []
     is_las30 = las_file.is_las30
+    # F-014: Detect LAS 1.2 to guard DLM emission (DLM is LAS 2.0/3.0 only).
+    is_las12 = las_file.version.vers.startswith("1.")
     lines.append("~VERSION INFORMATION")
     vers_desc = "CWLS LOG ASCII STANDARD -VERSION 3.0" if is_las30 else "CWLS LOG ASCII STANDARD"
     # Guard against empty vers field (analogous to wrap guard below).
@@ -165,13 +167,13 @@ def _write_version_section(las_file: LASFile) -> list[str]:
     wrap_desc = (
         "ONE LINE PER DEPTH STEP" if actual_wrap == "NO" else "MULTIPLE LINES PER DEPTH STEP"
     )
-    lines.append(f" WRAP.   {actual_wrap}  : {wrap_desc}")
+    lines.append(f" WRAP.   {_sanitize_las_value(actual_wrap)}  : {wrap_desc}")
     # DLM is defined in LAS 2.0 and 3.0 specs.  LAS 1.2 does not use
     # DLM and always defaults to SPACE.  When DLM is not SPACE (e.g.,
     # COMMA or TAB), emit the DLM line so the file declares the correct
     # delimiter — otherwise a re-read would default to SPACE, corrupting
     # comma- or tab-delimited data.
-    if las_file.version.dlm.upper() != "SPACE":
+    if las_file.version.dlm.upper() != "SPACE" and not is_las12:
         dlm_desc = "DELIMITING CHARACTER BETWEEN DATA COLUMNS"
         lines.append(
             f" DLM .                        {_sanitize_las_value(las_file.version.dlm)} : {dlm_desc}"
@@ -459,7 +461,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
     else:
         # Legacy single data section (~A).
         curve_names = las_file.curves_order
-        if any(name in las_file.logs for name in curve_names):
+        if any(name in las_file.logs or name in las_file.string_data for name in curve_names):
             lines.append("~A  " + "  ".join(_sanitize_las_value(name) for name in curve_names))
             lines.extend(
                 _format_data_rows(
@@ -650,20 +652,14 @@ def _format_fixed_precision(value: float, precision: str) -> str:
     # Values < 1: need sig_digits - magnitude - 1 decimal places
     #   e.g., 1.2345678e-05 (mag=-5): need 8 - (-5) - 1 = 12 → ".12f"
     decimal_places = sig_digits + max(0, (-magnitude) - 1)
-    # Cap at a reasonable maximum to avoid excessively long output
-    decimal_places = min(decimal_places, 30)
+    # Cap at a practical maximum to avoid excessively long output but
+    # high enough to represent values down to ~1e-92 without precision loss
+    # (8 sig_digits + 92 minus-1 = 99 decimal places).
+    # F-016: Raised from 30 to 100; removed the exponent-notation fallback
+    # below — the LAS spec forbids exponent notation in data sections.
+    decimal_places = min(decimal_places, 100)
     # Ensure at least sig_digits places (for values > 1)
     decimal_places = max(decimal_places, sig_digits)
 
     result = format(value, f".{decimal_places}f")
-    # F-D3-M02: Precision loss for values < 1e-38.  When value is non-zero
-    # but the capped decimal places produce all zeros (e.g., 1e-40 → 30
-    # decimal places of zeros), fall back to exponent notation to preserve
-    # the actual value rather than writing literal zero.
-    if value != 0.0:
-        # Check if fixed-point representation lost all significant digits:
-        # all characters except the leading minus and decimal point are '0'.
-        stripped = result.lstrip("-")
-        if all(c == "0" or c == "." for c in stripped):
-            return format(value, f".{sig_digits}e")
     return result

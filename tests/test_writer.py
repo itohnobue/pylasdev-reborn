@@ -347,6 +347,30 @@ class TestWriteLASFile:
         np.testing.assert_allclose(reread["logs"]["DT"], [50.0, 51.0, 52.0])
         np.testing.assert_allclose(reread["logs"]["GR"], [75.0, 76.0, 77.0])
 
+    # --- F-057: DLM is NOT emitted for LAS 1.2 files ---
+
+    def test_write_las12_with_dlm_comma_suppressed(self, tmp_path: Path) -> None:
+        """DLM line is NOT emitted for LAS 1.2 even when DLM=COMMA (F-057 fix).
+
+        LAS 1.2 does not use DLM; the delimiter is always SPACE.
+        The writer.py:176 guard suppresses DLM output for LAS 1.2.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="1.2", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        temp_file = tmp_path / "las12_dlm_comma.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        # DLM line must NOT appear in the output for LAS 1.2
+        assert " DLM " not in content, (
+            f"DLM line unexpectedly emitted for LAS 1.2:\n{content}"
+        )
+
     def test_write_las30_format_specifiers(self, tmp_path: Path) -> None:
         """Test writing LAS 3.0 curve format specifiers {F}, {S}."""
         las = LASFile()

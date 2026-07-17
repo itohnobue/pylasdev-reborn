@@ -156,7 +156,14 @@ def _decode_best_quality(
         )
 
     # Select the encoding with the highest word-character ratio.
-    candidates.sort(key=lambda x: -x[2])
+    # F-061: When ratios are equal, use a secondary preference for
+    # Western European encodings (cp1252, latin-1) over Cyrillic
+    # encodings (cp1251, cp866).  Without this, stable sort preserves
+    # FALLBACK_ENCODINGS insertion order, which puts cp1251 before
+    # cp1252 — causing mojibake for Western European files where both
+    # encodings produce the same word-char ratio.
+    _WESTERN = frozenset({"cp1252", "latin-1"})
+    candidates.sort(key=lambda x: (-x[2], 0 if x[0] in _WESTERN else 1))
     best_enc, best_content, best_ratio = candidates[0]
 
     # UTF-8 preference: when UTF-8 decodes successfully and its word-char

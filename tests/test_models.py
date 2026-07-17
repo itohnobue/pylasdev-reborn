@@ -502,6 +502,57 @@ class TestLASFile:
         with pytest.raises(ValueError, match="Number of parameter details"):
             LASFile.from_dict(data)
 
+    # --- F-057 fix: MAX_WELL_ENTRIES guard on well, well_units, well_descriptions ---
+
+    def test_from_dict_well_entries_max_guard(self, monkeypatch) -> None:
+        """LASFile.from_dict() enforces MAX_WELL_ENTRIES on well entries (F-057 fix).
+
+        Three guard points exist: well items, well_units items, and
+        well_descriptions items.  MAX_WELL_ENTRIES = MAX_PARAMETERS.
+        """
+        monkeypatch.setattr("pylasdev.parser.MAX_PARAMETERS", 5)
+
+        # Exceeding well entries
+        big_well = {f"KEY_{i}": str(i) for i in range(6)}
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": big_well,
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+        }
+        with pytest.raises(ValueError, match="Number of well entries"):
+            LASFile.from_dict(data)
+
+    def test_from_dict_well_units_max_guard(self, monkeypatch) -> None:
+        """LASFile.from_dict() enforces MAX_WELL_ENTRIES on well_units (F-057 fix)."""
+        monkeypatch.setattr("pylasdev.parser.MAX_PARAMETERS", 5)
+
+        big_units = {f"KEY_{i}": "unit" for i in range(6)}
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100"},
+            "well_units": big_units,
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+        }
+        with pytest.raises(ValueError, match="well unit entries"):
+            LASFile.from_dict(data)
+
+    def test_from_dict_well_descriptions_max_guard(self, monkeypatch) -> None:
+        """LASFile.from_dict() enforces MAX_WELL_ENTRIES on well_descriptions (F-057 fix)."""
+        monkeypatch.setattr("pylasdev.parser.MAX_PARAMETERS", 5)
+
+        big_descs = {f"KEY_{i}": "desc" for i in range(6)}
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100"},
+            "well_descriptions": big_descs,
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+        }
+        with pytest.raises(ValueError, match="well description entries"):
+            LASFile.from_dict(data)
+
     # --- F2-17 fix: dict.get() None bypass in CurveDefinition ---
 
     def test_from_dict_curve_none_in_get_guarded(self) -> None:

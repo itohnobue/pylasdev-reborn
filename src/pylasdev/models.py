@@ -44,6 +44,28 @@ def _create_parameter_entry(param_dict: dict[str, Any]) -> ParameterEntry:
     )
 
 
+def _validate_iterable_of_dicts(
+    items: Any,
+    context_name: str,
+) -> list[dict[str, Any]]:
+    """Validate that *items* is a list and every element is a dict.
+
+    Used by ``LASFile.from_dict`` to consolidate list-of-dicts validation
+    across multiple processing paths that previously used inconsistent
+    isinstance/error patterns (F-012, F-013, F-058).
+    """
+    if not isinstance(items, list):
+        raise TypeError(
+            f"{context_name} must be a list, got {type(items).__name__}"
+        )
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise TypeError(
+                f"{context_name}[{i}] must be a dict, got {type(item).__name__}"
+            )
+    return items
+
+
 @dataclass
 class VersionSection:
     """LAS Version Information section (~V).
@@ -338,6 +360,10 @@ class LASFile:
         from .data_reader import MAX_CURVES, MAX_DATA_LINES, MAX_TOTAL_ELEMENTS
         from .parser import MAX_DATA_SECTIONS, MAX_OTHER_LINES, MAX_PARAMETERS
 
+        # F-057: Bound well-related iterables to match the parser's
+        # MAX_DEFERRED_WELL_ENTRIES guard on the well re-processing path.
+        MAX_WELL_ENTRIES = MAX_PARAMETERS
+
         las_file = cls()
 
         version = data.get("version") or {}
@@ -348,15 +374,32 @@ class LASFile:
         )
 
         well = data.get("well") or {}
+        # F-057: Bound check — parser has MAX_DEFERRED_WELL_ENTRIES on its
+        # well re-processing path; from_dict previously had no bound at all.
+        if len(well) > MAX_WELL_ENTRIES:
+            raise ValueError(
+                f"Number of well entries ({len(well)}) exceeds maximum "
+                f"allowed ({MAX_WELL_ENTRIES})"
+            )
         for key, value in well.items():
             las_file.well[key] = _safe_str(value)
         # Restore well units if present (from v1.7+ roundtrip data)
         well_units = data.get("well_units") or {}
+        if len(well_units) > MAX_WELL_ENTRIES:
+            raise ValueError(
+                f"Number of well unit entries ({len(well_units)}) exceeds "
+                f"maximum allowed ({MAX_WELL_ENTRIES})"
+            )
         for key, unit in well_units.items():
             las_file.well.units[key] = _safe_str(unit)
 
         # Restore well descriptions if present (from v1.8+ roundtrip data)
         well_descriptions = data.get("well_descriptions") or {}
+        if len(well_descriptions) > MAX_WELL_ENTRIES:
+            raise ValueError(
+                f"Number of well description entries ({len(well_descriptions)}) "
+                f"exceeds maximum allowed ({MAX_WELL_ENTRIES})"
+            )
         for key, desc in well_descriptions.items():
             las_file.well.descriptions[key] = _safe_str(desc)
 
@@ -382,7 +425,10 @@ class LASFile:
                 f"Number of curves ({len(curves_data)}) exceeds maximum "
                 f"allowed ({MAX_CURVES})"
             )
-        if curves_data and isinstance(curves_data, list) and isinstance(curves_data[0], dict):
+        if curves_data and isinstance(curves_data, list):
+            # F-012: Validate every element is a dict, not just curves_data[0].
+            # Non-dict elements crash at curve_dict.get() downstream.
+            _validate_iterable_of_dicts(curves_data, "curves")
             for curve_dict in curves_data:
                 array_info = None
                 if "array_info" in curve_dict and isinstance(curve_dict["array_info"], dict):
@@ -446,21 +492,17 @@ class LASFile:
             # Check for parameter_details first to preserve full metadata
             # on roundtrip (e.g. array_index, zone, unit, description).
             param_details = data.get("parameter_details")
-            if param_details and isinstance(param_details, list):
+            if param_details:
                 if len(param_details) > MAX_PARAMETERS:
                     raise ValueError(
                         f"Number of parameter details ({len(param_details)}) exceeds maximum "
                         f"allowed ({MAX_PARAMETERS})"
                     )
+                # F2-25 + F-058 consistency: Validate as list-of-dicts via
+                # shared helper (same pattern as curves_data, section_curves,
+                # and data_sections).  Raises TypeError for non-dict elements.
+                param_details = _validate_iterable_of_dicts(param_details, "parameter_details")
                 for param_dict in param_details:
-                    # F2-25: Guard against non-dict elements in the list.
-                    # _create_parameter_entry assumes dict argument; passing
-                    # None/int/string causes TypeError on "zone" in param_dict.
-                    if not isinstance(param_dict, dict):
-                        raise TypeError(
-                            f"Parameter detail entry must be a dict, "
-                            f"got {type(param_dict).__name__}"
-                        )
                     las_file.parameters.append(_create_parameter_entry(param_dict))
             else:
                 # Pure legacy: only params dict, no details available
@@ -470,14 +512,10 @@ class LASFile:
                     )
         elif isinstance(params, list):
             # New format: [{"mnemonic": ..., "value": ..., ...}, ...]
+            # F2-25 consistency: Shared helper validates every element is a dict
+            # (previously checked inline, same as param_details and data_sections).
+            _validate_iterable_of_dicts(params, "parameters")
             for param_dict in params:
-                # F2-25: Guard against non-dict elements in the list.
-                # Same check as the param_details path above.
-                if not isinstance(param_dict, dict):
-                    raise TypeError(
-                        f"Parameter entry must be a dict, "
-                        f"got {type(param_dict).__name__}"
-                    )
                 las_file.parameters.append(_create_parameter_entry(param_dict))
 
         # F-06: Resource-exhaustion guard for other section content.
@@ -499,9 +537,12 @@ class LASFile:
                 f"Number of data sections ({len(ds_data)}) exceeds maximum "
                 f"allowed ({MAX_DATA_SECTIONS})"
             )
+        # F-058: Validate every element is a dict.  Previously non-dict
+        # elements were silently skipped with ``continue`` while two sibling
+        # paths (parameter_details and params) both raised TypeError.
+        # Using the shared helper also adds a missing list-type check.
+        ds_data = _validate_iterable_of_dicts(ds_data, "data_sections")
         for ds_dict in ds_data:
-            if not isinstance(ds_dict, dict):
-                continue
             ds_string_data = {}
             _ds_string_raw = ds_dict.get("string_data", {})
             # F-24: Per-section string_data entry count guard.  Every other
@@ -545,6 +586,10 @@ class LASFile:
                     f"Number of section curves ({len(_sc_raw)}) in section "
                     f"'{ds_name}' exceeds maximum allowed ({MAX_CURVES})"
                 )
+            # F-013: Validate every element is a dict.  Zero isinstance
+            # check on _sc_raw elements previously — non-dict elements
+            # crash at "array_info" in sc_dict / sc_dict.get().
+            _sc_raw = _validate_iterable_of_dicts(_sc_raw, "section_curves")
             for sc_dict in _sc_raw:
                 sc_array_info = None
                 if "array_info" in sc_dict and isinstance(sc_dict["array_info"], dict):
@@ -711,6 +756,23 @@ class LASFile:
                 raise ValueError(
                     f"Array length ({len(las_file.logs[name])}) for log "
                     f"'{name}' exceeds maximum allowed ({MAX_DATA_LINES})"
+                )
+
+        # F-011: Validate that log curve keys match curves_order exactly.
+        # The length check above ensures count matches; this catches phantom
+        # keys (extra curves in logs not in curves_order) and missing keys.
+        # Only valid for legacy LAS 1.2/2.0 files where all curve data lives
+        # in the logs dict.  LAS 3.0 files distribute curve data across
+        # data_sections and string_data, so curves_order typically includes
+        # curves whose data is in those sections, not in logs.
+        if las_file.logs and not las_file.data_sections:
+            _log_keys = set(las_file.logs.keys())
+            _order_keys = set(las_file.curves_order)
+            if _log_keys != _order_keys:
+                raise ValueError(
+                    f"Log curve keys do not match curves_order. "
+                    f"Extra keys: {_log_keys - _order_keys}, "
+                    f"Missing keys: {_order_keys - _log_keys}"
                 )
 
         # F-25: Cross-array length validation for top-level log arrays.

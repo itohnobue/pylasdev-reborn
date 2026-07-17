@@ -172,6 +172,18 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
 
     first_tokens = content_entries[0][1].split()
 
+    # F-019: Check for comma-delimited headerless data BEFORE any format
+    # detection.  When the first content line contains commas and all
+    # comma-separated tokens parse as floats, it is headerless
+    # comma-delimited data — not a header row.  Without this pre-check,
+    # whitespace-based split() produces a single token like "1.0,2.0,3.0"
+    # that fails _is_float_token, causing the line to be consumed as a
+    # header and silently losing the first data row.
+    if "," in content_entries[0][1]:
+        comma_tokens = [t.strip() for t in content_entries[0][1].split(",") if t.strip()]
+        if comma_tokens and all(_is_float_token(t) for t in comma_tokens):
+            return ("headerless", 0)
+
     # DUG Insight format detection — two patterns.
     #
     # Pattern A: single-token first line = column count (no separate title).

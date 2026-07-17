@@ -63,6 +63,13 @@ MAX_OTHER_LINES = 1_000_000
 # Overridable at module level.
 MAX_DEFERRED_WELL_ENTRIES = MAX_PARAMETERS
 
+# F-006: Maximum section sequence entries.  All other accumulators have explicit
+# MAX_* guards (_ascii_data_lines, las_file.curves, las_file.parameters,
+# _other_lines, _deferred_well_entries); _section_sequence had no bound,
+# enabling unbounded growth from repeated unknown section headers.
+# Overridable at module level.
+MAX_SECTION_SEQUENCE = 200
+
 # F-32 + G-17: Characters that Python's splitlines() treats as line breaks
 # beyond \\n and \\r.  When present in file content, they cause splitlines()
 # to produce fake section headers and corrupt parsed data.  The writer's
@@ -661,7 +668,7 @@ class LASParser:
                             source_info,
                         )
                         self._section_curve_start_idx = 0
-                        self._section_curve_end_idx = 0
+                        self._section_curve_end_idx = None  # F-051: None → all curves (0 → empty slice)
                 elif self._current_data_section_type != "LOG_DATA":
                     # G-02: No pipe — try to match data section type
                     # to a _Definition (e.g., CORE_DATA → CORE_DEFINITION).
@@ -805,6 +812,14 @@ class LASParser:
                     f"{new_section}:{section_name}" if section_name.strip()
                     else new_section
                 )
+                # F-006: Guard against unbounded section sequence growth
+                # from repeated unknown section headers.
+                if len(self._section_sequence) >= MAX_SECTION_SEQUENCE:
+                    raise LASParseError(
+                        f"Section sequence length ({len(self._section_sequence) + 1}) "
+                        f"exceeds maximum allowed ({MAX_SECTION_SEQUENCE}). "
+                        f"The file may be malformed or corrupt."
+                    )
                 self._section_sequence.append(section_label)
                 return
 
@@ -882,14 +897,36 @@ class LASParser:
         ~W appears before ~V (the version check is deferred until ~V is parsed).
         """
         if is_las12 and description:
-            if mnemonic in {"STRT", "STOP", "STEP", "NULL"}:
-                if self._well_format == "cwls":
+            # F-004/F-005 structural fix: hoist _well_format above the
+            # numeric/non-numeric split.  Previously the cwls/lasio
+            # branches were duplicated identically in both blocks (lines
+            # 901-904 and 917-920), creating a regression surface where
+            # a fix in one block could be missed in the other.
+            if self._well_format == "cwls":
+                if mnemonic in {"STRT", "STOP", "STEP", "NULL"}:
+                    # Mandatory numeric fields: VALUE before colon in CWLS.
                     actual_value = value
                     self.las_file.well.descriptions[mnemonic] = description
-                elif self._well_format == "lasio":
+                else:
+                    # F-004: Non-mandatory CWLS fields: VALUE after colon,
+                    # DESCRIPTION before colon.  In CWLS format, non-mandatory
+                    # fields like DATE, LOC, etc. place the value after the
+                    # colon (e.g. "DATE.   .LOG DATE :15/01/2001").  The
+                    # previous code stored pre-colon text as the value for
+                    # ALL CWLS fields — correct for mandatory but wrong for
+                    # non-mandatory where the value is post-colon.
                     actual_value = description
                     self.las_file.well.descriptions[mnemonic] = value
-                else:
+            elif self._well_format == "lasio":
+                # lasio convention: VALUE after colon (same as LAS 2.0+).
+                actual_value = description
+                self.las_file.well.descriptions[mnemonic] = value
+            else:
+                # Auto-mode: detect CWLS vs lasio convention heuristically.
+                if mnemonic in {"STRT", "STOP", "STEP", "NULL"}:
+                    # Float-based numeric detection for mandatory fields.
+                    # If pre-colon text parses as float → CWLS (value in
+                    # correct position); otherwise → lasio (swap).
                     try:
                         float(value.replace("D", "E").replace("d", "e"))
                     except ValueError:
@@ -898,28 +935,59 @@ class LASParser:
                     else:
                         actual_value = value
                         self.las_file.well.descriptions[mnemonic] = description
-            else:
-                if self._well_format == "cwls":
-                    actual_value = value
-                    self.las_file.well.descriptions[mnemonic] = description
-                elif self._well_format == "lasio":
-                    actual_value = description
-                    self.las_file.well.descriptions[mnemonic] = value
-                elif " " in value:
-                    actual_value = value
-                    self.las_file.well.descriptions[mnemonic] = description
                 else:
-                    logger.warning(
-                        "Cannot distinguish CWLS from lasio convention for "
-                        "well field '%s' with single-word pre-colon value "
-                        "'%s'. Defaulting to lasio (swapped) interpretation. "
-                        "If data appears wrong, set well_format='cwls' to "
-                        "force CWLS convention.",
-                        mnemonic,
-                        value,
-                    )
-                    actual_value = description
-                    self.las_file.well.descriptions[mnemonic] = value
+                    # F-005: Improved auto-mode heuristic for non-mandatory
+                    # fields.  The old heuristic (" " in value) only checked
+                    # pre-colon text for spaces — both CWLS descriptions
+                    # (e.g. "ANY OIL COMPANY") and lasio values can contain
+                    # spaces, causing false positives in both directions.
+                    # Better: check both sides for data-like patterns:
+                    #   - CWLS non-mandatory: "DESCRIPTION : VALUE"
+                    #     → post-colon text (VALUE) has digits, no spaces
+                    #   - lasio: "VALUE : DESCRIPTION"
+                    #     → pre-colon text (VALUE) has digits, no spaces
+                    value_has_spaces = " " in value
+                    value_has_digits = any(c.isdigit() for c in value)
+                    desc_has_spaces = " " in description
+                    desc_has_digits = any(c.isdigit() for c in description)
+
+                    if desc_has_digits and not value_has_digits and not desc_has_spaces:
+                        # Post-colon looks like data (has digits, no spaces)
+                        # = CWLS format with value after colon.
+                        # Swap to match explicit CWLS non-mandatory branch
+                        # (lines 918-919): post-colon text = VALUE,
+                        # pre-colon text = DESCRIPTION.
+                        actual_value = description
+                        self.las_file.well.descriptions[mnemonic] = value
+                    elif value_has_digits and not desc_has_digits and not value_has_spaces:
+                        # Pre-colon looks like data (has digits, no spaces)
+                        # = lasio format with value before colon.
+                        actual_value = description
+                        self.las_file.well.descriptions[mnemonic] = value
+                    elif value_has_spaces and not desc_has_spaces:
+                        # Multi-word pre-colon, single-word post-colon
+                        # = likely CWLS description before colon (VALUE after).
+                        # Swap to match explicit CWLS non-mandatory branch
+                        # (lines 918-919): post-colon text = VALUE,
+                        # pre-colon text = DESCRIPTION.
+                        actual_value = description
+                        self.las_file.well.descriptions[mnemonic] = value
+                    else:
+                        # Ambiguous — default to lasio convention and warn.
+                        # Include description in warning for debugging.
+                        logger.warning(
+                            "Cannot distinguish CWLS from lasio convention for "
+                            "well field '%s' with pre-colon value '%s' "
+                            "and post-colon description '%s'. "
+                            "Defaulting to lasio (swapped) interpretation. "
+                            "If data appears wrong, set well_format='cwls' to "
+                            "force CWLS convention.",
+                            mnemonic,
+                            value,
+                            description,
+                        )
+                        actual_value = description
+                        self.las_file.well.descriptions[mnemonic] = value
         else:
             # LAS 2.0+: MNEM.UNIT VALUE : DESCRIPTION (unambiguous — no
             # CWLS/lasio swap needed).  Also handles LAS 1.2 entries
@@ -1242,22 +1310,18 @@ class LASParser:
         if not self._ascii_data_lines:
             return
 
-        # F2-03: LAS 3.0 WRAP=YES is unsupported — each line is treated
-        # as a complete depth step, but wrapped mode spreads a single
-        # depth step across multiple lines.  Processing wrapped LAS 3.0
-        # data as unwrapped produces phantom rows and silently corrupts
-        # the data.  The writer already overrides WRAP to NO on output
-        # (writer.py:155-164); this is the input-side guard.
+        # F-003: LAS 3.0 WRAP=YES is unsupported — wrapped-mode data
+        # processing is not implemented.  The previous logger.warning was
+        # insufficient: it acknowledged the gap but allowed corrupt data
+        # to be parsed, producing phantom rows and misaligned values.
+        # Raising LASParseError prevents silent data corruption and makes
+        # the limitation explicit.  Users must convert wrapped files to
+        # unwrapped format (one line per depth step) or set WRAP=NO.
         if self.las_file.version.wrap.upper() == "YES":
-            logger.warning(
-                "LAS 3.0 WRAP=YES is unsupported by pylasdev — "
-                "wrapped-mode data processing is not implemented in "
-                "the LAS 3.0 parser.  The file will be read as "
-                "unwrapped (WRAP=NO).  Each line is assumed to be one "
-                "complete depth step — if the file is genuinely "
-                "wrapped, the parsed data will be silently incorrect.  "
-                "Consider converting the file to unwrapped format "
-                "(one line per depth step) before parsing."
+            raise LASParseError(
+                "LAS 3.0 WRAP=YES is not supported by pylasdev.  "
+                "Convert the file to unwrapped format (one line per "
+                "depth step) before parsing, or set WRAP to NO."
             )
 
         # Get delimiter character
@@ -1366,8 +1430,17 @@ class LASParser:
                 deduped_order.append(name)
                 output_names.add(name)
 
-        # Determine which curves are string type
-        string_curves = {i: c.data_format in ("S", "A") for i, c in enumerate(section_curves)}
+        # Determine which curves are string type.
+        # F-001: Previous one-liner (c.data_format in ("S", "A")) routed ALL
+        # "A"-format curves as strings, including array elements with {A:N}
+        # format specifiers where N is numeric.  Array-element curves (those
+        # with array_info set) contain numeric data and must be routed as
+        # numeric, not stored as np.str_.
+        string_curves = {
+            i: c.data_format in ("S",)
+            or (c.data_format in ("A",) and c.array_info is None)
+            for i, c in enumerate(section_curves)
+        }
 
         # F2-05: Validate curve format types — unrecognized formats silently
         # produce null data when routed through _to_finite_float().  Known

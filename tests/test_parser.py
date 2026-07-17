@@ -1517,9 +1517,14 @@ class TestValueOnlyPattern:
 
     # ── F2-03: WRAP=YES warning in LAS 3.0 ──────────────────────
 
-    def test_las30_wrap_yes_warns(self, caplog) -> None:
-        """F2-03: LAS 3.0 WRAP=YES should log a warning."""
-        import logging
+    def test_las30_wrap_yes_warns(self) -> None:
+        """F-003: LAS 3.0 WRAP=YES should raise LASParseError.
+
+        WRAP=YES data processing is not implemented — previously a
+        logger.warning allowed corrupt parsing to continue; now a
+        LASParseError prevents silent data corruption.
+        """
+        from pylasdev.exceptions import LASParseError
 
         content = (
             "~VERSION INFORMATION\n"
@@ -1531,11 +1536,8 @@ class TestValueOnlyPattern:
             " 1670.0\n"  # at least one data line so _process_ascii_data runs
         )
         parser = LASParser()
-        with caplog.at_level(logging.WARNING):
+        with pytest.raises(LASParseError, match="WRAP=YES"):
             parser.parse(content)
-        assert any(
-            "WRAP=YES" in record.message for record in caplog.records
-        ), f"Expected WRAP=YES warning, got: {[r.message for r in caplog.records]}"
 
     def test_las30_wrap_no_silent(self, caplog) -> None:
         """F2-03: LAS 3.0 WRAP=NO should NOT produce a WRAP=YES warning."""
