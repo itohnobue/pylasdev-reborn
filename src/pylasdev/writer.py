@@ -18,7 +18,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .data_reader import _get_null_value
-from .exceptions import LASWriteError
+from .exceptions import LASWriteError, PylasdevError
 from .models import CurveDefinition, LASFile
 
 # Control characters except space and tab (which are valid LAS whitespace).
@@ -88,6 +88,55 @@ def _sanitize_las_value(value: str) -> str:
     return value
 
 
+# Pattern matching whitespace-before-colon (\s+:).
+# Used in _escape_colons_for_las_value to insert an underscore between
+# the whitespace and colon, preventing the parser regex alternative
+# \s+:\s* from matching at embedded colon positions.
+_COLON_PRECEDED_BY_WS_RE = re.compile(r"(\s+):")
+
+# Pattern matching colon-followed-by-whitespace-or-end (:\s|\s*$).
+# Used in _escape_colons_for_las_value to insert an underscore after
+# the colon, preventing the parser regex alternatives \s*:\s+ and
+# :\s*$ from matching at embedded colon positions.
+_COLON_FOLLOWED_BY_WS_OR_END_RE = re.compile(r":(?=\s|$)")
+
+
+def _escape_colons_for_las_value(value: str) -> str:
+    """Escape colons in a LAS value to prevent parser misinterpretation.
+
+    The parser's DATA_LINE_PATTERN uses colon as the structural separator
+    between value and description fields.  The colon-separator regex::
+
+        (\\s+:\\s*|\\s*:\\s+|:\\s*$)
+
+    has three alternatives, all requiring whitespace on at least one side
+    of the colon (or end-of-string).  This helper inserts ``_`` to break
+    every whitespace-colon adjacency, ensuring no embedded colon can be
+    mistaken for the structural separator:
+
+    * ``" :"`` (space-colon)  → ``" _:"``  (``_`` between ws and colon)
+    * ``": "`` (colon-space)  → ``":_ "``  (``_`` between colon and ws)
+    * trailing ``":"``        → ``":_"``   (``_`` after colon at EOS)
+
+    When both sides have whitespace (``" : "``) both fixes apply,
+    producing ``" _:_ "`` which is safe against all three alternatives.
+
+    This helper is intentionally NOT part of ``_sanitize_las_value``
+    because that function also handles description text where ``": "``
+    is a legitimate LAS spec formatting convention
+    (e.g., ``"LAS 2.0 : CWLS LOG ASCII STANDARD"``).
+    """
+    # Step 1: Insert _ between whitespace and colon.
+    # Prevents \\s+:\\s* from matching at embedded colons.
+    value = _COLON_PRECEDED_BY_WS_RE.sub(r"\1_:", value)
+
+    # Step 2: Insert _ after colon when followed by whitespace or end.
+    # Prevents \\s*:\\s+ and :\\s*$ from matching.
+    value = _COLON_FOLLOWED_BY_WS_OR_END_RE.sub(r"\g<0>_", value)
+
+    return value
+
+
 def _validate_precision(precision: str) -> None:
     """Validate the precision format specifier for numeric output.
 
@@ -154,9 +203,12 @@ def write_las_file(
         # F34: Wrap from_dict in try/except so that malformed input
         # (e.g., non-numeric log values that fail np.array(dtype=np.float64)
         # in models.py) raises LASWriteError instead of raw ValueError.
+        # F-I2-M04: Also catch PylasdevError — from_dict may raise
+        # LASDataError (a PylasdevError subclass) for data validation
+        # failures instead of raw ValueError/TypeError.
         try:
             las_file = LASFile.from_dict(las_data)
-        except (ValueError, TypeError, AttributeError) as e:
+        except (ValueError, TypeError, AttributeError, PylasdevError) as e:
             raise LASWriteError(f"Cannot create LASFile from dict: {e}") from e
     elif isinstance(las_data, LASFile):
         las_file = las_data
@@ -166,9 +218,11 @@ def write_las_file(
         )
 
     # Always write with the specified encoding (default: utf-8).
+    # F-I2-M04: Also catch PylasdevError — content generation may raise
+    # PylasdevError subclasses from models.py validation.
     try:
         content = _generate_las_content(las_file, precision)
-    except (ValueError, TypeError, KeyError, AttributeError) as e:
+    except (ValueError, TypeError, KeyError, AttributeError, PylasdevError) as e:
         raise LASWriteError(f"Failed to generate LAS file content: {e}") from e
 
     try:
@@ -284,6 +338,12 @@ def _write_well_section(las_file: LASFile) -> list[str]:
         val = _sanitize_las_value(value)
         # Emit CWLS well descriptions if present (F-D3-H01 fix).
         desc = _sanitize_las_value(las_file.well.descriptions.get(key, ""))
+        # F-H04: Escape colons in well values/descriptions after general
+        # sanitization.  Embedded colons with adjacent whitespace (": ")
+        # or trailing colons get confused with the structural colon
+        # separator in the parser's DATA_LINE_PATTERN regex.
+        val = _escape_colons_for_las_value(val)
+        desc = _escape_colons_for_las_value(desc)
         desc_str = f"  {desc}" if desc else ""
         if is_las12:
             # F-03: LAS 1.2 CWLS spec places numeric well fields (STRT,
@@ -509,7 +569,23 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
         )
         delimiter = " "
 
-    if las_file.data_sections:
+    # F-I2-M17: Guard against data_sections in non-LAS-3.0 files.
+    # from_dict populates data_sections from the input dict unconditionally
+    # (regardless of LAS version).  Writing multi-section format for a
+    # non-LAS-3.0 file causes roundtrip data loss because the parser skips
+    # data sections when is_las30 is False.  Warn and fall back to
+    # single-section ~A format using the legacy logs/string_data fields.
+    if las_file.data_sections and not is_las30:
+        import warnings
+
+        warnings.warn(
+            "data_sections are only supported for LAS 3.0 files. "
+            "Falling back to single-section ~A format. "
+            "Multi-section data will be lost.",
+            stacklevel=3,
+        )
+
+    if las_file.data_sections and is_las30:
         # LAS 3.0: Multiple data sections with typed headers.
         emitted_defs: set[str] = set()
         for section in las_file.data_sections:

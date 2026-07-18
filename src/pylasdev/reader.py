@@ -61,6 +61,8 @@ def read_las_file(
         LASEncodingError: If file encoding cannot be determined.
         LASParseError: If file content cannot be parsed (e.g. missing
             required ~V section).
+        MemoryError: If the system runs out of memory during
+            conversion to dict.
 
     Warns:
         UserWarning: If LAS version is > 3.0 (unsupported but attempted).
@@ -127,9 +129,11 @@ def read_las_file_as_object(
     try:
         detected_encoding, content = read_with_encoding(file_path, encoding, max_file_size)
     except OSError as e:
-        raise LASReadError(f"Cannot read file: {file_path}") from e
+        raise LASReadError(f"Cannot read file (I/O error): {file_path}") from e
     except (ValueError, LookupError) as e:
-        raise LASReadError(f"Cannot read file: {file_path}") from e
+        raise LASReadError(
+            f"Cannot read file (size exceeded or invalid parameter): {file_path}"
+        ) from e
 
     parser = LASParser(mnem_base, well_format=well_format)
     # PERF-01: Split content once, pass lines list to both parser and

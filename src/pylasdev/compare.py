@@ -143,54 +143,19 @@ def compare_las_dicts(
                 if not _compare_data_sections(val1, val2, rtol, atol):
                     return False
             else:
-                try:
-                    if val1 != val2:
-                        logger.warning("List mismatch at '%s': %r vs %r", key, val1, val2)
-                        return False
-                except (ValueError, TypeError):
-                    # F13: List elements may contain numpy arrays or other
-                    # non-comparable types that raise "truth value is ambiguous".
-                    if not isinstance(val1, list):
-                        logger.warning(
-                            "Type mismatch at '%s': %s vs list",
-                            key,
-                            type(val1).__name__,
-                        )
-                        return False
-                    if len(val1) != len(val2):
-                        logger.warning(
-                            "List length mismatch at '%s': %d vs %d",
-                            key,
-                            len(val1),
-                            len(val2),
-                        )
-                        return False
-                    for idx, (a, b) in enumerate(zip(val1, val2, strict=False)):
-                        if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
-                            if not _compare_arrays(a, b, f"{key}[{idx}]", None, rtol, atol):
-                                return False
-                        elif isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
-                            # F2-008: Mixed ndarray/scalar — ndarray comparison
-                            # produces an array of bools whose __bool__() raises
-                            # ValueError. Treat as type mismatch.
-                            logger.warning(
-                                "Type mismatch at '%s[%d]': %s vs %s",
-                                key,
-                                idx,
-                                type(a).__name__,
-                                type(b).__name__,
-                            )
-                            return False
-                        elif a != b:
-                            logger.warning(
-                                "List[%d] mismatch at '%s': %r vs %r",
-                                idx,
-                                key,
-                                a,
-                                b,
-                            )
-                            return False
+                if not _compare_lists(val1, val2, key, rtol, atol):
+                    return False
         else:
+            # F-I2-M24: When val2 is a scalar type but val1 is a multi-element
+            # ndarray, _scalars_equal would raise ValueError ("ambiguous truth
+            # value"). Guard against this asymmetric dispatch.
+            if isinstance(val1, np.ndarray) and val1.size > 1:
+                logger.warning(
+                    "Type mismatch at '%s': ndarray vs %s",
+                    key,
+                    type(val2).__name__,
+                )
+                return False
             if not _scalars_equal(val1, val2):
                 logger.warning("Mismatch at '%s': %r vs %r", key, val1, val2)
                 return False
@@ -242,6 +207,67 @@ def _compare_arrays(
             logger.warning("Array values mismatch at '%s'", label)
             return False
 
+    return True
+
+
+def _compare_lists(
+    l1: Any,
+    l2: Any,
+    label: str,
+    rtol: float,
+    atol: float,
+) -> bool:
+    """Compare two lists that may contain numpy arrays.
+
+    Tries direct list equality first.  When numpy arrays inside the list
+    cause ValueError/TypeError (ambiguous truth value), falls back to
+    per-element comparison using _compare_arrays for ndarray pairs and
+    _scalars_equal for scalars.
+    """
+    try:
+        if l1 != l2:
+            logger.warning("List mismatch at '%s': %r vs %r", label, l1, l2)
+            return False
+    except (ValueError, TypeError):
+        if not isinstance(l1, list):
+            logger.warning(
+                "Type mismatch at '%s': %s vs list",
+                label,
+                type(l1).__name__,
+            )
+            return False
+        if len(l1) != len(l2):
+            logger.warning(
+                "List length mismatch at '%s': %d vs %d",
+                label,
+                len(l1),
+                len(l2),
+            )
+            return False
+        for idx, (a, b) in enumerate(zip(l1, l2, strict=False)):
+            if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+                if not _compare_arrays(
+                    a, b, f"{label}[{idx}]", None, rtol, atol
+                ):
+                    return False
+            elif isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+                logger.warning(
+                    "Type mismatch at '%s[%d]': %s vs %s",
+                    label,
+                    idx,
+                    type(a).__name__,
+                    type(b).__name__,
+                )
+                return False
+            elif not _scalars_equal(a, b):
+                logger.warning(
+                    "List[%d] mismatch at '%s': %r vs %r",
+                    idx,
+                    label,
+                    a,
+                    b,
+                )
+                return False
     return True
 
 
@@ -354,7 +380,7 @@ def _compare_data_sections(
                             type(v2[in_key]).__name__,
                         )
                         return False
-                    elif v1[in_key] != v2[in_key]:
+                    elif not _scalars_equal(v1[in_key], v2[in_key]):
                         logger.warning(
                             "Mismatch at 'data_sections[%d].%s.%s': %r vs %r",
                             i,
@@ -365,69 +391,23 @@ def _compare_data_sections(
                         )
                         return False
             elif isinstance(v2, list):
-                # F-28: List comparison may contain numpy arrays that raise
-                # ValueError on v1 != v2 ("truth value of an array is ambiguous").
-                # Use try/except with element-by-element ndarray fallback, matching
-                # the pattern in compare_las_dicts() at the parent list handler.
-                try:
-                    if v1 != v2:
-                        logger.warning(
-                            "List mismatch at 'data_sections[%d].%s': %r vs %r",
-                            i,
-                            k,
-                            v1,
-                            v2,
-                        )
-                        return False
-                except (ValueError, TypeError):
-                    if not isinstance(v1, list):
-                        logger.warning(
-                            "Type mismatch at 'data_sections[%d].%s': %s vs list",
-                            i,
-                            k,
-                            type(v1).__name__,
-                        )
-                        return False
-                    if len(v1) != len(v2):
-                        logger.warning(
-                            "List length mismatch at 'data_sections[%d].%s': %d vs %d",
-                            i,
-                            k,
-                            len(v1),
-                            len(v2),
-                        )
-                        return False
-                    for idx, (a, b) in enumerate(zip(v1, v2, strict=False)):
-                        if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
-                            if not _compare_arrays(
-                                a, b, f"data_sections[{i}].{k}[{idx}]", None, rtol, atol
-                            ):
-                                return False
-                        elif isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
-                            # F2-008: Mixed ndarray/scalar — ndarray comparison
-                            # produces an array of bools whose __bool__() raises
-                            # ValueError. Treat as type mismatch.
-                            logger.warning(
-                                "Type mismatch at 'data_sections[%d].%s[%d]': %s vs %s",
-                                i,
-                                k,
-                                idx,
-                                type(a).__name__,
-                                type(b).__name__,
-                            )
-                            return False
-                        elif a != b:
-                            logger.warning(
-                                "List[%d] mismatch at 'data_sections[%d].%s': %r vs %r",
-                                idx,
-                                i,
-                                k,
-                                a,
-                                b,
-                            )
-                            return False
+                if not _compare_lists(
+                    v1, v2, f"data_sections[{i}].{k}", rtol, atol
+                ):
+                    return False
             else:
-                if v1 != v2:
+                # F-I2-M25: When v2 is a scalar but v1 is a multi-element
+                # ndarray, raw comparison raises ValueError ("ambiguous truth
+                # value"). Guard against this asymmetric dispatch.
+                if isinstance(v1, np.ndarray) and v1.size > 1:
+                    logger.warning(
+                        "Type mismatch at 'data_sections[%d].%s': ndarray vs %s",
+                        i,
+                        k,
+                        type(v2).__name__,
+                    )
+                    return False
+                if not _scalars_equal(v1, v2):
                     logger.warning(
                         "Mismatch at 'data_sections[%d].%s': %r vs %r",
                         i,

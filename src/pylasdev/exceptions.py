@@ -32,5 +32,15 @@ class LASEncodingError(PylasdevError):
     """Raised when file encoding cannot be determined or decoded."""
 
 
+class LASDataError(PylasdevError, ValueError):
+    """Raised when LAS data fails validation in from_dict or data construction.
+
+    Inherits from both :class:`PylasdevError` and :class:`ValueError` so
+    that existing callers catching :class:`ValueError` (backward compatible)
+    and new callers catching :class:`PylasdevError` both capture validation
+    errors from :meth:`LASFile.from_dict` and :meth:`DevFile.from_dict`.
+    """
+
+
 class DEVReadError(PylasdevError):
     """Raised when a DEV file cannot be read or parsed."""

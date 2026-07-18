@@ -20,6 +20,7 @@ from pylasdev.models import (
     VersionSection,
 )
 from pylasdev.writer import (
+    _escape_colons_for_las_value,
     _format_data_rows,
     _format_fixed_precision,
     _format_number,
@@ -1535,3 +1536,146 @@ class TestLOGDataWithSectionCurves:
         assert "~CURVE INFORMATION" in content
         assert "GR.GAPI" in content
         assert "DT.US/M" not in content
+
+
+class TestColonEscaping:
+    """Tests for _escape_colons_for_las_value and colon roundtrip integrity.
+
+    F-EX-03 / F-H04 follow-up: The parser's DATA_LINE_PATTERN uses colon as
+    the structural separator between value and description, with a regex
+    (\\s+:\\s*|\\s*:\\s+|:\\s*$) that requires whitespace on at least one
+    side of the colon.  Well values containing embedded colons with adjacent
+    whitespace would be truncated on re-read.  _escape_colons_for_las_value
+    inserts ``_`` to break all whitespace-colon adjacencies.
+    """
+
+    # ── unit tests for the escaping function ────────────────────────
+
+    def test_no_adjacent_whitespace_not_escaped(self) -> None:
+        """Colon with no whitespace on either side is unchanged."""
+        assert _escape_colons_for_las_value("Oil:Gas Corp") == "Oil:Gas Corp"
+
+    def test_colon_space_escaped(self) -> None:
+        """": " (colon-space) → ":_ " (underscore between colon and space)."""
+        assert _escape_colons_for_las_value("Oil: Gas Corp") == "Oil:_ Gas Corp"
+
+    def test_trailing_colon_escaped(self) -> None:
+        """Trailing ":" → ":_" to prevent :\\s*$ match."""
+        assert _escape_colons_for_las_value("Oil:") == "Oil:_"
+
+    def test_space_colon_escaped(self) -> None:
+        """" :" (space-colon) → " _:" (underscore between space and colon)."""
+        assert _escape_colons_for_las_value("Oil :Gas Corp") == "Oil _:Gas Corp"
+
+    def test_space_colon_space_double_escaped(self) -> None:
+        """" : " (space-colon-space) → " _:_ " (underscore on both sides)."""
+        assert _escape_colons_for_las_value("Oil : Gas Corp") == "Oil _:_ Gas Corp"
+
+    def test_trailing_space_colon_escaped(self) -> None:
+        """Trailing " :" → " _:_" (both sides: before-colon + end-of-string)."""
+        assert _escape_colons_for_las_value("Oil :") == "Oil _:_"
+
+    def test_leading_colon_not_escaped_when_no_ws(self) -> None:
+        """Leading ":" with no following whitespace is unchanged."""
+        assert _escape_colons_for_las_value(":Oil") == ":Oil"
+
+    def test_leading_colon_space_escaped(self) -> None:
+        """" : " at start → ":_ " (colon-space escaping at position 0)."""
+        assert _escape_colons_for_las_value(": value") == ":_ value"
+
+    def test_leading_space_colon_escaped(self) -> None:
+        """" :" at start (space-colon-value) → " _:..." ."""
+        assert _escape_colons_for_las_value(" :value") == " _:value"
+
+    def test_multiple_spaces_before_colon_escaped(self) -> None:
+        """Multiple spaces before colon: all whitespace preserved, _ inserted."""
+        assert _escape_colons_for_las_value("  :value") == "  _:value"
+
+    def test_multiple_spaces_before_colon_with_trailing_space(self) -> None:
+        """"  : value" (two spaces, colon, space) is fully escaped."""
+        assert _escape_colons_for_las_value("  : value") == "  _:_ value"
+
+    def test_multiple_embedded_colons(self) -> None:
+        """Multiple embedded colons are all escaped independently."""
+        assert (
+            _escape_colons_for_las_value("A: B : C")
+            == "A:_ B _:_ C"
+        )
+
+    # ── roundtrip tests (write → parse → verify value survived) ────
+
+    def _roundtrip_well_value(self, tmp_path: Path, value: str) -> str:
+        """Helper: write a LAS file with a single well entry, parse it back,
+        and return the parsed well value."""
+        from pylasdev.parser import LASParser
+
+        las = LASFile()
+        las.version = VersionSection(vers="2.0", wrap="NO")
+        las.well["NULL"] = "-999.25"
+        las.well["STRT"] = "100.0"
+        las.well["STOP"] = "200.0"
+        las.well["COMP"] = value
+
+        temp_file = tmp_path / "colon_roundtrip.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        parser = LASParser()
+        re_read = parser.parse(content)
+        return re_read.well["COMP"]
+
+    def test_roundtrip_no_colon(self, tmp_path: Path) -> None:
+        """Plain value without colon survives roundtrip unchanged."""
+        result = self._roundtrip_well_value(tmp_path, "Oil")
+        assert result == "Oil"
+
+    def test_roundtrip_colon_space(self, tmp_path: Path) -> None:
+        """"Oil: Gas Corp" (colon-space) survives roundtrip (escaped form)."""
+        result = self._roundtrip_well_value(tmp_path, "Oil: Gas Corp")
+        # Value is preserved (not truncated), though in escaped form.
+        # The parser does not un-escape — that is a separate enhancement.
+        assert result == "Oil:_ Gas Corp"
+        assert "Oil" in result  # Not truncated to just "Oil"
+
+    def test_roundtrip_space_colon_space(self, tmp_path: Path) -> None:
+        """"Oil : Gas Corp" (space-colon-space) survives roundtrip."""
+        result = self._roundtrip_well_value(tmp_path, "Oil : Gas Corp")
+        # Must NOT be truncated to just "Oil" (the F-EX-03 corruption).
+        assert result != "Oil"
+        assert "Oil" in result
+        assert "Gas Corp" in result
+
+    def test_roundtrip_space_colon_no_trailing_space(self, tmp_path: Path) -> None:
+        """"Oil :Gas Corp" (space-colon, no space after) survives roundtrip."""
+        result = self._roundtrip_well_value(tmp_path, "Oil :Gas Corp")
+        assert result != "Oil"
+        assert "Oil" in result
+        assert "Gas Corp" in result
+
+    def test_roundtrip_trailing_colon(self, tmp_path: Path) -> None:
+        """"Oil:" (trailing colon) survives roundtrip."""
+        result = self._roundtrip_well_value(tmp_path, "Oil:")
+        # Must NOT be truncated — colon-containing value preserved.
+        assert result != "Oil"
+        assert "Oil" in result
+
+    def test_roundtrip_trailing_space_colon(self, tmp_path: Path) -> None:
+        """"Oil :" (trailing space-colon) survives roundtrip."""
+        result = self._roundtrip_well_value(tmp_path, "Oil :")
+        # Must NOT be truncated to just "Oil" (the F-EX-03 corruption).
+        assert result != "Oil"
+        assert "Oil" in result
+
+    def test_roundtrip_leading_colon_no_ws(self, tmp_path: Path) -> None:
+        """Leading colon without whitespace is harmless."""
+        result = self._roundtrip_well_value(tmp_path, ":Oil")
+        # Leading colon is not a structural separator — preserved as-is.
+        assert ":Oil" in result
+
+    def test_roundtrip_multiple_embedded_colons(self, tmp_path: Path) -> None:
+        """Multiple embedded colons all survive roundtrip."""
+        result = self._roundtrip_well_value(tmp_path, "A: B : C")
+        # Must contain A, B, C — not truncated at any colon.
+        assert "A" in result
+        assert "B" in result
+        assert "C" in result

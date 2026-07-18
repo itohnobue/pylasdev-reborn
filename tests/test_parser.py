@@ -707,6 +707,248 @@ Line two of free text.
         # Deduped order reflects the collision resolution
         assert section.curves_order == ["DT", "DT_2", "DT_2_2"]
 
+    # ── F-EX-01: Deferred data section boundary preservation ──────
+
+    def test_las30_deferred_data_separate_sections(self) -> None:
+        """F-EX-01: Deferred pre-~V data is NOT merged into post-~V DataSection.
+
+        When a LAS 3.0 file has ~A sections both BEFORE and AFTER ~V,
+        the deferred pre-~V data lines must produce a SEPARATE DataSection
+        — not be merged into the post-~V section.  Merging distinct sections
+        with different curve assignments and depth ranges produces corrupted
+        data in reversed order.
+        """
+        content = """~A
+100.0,50.0
+101.0,51.0
+~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+~A
+200.0,60.0
+201.0,61.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.data_sections) == 2, (
+            f"Expected 2 DataSections (pre-~V and post-~V), got {len(las.data_sections)}"
+        )
+        # First section: pre-~V data (name auto-generated since ~V not yet parsed)
+        sec0 = las.data_sections[0]
+        assert len(sec0.data["DEPT"]) == 2
+        assert sec0.data["DEPT"][0] == 100.0
+        assert sec0.data["DEPT"][1] == 101.0
+        assert sec0.data["DT"][0] == 50.0
+        assert sec0.data["DT"][1] == 51.0
+        # Second section: post-~V data
+        sec1 = las.data_sections[1]
+        assert len(sec1.data["DEPT"]) == 2
+        assert sec1.data["DEPT"][0] == 200.0
+        assert sec1.data["DEPT"][1] == 201.0
+        assert sec1.data["DT"][0] == 60.0
+        assert sec1.data["DT"][1] == 61.0
+
+    def test_las30_deferred_data_single_section_no_separation(self) -> None:
+        """F-EX-01: Single ~A section pre-~V with no post-~V data.
+
+        When there is ONLY a pre-~V ~A section (no subsequent data section),
+        the deferred data is appended to the empty _ascii_data_lines and
+        processed as one DataSection — the normal single-section path.
+        """
+        content = """~A
+100.0,50.0
+101.0,51.0
+~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.data_sections) == 1
+        sec0 = las.data_sections[0]
+        assert len(sec0.data["DEPT"]) == 2
+        assert sec0.data["DEPT"][0] == 100.0
+
+    # ── F-EX-02: First-block-only semantics ──────────────────────
+
+    def test_multi_a_first_block_only(self, tmp_path: Path) -> None:
+        """F-EX-02: Multi-~A files ingest only the FIRST contiguous ~A block.
+
+        When a LAS 2.0 file has ``~A(data1) ~OTHER ~A(data2)``, only data1
+        is ingested.  The parser's _pre_scan counts per_block_counts[0] and
+        the data reader breaks at the first non-~A section header — both
+        sides agree on first-block-only semantics.
+
+        Uses read_las_file() to exercise the full parser→data_reader pipeline.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A  DEPT  DT\n"
+            "100.0  50.0\n"
+            "101.0  51.0\n"
+            "~OTHER\n"
+            "Freeform text here.\n"
+            "~A  DEPT  DT\n"
+            "200.0  60.0\n"
+        )
+        test_file = tmp_path / "multi_a_first_block.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+
+        # Only the first ~A block's 2 data lines are ingested.
+        assert len(data["logs"]["DEPT"]) == 2
+        assert len(data["logs"]["DT"]) == 2
+        np.testing.assert_array_almost_equal(
+            data["logs"]["DEPT"], [100.0, 101.0]
+        )
+        np.testing.assert_array_almost_equal(
+            data["logs"]["DT"], [50.0, 51.0]
+        )
+
+    # ── F-S9-01: DataSection idx increment after save/swap ─────────
+
+    def test_deferred_data_section_names_unique(self) -> None:
+        """F-S9-01: DataSection names are unique after save/swap path.
+
+        When ~A(pre-~V) ~V ~C ~A(post-~V) produces two DataSections via
+        the save/swap path in _replay_deferred_well(), the idx increment
+        ensures both sections get distinct names (Section_0, Section_1)
+        rather than the same auto-generated name.
+        """
+        content = """~A
+100.0,50.0
+101.0,51.0
+~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+~A
+200.0,60.0
+201.0,61.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.data_sections) == 2
+        assert las.data_sections[0].name != las.data_sections[1].name, (
+            f"DataSection names must be unique: got '{las.data_sections[0].name}' "
+            f"for both sections"
+        )
+
+    def test_deferred_data_pre_curve_scoping(self) -> None:
+        """F-S9-02: Pre-~V DataSection has correct curve scoping.
+
+        When a pre-~V ~C exists before the deferred ~A section, the
+        pre-~V DataSection must be scoped to the full curve range
+        (allowing pre-~V data values to map to their correct curves)
+        rather than the post-~V curve range which would cross-assign
+        values to wrong curves.
+
+        Without this fix: pre-~V data (100.0, 50.0) with 2 columns
+        gets scoped to post-~V curves (only GR — 1 curve), causing
+        DEPT=100.0 to be stored as GR and DT=50.0 silently dropped.
+        """
+        content = """~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+~A PRE_SECTION
+100.0,50.0
+101.0,51.0
+~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ GR.API       : GAMMA  {F}
+~A POST_SECTION
+200.0
+201.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.data_sections) == 2
+
+        # Pre-~V section: should have data for DEPT and DT (pre-~V curves).
+        # GR (post-~V curve) gets null — acceptable since pre-~V data has
+        # no values for it.
+        sec_pre = las.data_sections[0]
+        assert "DEPT" in sec_pre.data, (
+            f"Pre-~V section must contain DEPT data, got curves: {list(sec_pre.data.keys())}"
+        )
+        assert "DT" in sec_pre.data, (
+            f"Pre-~V section must contain DT data, got curves: {list(sec_pre.data.keys())}"
+        )
+        assert sec_pre.data["DEPT"][0] == 100.0
+        assert sec_pre.data["DEPT"][1] == 101.0
+        assert sec_pre.data["DT"][0] == 50.0
+        assert sec_pre.data["DT"][1] == 51.0
+
+        # Post-~V section: only GR data.
+        sec_post = las.data_sections[1]
+        assert sec_post.data["GR"][0] == 200.0
+        assert sec_post.data["GR"][1] == 201.0
+
+    def test_deferred_data_section_name_not_corrupted(self) -> None:
+        """F-S9-02: Pre-~V DataSection name is not corrupted by post-~V context.
+
+        When the pre-~V ~A section has a different name than post-~V ~A,
+        the pre-~V DataSection must NOT inherit the post-~V section's name.
+        The pre-~V section falls back to auto-generated "Section_N" since
+        its original name was overwritten by post-~V section handling
+        (known limitation).
+        """
+        content = """~A PRE_V_NAME
+100.0,50.0
+101.0,51.0
+~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+~A POST_V_NAME
+200.0,60.0
+201.0,61.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.data_sections) == 2
+
+        # Pre-~V section: should NOT be named 'POST_V_NAME'
+        sec_pre = las.data_sections[0]
+        assert sec_pre.name != "POST_V_NAME", (
+            f"Pre-~V DataSection must not inherit post-~V section name: "
+            f"got '{sec_pre.name}'"
+        )
+
+        # Post-~V section: should keep its name
+        sec_post = las.data_sections[1]
+        assert sec_post.name == "POST_V_NAME", (
+            f"Post-~V DataSection name should be 'POST_V_NAME', got '{sec_post.name}'"
+        )
+        # Names must be different
+        assert sec_pre.name != sec_post.name, (
+            f"Section names must differ: '{sec_pre.name}' vs '{sec_post.name}'"
+        )
+
 
 class TestLAS12WellSectionSwap:
     """T1/F-10: LAS 1.2 value/description swap across versions."""

@@ -84,24 +84,32 @@ def _normalize_dev_column(name: str) -> str:
     return _DEV_ALIASES.get(name.upper(), name)
 
 
-def _deduplicate_dev_columns(names: list[str]) -> list[str]:
-    """Deduplicate DEV column names with cross-base collision detection.
+def _deduplicate_string_list(
+    items: list[str],
+    *,
+    name_label: str = "name",
+    _stacklevel: int = 2,
+) -> list[str]:
+    """Deduplicate a list of strings with cross-base collision detection.
 
-    Ported from ``_deduplicate_curves`` in ``data_reader.py``.  Uses an
-    ``output_names`` set + while-loop to ensure generated ``_N`` suffixes
-    don't collide with any name already in the output.
+    Common deduplication algorithm shared across DEV column names and
+    LAS curve/parameter mnemonics.  Uses an ``output_names`` set +
+    while-loop to ensure generated ``_N`` suffixes don't collide with
+    any name already in the output.
 
     Args:
-        names: Raw column names from the header line.
+        items:       List of strings to deduplicate.
+        name_label:  Human-readable label used in warning messages
+                     (e.g. ``"DEV column name"``).
+        _stacklevel: Stacklevel for ``warnings.warn``.
 
     Returns:
-        Deduplicated column names.  A warning is emitted for each
-        duplicate.
+        Deduplicated list of strings with ``_N`` suffixes on collisions.
     """
     seen: dict[str, int] = {}
-    deduped: list[str] = []
+    result: list[str] = []
     output_names: set[str] = set()
-    for name in names:
+    for name in items:
         if name in seen:
             seen[name] += 1
             suffix = seen[name]
@@ -111,12 +119,12 @@ def _deduplicate_dev_columns(names: list[str]) -> list[str]:
                 new_name = f"{name}_{suffix}"
             seen[name] = suffix
             warnings.warn(
-                f"Duplicate DEV column name '{name}' renamed to "
+                f"Duplicate {name_label} '{name}' renamed to "
                 f"'{new_name}'. Data may come from a file with "
-                f"repeated column names.",
-                stacklevel=2,
+                f"repeated {name_label}s.",
+                stacklevel=_stacklevel,
             )
-            deduped.append(new_name)
+            result.append(new_name)
             output_names.add(new_name)
         else:
             if name in output_names:
@@ -127,18 +135,37 @@ def _deduplicate_dev_columns(names: list[str]) -> list[str]:
                     new_name = f"{name}_{suffix}"
                 seen[name] = suffix
                 warnings.warn(
-                    f"Duplicate DEV column name '{name}' renamed to "
+                    f"Duplicate {name_label} '{name}' renamed to "
                     f"'{new_name}'. Data may come from a file with "
-                    f"repeated column names.",
-                    stacklevel=2,
+                    f"repeated {name_label}s.",
+                    stacklevel=_stacklevel,
                 )
-                deduped.append(new_name)
+                result.append(new_name)
                 output_names.add(new_name)
             else:
                 seen[name] = 1
-                deduped.append(name)
+                result.append(name)
                 output_names.add(name)
-    return deduped
+    return result
+
+
+def _deduplicate_dev_columns(names: list[str]) -> list[str]:
+    """Deduplicate DEV column names with cross-base collision detection.
+
+    Thin wrapper around ``_deduplicate_string_list`` with DEV-specific
+    label and adjusted stacklevel so warnings point to the caller of
+    this function rather than the internal helper.
+
+    Args:
+        names: Raw column names from the header line.
+
+    Returns:
+        Deduplicated column names.  A warning is emitted for each
+        duplicate.
+    """
+    return _deduplicate_string_list(
+        names, name_label="DEV column name", _stacklevel=3
+    )
 
 
 def _is_float_token(token: str) -> bool:
@@ -208,8 +235,14 @@ def _split_delimited_line(
         List of individual field values with leading / trailing
         whitespace stripped from each.
     """
-    reader = csv.reader([line], delimiter=delimiter, skipinitialspace=True)
-    tokens: list[str] = next(reader, [])
+    try:
+        reader = csv.reader([line], delimiter=delimiter, skipinitialspace=True)
+        tokens: list[str] = next(reader, [])
+    except csv.Error as e:
+        raise DEVReadError(
+            f"Failed to parse delimited line with delimiter "
+            f"{delimiter!r}: {e}"
+        ) from e
     return [v.strip() for v in tokens[:max_tokens]]
 
 
@@ -545,7 +578,7 @@ def read_dev_file_as_object(
         stripped = line.strip()
         if stripped and not stripped.startswith("#"):
             content_entries.append((i, stripped))
-            if len(content_entries) >= 3:
+            if len(content_entries) >= 4:
                 break
 
     format_type, skip_content_lines = _detect_dev_format(content_entries)
@@ -588,6 +621,52 @@ def read_dev_file_as_object(
                 delimiter = " "
         else:
             delimiter = " "
+
+        # Cross-validate auto-detected delimiter against first data line
+        # (F-M27).  When the header uses commas but data lines are
+        # space-delimited, the auto-detected comma delimiter produces a
+        # single token from the entire data line, causing all values to
+        # become NaN.  Skip for headerless — the header line IS the data.
+        if hdr and format_type != "headerless":
+            _content_seen = 0
+            _first_data: str | None = None
+            for _lin in lines:
+                _s = _lin.strip()
+                if not _s or _s.startswith("#"):
+                    continue
+                _content_seen += 1
+                if _content_seen > skip_content_lines:
+                    _first_data = _s
+                    break
+            if _first_data is not None:
+                if delimiter == " ":
+                    _hdr_cols = len(hdr.split())
+                    _data_cols = len(_first_data.split())
+                else:
+                    _hdr_cols = len(
+                        [t for t in hdr.split(delimiter) if t.strip()]
+                    )
+                    _data_cols = len(
+                        [t for t in _first_data.split(delimiter) if t.strip()]
+                    )
+                if _hdr_cols >= 2 and _data_cols == 1:
+                    warnings.warn(
+                        f"Auto-detected delimiter {delimiter!r} from "
+                        f"header ({_hdr_cols} columns) but first data "
+                        f"line produces only {_data_cols} token(s). "
+                        f"The file may be space-delimited data with a "
+                        f"comma-separated header. Consider passing "
+                        f"`delimiter=' '` explicitly.",
+                        stacklevel=2,
+                    )
+                elif abs(_hdr_cols - _data_cols) >= 3:
+                    warnings.warn(
+                        f"Auto-detected delimiter {delimiter!r} produces "
+                        f"{_hdr_cols} columns from header but "
+                        f"{_data_cols} tokens from first data line. "
+                        f"Delimiter detection may be incorrect.",
+                        stacklevel=2,
+                    )
 
     # Guard against empty delimiter — str.split("") raises ValueError.
     # The auto-detection above always produces "," or " " but a caller

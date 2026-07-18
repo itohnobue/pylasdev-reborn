@@ -30,6 +30,7 @@ Public API:
     LASParseError              — LAS file content cannot be parsed
     LASVersionError            — Provided for user code to enforce strict version policies
     LASEncodingError           — File encoding cannot be determined or decoded
+    LASDataError               — LAS data validation fails in from_dict
     DEVReadError               — DEV file cannot be read or parsed
 """
 
@@ -44,6 +45,7 @@ from .compare import compare_las_dicts
 from .dev_reader import read_dev_file, read_dev_file_as_object
 from .exceptions import (
     DEVReadError,
+    LASDataError,
     LASEncodingError,
     LASParseError,
     LASReadError,
@@ -94,5 +96,6 @@ __all__ = [
     "LASParseError",
     "LASVersionError",
     "LASEncodingError",
+    "LASDataError",
     "DEVReadError",
 ]

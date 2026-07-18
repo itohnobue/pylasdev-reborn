@@ -208,18 +208,20 @@ def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int) -
     # simply eliminates a redundant check (the same bounds guard runs
     # inside _read_normal).
 
-    wrap_mode = las_file.version.wrap.upper() == "YES"
     delimiter = las_file.version.delimiter_char
 
-    if wrap_mode:
-        # Auto-detect wrap mismatch: if the first data line has >= curve_count
-        # values, the data is actually non-wrapped despite WRAP=YES header.
-        # This handles mislabeled files (e.g., Petrel exports).
-        actual_wrap = _detect_actual_wrap(lines, curve_count, delimiter)
-        if actual_wrap:
-            _read_wrapped(lines, las_file, curve_count, delimiter)
-        else:
-            _read_normal(lines, las_file, curve_count, data_line_count, delimiter)
+    # F-H01: Unconditionally detect actual wrap mode from data content
+    # regardless of the WRAP header flag.  The header may be wrong
+    # (e.g. mislabeled Petrel exports claim WRAP=YES but data is
+    # non-wrapped, or files with WRAP=NO actually contain wrapped data).
+    # Using the wrong reader corrupts all non-depth curve values:
+    #   - _read_normal on wrapped data  → extra columns discarded,
+    #     only first value per line used, rest become null_value
+    #   - _read_wrapped on non-wrapped  → depth/C1 swap via the
+    #     depth-line flag protocol treating full lines as single values
+    actual_wrap = _detect_actual_wrap(lines, curve_count, delimiter)
+    if actual_wrap:
+        _read_wrapped(lines, las_file, curve_count, delimiter)
     else:
         _read_normal(lines, las_file, curve_count, data_line_count, delimiter)
 
@@ -270,14 +272,32 @@ def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " "
         if delimiter == " ":
             values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
         else:
-            reader = csv.reader(
-                [stripped], delimiter=delimiter, quoting=csv.QUOTE_MINIMAL
-            )
-            row = next(reader)
+            # F-I2-M12: Wrap csv.reader in try/except — csv.Error
+            # (e.g. unclosed quotes or field-size overflow) is NOT a
+            # LASParseError subclass and would escape the public API
+            # (reader.py only catches LASParseError).
+            try:
+                reader = csv.reader(
+                    [stripped], delimiter=delimiter, quoting=csv.QUOTE_MINIMAL
+                )
+                row = next(reader)
+            except csv.Error as e:
+                raise LASParseError(
+                    f"Failed to parse delimited data line: {e}"
+                ) from e
             # Safety cap: prevent unbounded token count from malformed input,
             # matching the maxsplit behavior of str.split.
             values = row[: MAX_TOKENS_PER_LINE + 1]
 
+        # F-M20: When curve_count is 1, wrapped and non-wrapped modes are
+        # equivalent — every line holds exactly one value regardless of
+        # mode.  The space-delimiter heuristic ``len(values) < curve_count``
+        # is degenerate for curve_count=1 (always False), and forcing
+        # wrapped mode on a single-curve file triggers unnecessary overflow
+        # warnings and counter logic in _read_wrapped.  Use non-wrapped
+        # (the simpler path) when there is nothing to distinguish.
+        if curve_count <= 1:
+            return False
         # F-023: For non-space delimiters (COMMA, TAB), trailing empty values
         # can be omitted per CSV convention, making the first line appear
         # shorter than curve_count.  Use a different heuristic: a wrapped
@@ -314,16 +334,11 @@ def _deduplicate_curves(las_file: LASFile, _stacklevel: int = 2) -> None:
     for idx, name in enumerate(las_file.curves_order):
         if name in seen:
             seen[name] += 1
-            # F-22: Ensure the generated name doesn't collide with
-            # any name already in the output (including original names
-            # that match the _N suffix pattern).
-            suffix = seen[name]
-            new_name = f"{name}_{suffix}"
-            while new_name in output_names:
-                suffix += 1
-                new_name = f"{name}_{suffix}"
+            new_name = _resolve_unique_curve_name(
+                name, seen[name], output_names
+            )
             # Update the seen counter to match the actual suffix used
-            seen[name] = suffix
+            seen[name] = _suffix_from_name(new_name, name)
             _rename_duplicate_curve(
                 las_file,
                 idx,
@@ -340,12 +355,10 @@ def _deduplicate_curves(las_file: LASFile, _stacklevel: int = 2) -> None:
             # ["DEPT","DEPT_2","DEPT_2_2"], not
             # ["DEPT","DEPT_2","DEPT_2"] with duplicate keys.
             if name in output_names:
-                suffix = 2
-                new_name = f"{name}_{suffix}"
-                while new_name in output_names:
-                    suffix += 1
-                    new_name = f"{name}_{suffix}"
-                seen[name] = suffix
+                new_name = _resolve_unique_curve_name(
+                    name, 2, output_names
+                )
+                seen[name] = _suffix_from_name(new_name, name)
                 _rename_duplicate_curve(
                     las_file,
                     idx,
@@ -361,6 +374,48 @@ def _deduplicate_curves(las_file: LASFile, _stacklevel: int = 2) -> None:
                 output_names.add(name)
     if new_order != las_file.curves_order:
         las_file.curves_order = new_order
+
+
+def _resolve_unique_curve_name(
+    base_name: str,
+    start_suffix: int,
+    output_names: set[str],
+) -> str:
+    """Resolve a unique curve name by appending incrementing _N suffix.
+
+    F-M19: Extracted helper for the deduplication collision-resolution
+    algorithm shared across parser.py, data_reader.py, and dev_reader.py.
+
+    Args:
+        base_name: The original curve mnemonic.
+        start_suffix: Starting integer for the suffix (e.g. 2 for first
+            duplicate, or higher for already-seen names).
+        output_names: Set of names already in the output (for collision
+            detection against previously-generated _N suffixes).
+
+    Returns:
+        A unique name of the form ``f"{base_name}_{N}"`` that does not
+        collide with any name in *output_names*.
+    """
+    suffix = start_suffix
+    new_name = f"{base_name}_{suffix}"
+    while new_name in output_names:
+        suffix += 1
+        new_name = f"{base_name}_{suffix}"
+    return new_name
+
+
+def _suffix_from_name(name: str, base_name: str) -> int:
+    """Extract the _N suffix from a resolved unique curve name.
+
+    Given ``name = "DEPT_3"`` and ``base_name = "DEPT"``, returns 3.
+    Used to keep the ``seen`` counter in sync with the actual suffix
+    assigned by :func:`_resolve_unique_curve_name`.
+    """
+    try:
+        return int(name[len(base_name) + 1:])
+    except (ValueError, IndexError):
+        return 0
 
 
 def _rename_duplicate_curve(
@@ -440,7 +495,12 @@ def _read_normal(
                 in_ascii = True
             else:
                 if in_ascii:
-                    break  # End of ASCII section — new section started
+                    # Stop reading at the first non-~A section header.
+                    # _pre_scan counts data lines for the FIRST contiguous
+                    # ~A block only (per_block_counts[0]), matching this
+                    # break-at-first-non-~A behavior.  Both sides agree:
+                    # only the first ~A block is ingested.
+                    break
             continue
 
         if not in_ascii or not stripped or stripped.startswith("#"):
@@ -453,10 +513,19 @@ def _read_normal(
         if delimiter == " ":
             values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
         else:
-            reader = csv.reader(
-                [stripped], delimiter=delimiter, quoting=csv.QUOTE_MINIMAL
-            )
-            row = next(reader)
+            # F-I2-M12: Wrap csv.reader in try/except — csv.Error
+            # (e.g. unclosed quotes or field-size overflow) is NOT a
+            # LASParseError subclass and would escape the public API
+            # (reader.py only catches LASParseError).
+            try:
+                reader = csv.reader(
+                    [stripped], delimiter=delimiter, quoting=csv.QUOTE_MINIMAL
+                )
+                row = next(reader)
+            except csv.Error as e:
+                raise LASParseError(
+                    f"Failed to parse delimited data line: {e}"
+                ) from e
             # Safety cap: prevent unbounded token count from malformed input,
             # matching the maxsplit behavior of str.split.
             values = row[: MAX_TOKENS_PER_LINE + 1]
@@ -625,7 +694,12 @@ def _read_wrapped(
                 in_ascii = True
             else:
                 if in_ascii:
-                    break  # End of ASCII section — new section started
+                    # Stop reading at the first non-~A section header.
+                    # _pre_scan counts data lines for the FIRST contiguous
+                    # ~A block only (per_block_counts[0]), matching this
+                    # break-at-first-non-~A behavior.  Both sides agree:
+                    # only the first ~A block is ingested.
+                    break
             continue
 
         if not in_ascii or not stripped or stripped.startswith("#"):
@@ -638,10 +712,19 @@ def _read_wrapped(
         if delimiter == " ":
             values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
         else:
-            reader = csv.reader(
-                [stripped], delimiter=delimiter, quoting=csv.QUOTE_MINIMAL
-            )
-            row = next(reader)
+            # F-I2-M12: Wrap csv.reader in try/except — csv.Error
+            # (e.g. unclosed quotes or field-size overflow) is NOT a
+            # LASParseError subclass and would escape the public API
+            # (reader.py only catches LASParseError).
+            try:
+                reader = csv.reader(
+                    [stripped], delimiter=delimiter, quoting=csv.QUOTE_MINIMAL
+                )
+                row = next(reader)
+            except csv.Error as e:
+                raise LASParseError(
+                    f"Failed to parse delimited data line: {e}"
+                ) from e
             # Safety cap: prevent unbounded token count from malformed input,
             # matching the maxsplit behavior of str.split.
             values = row[: MAX_TOKENS_PER_LINE + 1]
@@ -724,6 +807,23 @@ def _read_wrapped(
                         f"Extra value(s) discarded. Line content: '{stripped[:80]}'",
                         stacklevel=2,
                     )
+                    # F-I2-M15: If the previous depth line had extra values
+                    # (suggesting a multi-value non-wrapped row was parsed as
+                    # a depth line), and this data line overflows (has enough
+                    # values to exceed all remaining non-depth curves), then
+                    # the file is likely non-wrapped being read as wrapped.
+                    # The first values from each line are misrouted: what
+                    # should be the next depth step goes to C1 instead,
+                    # causing a permanent DEPTH↔C1 swap.
+                    if depth_had_extra:
+                        warnings.warn(
+                            f"Wrapped mode: suspected non-wrapped data — "
+                            f"a previous depth line had extra values and "
+                            f"this data line overflowed. DEPTH and curve "
+                            f"values are likely swapped. "
+                            f"Line content: '{stripped[:80]}'",
+                            stacklevel=2,
+                        )
                     break
 
                 data_lists[counter].append(_to_finite_float(val_str, null_value))
@@ -750,6 +850,24 @@ def _read_wrapped(
                             f"'{stripped[:80]}'",
                             stacklevel=2,
                         )
+                        # F-I2-M15: If the previous depth line also had
+                        # extra values (depth_had_extra is True) AND this
+                        # data line completes the step with leftover values,
+                        # the file is likely non-wrapped data misread as
+                        # wrapped.  Each multi-value line contributes only
+                        # its first value where one curve value is expected,
+                        # permanently swapping DEPTH with C1 (and C1 with C2,
+                        # etc.) for all subsequent depth steps.
+                        if depth_had_extra:
+                            warnings.warn(
+                                f"Wrapped mode: suspected non-wrapped data — "
+                                f"previous depth line had extra values and "
+                                f"this data line completed the step with "
+                                f"{len(values) - i - 1} leftover value(s). "
+                                f"DEPTH and curve values may be swapped. "
+                                f"Line content: '{stripped[:80]}'",
+                                stacklevel=2,
+                            )
                     counter = 0
                     depth_line = True
                     depth_had_extra = False

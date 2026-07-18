@@ -70,6 +70,10 @@ def detect_encoding(file_path: Path) -> str:
     if HAS_CHARDET:
         with open(file_path, "rb") as f:
             raw = f.read(50_000)
+        # Strip UTF-8 BOM before passing to chardet for consistency
+        # with read_with_encoding(), which also strips the BOM.
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
         return _detect_encoding_from_bytes(raw)
 
     return "utf-8"
