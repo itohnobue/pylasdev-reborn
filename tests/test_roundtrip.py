@@ -173,6 +173,174 @@ class TestRoundTrip:
                     err_msg=f"string_data mismatch for {key} in section {i}",
                 )
 
+    # --- F-053/IF-011: Per-section parameter roundtrip ---
+    def test_per_section_parameter_roundtrip(self, tmp_path: Path) -> None:
+        """F-053/IF-011 (R-003): Per-section parameters survive write/read roundtrip.
+
+        Construct a LAS 3.0 LASFile with parameters having
+        section_type='CORE' and section_type=None.  Write to file,
+        re-read, and verify that section_type is preserved on each
+        ParameterEntry.  Also verify the writer emits a separate
+        ~Core_Parameter section for section-typed parameters.
+        """
+        from pylasdev.models import (
+            CurveDefinition,
+            DataSection,
+            LASFile,
+            ParameterEntry,
+            VersionSection,
+        )
+
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
+        las.logs["DEPT"] = np.array([100.0, 101.0])
+
+        # Global parameter (section_type=None → standard ~P section)
+        las.parameters.append(
+            ParameterEntry(
+                mnemonic="BHT",
+                unit="DEGC",
+                value="35.5",
+                description="Bottom Hole Temperature",
+            )
+        )
+        # Per-section parameter (section_type="CORE")
+        las.parameters.append(
+            ParameterEntry(
+                mnemonic="MATR",
+                value="SAND",
+                description="Neutron Matrix",
+                section_type="CORE",
+            )
+        )
+
+        # Add a CORE_DATA section so the writer has something to pair
+        section = DataSection(
+            name="Core[1]",
+            section_type="CORE_DATA",
+            curves_order=["DEPT"],
+            data={"DEPT": np.array([550.0, 551.0])},
+        )
+        las.data_sections.append(section)
+
+        temp_file = tmp_path / "per_section_param.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        # Write-time verification: ~CORE_Parameter section
+        # should be present for the CORE-typed parameter
+        assert "~CORE_Parameter" in content, (
+            f"Expected per-section parameter block for CORE in output:\n{content[:2000]}"
+        )
+        # Standard ~P section should also be present for global parameter
+        assert "~PARAMETER" in content or "~Parameter" in content, (
+            "Expected standard ~P section for global parameters"
+        )
+
+        # Roundtrip: re-read and verify section_type preserved
+        data = read_las_file(temp_file)
+        param_details = data.get("parameter_details", [])
+        assert len(param_details) >= 2, (
+            f"Expected at least 2 parameters, got {len(param_details)}"
+        )
+
+        # Find BHT (section_type should be None → not in output or default)
+        bht_params = [p for p in param_details if p.get("mnemonic") == "BHT"]
+        assert len(bht_params) == 1
+        # BHT should have no section_type (global parameter)
+        assert bht_params[0].get("section_type") in (None, ""), (
+            f"BHT should not have section_type, got: {bht_params[0].get('section_type')!r}"
+        )
+
+        # Find MATR (section_type should be 'CORE')
+        matr_params = [p for p in param_details if p.get("mnemonic") == "MATR"]
+        assert len(matr_params) == 1, "MATR parameter missing from roundtrip"
+        assert matr_params[0].get("section_type") == "CORE", (
+            f"MATR section_type should be 'CORE', got: {matr_params[0].get('section_type')!r}"
+        )
+
+    def test_per_section_parameter_multiple_section_types(self, tmp_path: Path) -> None:
+        """F-053/IF-011: Multiple section types each get their own
+        per-section parameter block."""
+        from pylasdev.models import (
+            CurveDefinition,
+            DataSection,
+            LASFile,
+            ParameterEntry,
+            VersionSection,
+        )
+
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        # Parameters with different section types
+        las.parameters.append(
+            ParameterEntry(
+                mnemonic="CORE_PARAM",
+                value="core_val",
+                section_type="CORE",
+            )
+        )
+        las.parameters.append(
+            ParameterEntry(
+                mnemonic="DRILL_PARAM",
+                value="drill_val",
+                section_type="DRILLING",
+            )
+        )
+
+        # Add corresponding data sections
+        las.data_sections.append(
+            DataSection(
+                name="Core[1]",
+                section_type="CORE_DATA",
+                curves_order=["DEPT"],
+                data={"DEPT": np.array([550.0])},
+            )
+        )
+        las.data_sections.append(
+            DataSection(
+                name="Drill[1]",
+                section_type="DRILLING_DATA",
+                curves_order=["DEPT"],
+                data={"DEPT": np.array([100.0])},
+            )
+        )
+
+        temp_file = tmp_path / "multi_section_param.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+
+        # Both per-section parameter blocks should be present
+        assert "~CORE_Parameter" in content, (
+            f"Missing ~CORE_Parameter section:\n{content[:2000]}"
+        )
+        assert "~DRILLING_Parameter" in content, (
+            f"Missing ~DRILLING_Parameter section:\n{content[:2000]}"
+        )
+        assert "core_val" in content
+        assert "drill_val" in content
+
+        # Roundtrip: re-read and verify section_type preserved
+        data = read_las_file(temp_file)
+        param_details = data.get("parameter_details", [])
+
+        core_params = [p for p in param_details if p.get("mnemonic") == "CORE_PARAM"]
+        assert len(core_params) == 1
+        assert core_params[0].get("section_type") == "CORE"
+
+        drill_params = [p for p in param_details if p.get("mnemonic") == "DRILL_PARAM"]
+        assert len(drill_params) == 1
+        assert drill_params[0].get("section_type") == "DRILLING"
+
     def test_roundtrip_preserves_curve_metadata(self) -> None:
         """Test that to_dict/from_dict round-trip preserves curve metadata."""
         from pylasdev.models import CurveDefinition, LASFile, VersionSection

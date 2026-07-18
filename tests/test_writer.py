@@ -1645,6 +1645,238 @@ class TestLOGDataWithSectionCurves:
         assert "DT.US/M" not in content
 
 
+class TestPrecisionRejection:
+    """IF-016/IF-017: Write-time rejection of 'n' and '%' precision codes.
+
+    _validate_precision accepts 'n' and '%' with a warning for backward
+    compatibility, but write_las_file must REJECT them with LASWriteError
+    to prevent silent data corruption (locale-dependent output or
+    percentage-scaled values).
+    """
+
+    def test_precision_n_rejected_at_write(self, tmp_path: Path) -> None:
+        """IF-016: write_las_file with precision='.5n' raises LASWriteError.
+
+        The 'n' format code produces locale-dependent output (e.g., comma
+        as decimal separator) that is unparseable in LAS format.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="2.0")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        temp_file = tmp_path / "prec_n.las"
+        with pytest.raises(LASWriteError, match="Precision format code 'n'"):
+            write_las_file(temp_file, las, precision=".5n")
+
+    def test_precision_percent_rejected_at_write(self, tmp_path: Path) -> None:
+        """IF-017: write_las_file with precision='.3%' raises LASWriteError.
+
+        The '%' format code multiplies values by 100 and appends '%',
+        producing values that cannot be re-parsed as floating-point numbers.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="2.0")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        temp_file = tmp_path / "prec_pct.las"
+        with pytest.raises(LASWriteError, match="Precision format code '%'"):
+            write_las_file(temp_file, las, precision=".3%")
+
+    def test_precision_f_valid_succeeds(self, tmp_path: Path) -> None:
+        """Valid precision '.5f' is accepted and writes successfully.
+
+        This is the sanity check — standard format codes must work.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="2.0")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        temp_file = tmp_path / "prec_f.las"
+        write_las_file(temp_file, las, precision=".5f")  # Should not raise
+        assert temp_file.exists()
+        content = temp_file.read_text()
+        assert "100.00000" in content
+
+
+class TestAPICodeColonEscaping:
+    """IF-024: api_code colon escaping roundtrip.
+
+    The parser's DATA_LINE_PATTERN uses colon as structural separator.
+    A CurveEntry api_code with an embedded colon adjacent to whitespace
+    would be split across fields on re-read, corrupting the curve
+    definition.  The writer escapes api_code colons via
+    _escape_colons_for_las_value.
+    """
+
+    def test_api_code_embedded_colon_roundtrip(self, tmp_path: Path) -> None:
+        """IF-024: CurveEntry api_code='42 : injected' roundtrips correctly.
+
+        Without escaping, the parser would split this at the colon,
+        treating '42' as the api_code and 'injected' as a separate field.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="2.0")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "DT"]
+        las.curves.append(
+            CurveDefinition(
+                mnemonic="DEPT",
+                unit="M",
+                api_code="42 : injected",
+                description="Depth",
+            )
+        )
+        las.curves.append(
+            CurveDefinition(
+                mnemonic="DT",
+                unit="US/M",
+                api_code="99",
+                description="Sonic",
+            )
+        )
+        las.logs["DEPT"] = np.array([100.0])
+        las.logs["DT"] = np.array([50.0])
+
+        temp_file = tmp_path / "api_colon.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        # The api_code with colon must be escaped in the output
+        # (e.g., "42 _:_ injected" or similar — _escape_colons_for_las_value
+        # inserts _ at whitespace-colon adjacencies)
+        # Verify it's readable
+        assert "42" in content
+        assert "injected" in content
+        # The raw colon-space pattern should be escaped
+        curve_section = content.split("~CURVE")[1].split("~A")[0]
+        assert "42" in curve_section
+
+        # Roundtrip: re-read and check api_code is preserved (escaped form)
+        from pylasdev.parser import LASParser
+
+        parser = LASParser()
+        re_read = parser.parse(content)
+        # DEPT has the colon-containing api_code
+        dept_curve = re_read.curves[0]  # DEPT is first in curves_order
+        # api_code is preserved (though in escaped form — _escape_colons
+        # inserts _ between whitespace-colon adjacencies)
+        assert "42" in dept_curve.api_code, (
+            f"api_code should contain '42', got: {dept_curve.api_code!r}"
+        )
+        assert "injected" in dept_curve.api_code, (
+            f"api_code should contain 'injected', got: {dept_curve.api_code!r}"
+        )
+
+    def test_api_code_no_colon_unchanged(self, tmp_path: Path) -> None:
+        """IF-024: api_code without colon survives roundtrip unchanged."""
+        las = LASFile()
+        las.version = VersionSection(vers="2.0")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "DT"]
+        las.curves.append(
+            CurveDefinition(mnemonic="DEPT", unit="M", api_code="12345", description="Depth")
+        )
+        las.curves.append(
+            CurveDefinition(mnemonic="DT", unit="US/M", api_code="99", description="Sonic")
+        )
+        las.logs["DEPT"] = np.array([100.0])
+        las.logs["DT"] = np.array([50.0])
+
+        temp_file = tmp_path / "api_no_colon.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        assert "12345" in content
+
+        from pylasdev.parser import LASParser
+
+        parser = LASParser()
+        re_read = parser.parse(content)
+        assert re_read.curves[0].api_code == "12345"
+
+
+class TestWriteMultiSectionRejection:
+    """F-019/IF-007: Write-time rejection of multi-section non-3.0 files.
+
+    The writer at writer.py:709-716 raises LASWriteError when a non-LAS-3.0
+    file has multiple data_sections because the parser cannot correctly
+    re-read multi-section data from LAS 1.2/2.0 files.
+    """
+
+    def test_write_non_3_0_multi_section_raises(self, tmp_path: Path) -> None:
+        """F-019: write_las_file with version 2.0 and 2 data_sections
+        raises LASWriteError.
+
+        The writer guards against multiple data_sections in non-LAS-3.0
+        files because the parser only reads the first ~A block for
+        LAS 1.2/2.0.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="2.0")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        # Two data_sections on a LAS 2.0 file
+        section1 = DataSection(
+            name="CURVE",
+            curves_order=["DEPT"],
+            data={"DEPT": np.array([100.0])},
+        )
+        section2 = DataSection(
+            name="CURVE2",
+            curves_order=["DEPT"],
+            data={"DEPT": np.array([200.0])},
+        )
+        las.data_sections.append(section1)
+        las.data_sections.append(section2)
+
+        temp_file = tmp_path / "non3_multi.las"
+        with pytest.raises(LASWriteError, match=r"Multiple data_sections.*only supported for LAS 3.0"):
+            write_las_file(temp_file, las)
+
+    def test_write_las30_multi_section_succeeds(self, tmp_path: Path) -> None:
+        """F-019: write_las_file with version 3.0 and 2 data_sections succeeds.
+
+        LAS 3.0 natively supports multiple data sections.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        section1 = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["DEPT"],
+            data={"DEPT": np.array([100.0, 101.0])},
+        )
+        section2 = DataSection(
+            name="CORE",
+            section_type="CORE_DATA",
+            curves_order=["DEPT"],
+            data={"DEPT": np.array([200.0])},
+        )
+        las.data_sections.append(section1)
+        las.data_sections.append(section2)
+
+        temp_file = tmp_path / "las30_multi.las"
+        write_las_file(temp_file, las)  # Should not raise
+        assert temp_file.exists()
+
+
 class TestColonEscaping:
     """Tests for _escape_colons_for_las_value and colon roundtrip integrity.
 

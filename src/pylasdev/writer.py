@@ -19,7 +19,7 @@ from numpy.typing import NDArray
 
 from .data_reader import _get_null_value
 from .exceptions import LASWriteError, PylasdevError
-from .models import CurveDefinition, LASFile
+from .models import CurveDefinition, LASFile, ParameterEntry
 
 # Control characters except space and tab (which are valid LAS whitespace).
 # Tab (\x09) is handled separately in _sanitize_las_value — it is replaced
@@ -179,8 +179,11 @@ def _validate_precision(precision: str) -> None:
             format specifier.
     """
     # Must start with '.' followed by digits, optionally ending with a
-    # float-compatible presentation type (e, E, f, F, g, G, n, %).
+    # float-compatible presentation type (e, E, f, F, g, G).
     # Integer-specific codes (b, c, d, o, x, X) are rejected.
+    # The 'n' and '%' format codes are accepted by the regex for backward
+    # compatibility (existing tests call _validate_precision with these)
+    # but produce a warning at write time — see _check_precision_for_write.
     # No type code at all defaults to g-type for floats (safe).
     if not re.match(r"^\.\d+([eEfFgGn%])?$", precision):
         raise ValueError(
@@ -188,6 +191,23 @@ def _validate_precision(precision: str) -> None:
             f"Expected a format like '.8g', '.6f', or '.10e'. "
             f"Non-numeric format codes (x, o, b, c, d) are not supported "
             f"for LAS numeric data output."
+        )
+    # F-IF016/F-IF017: Warn about 'n' and '%' format codes.  'n' is
+    # locale-dependent (produces comma decimals and grouping characters
+    # that are unparseable in LAS format).  '%' multiplies values by 100
+    # and appends '%' (e.g., format(-999.25, ".8%") → "-99925.00000000%"),
+    # producing values that cannot be re-parsed as floating-point numbers.
+    if precision[-1] in ("n", "%"):
+        import warnings
+
+        warnings.warn(
+            f"Precision format code '{precision[-1]}' in '{precision}' "
+            f"is not safe for LAS output.  The 'n' format code produces "
+            f"locale-dependent output (unparseable comma/grouping). "
+            f"The '%' format code multiplies by 100 and appends '%' "
+            f"(unparseable suffix).  Consider using 'g', 'f', or 'e' instead.",
+            UserWarning,
+            stacklevel=2,
         )
 
 
@@ -223,6 +243,20 @@ def write_las_file(
         _validate_precision(precision)
     except ValueError as e:
         raise LASWriteError(f"Invalid precision format: {e}") from e
+
+    # F-IF016/F-IF017: Reject 'n' and '%' format codes at write time.
+    # The _validate_precision function warns about these but accepts them
+    # for backward compatibility; the actual write path must reject them
+    # to prevent silent data corruption.
+    if precision and precision[-1] in ("n", "%"):
+        raise LASWriteError(
+            f"Precision format code '{precision[-1]}' in '{precision}' "
+            f"is not supported for LAS output.  The 'n' format code "
+            f"produces locale-dependent decimal separators and grouping. "
+            f"The '%' format code multiplies values by 100 and appends "
+            f"'%'.  Both corrupt numeric data on re-read.  Use 'g', 'f', "
+            f"or 'e' instead."
+        )
 
     file_path = Path(file_path)
 
@@ -437,21 +471,26 @@ def _write_curve_section(las_file: LASFile) -> list[str]:
 
 
 def _write_parameter_section(las_file: LASFile) -> list[str]:
-    """Write ~P Parameter section."""
-    lines: list[str] = []
+    """Write ~P Parameter section.
+
+    For LAS 3.0 files with per-section parameters (F-053), groups
+    parameters by section_type and emits separate typed parameter
+    sections (e.g., ~Core_Parameter, ~Drilling_Parameter).  Parameters
+    without a section_type go into the standard ~PARAMETER INFORMATION
+    section.  LAS 1.2/2.0 files always emit a single flat section.
+    """
     if not las_file.parameters:
-        return lines
+        return []
+
+    lines: list[str] = []
     is_las30 = las_file.is_las30
-    lines.append("~PARAMETER INFORMATION")
-    for param in las_file.parameters:
+
+    def _format_one_param(param: ParameterEntry) -> str:
+        """Format a single parameter line (common to all section types)."""
         unit = _sanitize_las_value(param.unit) if param.unit else ""
         desc = param.description if param.description else ""
 
-        # F-M05: Emit data_format specifier in LAS 3.0 parameter lines,
-        # matching the curve writer pattern (_format_curve_line).  The
-        # parser strips the {F} specifier from the description and stores
-        # it in param.data_format; without this, {F} is irrevocably lost
-        # on roundtrip.
+        # F-M05: Emit data_format specifier in LAS 3.0 parameter lines.
         if is_las30 and param.data_format:
             desc = f"{desc}  {{{param.data_format}}}"
 
@@ -461,21 +500,48 @@ def _write_parameter_section(las_file: LASFile) -> list[str]:
                 zone_str += f"[{param.zone.zone_index}]"
             desc = f"{desc}{zone_str}"
 
-        # F-I2-M30: Escape colons in parameter values and descriptions
-        # after general sanitization.  Embedded colons with adjacent
-        # whitespace (": ") or trailing colons can be mistaken for the
-        # structural colon separator in the parser's DATA_LINE_PATTERN,
-        # causing truncation on re-read.  Well section handles this
-        # (_write_well_section lines 345-346); parameter section must
-        # do the same.
+        # F-I2-M30: Escape colons in parameter values and descriptions.
         value = _sanitize_las_value(param.value)
         desc = _sanitize_las_value(desc)
         value = _escape_colons_for_las_value(value)
         desc = _escape_colons_for_las_value(desc)
 
-        lines.append(
-            f" {_sanitize_las_value(param.mnemonic)}.{unit}  {value}  : {desc}"
-        )
+        return f" {_sanitize_las_value(param.mnemonic)}.{unit}  {value}  : {desc}"
+
+    # F-053: For LAS 3.0, group parameters by section_type for per-section
+    # parameter roundtrip.  Standard ~P section parameters have section_type=None.
+    if is_las30:
+        # Partition: parameters with section_type (per-section) vs without (standard).
+        # dict preserves insertion order in Python 3.8+.
+        sections: dict[str | None, list[ParameterEntry]] = {}
+        for param in las_file.parameters:
+            sections.setdefault(param.section_type, []).append(param)
+
+        # Emit standard ~PARAMETER INFORMATION first (section_type=None).
+        std_params = sections.pop(None, [])
+        if std_params:
+            lines.append("~PARAMETER INFORMATION")
+            for param in std_params:
+                lines.append(_format_one_param(param))
+            lines.append("")
+
+        # Emit per-section typed parameter sections.
+        # Order is preserved from dict (first-seen order).
+        # Section header format: ~{SectionType}_Parameter (e.g., ~Core_Parameter).
+        for section_type, params in sections.items():
+            if not section_type:
+                continue
+            lines.append(f"~{_sanitize_las_value(section_type)}_Parameter")
+            for param in params:
+                lines.append(_format_one_param(param))
+            lines.append("")
+
+        return lines
+
+    # LAS 1.2 / 2.0: single flat ~PARAMETER INFORMATION section.
+    lines.append("~PARAMETER INFORMATION")
+    for param in las_file.parameters:
+        lines.append(_format_one_param(param))
     lines.append("")
     return lines
 
@@ -590,6 +656,13 @@ def _format_curve_line(curve: CurveDefinition, is_las30: bool) -> str:
         desc = f"{desc}  {format_str}"
 
     api_code = _sanitize_las_value(curve.api_code) if curve.api_code else ""
+    # F-IF024: Escape colons in the API code after general sanitization.
+    # The api_code appears BEFORE the structural colon in the output:
+    # MNEM.UNIT{api_code}  : DESC.  An embedded colon in api_code
+    # (e.g., "42 : injected") creates a spurious structural colon match
+    # in the parser's DATA_LINE_PATTERN, causing value/description
+    # misrouting on re-read.
+    api_code = _escape_colons_for_las_value(api_code)
     api = f"  {api_code}" if api_code else ""
     # F-M10: Escape colons in the curve description after general
     # sanitization.  Embedded colons with adjacent whitespace (e.g.,
@@ -627,19 +700,26 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
         )
         delimiter = " "
 
-    # F-I2-M17: Guard against data_sections in non-LAS-3.0 files.
+    # F-I2-M17 / F-019: Guard against data_sections in non-LAS-3.0 files.
     # from_dict populates data_sections from the input dict unconditionally
-    # (regardless of LAS version).  Writing multi-section format for a
-    # non-LAS-3.0 file causes roundtrip data loss because the parser skips
-    # data sections when is_las30 is False.  Warn and fall back to
-    # single-section ~A format using the legacy logs/string_data fields.
+    # (regardless of LAS version).  Multiple sections on a non-LAS-3.0 file
+    # cause guaranteed roundtrip data loss (parser skips all data for
+    # non-LAS-3.0 settings).  A single section can safely fall back to
+    # legacy ~A format.
     if las_file.data_sections and not is_las30:
+        if len(las_file.data_sections) > 1:
+            raise LASWriteError(
+                f"Multiple data_sections ({len(las_file.data_sections)}) "
+                f"are only supported for LAS 3.0 files, but version is "
+                f"{las_file.version.vers!r}. Cannot safely write multi-section "
+                f"data for non-LAS-3.0 format."
+            )
         import warnings
 
         warnings.warn(
             "data_sections are only supported for LAS 3.0 files. "
             "Falling back to single-section ~A format. "
-            "Multi-section data will be lost.",
+            "Single-section data will be preserved.",
             stacklevel=3,
         )
 

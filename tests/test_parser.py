@@ -1491,6 +1491,154 @@ class TestLAS30AsciiDataBranches:
         assert len(las.data_sections[1].data["DEPT"]) == 1
 
 
+class TestVERSValidation:
+    """F-005/IF-003: VERS validation — reject non-standard values.
+
+    The parser validates VERS against known LAS versions (1.2, 2.0, 3.0).
+    Non-standard values must warn and fall back to safe defaults.
+    """
+
+    def test_vers_comma_decimal_defaults_to_2_0(self) -> None:
+        """F-005: VERS with comma decimal separator ('1,2') emits warning
+        and defaults to '2.0'.
+
+        Comma-separated version strings (e.g., '1,2' from European locale)
+        silently fail all startswith() checks, causing the parser to use
+        LAS 1.2 well-field conventions for LAS 2.0 files.  The fix warns
+        and defaults to 2.0.
+        """
+        import warnings
+
+        content = """~VERSION INFORMATION
+ VERS . 1,2 : CWLS LOG ASCII STANDARD
+ WRAP.   NO   : ONE LINE PER DEPTH STEP
+"""
+        parser = LASParser()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            las = parser.parse(content)
+            vers_warnings = [
+                x for x in w if "Unknown VERS value" in str(x.message)
+            ]
+            assert len(vers_warnings) >= 1, (
+                f"Expected VERS warning for coma decimal, got: "
+                f"{[str(x.message) for x in w]}"
+            )
+            assert "1,2" in str(vers_warnings[0].message)
+            # Must default to "2.0" — not "1,2" (which would be unusable)
+            assert las.version.vers == "2.0"
+
+    def test_vers_non_standard_preserved_with_warning(self) -> None:
+        """F-005: VERS with non-standard but version-like value ('1.20')
+        emits warning and preserves the value.
+
+        LAS 1.20 is a real format; the value is preserved so the reader
+        can emit its own 'not officially supported' warning.
+        """
+        import warnings
+
+        content = """~VERSION INFORMATION
+ VERS . 1.20 : CWLS LOG ASCII STANDARD -VERSION 1.20
+ WRAP.   NO   : ONE LINE PER DEPTH STEP
+"""
+        parser = LASParser()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            las = parser.parse(content)
+            vers_warnings = [
+                x for x in w if "Non-standard VERS value" in str(x.message)
+            ]
+            assert len(vers_warnings) >= 1, (
+                f"Expected warning for non-standard VERS 1.20, got: "
+                f"{[str(x.message) for x in w]}"
+            )
+            assert "1.20" in str(vers_warnings[0].message)
+            # Value must be preserved as-is for reader's own validation
+            assert las.version.vers == "1.20"
+
+    def test_vers_standard_no_warning(self) -> None:
+        """F-005: Standard VERS value '2.0' produces no warning."""
+        import warnings
+
+        content = """~VERSION INFORMATION
+ VERS.   2.0  : CWLS LOG ASCII STANDARD
+ WRAP.   NO   : ONE LINE PER DEPTH STEP
+"""
+        parser = LASParser()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            las = parser.parse(content)
+            vers_warnings = [
+                x for x in w
+                if "VERS" in str(x.message) and (
+                    "Non-standard" in str(x.message)
+                    or "Unknown VERS" in str(x.message)
+                )
+            ]
+            assert len(vers_warnings) == 0, (
+                f"Unexpected VERS warning: {[str(x.message) for x in vers_warnings]}"
+            )
+            assert las.version.vers == "2.0"
+
+
+class TestEmptyUnitWellEntry:
+    """F-008: Empty-unit well entry parsing.
+
+    When a well entry line has an empty unit (e.g., ``MNEM . : VALUE``),
+    the unit should be stored as an empty string — not dropped entirely.
+    """
+
+    def test_empty_unit_well_entry_preserved(self) -> None:
+        """F-008: Parse a well entry with empty unit -> unit stored as ''.
+
+        The regex captures an empty string for the unit group (text between
+        dot and whitespace).  The fix changed the truthiness
+        check to ``is not None`` so that empty string units are stored
+        rather than silently dropped.
+        """
+        content = """~VERSION INFORMATION
+ VERS.   2.0  : CWLS LOG ASCII STANDARD
+ WRAP.   NO   : ONE LINE PER DEPTH STEP
+~WELL INFORMATION
+ MNEM. VALUE : DESCRIPTION
+ STRT.M      1670.0 : START DEPTH
+ STOP.M      1660.0 : STOP DEPTH
+ STEP.M     -0.1250 : STEP
+ NULL.    -999.25   : NULL VALUE
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        # The unit dict entry must exist with an empty string value
+        assert "MNEM" in las.well.units, (
+            f"Empty unit should be stored, got units: {las.well.units}"
+        )
+        assert las.well.units["MNEM"] == "", (
+            f"Expected empty string unit, got: {las.well.units['MNEM']!r}"
+        )
+        assert las.well["MNEM"] == "VALUE"
+
+    def test_empty_unit_well_entry_roundtrip(self, tmp_path: Path) -> None:
+        """F-008: Empty-unit well entry survives write/read roundtrip."""
+        content = """~VERSION INFORMATION
+ VERS.   2.0  : CWLS LOG ASCII STANDARD
+ WRAP.   NO   : ONE LINE PER DEPTH STEP
+~WELL INFORMATION
+ MNEM. VALUE : DESCRIPTION
+ STRT.M      1670.0 : START DEPTH
+ STOP.M      1660.0 : STOP DEPTH
+ STEP.M     -0.1250 : STEP
+ NULL.    -999.25   : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M  :  Depth
+~A  DEPT
+100.0
+"""
+        temp_file = tmp_path / "empty_unit.las"
+        temp_file.write_text(content, encoding="utf-8")
+        data = read_las_file(temp_file)
+        assert data["well"]["MNEM"] == "VALUE"
+
+
 class TestIndexedDataSectionNegativeBranches:
     """F-02/T-02: Tests for _is_indexed_data_section negative branches.
 

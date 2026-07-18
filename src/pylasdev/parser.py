@@ -1049,7 +1049,51 @@ class LASParser:
         value = match.group("value").strip()
 
         if mnemonic == "VERS":
-            self.las_file.version.vers = value
+            # F-005: Validate VERS against known LAS versions.
+            # Non-standard values (e.g., "1,2" with comma, "2,0")
+            # silently fail all startswith() checks, causing the
+            # parser to use LAS 1.2 well-field conventions for LAS 2.0
+            # files and discard LAS 3.0 data sections entirely.
+            # Accept known versions ("1.2", "2.0", "3.0") silently.
+            # Accept version-like strings (digit.digit pattern, e.g.,
+            # "1.20", "4.0") with a warning — the reader will later
+            # emit its own "not officially supported" warning for
+            # unrecognized versions.
+            # Non-numeric values (e.g., "CWLS LOG ASCII STANDARD" from
+            # mis-formatted version lines) are preserved as-is for
+            # backward compatibility.
+            # For completely non-standard values (commas, no dot, etc.),
+            # warn and default to "2.0".
+            vers_normalized = value.strip()
+            if vers_normalized in {"1.2", "2.0", "3.0"}:
+                self.las_file.version.vers = vers_normalized
+            elif re.match(r"^\d+\.\d+$", vers_normalized):
+                # Version-like but non-standard (e.g., "1.20", "4.0") —
+                # warn but preserve the value.  The reader will emit its
+                # own "not officially supported" warning for unrecognized
+                # versions.
+                warnings.warn(
+                    f"Non-standard VERS value '{value}'. "
+                    f"Expected 1.2, 2.0, or 3.0. "
+                    f"Preserving as-is for backward compatibility.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self.las_file.version.vers = vers_normalized
+            elif vers_normalized and not vers_normalized[0].isdigit():
+                # Non-numeric VERS value (e.g., description text parsed
+                # as VERS value due to malformed version line).  Preserve
+                # as-is — the is_las30/is_las12 false-negative is the
+                # intended fallback.
+                self.las_file.version.vers = vers_normalized
+            else:
+                warnings.warn(
+                    f"Unknown VERS value '{value}'. Expected 1.2, 2.0, or 3.0. "
+                    f"Defaulting to 2.0.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self.las_file.version.vers = "2.0"
         elif mnemonic == "WRAP":
             wrap_upper = value.upper()
             if wrap_upper in {"YES", "NO"}:
@@ -1228,7 +1272,10 @@ class LASParser:
                 stacklevel=2,
             )
         self.las_file.well[mnemonic] = actual_value
-        if unit:
+        # F-008: Use `is not None` instead of truthiness check.  An empty
+        # string is a semantically meaningful unit (e.g., unitless well
+        # fields) and should not be silently dropped.
+        if unit is not None:
             self.las_file.well.units[mnemonic] = unit
 
     def _replay_deferred_well(self) -> None:
@@ -1614,6 +1661,18 @@ class LASParser:
         # Apply mnemonic normalization from mnem_base (same as curve handling)
         normalized = self._mnem_base_upper.get(raw_mnemonic, raw_mnemonic)
 
+        # F-053: Determine section_type for per-section parameter grouping.
+        # The section dispatcher sets _current_section_name from the section
+        # header: standard ~P/~Parameter → "P" or "PARAMETER"; typed
+        # sections (e.g., ~Core_Parameter) → "CORE_PARAMETER".
+        # Derive section_type by stripping the _PARAMETER/_PARAMETERS suffix.
+        _section_type: str | None = None
+        _sect_name = (self._current_section_name or "").upper()
+        if _sect_name.endswith("_PARAMETER"):
+            _section_type = _sect_name[: -len("_PARAMETER")]
+        elif _sect_name.endswith("_PARAMETERS"):
+            _section_type = _sect_name[: -len("_PARAMETERS")]
+
         param = ParameterEntry(
             mnemonic=normalized,
             unit=unit,
@@ -1621,6 +1680,7 @@ class LASParser:
             description=description,
             array_index=array_index,
             zone=zone,
+            section_type=_section_type,
         )
         # F-M15: Store data_format as an instance attribute for roundtrip
         # fidelity.  Forward-compatible — works before and after the field

@@ -63,6 +63,11 @@ def _create_parameter_entry(param_dict: dict[str, Any]) -> ParameterEntry:
             f"array_index: expected int or None, "
             f"got {type(_array_index).__name__}"
         )
+    # F-053: Restore per-section parameter grouping on roundtrip.
+    # section_type is optional; None means the standard ~P section.
+    _section_type = param_dict.get("section_type")
+    if _section_type is not None and not isinstance(_section_type, str):
+        _section_type = _safe_str(_section_type)
     return ParameterEntry(
         mnemonic=_safe_str(param_dict.get("mnemonic", "")),
         unit=_safe_str(param_dict.get("unit", "")),
@@ -71,6 +76,7 @@ def _create_parameter_entry(param_dict: dict[str, Any]) -> ParameterEntry:
         data_format=_safe_str(param_dict.get("data_format"), ""),
         array_index=_array_index,
         zone=zone,
+        section_type=_section_type,
     )
 
 
@@ -120,6 +126,149 @@ def _resolve_dict_entry(
             f"{key}: expected {expected_type}, got {type(value).__name__}"
         )
     return value
+
+
+# Valid data_format values for LAS curves (LAS 3.0 spec).
+_VALID_DATA_FORMATS = frozenset({"F", "E", "D", "A", "S"})
+
+
+def _validate_from_dict_input(data: dict[str, Any]) -> None:
+    """Validate from_dict input before construction (F-017, F-018, IF-015,
+    IF-026, F-019).
+
+    Raises ``ValueError`` or ``TypeError`` for invalid input.
+    Called at the start of ``LASFile.from_dict`` before any construction,
+    closing Pattern #7 (from_dict validation gaps) structurally.
+    """
+    # --- F-017: Mandatory well fields (STRT, STOP, STEP, NULL) ---
+    well = data.get("well")
+    if isinstance(well, dict) and well:
+        _mandatory = {"STRT", "STOP", "STEP", "NULL"}
+        _well_keys = {k.upper() for k in well if isinstance(k, str)}
+        _missing = _mandatory - _well_keys
+        if _missing:
+            # F-017: Warn about missing mandatory well fields at construction
+            # time.  Consistent with parser.py:436-442 and writer.py:333-343
+            # which also warn rather than error.  The writer will produce valid
+            # LAS output with defaults for missing fields.
+            warnings.warn(
+                f"Mandatory well field(s) missing: "
+                f"{', '.join(sorted(_missing))}",
+                stacklevel=3,
+            )
+
+    # --- F-018: DLM validation ---
+    version = data.get("version")
+    if isinstance(version, dict):
+        dlm_raw = version.get("DLM")
+        if dlm_raw is not None and dlm_raw != "":
+            dlm_upper = str(dlm_raw).upper()
+            if dlm_upper not in {"SPACE", "TAB", "COMMA"}:
+                raise ValueError(
+                    f"Invalid DLM value '{dlm_raw}'. "
+                    f"Expected SPACE, TAB, or COMMA."
+                )
+
+    # --- IF-015: data_format validation ---
+    curves = data.get("curves")
+    if isinstance(curves, list):
+        for i, cd in enumerate(curves):
+            if isinstance(cd, dict) and "data_format" in cd:
+                _raw = cd.get("data_format")
+                if _raw is None:
+                    continue  # None means "not set" — same as absent
+                df = str(_raw).upper()
+                if df and df not in _VALID_DATA_FORMATS:
+                    raise ValueError(
+                        f"curves[{i}]: invalid data_format '{cd['data_format']}'. "
+                        f"Valid values: {', '.join(sorted(_VALID_DATA_FORMATS))}"
+                    )
+    # Per-section curves
+    data_sections = data.get("data_sections")
+    if isinstance(data_sections, list):
+        for si, ds in enumerate(data_sections):
+            if not isinstance(ds, dict):
+                continue
+            scs = ds.get("section_curves")
+            if isinstance(scs, list):
+                for ci, sc in enumerate(scs):
+                    if isinstance(sc, dict) and "data_format" in sc:
+                        _raw = sc.get("data_format")
+                        if _raw is None:
+                            continue
+                        df = str(_raw).upper()
+                        if df and df not in _VALID_DATA_FORMATS:
+                            raise ValueError(
+                                f"data_sections[{si}].section_curves[{ci}]: "
+                                f"invalid data_format '{sc['data_format']}'. "
+                                f"Valid values: {', '.join(sorted(_VALID_DATA_FORMATS))}"
+                            )
+
+    # --- IF-026: Cross-validate data_format vs data placement ---
+    _check_df_vs_placement(curves, data, "top-level")
+    # Also validate per-section curves against their section-level data/string_data
+    if isinstance(data_sections, list):
+        for si, ds in enumerate(data_sections):
+            if isinstance(ds, dict):
+                scs = ds.get("section_curves")
+                if isinstance(scs, list):
+                    _check_df_vs_placement(
+                        scs, ds, f"data_sections[{si}]"
+                    )
+
+    # --- F-019: Non-3.0 multi-section data_sections ---
+    vers_raw = version.get("VERS") if isinstance(version, dict) else None
+    vers = str(vers_raw).strip() if vers_raw else ""
+    if isinstance(data_sections, list) and len(data_sections) > 1:
+        if not vers.startswith("3"):
+            raise ValueError(
+                f"Multiple data_sections ({len(data_sections)}) are only "
+                f"supported for LAS 3.0 files, but version is {vers!r}. "
+                f"Use a single section for LAS 1.2/2.0."
+            )
+
+
+def _check_df_vs_placement(
+    curves: list[dict[str, Any]] | None,
+    data: dict[str, Any],
+    context: str,
+) -> None:
+    """Cross-validate curve data_format against data placement (IF-026)."""
+    if not curves:
+        return
+    # Build sets of curve names in numeric data vs string data.
+    # "logs" key for top-level LASFile dicts, "data" key for per-section DataSection dicts.
+    logs = data.get("logs") or data.get("data") or {}
+    string_data = data.get("string_data", {})
+    logs_keys: set[str] = set()
+    string_data_keys: set[str] = set()
+    if isinstance(logs, dict):
+        logs_keys = {str(k) for k in logs}
+    if isinstance(string_data, dict):
+        string_data_keys = {str(k) for k in string_data}
+
+    for i, cd in enumerate(curves):
+        if not isinstance(cd, dict):
+            continue
+        _raw_df = cd.get("data_format")
+        if _raw_df is None:
+            continue  # None means "not set" — skip cross-validation
+        df = str(_raw_df).upper()
+        mnemonic = str(cd.get("mnemonic", ""))
+        if not df or not mnemonic:
+            continue
+        if df == "S" and mnemonic in logs_keys:
+            raise ValueError(
+                f"{context} curve '{mnemonic}' (index {i}) has "
+                f"data_format='S' but is in logs (numeric data). "
+                f"String-format curves must be in string_data."
+            )
+        if df != "S" and mnemonic in string_data_keys:
+            raise ValueError(
+                f"{context} curve '{mnemonic}' (index {i}) has "
+                f"data_format='{df}' but is in string_data. "
+                f"Numeric-format curves must be in logs."
+            )
 
 
 @dataclass
@@ -286,6 +435,12 @@ class ParameterEntry:
     # LAS 3.0 specific fields
     array_index: int | None = None  # For RUN[1], RUN[2], etc.
     zone: ParameterZone | None = None  # Zone association via pipe notation
+    # F-053: Per-section parameter grouping.  When parameters are parsed
+    # from a LAS 3.0 typed section (e.g., ~Core_Parameter), section_type
+    # records the originating section type (e.g., "CORE") so the writer
+    # can reconstruct per-section parameter sections on roundtrip.
+    # Parameters from a standard ~P/~Parameter section have section_type=None.
+    section_type: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -303,6 +458,8 @@ class ParameterEntry:
                 "zone_name": self.zone.zone_name,
                 "zone_index": self.zone.zone_index,
             }
+        if self.section_type is not None:
+            result["section_type"] = self.section_type
         return result
 
     @property
@@ -418,6 +575,10 @@ class LASFile:
         """
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data).__name__}")
+
+        # F-017/F-018/IF-015/IF-026/F-019: Pre-construction validation layer.
+        # Closes Pattern #7 (from_dict validation gaps) structurally.
+        _validate_from_dict_input(data)
 
         # F-06: Deferred imports to avoid circular dependencies
         # (models.py ← parser.py/data_reader.py which import from models.py).

@@ -372,7 +372,9 @@ class TestLASFile:
             data={
                 "CORET": np.array([1.0, 2.0]),
                 "COREB": np.array([3.0, 4.0]),
-                "CDES": np.array([5.0, 6.0]),
+            },
+            string_data={
+                "CDES": np.array(["desc_one", "desc_two"]),
             },
             section_curves=[
                 # Full metadata with array_info
@@ -448,6 +450,10 @@ class TestLASFile:
         # Verify numeric data is preserved
         np.testing.assert_array_equal(rt_section.data["CORET"], np.array([1.0, 2.0]))
         np.testing.assert_array_equal(rt_section.data["COREB"], np.array([3.0, 4.0]))
+        # Verify string data is preserved (CDES has data_format="S")
+        np.testing.assert_array_equal(
+            rt_section.string_data["CDES"], np.array(["desc_one", "desc_two"])
+        )
 
     def test_section_curves_empty_roundtrip(self) -> None:
         """Test DataSection with empty section_curves survives roundtrip.
@@ -1063,6 +1069,285 @@ class TestLASFile:
         """
         with pytest.raises(TypeError, match="Expected dict, got"):
             LASFile.from_dict("not_a_dict")
+
+    # --- F-017: Mandatory well field validation ---
+
+    def test_from_dict_missing_mandatory_well_field_warns(self) -> None:
+        """F-017: LASFile.from_dict() with well dict missing STRT emits warning.
+
+        The pre-construction validation layer at models.py:143-158 checks
+        that the four mandatory LAS 2.0 well fields (STRT, STOP, STEP, NULL)
+        are present.  Missing fields trigger UserWarning.
+        """
+        import warnings
+
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"COMP": "TestCo"},  # Missing STRT, STOP, STEP, NULL
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+        }
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            LASFile.from_dict(data)
+            mandatory_warnings = [
+                x for x in w if "Mandatory well field(s) missing" in str(x.message)
+            ]
+            assert len(mandatory_warnings) == 1
+            assert "STRT" in str(mandatory_warnings[0].message)
+            assert "STOP" in str(mandatory_warnings[0].message)
+            assert "STEP" in str(mandatory_warnings[0].message)
+            assert "NULL" in str(mandatory_warnings[0].message)
+
+    def test_from_dict_all_mandatory_well_fields_no_warning(self) -> None:
+        """F-017: LASFile.from_dict() with all mandatory well fields — no warning."""
+        import warnings
+
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {
+                "STRT": "100.0",
+                "STOP": "200.0",
+                "STEP": "1.0",
+                "NULL": "-999.25",
+            },
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+        }
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            LASFile.from_dict(data)
+            mandatory_warnings = [
+                x for x in w if "Mandatory well field(s) missing" in str(x.message)
+            ]
+            assert len(mandatory_warnings) == 0, (
+                f"Unexpected warning: {[str(x.message) for x in mandatory_warnings]}"
+            )
+
+    # --- F-018: DLM validation ---
+
+    def test_from_dict_dlm_invalid_raises_value_error(self) -> None:
+        """F-018: LASFile.from_dict() with DLM='INVALID' raises ValueError.
+
+        The pre-construction validation at models.py:160-170 checks that
+        DLM is one of SPACE, TAB, or COMMA (case-insensitive).
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "INVALID"},
+            "well": {"STRT": "100", "STOP": "200", "STEP": "1", "NULL": "-999"},
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+        }
+        with pytest.raises(ValueError, match="Invalid DLM value"):
+            LASFile.from_dict(data)
+
+    def test_from_dict_dlm_case_insensitive_accepts(self) -> None:
+        """F-018: LASFile.from_dict() with DLM='space' (lowercase) is accepted.
+
+        The validation uppercases the value before comparing against the
+        valid set (SPACE, TAB, COMMA), so 'space' should pass validation.
+        The value itself is preserved as-is (not uppercased).
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "space"},
+            "well": {"STRT": "100", "STOP": "200", "STEP": "1", "NULL": "-999"},
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+        }
+        las = LASFile.from_dict(data)
+        # Value is case-preserved (not normalized to uppercase)
+        assert las.version.dlm == "space"
+
+    def test_from_dict_dlm_all_valid_values_accepted(self) -> None:
+        """F-018: All valid DLM values (SPACE, TAB, COMMA) accepted case-insensitively."""
+        for dlm in ("SPACE", "TAB", "COMMA", "space", "Tab", "comma"):
+            data: dict[str, Any] = {
+                "version": {"VERS": "2.0", "WRAP": "NO", "DLM": dlm},
+                "well": {"STRT": "100", "STOP": "200", "STEP": "1", "NULL": "-999"},
+                "curves_order": ["DEPT"],
+                "logs": {"DEPT": np.array([100.0])},
+            }
+            las = LASFile.from_dict(data)
+            # Value is case-preserved; validation is case-insensitive
+            assert las.version.dlm.upper() == dlm.upper()
+
+    def test_from_dict_dlm_none_or_empty_no_error(self) -> None:
+        """F-018: DLM=None or DLM='' (empty) should not raise — skipped by guard.
+
+        The guard at models.py:163-165 checks ``if dlm_raw is not None and dlm_raw != ""``,
+        so None and empty string are silently skipped.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": ""},
+            "well": {"STRT": "100", "STOP": "200", "STEP": "1", "NULL": "-999"},
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+        }
+        las = LASFile.from_dict(data)
+        # Empty string is preserved (not replaced with default)
+        assert las.version.dlm == ""
+
+    # --- F-019/IF-007: Non-3.0 multi-section rejection ---
+
+    def test_from_dict_non_3_0_multi_section_raises(self) -> None:
+        """F-019: LASFile.from_dict() with vers='2.0' and 2 data_sections
+        raises ValueError.
+
+        Multiple data_sections are only valid for LAS 3.0 — non-3.0
+        versions cannot have more than one data section.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100", "STOP": "200", "STEP": "1", "NULL": "-999"},
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+            "data_sections": [
+                {
+                    "name": "Section1",
+                    "section_type": "LOG_DATA",
+                    "curves_order": ["DEPT"],
+                    "data": {"DEPT": np.array([100.0])},
+                },
+                {
+                    "name": "Section2",
+                    "section_type": "LOG_DATA",
+                    "curves_order": ["DEPT"],
+                    "data": {"DEPT": np.array([200.0])},
+                },
+            ],
+        }
+        with pytest.raises(ValueError, match="Multiple data_sections"):
+            LASFile.from_dict(data)
+
+    def test_from_dict_las30_multi_section_succeeds(self) -> None:
+        """F-019: LASFile.from_dict() with vers='3.0' and 2 data_sections succeeds.
+
+        LAS 3.0 supports multiple typed data sections natively.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT", "unit": "M"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "data_sections": [
+                {
+                    "name": "Section1",
+                    "section_type": "LOG_DATA",
+                    "curves_order": ["DEPT"],
+                    "data": {"DEPT": np.array([100.0, 101.0])},
+                },
+                {
+                    "name": "Section2",
+                    "section_type": "CORE_DATA",
+                    "curves_order": ["DEPT"],
+                    "data": {"DEPT": np.array([200.0])},
+                },
+            ],
+        }
+        las = LASFile.from_dict(data)
+        assert len(las.data_sections) == 2
+
+    # --- IF-026: data_format/placement cross-validation ---
+
+    def test_from_dict_string_format_in_numeric_data_raises(self) -> None:
+        """IF-026: Curve with data_format='S' in logs (numeric) raises ValueError.
+
+        _check_df_vs_placement verifies that {S} format curves appear in
+        string_data, not logs (numeric data).
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT", "CDES"],
+            "curves": [
+                {"mnemonic": "DEPT", "unit": "M", "data_format": "F"},
+                {"mnemonic": "CDES", "unit": "", "data_format": "S"},
+            ],
+            "logs": {
+                "DEPT": np.array([100.0, 101.0]),
+                "CDES": np.array([1.0, 2.0]),  # CDES is S format — wrong placement
+            },
+        }
+        with pytest.raises(ValueError, match="data_format='S' but is in logs"):
+            LASFile.from_dict(data)
+
+    def test_from_dict_numeric_format_in_string_data_raises(self) -> None:
+        """IF-026: Curve with data_format='F' in string_data raises ValueError.
+
+        {F} format curves must appear in logs (numeric data), not string_data.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT", "CDES"],
+            "curves": [
+                {"mnemonic": "DEPT", "unit": "M", "data_format": "F"},
+                {"mnemonic": "CDES", "unit": "", "data_format": "S"},
+            ],
+            "logs": {"DEPT": np.array([100.0])},
+            "string_data": {
+                "DEPT": np.array(["bad"]),  # DEPT is F format — wrong placement
+            },
+        }
+        with pytest.raises(ValueError, match="Numeric-format curves must be in logs"):
+            LASFile.from_dict(data)
+
+    def test_from_dict_section_s_format_in_data_key_raises(self) -> None:
+        """IF-026 / R-001: Per-section curve with data_format='S' in 'data'
+        dict (not in string_data) raises ValueError.
+
+        DataSection uses the key 'data' (not 'logs') for numeric data.
+        The cross-validation at models.py:241 resolves the correct key
+        via ``logs = data.get("logs") or data.get("data") or {}``,
+        covering both top-level 'logs' and per-section 'data' dicts.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT", "unit": "M"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "data_sections": [
+                {
+                    "name": "CORE",
+                    "section_type": "CORE_DATA",
+                    "curves_order": ["CDES"],
+                    "section_curves": [
+                        {"mnemonic": "CDES", "data_format": "S"},
+                    ],
+                    "data": {
+                        # CDES is S format but in 'data' (numeric) — should be in string_data
+                        "CDES": np.array([1.0, 2.0]),
+                    },
+                }
+            ],
+        }
+        with pytest.raises(ValueError, match="data_format='S' but is in logs"):
+            LASFile.from_dict(data)
+
+    def test_from_dict_cross_validation_skips_none_data_format(self) -> None:
+        """IF-026: data_format=None (not set) skips cross-validation.
+
+        When data_format is None, _check_df_vs_placement returns early
+        without raising — curves can appear in either logs or string_data.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT", "CDES"],
+            "curves": [
+                {"mnemonic": "DEPT", "unit": "M"},
+                {"mnemonic": "CDES", "unit": ""},
+            ],
+            "logs": {
+                # CDES has no data_format — cross-validation skipped
+                "DEPT": np.array([100.0]),
+                "CDES": np.array([1.0]),
+            },
+            "string_data": {"CDES": np.array(["desc"])},
+        }
+        LASFile.from_dict(data)  # Should not raise
 
 
 class TestDevFile:
