@@ -17,6 +17,32 @@ logger = logging.getLogger(__name__)
 
 def _scalars_equal(a: Any, b: Any) -> bool:
     """Compare two scalars, treating NaN == NaN as equal."""
+    # Guard against empty or multi-element ndarrays that would raise
+    # ValueError ("ambiguous truth value") on bool(a == b).
+    if isinstance(a, np.ndarray):
+        if a.size == 0:
+            logger.warning(
+                "Empty ndarray in scalar comparison; treating as unequal."
+            )
+            return False
+        if a.size > 1:
+            logger.warning(
+                "Multi-element ndarray in scalar comparison; treating as unequal."
+            )
+            return False
+        a = a.item()
+    if isinstance(b, np.ndarray):
+        if b.size == 0:
+            logger.warning(
+                "Empty ndarray in scalar comparison; treating as unequal."
+            )
+            return False
+        if b.size > 1:
+            logger.warning(
+                "Multi-element ndarray in scalar comparison; treating as unequal."
+            )
+            return False
+        b = b.item()
     if isinstance(a, (float, np.floating)) and isinstance(b, (float, np.floating)):
         if math.isnan(a) and math.isnan(b):
             return True

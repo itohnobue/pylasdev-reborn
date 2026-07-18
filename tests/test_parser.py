@@ -461,7 +461,11 @@ Line two of free text.
         """Test LAS 3.0 processing with non-numeric NULL value.
 
         When NULL field cannot be converted to float, it should fall back
-        to -999.25 (lines 338-341 of parser.py).
+        to -999.25 (parser.py:1879 via _get_null_value).  Data values that
+        equal the fallback null sentinel (-999.25) must be stored as-is,
+        and non-numeric data values must be replaced with the null_value.
+        This exercises BOTH the _get_null_value ValueError except path AND
+        the null-value replacement in _to_finite_float.
         """
         content = """~VERSION INFORMATION
  VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
@@ -475,14 +479,22 @@ Line two of free text.
 ~A
 100.0,50.0
 101.0,51.0
+-999.25,BAD_VALUE
 """
         parser = LASParser()
         las = parser.parse(content)
-        # Data sections should be populated despite non-numeric NULL
         assert len(las.data_sections) == 1
-        assert "DEPT" in las.data_sections[0].data
-        assert las.data_sections[0].data["DEPT"][0] == 100.0
-        assert las.data_sections[0].data["DT"][0] == 50.0
+        data = las.data_sections[0].data
+        assert data["DEPT"][0] == 100.0
+        assert data["DT"][0] == 50.0
+        # Row 2: DEPT="-999.25" (the actual null sentinel from the fallback),
+        #         DT="BAD_VALUE" (non-numeric → replaced with null_value).
+        assert data["DEPT"][2] == -999.25, (
+            "DEPTH null sentinel -999.25 must be stored as -999.25"
+        )
+        assert data["DT"][2] == -999.25, (
+            "Non-numeric BAD_VALUE must be replaced with null_value (-999.25)"
+        )
 
     # --- TEST-05: ValueError handler for non-string curves with bad data (lines 377-381) ---
     def test_las30_valueerror_non_string_curve(self) -> None:
@@ -1173,11 +1185,10 @@ class TestConcurrentParserAccess:
         # If errors exist, the parser is not thread-safe for concurrent use
         # with the same instance (expected — LASParser is designed with
         # per-instance state that parse() resets)
-        if errors:
-            warnings.warn(
-                f"LASParser is not thread-safe for shared-instance use (errors: {errors})",
-                stacklevel=1,
-            )
+        assert len(errors) == 0, (
+            f"LASParser is not thread-safe for shared-instance use. "
+            f"Errors from concurrent threads: {errors}"
+        )
 
 
 class TestFormatSpecOffsetError:
@@ -1812,3 +1823,297 @@ class TestValueOnlyPattern:
         assert _is_indexed_data_section("TEST_DATA[1]") is True
         assert _is_indexed_data_section("PERFORATIONS_DATA[2]") is True
         assert _is_indexed_data_section("LOG_DATA[1]") is True
+
+
+class TestMaxGuardLimits:
+    """F-I2-M42: MAX_* guard tests for parser.py.
+
+    All 7 parser guards raise LASParseError when exceeded.  Each test
+    monkeypatches one constant to a tiny value and verifies the guard fires.
+    """
+
+    # ── MAX_CURVES (parser.py:1513) ──────────────────────────────
+
+    def test_max_curves_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """MAX_CURVES guard raises LASParseError when curve count exceeds limit."""
+        monkeypatch.setattr("pylasdev.parser.MAX_CURVES", 1)
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+"""
+        parser = LASParser()
+        with pytest.raises(LASParseError, match=r"Curve count.*exceeds"):
+            parser.parse(content)
+
+    # ── MAX_PARAMETERS (parser.py:1625) ──────────────────────────
+
+    def test_max_parameters_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """MAX_PARAMETERS guard raises LASParseError when parameter count exceeds limit."""
+        monkeypatch.setattr("pylasdev.parser.MAX_PARAMETERS", 1)
+        content = """~VERSION INFORMATION
+ VERS.   2.0  :
+ WRAP.   NO   :
+~PARAMETER INFORMATION
+ BHT.DEGC    35.5 : BOTTOM HOLE TEMPERATURE
+ BS .MM      200  : BIT SIZE
+"""
+        parser = LASParser()
+        with pytest.raises(LASParseError, match=r"Parameter count.*exceeds"):
+            parser.parse(content)
+
+    # ── MAX_OTHER_LINES (parser.py:985) ──────────────────────────
+
+    def test_max_other_lines_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """MAX_OTHER_LINES guard raises LASParseError when other-line count exceeds limit."""
+        monkeypatch.setattr("pylasdev.parser.MAX_OTHER_LINES", 1)
+        content = """~VERSION INFORMATION
+ VERS.   2.0  :
+ WRAP.   NO   :
+~X CUSTOM
+ Some body text here.
+"""
+        parser = LASParser()
+        with pytest.raises(LASParseError, match=r"Other section line count.*exceeds"):
+            parser.parse(content)
+
+    # ── MAX_SECTION_SEQUENCE (parser.py:950) ─────────────────────
+
+    def test_max_section_sequence_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """MAX_SECTION_SEQUENCE guard raises LASParseError when section count exceeds limit."""
+        monkeypatch.setattr("pylasdev.parser.MAX_SECTION_SEQUENCE", 1)
+        content = """~VERSION INFORMATION
+ VERS.   2.0  :
+ WRAP.   NO   :
+~WELL INFORMATION
+ STRT.M   1670.0 :
+"""
+        parser = LASParser()
+        with pytest.raises(LASParseError, match=r"Section sequence length.*exceeds"):
+            parser.parse(content)
+
+    # ── MAX_DEFERRED_WELL_ENTRIES (parser.py:1375) ───────────────
+
+    def test_max_deferred_well_entries_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """MAX_DEFERRED_WELL_ENTRIES guard raises LASParseError for ~W before ~V."""
+        monkeypatch.setattr("pylasdev.parser.MAX_DEFERRED_WELL_ENTRIES", 1)
+        # ~W before ~V: both entries are deferred
+        content = """~WELL INFORMATION
+ STRT.M   1670.0 : START DEPTH
+ STOP.M   1660.0 : STOP DEPTH
+~VERSION INFORMATION
+ VERS.   2.0  :
+ WRAP.   NO   :
+"""
+        parser = LASParser()
+        with pytest.raises(LASParseError, match=r"Deferred well entry count.*exceeds"):
+            parser.parse(content)
+
+    # ── MAX_DATA_LINES (parser.py:1927) ──────────────────────────
+
+    def test_max_data_lines_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """MAX_DATA_LINES guard raises LASParseError when data lines exceed limit."""
+        monkeypatch.setattr("pylasdev.parser.MAX_DATA_LINES", 1)
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+~A
+100.0
+101.0
+"""
+        parser = LASParser()
+        with pytest.raises(LASParseError, match=r"ASCII data line count.*exceeds"):
+            parser.parse(content)
+
+    # ── MAX_DATA_SECTIONS (parser.py:1920) ───────────────────────
+
+    def test_max_data_sections_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """MAX_DATA_SECTIONS guard raises LASParseError when section count exceeds limit."""
+        monkeypatch.setattr("pylasdev.parser.MAX_DATA_SECTIONS", 1)
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+~A Section1
+100.0
+~A Section2
+200.0
+"""
+        parser = LASParser()
+        with pytest.raises(LASParseError, match=r"Data section count.*exceeds"):
+            parser.parse(content)
+
+
+class TestPipeDelimitedSectionHeaders:
+    """F-I2-M43: Pipe-delimited section header parsing in LAS 3.0.
+
+    Tests pipe-delimiter syntax on data section headers as parser INPUT
+    (not just writer output).  Exercises the pipe-extraction branches
+    at parser.py:551-563 and the pipe-resolution branches at lines
+    726-779.
+    """
+
+    def test_pipe_to_definition_curves(self) -> None:
+        """~Core[1] | Core_Definition routes data to the definition's curves."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~CORE_DEFINITION
+ RHOZ.OHMM       :  RESISTIVITY  {F}
+ PHIZ.V/V        :  POROSITY  {F}
+~Core[1] | Core_Definition
+2.5,0.15
+3.1,0.18
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.data_sections) == 1
+        sec = las.data_sections[0]
+        assert sec.section_type == "CORE_DATA"
+        # Data must be scoped to Core_Definition curves (RHOZ, PHIZ)
+        assert sec.data["RHOZ"][0] == 2.5
+        assert sec.data["PHIZ"][0] == 0.15
+        assert sec.data["RHOZ"][1] == 3.1
+        assert sec.data["PHIZ"][1] == 0.18
+
+    def test_pipe_to_curve_main_block(self) -> None:
+        """~ASCII | CURVE routes data to the main (non-definition) curve block."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+~ASCII | CURVE
+100.0,50.0
+101.0,51.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.data_sections) == 1
+        sec = las.data_sections[0]
+        assert sec.data["DEPT"][0] == 100.0
+        assert sec.data["DT"][0] == 50.0
+
+    def test_pipe_to_short_c_alias(self) -> None:
+        """~A | C is accepted as equivalent to | CURVE (both uppercase match)."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+~A | C
+100.0,50.0
+101.0,51.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.data_sections) == 1
+        sec = las.data_sections[0]
+        assert sec.data["DEPT"][0] == 100.0
+
+    def test_pipe_target_resets_on_unrecognized_target(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Unrecognized pipe target logs warning and resets curve indices."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+~A | UNKNOWN_TARGET
+100.0,50.0
+101.0,51.0
+"""
+        parser = LASParser()
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            las = parser.parse(content)
+            assert "Unrecognized pipe target" in caplog.text
+        # Data should still parse (uses default curve scope)
+        assert len(las.data_sections) == 1
+        assert las.data_sections[0].data["DEPT"][0] == 100.0
+
+
+class TestNonLetterTildeHeaders:
+    """F-I2-M44: Non-letter tilde header handling.
+
+    Lines starting with ~ followed by a non-letter character (~., ~#,
+    ~/, bare ~) do NOT match SECTION_PATTERN but DO match the
+    startswith("~") guard at parser.py:966.  They are routed to
+    _other_lines rather than producing corrupt data rows or crashing.
+    """
+
+    def test_tilde_period_header_routed_to_other(self) -> None:
+        """~. header is routed to _other_lines via startswith("~") guard.
+
+        Non-letter tilde headers do NOT reset _current_section, so
+        subsequent body lines are still processed by the active section
+        handler.  This test verifies the ~. line itself reaches
+        _other_lines and the parser does not crash.
+        """
+        content = """~VERSION INFORMATION
+ VERS.   2.0  :
+ WRAP.   NO   :
+~.
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert "~." in las.other
+
+    def test_tilde_hash_header_routed_to_other(self) -> None:
+        """~# header is routed to _other_lines."""
+        content = """~VERSION INFORMATION
+ VERS.   2.0  :
+ WRAP.   NO   :
+~#
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert "~#" in las.other
+
+    def test_tilde_slash_header_routed_to_other(self) -> None:
+        """~/ header is routed to _other_lines."""
+        content = """~VERSION INFORMATION
+ VERS.   2.0  :
+ WRAP.   NO   :
+~/
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert "~/" in las.other
+
+    def test_bare_tilde_header_routed_to_other(self) -> None:
+        """Bare ~ (tilde alone on a line) is routed to _other_lines."""
+        content = """~VERSION INFORMATION
+ VERS.   2.0  :
+ WRAP.   NO   :
+~
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert "~" in las.other

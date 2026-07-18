@@ -341,11 +341,29 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                     # Single-column all-float comma token — headerless data.
                     return ("headerless", 0)
             elif mostly_float:
-                # F-23: Mostly numeric with at most 1 non-float token
-                # (e.g., sentinel "na", "NULL", "err", "N/A").  A single
-                # non-float sentinel in an otherwise numeric row shouldn't
-                # cause the entire file to be treated as having a header.
-                return ("headerless", 0)
+                # F-23: Mostly numeric with at most 1 non-float token.
+                # Distinguish between a genuine sentinel (e.g. "na", "NULL",
+                # "err", "N/A") and a column name (e.g. "DEPTH", "X").
+                # A sentinel in an otherwise numeric row is headerless data;
+                # a column name means the first row is a header.
+                _non_float_tokens = [
+                    t for t in comma_tokens if not _is_float_token(t)
+                ]
+                _SENTINELS = {
+                    "na", "null", "err", "n/a", "nan", "none", "-",
+                    "null.", "n.a.", "nil", "nd", "missing",
+                }
+                _is_sentinel = all(
+                    t.lower().strip() in _SENTINELS
+                    for t in _non_float_tokens
+                )
+                if not _is_sentinel:
+                    # Non-float token looks like a column name, not a
+                    # sentinel.  Fall through to whitespace-based format
+                    # detection (which will treat this as a simple header).
+                    pass
+                else:
+                    return ("headerless", 0)
             # Otherwise: too many non-float tokens for this to be headerless
             # data.  Fall through to whitespace-based format detection.
 
@@ -595,6 +613,12 @@ def read_dev_file_as_object(
         )
 
     # --- Auto-detect delimiter ---
+    # When auto-correction fires (comma-header + space-data), the original
+    # comma-split header tokens must be cached before the delimiter switch
+    # so Pass 2 uses correct column names instead of re-splitting the header
+    # line with the wrong (space) delimiter.
+    _cached_hdr_names: list[str] | None = None
+
     if delimiter is None:
         # Use the actual header line for delimiter detection:
         # - simple:   first content line
@@ -650,22 +674,50 @@ def read_dev_file_as_object(
                         [t for t in _first_data.split(delimiter) if t.strip()]
                     )
                 if _hdr_cols >= 2 and _data_cols == 1:
-                    warnings.warn(
-                        f"Auto-detected delimiter {delimiter!r} from "
-                        f"header ({_hdr_cols} columns) but first data "
-                        f"line produces only {_data_cols} token(s). "
-                        f"The file may be space-delimited data with a "
-                        f"comma-separated header. Consider passing "
-                        f"`delimiter=' '` explicitly.",
-                        stacklevel=2,
-                    )
+                    # Auto-detected delimiter fails on first data line
+                    # (produces only 1 token).  Try the alternative delimiter
+                    # for auto-correction before raising an error.
+                    _alt_delim = " " if delimiter == "," else ","
+                    if _alt_delim == " ":
+                        _data_alt_cols = len(_first_data.split())
+                    else:
+                        _data_alt_cols = len(
+                            [t for t in _first_data.split(_alt_delim)
+                             if t.strip()]
+                        )
+                    if _data_alt_cols >= 2 and _data_alt_cols == _hdr_cols:
+                        logger.warning(
+                            "Auto-corrected delimiter from %r to %r: "
+                            "header has %d columns but first data line "
+                            "produced only %d token(s) with %r delimiter.",
+                            delimiter, _alt_delim, _hdr_cols,
+                            _data_cols, delimiter,
+                        )
+                        # F-01: Cache header column names parsed with the
+                        # ORIGINAL delimiter before switching.  Without this,
+                        # Pass 2 re-parses the header line with the new
+                        # (space) delimiter, collapsing a comma-delimited
+                        # header like "MD,TVD,INC" into a single bogus
+                        # column name.  The cached names are passed to both
+                        # the simple-format and DUG-format header paths.
+                        _cached_hdr_names = [t.strip() for t in hdr.split(delimiter) if t.strip()]
+                        delimiter = _alt_delim
+                    else:
+                        raise DEVReadError(
+                            f"Delimiter mismatch: auto-detected delimiter "
+                            f"{delimiter!r} produces {_hdr_cols} columns "
+                            f"from header but only {_data_cols} token(s) "
+                            f"from first data line. Alternative delimiter "
+                            f"{_alt_delim!r} does not match ({_data_alt_cols} "
+                            f"tokens). Specify delimiter explicitly."
+                        )
                 elif abs(_hdr_cols - _data_cols) >= 3:
-                    warnings.warn(
-                        f"Auto-detected delimiter {delimiter!r} produces "
-                        f"{_hdr_cols} columns from header but "
-                        f"{_data_cols} tokens from first data line. "
-                        f"Delimiter detection may be incorrect.",
-                        stacklevel=2,
+                    raise DEVReadError(
+                        f"Delimiter mismatch: auto-detected delimiter "
+                        f"{delimiter!r} produces {_hdr_cols} columns from "
+                        f"header but {_data_cols} tokens from first data "
+                        f"line (difference: {abs(_hdr_cols - _data_cols)}). "
+                        f"Specify delimiter explicitly."
                     )
 
     # Guard against empty delimiter — str.split("") raises ValueError.
@@ -778,6 +830,10 @@ def read_dev_file_as_object(
                 continue
             elif content_seen == skip_content_lines:
                 # Header line — parse column names.
+                # Use cached header names if auto-correction changed
+                # the delimiter (F-01 fix — prevents comma-header misparse).
+                if _cached_hdr_names is not None:
+                    values = _cached_hdr_names
                 # Handle *COLUMNS keyword format (Petra/CPS variant)
                 if _is_columns_header(values):
                     names = _parse_columns_tokens(values)
@@ -841,6 +897,10 @@ def read_dev_file_as_object(
         else:  # simple header format
             if content_seen == 1:
                 # First non-comment line = column names.
+                # Use cached header names if auto-correction changed
+                # the delimiter (F-01 fix — prevents comma-header misparse).
+                if _cached_hdr_names is not None:
+                    values = _cached_hdr_names
                 # Handle *COLUMNS keyword format (Petra/CPS variant)
                 if _is_columns_header(values):
                     names = _parse_columns_tokens(values)

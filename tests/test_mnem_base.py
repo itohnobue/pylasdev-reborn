@@ -10,6 +10,34 @@ import pytest
 from pylasdev.mnem_base import MNEM_BASE, resolve_mnemonic
 
 
+def _build_uppercased_first_wins(
+    mnem_base: dict[str, str],
+) -> dict[str, str]:
+    """Build uppercased mnemonic dict using sorted first-wins semantics.
+
+    Matches the parser's algorithm at parser.py:298-315:
+    1. Sort by (not isupper, key) — canonical uppercase entries come first.
+    2. First-wins on key.upper() — later entries for the same key are ignored.
+    3. Resolve chains via resolve_mnemonic to reach terminal canonical names.
+
+    Dict comprehension {k.upper(): v for ...} uses last-wins semantics
+    and produces different results for 84 BK/LL/Cyrillic entries (F-M26).
+    """
+    # Step 1: sort uppercase-first, then alphabetically
+    sorted_items = sorted(
+        mnem_base.items(),
+        key=lambda item: (not item[0].isupper(), item[0]),
+    )
+    # Step 2: first-wins by uppercased key
+    raw_upper: dict[str, str] = {}
+    for k, v in sorted_items:
+        key = k.upper()
+        if key not in raw_upper:
+            raw_upper[key] = v
+    # Step 3: resolve chains to terminal canonical names
+    return {k: resolve_mnemonic(raw_upper, k) for k in raw_upper}
+
+
 class TestMnemBase:
     """Tests for the mnemonic alias database."""
 
@@ -184,14 +212,14 @@ class TestResolveMnemonic:
 
     def test_resolve_with_real_mnem_base_single_hop(self) -> None:
         """Use real MNEM_BASE to verify single-hop resolution works."""
-        uppered = {k.upper(): v for k, v in MNEM_BASE.items()}
+        uppered = _build_uppercased_first_wins(MNEM_BASE)
         # AK → DT (single hop, works in uppercased dict)
         result = resolve_mnemonic(uppered, "AK")
         assert result == "DT"
 
     def test_resolve_three_hop_real_chain(self) -> None:
         """Real chain from MNEM_BASE: GZ3R1 → OGZ (resolved single-hop in uppercased)."""
-        uppered = {k.upper(): v for k, v in MNEM_BASE.items()}
+        uppered = _build_uppercased_first_wins(MNEM_BASE)
         result = resolve_mnemonic(uppered, "GZ3R1")
         assert result == "OGZ"
 

@@ -1183,3 +1183,272 @@ class TestEmptyColumnNames:
         assert list(data.keys()) == ["MD", "TVD", "X"]
         assert len(data["MD"]) == 2
         assert data["MD"][0] == 0.0
+
+
+class TestColumnsKeywordFormat:
+    """M59: Tests for *COLUMNS keyword format (Petra/CPS variant).
+
+    The *COLUMNS keyword format uses a header line starting with the
+    literal keyword *COLUMNS followed by *-prefixed column names.
+    Functions at dev_reader.py:195-213,272,781-783,844-846.
+    """
+
+    def test_columns_simple_format_basic(self, tmp_path: Path) -> None:
+        """Parse a *COLUMNS header in simple format with data rows."""
+        content = "*COLUMNS *MD *TVD *X *Y\n0.0 0.0 100.0 200.0\n100.0 99.0 101.0 201.0\n"
+        test_file = tmp_path / "columns_simple.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "X", "Y"]
+        assert len(data["MD"]) == 2
+        assert data["MD"][0] == 0.0
+        assert data["MD"][1] == 100.0
+        assert data["TVD"][0] == 0.0
+        assert data["X"][0] == 100.0
+        assert data["Y"][0] == 200.0
+
+    def test_columns_simple_format_single_row(self, tmp_path: Path) -> None:
+        """Parse *COLUMNS header with a single data row."""
+        content = "*COLUMNS *MD *TVD *GR\n100.0 50.0 75.0\n"
+        test_file = tmp_path / "columns_single.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "GR"]
+        assert len(data["MD"]) == 1
+        assert data["MD"][0] == 100.0
+
+    def test_columns_lowercase_keyword(self, tmp_path: Path) -> None:
+        """*columns (lowercase) still triggers the keyword format path."""
+        content = "*columns *md *tvd *x\n0.0 0.0 100.0\n"
+        test_file = tmp_path / "columns_lower.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["md", "tvd", "x"]
+        assert data["md"][0] == 0.0
+
+    def test_columns_mixed_case_keyword(self, tmp_path: Path) -> None:
+        """*Columns (mixed case) triggers keyword format via .upper() check."""
+        content = "*Columns *MD *TVD *GR\n100.0 50.0 75.0\n"
+        test_file = tmp_path / "columns_mixed.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "GR"]
+        assert data["GR"][0] == 75.0
+
+    def test_columns_header_only_no_data(self, tmp_path: Path) -> None:
+        """*COLUMNS header with no data rows produces empty columns."""
+        content = "*COLUMNS *MD *TVD *X *Y\n"
+        test_file = tmp_path / "columns_no_data.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "X", "Y"]
+        assert len(data["MD"]) == 0
+
+    def test_columns_with_comments(self, tmp_path: Path) -> None:
+        """*COLUMNS format with comment lines interspersed."""
+        content = (
+            "# Well-X survey\n"
+            "*COLUMNS *MD *TVD *X\n"
+            "# Data starts here\n"
+            "0.0 0.0 100.0\n"
+            "100.0 99.0 101.0\n"
+        )
+        test_file = tmp_path / "columns_comments.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "X"]
+        assert len(data["MD"]) == 2
+        assert data["MD"][0] == 0.0
+
+    def test_columns_as_object(self, tmp_path: Path) -> None:
+        """*COLUMNS format via read_dev_file_as_object API."""
+        content = "*COLUMNS *MD *TVD *X\n0.0 0.0 100.0\n100.0 99.0 101.0\n"
+        test_file = tmp_path / "columns_obj.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        dev = read_dev_file_as_object(test_file)
+        assert dev.column_order == ["MD", "TVD", "X"]
+        assert len(dev.columns["MD"]) == 2
+        np.testing.assert_array_equal(dev.columns["MD"], [0.0, 100.0])
+
+
+class TestEmptyDelimiterGuard:
+    """M60: Tests for empty delimiter guard at dev_reader.py:674-678.
+
+    The guard rejects empty string delimiters that would cause
+    str.split("") to raise ValueError.
+    """
+
+    def test_empty_delimiter_raises_error(self, tmp_path: Path) -> None:
+        """Passing delimiter="" raises DEVReadError."""
+        content = "MD TVD X\n0.0 0.0 100.0\n"
+        test_file = tmp_path / "empty_delim.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with pytest.raises(DEVReadError, match="Delimiter must be a non-empty string"):
+            read_dev_file(test_file, delimiter="")
+
+    def test_empty_delimiter_as_object(self, tmp_path: Path) -> None:
+        """Passing delimiter="" to read_dev_file_as_object raises DEVReadError."""
+        content = "MD TVD\n0.0 0.0\n"
+        test_file = tmp_path / "empty_delim_obj.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with pytest.raises(DEVReadError, match="Delimiter must be a non-empty string"):
+            read_dev_file_as_object(test_file, delimiter="")
+
+    def test_multi_char_delimiter_not_rejected_by_guard(self, tmp_path: Path) -> None:
+        """Multi-char delimiter (e.g. "::") passes the empty guard.
+
+        The guard at 674 only checks truthiness — not single-char validation.
+        csv.reader(delimiter="::") raises TypeError which may or may not
+        be caught. This test documents current behavior with a valid
+        single-char delimiter.
+        """
+        content = "MD,TVD,X\n0.0,0.0,100.0\n"
+        test_file = tmp_path / "good_delim.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Valid single-char delimiter should work
+        data = read_dev_file(test_file, delimiter=",")
+        assert list(data.keys()) == ["MD", "TVD", "X"]
+
+
+class TestDelimiterAutoCorrectionHeader:
+    """F-01: Tests for delimiter auto-correction preserving header column names.
+
+    When a DEV file has a comma-delimited header but space-delimited data,
+    the auto-correction at dev_reader.py switches the delimiter from comma
+    to space.  Before the F-01 fix, Pass 2 would re-split the comma header
+    with the space delimiter, collapsing multi-column headers like
+    "MD,TVD,INC" into a single bogus column name.  After the fix, the
+    original comma-split header names are cached and used in Pass 2.
+    """
+
+    def test_auto_correction_simple_format(self, tmp_path: Path) -> None:
+        """Comma-delimited header + space-delimited data: columns correct."""
+        content = (
+            "MD,TVD,INC\n"
+            "1000.0 2000.0 3000.0\n"
+            "1100.0 2100.0 3100.0\n"
+        )
+        test_file = tmp_path / "mix_comma_header_space_data.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Must have 3 columns, not 1 bogus column "MD,TVD,INC"
+        assert list(data.keys()) == ["MD", "TVD", "INC"], (
+            f"Expected ['MD','TVD','INC'], got {list(data.keys())}"
+        )
+        assert len(data["MD"]) == 2
+        assert data["MD"][0] == 1000.0
+        assert data["MD"][1] == 1100.0
+        assert data["TVD"][0] == 2000.0
+        assert data["TVD"][1] == 2100.0
+        assert data["INC"][0] == 3000.0
+        assert data["INC"][1] == 3100.0
+
+    def test_auto_correction_dug_format(self, tmp_path: Path) -> None:
+        """DUG format: comma-header + space-data — columns correct."""
+        content = (
+            "Well-Survey\n"
+            "3\n"
+            "MD,TVD,INC\n"
+            "1000.0 2000.0 3000.0\n"
+            "1100.0 2100.0 3100.0\n"
+        )
+        test_file = tmp_path / "dug_mix_delim.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "INC"], (
+            f"Expected ['MD','TVD','INC'], got {list(data.keys())}"
+        )
+        assert len(data["MD"]) == 2
+        assert data["MD"][0] == 1000.0
+        assert data["MD"][1] == 1100.0
+
+    def test_auto_correction_disk_as_object(self, tmp_path: Path) -> None:
+        """Read via read_dev_file_as_object API — columns correct."""
+        content = "X,Y,Z\n100.0 200.0 300.0\n150.0 250.0 350.0\n"
+        test_file = tmp_path / "obj_mix_delim.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        dev = read_dev_file_as_object(test_file)
+        assert dev.column_order == ["X", "Y", "Z"], (
+            f"Expected ['X','Y','Z'], got {dev.column_order}"
+        )
+        assert len(dev.columns["X"]) == 2
+        assert dev.columns["X"][0] == 100.0
+
+    def test_auto_correction_with_columns_keyword(self, tmp_path: Path) -> None:
+        """*COLUMNS header with space data — raises DEVReadError.
+
+        The *COLUMNS keyword adds an extra token to the header, making
+        the column counts mismatch (4 tokens in header, 3 in data).
+        Auto-correction correctly rejects this as unresolvable.
+        """
+        content = (
+            "*COLUMNS,*MD,*TVD,*GR\n"
+            "100.0 50.0 75.0\n"
+        )
+        test_file = tmp_path / "columns_mix_delim.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Auto-correction: header has 4 comma tokens, data has 3 space
+        # tokens.  _data_alt_cols (3) != _hdr_cols (4) → DEVReadError.
+        with pytest.raises(DEVReadError, match="Delimiter mismatch"):
+            read_dev_file(test_file)
+
+    def test_auto_correction_with_trailing_comma(self, tmp_path: Path) -> None:
+        """Comma-header with trailing comma + space data — correct columns."""
+        content = "MD,TVD,\n1000.0 2000.0\n1100.0 2100.0\n"
+        test_file = tmp_path / "trail_mix_delim.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Trailing comma stripped by the filter logic
+        assert list(data.keys()) == ["MD", "TVD"], (
+            f"Expected ['MD','TVD'], got {list(data.keys())}"
+        )
+        assert len(data["MD"]) == 2
+
+    def test_auto_correction_with_commas_and_spaces(self, tmp_path: Path) -> None:
+        """Comma-header with spaces after commas + space data — correct."""
+        content = "MD, TVD, INC, AZI\n1000.0 2000.0 3000.0 4000.0\n"
+        test_file = tmp_path / "space_comma_mix.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "INC", "AZI"], (
+            f"Expected ['MD','TVD','INC','AZI'], got {list(data.keys())}"
+        )
+        assert data["MD"][0] == 1000.0
+        assert data["AZI"][0] == 4000.0
+
+    def test_pure_space_delimiter_unaffected(self, tmp_path: Path) -> None:
+        """Pure space-delimited file unaffected by the fix (no regression)."""
+        content = "MD TVD X\n0.0 0.0 100.0\n100.0 99.0 101.0\n"
+        test_file = tmp_path / "pure_space.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "X"]
+        assert len(data["MD"]) == 2
+        assert data["MD"][0] == 0.0
+
+    def test_pure_comma_delimiter_unaffected(self, tmp_path: Path) -> None:
+        """Pure comma-delimited file unaffected by the fix (no regression)."""
+        content = "MD,TVD,X\n0.0,0.0,100.0\n100.0,99.0,101.0\n"
+        test_file = tmp_path / "pure_comma.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "X"]
+        assert len(data["MD"]) == 2

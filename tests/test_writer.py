@@ -26,6 +26,7 @@ from pylasdev.writer import (
     _format_number,
     _sanitize_las_value,
     _section_type_to_prefix,
+    _validate_precision,
 )
 
 
@@ -134,8 +135,17 @@ class TestWriteLASFile:
 
         content = temp_file.read_text()
         assert "~A" in content
-        # Check numeric data is written
-        assert "1670" in content
+        # F-I2-M46: Verify data values appear in the data section specifically,
+        # not just anywhere in the file.  The well section also contains "1670"
+        # (STRT value), so a whole-file substring match creates false confidence
+        # if the data section is empty.
+        data_section = content.split("~A", 1)[1]
+        data_lines = [ln for ln in data_section.splitlines() if ln.strip()]
+        assert len(data_lines) >= 4  # 1 header + 3 data rows
+        # Data section must contain the first DEPT value (1670.0 → "1670")
+        assert "1670" in data_section
+        # Also verify other curve data values
+        assert "1669.875" in data_section or "1670" in data_lines[1]
 
     def test_write_read_roundtrip(self, sample_las_data: dict, tmp_path: Path) -> None:
         """Test that write then read produces equivalent data."""
@@ -542,15 +552,26 @@ class TestWriteLASFile:
         las = LASFile()
         las.version = VersionSection(vers="2.0")
         las.well["NULL"] = "NONE"
-        las.curves_order = ["DEPT"]
+        las.curves_order = ["DEPT", "DT"]
         las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
-        las.logs["DEPT"] = np.array([100.0])
+        las.curves.append(CurveDefinition(mnemonic="DT", unit="US/M"))
+        # F-I2-M47: Include a NaN value to verify that _get_null_value()'s
+        # fallback to -999.25 is actually exercised.  Without actual null
+        # sentinel values in the data, the output only contains clean floats
+        # and the null-value path is never tested.
+        las.logs["DEPT"] = np.array([100.0, 101.0])
+        las.logs["DT"] = np.array([50.0, np.nan])
 
         temp_file = tmp_path / "null_test.las"
         write_las_file(temp_file, las)  # Should not crash
 
         content = temp_file.read_text()
         assert "100" in content
+        # Verify NaN was replaced with the fallback null value (-999.25)
+        assert "-999.25" in content
+        # Verify roundtrip: NaN position is restored as null_value
+        reread = read_las_file(temp_file)
+        assert reread["logs"]["DT"][1] == pytest.approx(-999.25)
 
     # --- TEST-17: LAS 3.0 data_sections with non-numeric NULL value ---
     def test_write_las30_non_numeric_null_in_data_sections(self, tmp_path: Path) -> None:
@@ -558,13 +579,21 @@ class TestWriteLASFile:
         las = LASFile()
         las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
         las.well["NULL"] = "NOT A NUMBER"
-        las.curves_order = ["DEPT"]
+        las.curves_order = ["DEPT", "DT"]
         las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.curves.append(CurveDefinition(mnemonic="DT", unit="US/M"))
 
+        # F-I2-M48: Include a NaN value to verify that the non-numeric NULL
+        # fallback (-999.25) is exercised in the LAS 3.0 data_sections path.
+        # Without actual null sentinel values, the test only verifies clean
+        # floats pass through — the null-value path is never tested.
         section = DataSection(
             name="CURVE",
-            curves_order=["DEPT"],
-            data={"DEPT": np.array([100.0, 101.0])},
+            curves_order=["DEPT", "DT"],
+            data={
+                "DEPT": np.array([100.0, 101.0]),
+                "DT": np.array([np.nan, 51.0]),
+            },
         )
         las.data_sections.append(section)
 
@@ -574,6 +603,38 @@ class TestWriteLASFile:
         content = temp_file.read_text()
         assert "100" in content
         assert "101" in content
+        # Verify NaN was replaced with the fallback null value (-999.25)
+        assert "-999.25" in content
+        # Verify roundtrip: NaN position is restored as null_value
+        reread = read_las_file(temp_file)
+        assert reread["logs"]["DT"][0] == pytest.approx(-999.25)
+
+    # --- F-I2-M49: roundtrip test for #-prefixed value ---
+    def test_write_hash_prefix_value_preserved(self, tmp_path: Path) -> None:
+        """Value starting with ``#`` is escaped with ``_`` prefix to
+        prevent silent data loss on re-read.  The parser treats
+        ``#``-prefixed lines as comments, so without the guard at
+        writer.py:86-87 the value would be dropped entirely."""
+        las = LASFile()
+        las.version = VersionSection(vers="2.0")
+        las.well["NULL"] = "-999.25"
+        las.well["STRT"] = "100.0"
+        las.well["STOP"] = "200.0"
+        las.well["COMP"] = "#TestCompany"  # Value starting with #
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        temp_file = tmp_path / "hash_prefix.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        # The value should appear as _#TestCompany (escaped) — never as a
+        # bare # at the start of a line, which the parser would skip.
+        assert "_#TestCompany" in content
+        # Verify re-read: the value survives roundtrip
+        reread = read_las_file(temp_file)
+        assert "_#TestCompany" in reread["well"]["COMP"]
 
     # --- TEST-06: zone_index=None branch (line 125->127) ---
     def test_write_zone_without_index(self, tmp_path: Path) -> None:
@@ -635,8 +696,20 @@ class TestWriteLASFile:
 
         content = temp_file.read_text()
         assert "~A BROKEN" in content
-        # No data rows should be written (guard at line 198 returns [])
-        # Content after ~A BROKEN should be empty or next section
+        # F-I2-M52: Verify that when curve_names[0] is not in the data dict,
+        # no data rows are written after the section header.  The section
+        # header is emitted unconditionally at writer.py:687, but
+        # _format_data_rows returns [] when num_rows == 0 (writer.py:760-761).
+        # Without this assertion, the test only proves the header exists —
+        # it doesn't verify the guard actually prevented data rows.
+        # The header line includes " | CURVE" for LAS 3.0 LOG_DATA sections.
+        data_section_after = content.split("~A BROKEN", 1)[1]
+        # Skip the first line (rest of the header: " | CURVE")
+        remainder = data_section_after.split("\n", 1)[1] if "\n" in data_section_after else ""
+        data_rows = [ln for ln in remainder.splitlines() if ln.strip()]
+        assert data_rows == [], (
+            f"Expected no data rows after ~A BROKEN, got: {data_rows}"
+        )
 
     # --- F-24: NaN values in _format_data_rows ---
     def test_write_nan_values(self, tmp_path: Path) -> None:
@@ -883,6 +956,39 @@ class TestWriteLASFile:
         # Lowercase section letter also matched
         assert _sanitize_las_value("~a lowercase") == "a lowercase"
 
+    # --- F-I2-M49: # prefix escaping ---
+    def test_sanitize_escapes_hash_prefix(self) -> None:
+        """_sanitize_las_value prefixes ``#`` with ``_`` to prevent
+        comment injection.  The parser skips ``#``-prefixed lines as
+        comments in data sections, so a value starting with ``#``
+        would be silently dropped on re-read without this guard
+        (writer.py:86-87)."""
+        assert _sanitize_las_value("#comment") == "_#comment"
+        assert _sanitize_las_value("#") == "_#"
+        # Values not starting with # are unchanged
+        assert _sanitize_las_value("comment #not_start") == "comment #not_start"
+        # Leading whitespace before # also escaped (writer.py:95-98)
+        assert _sanitize_las_value(" #comment") == " _#comment"
+        assert _sanitize_las_value("  #value") == "  _#value"
+
+    # --- F-I2-M51: edge-case tests for _sanitize_las_value ---
+    def test_sanitize_empty_string(self) -> None:
+        """_sanitize_las_value with empty string returns empty string."""
+        assert _sanitize_las_value("") == ""
+
+    def test_sanitize_control_char_only(self) -> None:
+        """_sanitize_las_value strips all control characters,
+        returning empty string for control-char-only input."""
+        assert _sanitize_las_value("\x00\x01\x02") == ""
+        assert _sanitize_las_value("\x0b\x0c\x1c") == ""
+
+    def test_sanitize_standalone_section_header(self) -> None:
+        """_sanitize_las_value strips leading ~ from standalone
+        section-header-like values ("~A", "~V")."""
+        assert _sanitize_las_value("~A") == "A"
+        assert _sanitize_las_value("~V") == "V"
+        assert _sanitize_las_value("~a") == "a"
+
     def test_sanitize_preserves_clean_text(self) -> None:
         """Test that _sanitize_las_value leaves clean text unchanged."""
         clean = "LAS 2.0 : CWLS LOG ASCII STANDARD"
@@ -994,7 +1100,8 @@ class TestWriteLASFile:
             line for line in data_section.splitlines() if line.strip() and not line.startswith("#")
         ]
         # With 3 curves, non-wrapped mode: 1 header line + 2 data lines = 3 lines total
-        assert len(data_lines) >= 2  # at least the data lines
+        # F-I2-M50: Assert exact count — >= 2 would pass even if one row is lost.
+        assert len(data_lines) == 3, f"Expected 3 lines (1 header + 2 data), got {len(data_lines)}"
         # Verify WRAP is overridden to NO (F-01: header-data consistency fix)
         assert "WRAP.   NO" in content
         assert "WRAP.   YES" not in content
@@ -1679,3 +1786,119 @@ class TestColonEscaping:
         assert "A" in result
         assert "B" in result
         assert "C" in result
+
+
+class TestValidatePrecision:
+    """F-I2-M70: Tests for _validate_precision with invalid format codes.
+
+    All existing precision tests use valid values (.4g, .8g, .5g).
+    The validation guard at writer.py:169 rejects non-numeric format
+    codes (x, o, b, c, d) that would produce hex/octal/binary/character
+    output when applied to floating-point values.
+    """
+
+    def test_valid_precision_formats_pass(self) -> None:
+        """All float-compatible format specifiers pass validation."""
+        _validate_precision(".8g")
+        _validate_precision(".6f")
+        _validate_precision(".10e")
+        _validate_precision(".4E")
+        _validate_precision(".12F")
+        _validate_precision(".5n")
+        _validate_precision(".3%")
+        _validate_precision(".1G")
+        # No type code defaults to g-type (safe for floats)
+        _validate_precision(".8")
+
+    def test_invalid_hex_format_raises(self) -> None:
+        """Hex format code 'x' raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid precision format"):
+            _validate_precision(".8x")
+
+    def test_invalid_hex_uppercase_raises(self) -> None:
+        """Uppercase hex format code 'X' raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid precision format"):
+            _validate_precision(".4X")
+
+    def test_invalid_decimal_integer_raises(self) -> None:
+        """Decimal integer format code 'd' raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid precision format"):
+            _validate_precision(".5d")
+
+    def test_invalid_binary_format_raises(self) -> None:
+        """Binary format code 'b' raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid precision format"):
+            _validate_precision(".8b")
+
+    def test_invalid_octal_format_raises(self) -> None:
+        """Octal format code 'o' raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid precision format"):
+            _validate_precision(".8o")
+
+    def test_invalid_character_format_raises(self) -> None:
+        """Character format code 'c' raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid precision format"):
+            _validate_precision(".2c")
+
+    def test_missing_dot_raises(self) -> None:
+        """Format string without leading dot raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid precision format"):
+            _validate_precision("8g")
+
+    def test_no_digits_raises(self) -> None:
+        """Format string with dot but no digits raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid precision format"):
+            _validate_precision(".g")
+
+    def test_arbitrary_string_raises(self) -> None:
+        """Completely non-format string raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid precision format"):
+            _validate_precision("abc")
+
+    def test_empty_string_raises(self) -> None:
+        """Empty string raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid precision format"):
+            _validate_precision("")
+
+
+class TestLeadingSectionRegex:
+    """F-I2-M71: Tests for \\s* portion of _LEADING_SECTION_RE.
+
+    The regex ``^\\s*~([A-Za-z])`` (writer.py:40) strips leading
+    whitespace before a section-header-like ``~[A-Za-z]`` pattern.
+    Existing tests only verify ``~VERSION`` without leading whitespace.
+    A regression to ``^~`` (without \\s*) would cause leading-whitespace
+    values to bypass sanitization and go undetected.
+    """
+
+    def test_leading_tab_before_section_header(self) -> None:
+        """Tab before ~VERSION: \t is stripped along with ~."""
+        assert _sanitize_las_value("\t~VERSION broken") == "VERSION broken"
+
+    def test_leading_spaces_before_section_header(self) -> None:
+        """Two spaces before ~VERSION: spaces and ~ are stripped."""
+        assert _sanitize_las_value("  ~VERSION info") == "VERSION info"
+
+    def test_leading_spaces_before_A_section(self) -> None:
+        """Three spaces before ~A data: all whitespace and ~ stripped."""
+        assert _sanitize_las_value("   ~A data") == "A data"
+
+    def test_leading_tab_before_lowercase_section(self) -> None:
+        """Tab before lowercase ~a: whitespace + ~ stripped, letter preserved."""
+        assert _sanitize_las_value("\t~a lowercase") == "a lowercase"
+
+    def test_leading_mixed_whitespace_before_section(self) -> None:
+        """Mix of tab and spaces before ~W text."""
+        assert _sanitize_las_value("\t  ~W text") == "W text"
+
+    def test_leading_whitespace_only_no_tilde(self) -> None:
+        """Leading whitespace without tilde is left unchanged
+        (not a section header pattern)."""
+        result = _sanitize_las_value("  no-tilde here")
+        assert result == "  no-tilde here"
+
+    def test_leading_tilde_no_letter_unchanged(self) -> None:
+        """~ followed by non-letter (digit) is NOT matched by
+        [A-Za-z] — leading whitespace + tilde preserved."""
+        result = _sanitize_las_value("  ~1 numeric")
+        assert result == "  ~1 numeric"

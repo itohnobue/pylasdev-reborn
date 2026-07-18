@@ -19,8 +19,8 @@ class TestRoundTrip:
         write_las_file(temp_file, sample_las_data)
         roundtrip = read_las_file(temp_file)
 
-        # Check structure
-        assert set(roundtrip["curves_order"]) == set(sample_las_data["curves_order"])
+        # Check structure — strict list equality: DEPT/DT position swap must fail
+        assert roundtrip["curves_order"] == sample_las_data["curves_order"]
 
         # Check data values
         for curve in sample_las_data["curves_order"]:

@@ -15,6 +15,7 @@ import csv
 import logging
 import re
 import warnings
+from itertools import groupby
 from typing import ClassVar
 
 import numpy as np
@@ -71,13 +72,30 @@ MAX_DEFERRED_WELL_ENTRIES = MAX_PARAMETERS
 # Overridable at module level.
 MAX_SECTION_SEQUENCE = 200
 
-# F-32 + G-17: Characters that Python's splitlines() treats as line breaks
-# beyond \\n and \\r.  When present in file content, they cause splitlines()
-# to produce fake section headers and corrupt parsed data.  The writer's
-# _CONTROL_CHARS_RE already strips these; this makes the read path symmetric.
-# Characters: \\x0b (VT), \\x0c (FF), \\x1c (FS), \\x1d (GS), \\x1e (RS),
-# \\x85 (NEL), \\u2028 (LINE SEPARATOR), \\u2029 (PARAGRAPH SEPARATOR).
-_SPLITLINES_CHARS_RE = re.compile(r"[\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+# F-I2-M06: Maximum length of a single line in bytes/characters.  max_file_size
+# (500MB) bounds total file but not individual line length — a crafted file
+# could allocate a 500MB string for a single line.  Real-world LAS lines are
+# typically under 1 KB; 50 KB allows generous descriptions while preventing
+# absurd single-line allocations.  Overridable at module level.
+MAX_LINE_LENGTH = 50_000
+
+# F-I2-M07: Maximum length of a captured field (value, description) after
+# regex matching.  The DATA_LINE_PATTERN uses unbounded .*? groups; a crafted
+# 500MB value/description could be allocated.  This guards each captured group
+# independently.  Overridable at module level.
+MAX_FIELD_LENGTH = 100_000
+
+# F-32 + G-17 + F-I2-M04 + F-I2-M05: Control characters that appear in file
+# content and must be stripped before splitlines() to prevent section-header
+# injection and silent data corruption.  The writer's _CONTROL_CHARS_RE strips
+# these; this makes the read path symmetric.
+# F-I2-M04: Added \x00 (null byte) — previously bypassed SECTION_PATTERN,
+#   routing ~\x00VERSION to _other_lines and corrupting float parsing.
+# F-I2-M05: Added remaining control characters (\x00-\x08, \x0E-\x1F, \x7F)
+#   that the writer strips but the parser/reader previously passed through.
+# Characters: \x00-\x08, \x0B (VT), \x0C (FF), \x0E-\x1F (FS/GS/RS/etc.),
+# \x7F (DEL), \x85 (NEL), \u2028 (LINE SEPARATOR), \u2029 (PARAGRAPH SEPARATOR).
+_SPLITLINES_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85\u2028\u2029]")
 
 # Section header: line starting with ~, followed by section keyword and trailing content.
 # Captures the full section word (e.g., "VERSION", "Core_Definition", "Core[1]")
@@ -133,7 +151,12 @@ ARRAY_MNEMONIC_PATTERN = re.compile(r"^(?P<base>[\w\-]+)\[(?P<index>\d+)\]$")
 # (D, DEG, date templates, extended exponent notation).  Format group
 # captures one or more non-brace, non-colon characters; colon and
 # optional offset follow.
-FORMAT_SPEC_PATTERN = re.compile(r"\{(?P<format>[A-Za-z][^}:]*?)(?::(?P<offset>[\d.]*))?\s*\}")
+# F-I2-M08: Exclude whitespace (\s) from the format body so that
+# brace-enclosed text containing spaces (e.g. "{well A12}") is NOT
+# matched as a format specifier.  LAS 3.0 format specifiers do not
+# contain spaces; matching them caused description corruption via
+# sub("") stripping legitimate brace-enclosed text.
+FORMAT_SPEC_PATTERN = re.compile(r"\{(?P<format>[A-Za-z][^}:\s]*?)(?::(?P<offset>[\d.]*))?\s*\}")
 
 # LAS 3.0: Zone association via pipe (e.g., | Run[1], | Zone[2]).
 # F-M16: Support zone names containing spaces (e.g., "| Main Zone").
@@ -330,7 +353,12 @@ class LASParser:
         # F-M12: Raw ASCII data lines are buffered when data sections (~A,
         # ~ASCII, etc.) appear before ~V so they can be re-processed after
         # the version (and hence is_las30) is known.
-        self._deferred_ascii_data_lines: list[str] = []
+        # F-H01: Each entry is a (section_type, section_name, section_idx,
+        # raw_line) tuple to preserve per-section boundaries across the
+        # deferred replay.  section_idx distinguishes consecutive sections
+        # that happen to have the same section_type and section_name
+        # (e.g., two bare ~A sections).
+        self._deferred_ascii_data_lines: list[tuple[str, str, int, str]] = []
         # F-34: Track section headers encountered (in order) for cross-section
         # consistency validation: duplicate detection and LAS 3.0 ordering check.
         self._section_sequence: list[str] = []
@@ -475,9 +503,13 @@ class LASParser:
             if match:
                 section_word = match.group(1).upper()
                 is_ascii = section_word in {"A", "ASCII"}
-                if not is_ascii and in_ascii and count > 0:
-                    # Non-~A section — save the accumulated count for the
-                    # contiguous ~A block that just ended.
+                # F-I2-M10: Always save the count for the contiguous ~A block
+                    # that just ended — zero-count blocks must be preserved so
+                    # per_block_counts[0] correctly reflects the first block's
+                    # actual count.  Skipping zero blocks caused
+                    # per_block_counts[0] to pick up a later block's count,
+                    # producing a data-size mismatch in _read_normal.
+                if not is_ascii and in_ascii:
                     per_block_counts.append(count)
                     count = 0
                 in_ascii = is_ascii
@@ -489,7 +521,8 @@ class LASParser:
             ):
                 count += 1
 
-        if in_ascii and count > 0:
+        # F-I2-M10: Always append final block count — even zero.
+        if in_ascii:
             per_block_counts.append(count)
 
         # Use the count from the first contiguous ~A block, matching
@@ -498,6 +531,15 @@ class LASParser:
 
     def _parse_line(self, line: str) -> None:
         """Route a single line to the appropriate section handler."""
+        # F-I2-M06: Guard against absurdly long lines before any regex
+        # processing.  max_file_size bounds total file but crafted files
+        # can place a 500MB payload in a single line, causing unbounded
+        # regex backtracking and string allocation.
+        if len(line) > MAX_LINE_LENGTH:
+            raise LASParseError(
+                f"Line length ({len(line)}) exceeds maximum allowed "
+                f"({MAX_LINE_LENGTH}). The file may be malformed or corrupt."
+            )
         # F-M-07: Strip leading whitespace before matching SECTION_PATTERN,
         # matching _pre_scan behavior.  Leading spaces would otherwise break
         # section header detection in the main parse pass.
@@ -738,6 +780,19 @@ class LASParser:
             else:
                 # Unknown section type — accumulate lines as free-form text (like ~O).
                 new_section = None
+                # F-M01: Warn when a pipe target is specified on an
+                # unknown/non-data section.  Pipe annotations are only
+                # meaningful for data sections (~A, ~ASCII, etc.).
+                if pipe_target:
+                    source_info = f" in {self.source_file}" if self.source_file else ""
+                    logger.warning(
+                        "Pipe target '| %s' on non-data section '~%s'%s — "
+                        "pipe annotations are only meaningful for data "
+                        "sections. The pipe target will be ignored.",
+                        pipe_target,
+                        section_word,
+                        source_info,
+                    )
                 section_name = f"{section_word} {section_rest}".strip()
                 self._append_other_line(line)
                 source_info = f" in {self.source_file}" if self.source_file else ""
@@ -764,6 +819,22 @@ class LASParser:
                 # aren't misrouted to the previous section's handler.
                 self._current_section = None
                 return
+
+            # F-M01: Warn when a pipe target is specified on a known
+            # non-data section (V, W, C, P, O).  Pipe annotations are
+            # only meaningful for data sections and are silently ignored
+            # here — the pipe_target variable is only consumed in the
+            # data-section branch (lines 684-737).
+            if pipe_target and new_section not in ("A", None):
+                source_info = f" in {self.source_file}" if self.source_file else ""
+                logger.warning(
+                    "Pipe target '| %s' on non-data section '~%s'%s — "
+                    "pipe annotations are only meaningful for data "
+                    "sections. The pipe target will be ignored.",
+                    pipe_target,
+                    section_word,
+                    source_info,
+                )
 
             # F1: When leaving a data section for a non-data section,
             # process pending data from the previous section.
@@ -920,11 +991,42 @@ class LASParser:
         self._other_lines.append(line)
 
     def _match_data_line(self, line: str) -> re.Match[str] | None:
-        """Try to match a header data line with colon, then without."""
+        """Try to match a header data line with colon, then without.
+
+        F-I2-M07: Validates captured group lengths after a successful
+        match to prevent unbounded string allocation from crafted files
+        with 500MB values or descriptions.
+        """
         match = DATA_LINE_PATTERN.match(line)
         if match:
+            self._validate_data_line_fields(match)
             return match
-        return VALUE_ONLY_PATTERN.match(line)
+        match = VALUE_ONLY_PATTERN.match(line)
+        if match:
+            self._validate_data_line_fields(match)
+            return match
+        return None
+
+    def _validate_data_line_fields(self, match: re.Match[str]) -> None:
+        """Validate captured group lengths in a data-line match (F-I2-M07).
+
+        DATA_LINE_PATTERN uses unbounded .*? groups for value and
+        description; a crafted file can cause multi-megabyte allocations
+        in a single captured group.  This guard checks each named group
+        independently.
+
+        Raises:
+            LASParseError: If any captured group exceeds MAX_FIELD_LENGTH.
+        """
+        groupdict = match.groupdict()
+        for group_name in ("value", "description", "mnemonic", "unit"):
+            val = groupdict.get(group_name)
+            if val and len(val) > MAX_FIELD_LENGTH:
+                raise LASParseError(
+                    f"Field '{group_name}' length ({len(val)}) exceeds "
+                    f"maximum allowed ({MAX_FIELD_LENGTH}). "
+                    f"The file may be malformed or corrupt."
+                )
 
     def _parse_version(self, line: str) -> None:
         """Parse ~V (version) section line."""
@@ -972,6 +1074,19 @@ class LASParser:
                     stacklevel=2,
                 )
                 self.las_file.version.dlm = "SPACE"
+        else:
+            # F-M07: Warn about unknown ~V fields (PROG, PROD, LIC, etc.).
+            # Extended ~V mnemonics beyond VERS/WRAP/DLM are silently discarded
+            # by the parser — there is no extensible storage on VersionSection
+            # for custom fields.  Warnings alert users that roundtrip fidelity
+            # will be lost for non-standard ~V entries.
+            warnings.warn(
+                f"Unknown ~V field '{mnemonic}={value}' — only VERS, WRAP, and DLM "
+                f"are recognized. Extended ~V fields (PROG, PROD, LIC, etc.) are "
+                f"not stored and will be lost on roundtrip.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     def _store_well_entry(
         self, mnemonic: str, unit: str, value: str, description: str | None, is_las12: bool
@@ -1139,62 +1254,66 @@ class LASParser:
             self._deferred_well_entries.clear()
 
         # F-M12: Replay deferred data lines if the file is LAS 3.0.
+        # F-H01: Each deferred entry is a (section_type, section_name,
+        # section_idx, line) tuple.  Group by (section_type, section_name,
+        # section_idx) to create one DataSection per original pre-~V data
+        # section.  section_idx disambiguates consecutive bare sections
+        # that share the same type and name.
         if self._deferred_ascii_data_lines:
             if self.las_file.version.is_las30:
-                # F-EX-01: When _ascii_data_lines already contains data from a
-                # subsequent section (end-of-loop replay at line 375), process
-                # the deferred lines as their OWN DataSection rather than
-                # appending them.  Appending would merge distinct ~A sections
-                # with different depth ranges and curve assignments, producing
-                # corrupted data (values from distinct sections interleaved).
-                #
-                # At intra-loop replay sites (lines 759, 775, 801, 807),
-                # _ascii_data_lines is either empty or contains data from the
-                # SAME section as the deferred lines — appending is correct there.
-                if self._ascii_data_lines:
-                    # Save post-~V state that _process_ascii_data() reads.
-                    # These reflect the current (post-~V) section context and
-                    # are restored after processing the pre-~V deferred data.
-                    saved_lines = self._ascii_data_lines
-                    saved_curve_start = self._section_curve_start_idx
-                    saved_curve_end = self._section_curve_end_idx
-                    saved_section_type = self._current_data_section_type
-                    saved_section_name = self._current_section_name
+                # Build groups from per-line tuple storage.
+                # itertools.groupby groups consecutive lines with the same
+                # key — correct since deferred lines are appended in file
+                # order and section boundaries are naturally contiguous.
+                groups: list[tuple[tuple[str, str, int], list[str]]] = []
+                for key, group_iter in groupby(
+                    self._deferred_ascii_data_lines,
+                    key=lambda t: (t[0], t[1], t[2]),
+                ):
+                    groups.append((key, [line for _, _, _, line in group_iter]))
 
-                    # Set pre-~V context for deferred data processing.
-                    # In the common case (no pre-~V ~C), deferred data was
-                    # collected with _section_curve_start_idx=0 and
-                    # _section_curve_end_idx=None (initial values), giving the
-                    # full curve range.  When a pre-~V ~C exists, the pre-~V
-                    # curve indices are lost (overwritten by post-~V ~C) — we
-                    # fall back to the full curve range so pre-~V data values
-                    # map to the correct curves rather than being cross-assigned
-                    # to post-~V curves.  Per-section curve scoping for pre-~V
-                    # deferred data is approximate when different ~C blocks
-                    # exist before and after ~V (known limitation).
+                # Save current state before processing deferred groups.
+                saved_lines = self._ascii_data_lines
+                saved_curve_start = self._section_curve_start_idx
+                saved_curve_end = self._section_curve_end_idx
+                saved_section_type = self._current_data_section_type
+                saved_section_name = self._current_section_name
+
+                # Process each deferred group as its own DataSection.
+                for (section_type, _section_name, _section_idx), raw_lines in groups:
+                    # Use default curve indices (full range).
                     self._section_curve_start_idx = 0
                     self._section_curve_end_idx = None
-                    # _current_data_section_type and _current_section_name:
-                    # pre-~V values were overwritten by post-~V section handling.
-                    # "LOG_DATA" and "" are safe defaults — the empty name falls
-                    # back to the auto-generated "Section_N" (line 1718).
-                    self._current_data_section_type = "LOG_DATA"
-                    self._current_section_name = ""
-
-                    self._ascii_data_lines = list(self._deferred_ascii_data_lines)
+                    # Pre-~V section type may be stale — use stored value.
+                    self._current_data_section_type = section_type or "LOG_DATA"
+                    # Preserve user-provided section names when available.
+                    # Bare section keywords (e.g., "A" from ~A,
+                    # "Core[1]" from ~Core[1]) are blanked so
+                    # auto-generation produces unique Section_N names.
+                    # Real user-provided names (e.g., "Main Log" from
+                    # "~A Main Log") are preserved across replay.
+                    _is_bare_keyword = (
+                        _section_name in _DATA_SECTION_WORDS
+                        or _is_indexed_data_section(_section_name)
+                    )
+                    if _section_name and not _is_bare_keyword:
+                        self._current_section_name = _section_name
+                    else:
+                        self._current_section_name = ""
+                    self._ascii_data_lines = raw_lines
                     self._process_ascii_data()
-                    self._current_data_section_idx += 1  # F-S9-01
+                    self._current_data_section_idx += 1
 
-                    # Restore post-~V state for the caller (line 400) to process
-                    # the post-~V data correctly.
+                # Restore state.
+                if saved_lines:
                     self._ascii_data_lines = saved_lines
-                    self._section_curve_start_idx = saved_curve_start
-                    self._section_curve_end_idx = saved_curve_end
-                    self._current_data_section_type = saved_section_type
-                    self._current_section_name = saved_section_name
                 else:
-                    for deferred_line in self._deferred_ascii_data_lines:
-                        self._ascii_data_lines.append(deferred_line)
+                    self._ascii_data_lines = []
+                self._section_curve_start_idx = saved_curve_start
+                self._section_curve_end_idx = saved_curve_end
+                self._current_data_section_type = saved_section_type
+                # F-I2-M01: Reset section name (defense-in-depth).
+                self._current_section_name = saved_section_name or ""
             self._deferred_ascii_data_lines.clear()
 
     def _parse_well(self, line: str) -> None:
@@ -1544,7 +1663,18 @@ class LASParser:
                         f"allowed ({MAX_DATA_LINES}). "
                         f"The file may be malformed or corrupt."
                     )
-                self._deferred_ascii_data_lines.append(line)
+                # F-H01: Store per-line (section_type, section_name,
+                # section_idx, line) so _replay_deferred_well can
+                # reconstruct per-section grouping.  section_idx
+                # disambiguates consecutive bare sections.
+                self._deferred_ascii_data_lines.append(
+                    (
+                        self._current_data_section_type,
+                        self._current_section_name,
+                        self._current_data_section_idx,
+                        line,
+                    )
+                )
             return
         # F-27: Early bounds check during accumulation — reject before the
         # list grows unbounded.  The main check in _process_ascii_data runs
@@ -1726,16 +1856,30 @@ class LASParser:
         # like {DD/MM/YYYY}) route through float() and produce null_value
         # for every data point without any warning.
         #
-        # F-M14: Only validate the format TYPE character (first letter)
-        # against known types.  Extended format specifiers like {E0.00E+00},
-        # {F8.3}, {E12.5} produce data_format strings like "E0.00E+00",
-        # which don't match single-letter _KNOWN_CURVE_FORMATS entries.
-        # The type character alone determines whether a curve is numeric or
-        # string — the rest is formatting metadata.
+        # F-M03: Validate the FULL format specifier, not just the first
+        # character.  The prior `fmt[0]` check passed both "D" (valid
+        # Fortran double) and "DEG"/"DD/MM/YYYY" (non-numeric templates)
+        # since all start with "D".  Now we require the format to either
+        # be a single known type letter, or a known letter followed by a
+        # valid width.precision pattern (e.g., "F8.3", "E10.2").
         _KNOWN_CURVE_FORMATS: frozenset[str] = frozenset({"F", "E", "D", "S", "A"})
+        # F-M03: Match full numeric format specifiers — single letter or
+        # letter + width[.precision][±exponent] (e.g., "F8.3", "E0.00E+00").
+        # Non-numeric templates like "DEG" and "DD/MM/YYYY" fail because
+        # the second character is a letter or slash, not a digit.
+        # F-M03 / R9-018: S and A are bare format specifiers with no
+        # numeric width suffix (LAS spec).  The previous character class
+        # [FEDS] incorrectly accepted "S10" as valid, causing string
+        # curves to be classified as numeric and their values to become
+        # NaN.  Split into: [FED] with optional width, or [SA] bare.
+        _FORMAT_SPEC_RE = re.compile(
+            r"^(?:[FED](?:\d+(?:\.\d+)?(?:[ED][+-]?\d+)?)?|[SA])$"
+        )
         for curve in section_curves:
             fmt = curve.data_format
-            if fmt and fmt[0] not in _KNOWN_CURVE_FORMATS:
+            if fmt and not (
+                fmt in _KNOWN_CURVE_FORMATS or _FORMAT_SPEC_RE.match(fmt)
+            ):
                 logger.warning(
                     "Curve '%s' has unsupported format specifier '{%s}'. "
                     "Non-numeric format types (e.g., {DEG}, date "
@@ -1765,6 +1909,23 @@ class LASParser:
             for line in self._ascii_data_lines
             if not COMMENT_PATTERN.match(line) and not EMPTY_PATTERN.match(line)
         )
+
+        # F-I2-M09: Guard against zero data rows.  When actual_count is 0
+        # (all lines are comments/blanks), num_curves * 0 = 0 always passes
+        # MAX_TOTAL_ELEMENTS check, but np.zeros(0) still allocates an empty
+        # ndarray per curve — up to MAX_CURVES per section and MAX_DATA_SECTIONS
+        # sections can produce GB-scale allocations within guard limits.
+        # A section with zero data rows has nothing to process; return early.
+        if actual_count == 0:
+            warnings.warn(
+                f"Data section '{self._current_section_name or 'ASCII'}' has "
+                f"{len(self._ascii_data_lines)} raw line(s) but 0 data rows "
+                f"(all lines are comments or blanks). No data will be stored "
+                f"for this section.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return
 
         # F-26: Global aggregate limit across ALL data sections.
         # Each section passes per-section bounds (MAX_DATA_LINES, MAX_CURVES,
@@ -1963,11 +2124,28 @@ class LASParser:
             data_before_curves = False
             curve_seen = False
             for label in self._section_sequence:
-                letter = label[0]  # First char is the section letter code
-                if letter == "A" and not curve_seen:
+                # F-M02: Extract section_word from the label (which may
+                # include a ":section_name" suffix) instead of using
+                # label[0].  The prior code assumed single-letter codes
+                # (e.g., "A" for data, "C" for curves), but commit 6156a03
+                # changed _section_sequence to store full section words
+                # (e.g., "CORE_DATA", "CORE_DEFINITION").  CORE_DATA[0]="C"
+                # was miscategorized as a curve section, producing
+                # false-negative data-before-curves warnings.
+                section_word = label.split(":")[0]
+                is_data = (
+                    section_word in _DATA_SECTION_WORDS
+                    or section_word.endswith("_DATA")
+                    or _is_indexed_data_section(section_word)
+                )
+                is_curve = (
+                    section_word in {"C", "CURVE"}
+                    or section_word.endswith("_DEFINITION")
+                )
+                if is_data and not curve_seen:
                     data_before_curves = True
                     break
-                if letter == "C":
+                if is_curve:
                     curve_seen = True
             if data_before_curves:
                 logger.warning(

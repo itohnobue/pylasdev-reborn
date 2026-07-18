@@ -20,11 +20,13 @@ from .parser import LASParser
 
 logger = logging.getLogger(__name__)
 
-# F-32 + G-17: Characters that Python's splitlines() treats as line breaks
-# beyond \n and \r.  Sanitize before splitlines() to prevent section-header
-# injection in crafted files.  The writer's _CONTROL_CHARS_RE already strips
+# F-32 + G-17 + F-I2-M04 + F-I2-M05: Control characters that appear in file
+# content and must be stripped before splitlines() to prevent section-header
+# injection and silent data corruption.  The writer's _CONTROL_CHARS_RE strips
 # these; this makes the read path symmetric.
-_SPLITLINES_CHARS_RE = re.compile(r"[\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+# Characters: \x00-\x08, \x0B (VT), \x0C (FF), \x0E-\x1F (FS/GS/RS/etc.),
+# \x7F (DEL), \x85 (NEL), \u2028 (LINE SEPARATOR), \u2029 (PARAGRAPH SEPARATOR).
+_SPLITLINES_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85\u2028\u2029]")
 
 
 def read_las_file(

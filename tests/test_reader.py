@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from pylasdev import read_las_file, read_las_file_as_object
+from pylasdev import read_dev_file, read_las_file, read_las_file_as_object
 from pylasdev.exceptions import LASParseError, LASReadError
 from pylasdev.models import LASFile
 
@@ -1968,3 +1968,212 @@ class TestGetNullValue:
         well: dict[str, str] = {}
         result = _get_null_value(well)
         assert result == -999.25
+
+
+class TestMaxTokensPerLineGuard:
+    """M68: Tests for MAX_TOKENS_PER_LINE DoS guard.
+
+    MAX_TOKENS_PER_LINE (data_reader.py:37, =MAX_CURVES=100_000)
+    caps the number of tokens parsed from a single data line to
+    prevent resource exhaustion from pathological input. Used at
+    7 call sites across data_reader.py and dev_reader.py.
+    Previously had zero test coverage (grep confirmed).
+    """
+
+    def test_token_count_capped_in_normal_mode(self, tmp_path: Path) -> None:
+        """MAX_TOKENS_PER_LINE caps tokens in normal (non-wrapped) mode.
+
+        Mock MAX_TOKENS_PER_LINE to a low value and verify that extra
+        tokens on a data line are silently truncated instead of causing
+        resource exhaustion.
+        """
+        from unittest import mock
+
+        # Build a file with 3 declared curves but 4+ space-separated
+        # tokens on a data line.
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            " GR.GAPI  :  Gamma Ray\n"
+            "~A  DEPT  DT  GR\n"
+            "100.0  50.0  75.0  99.0\n"
+            "101.0  51.0  76.0  88.0\n"
+        )
+        test_file = tmp_path / "token_cap_normal.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Patch MAX_TOKENS_PER_LINE to 2: split() produces at most 3 tokens.
+        # Data line "100.0  50.0  75.0  99.0" → "100.0", "50.0", "75.0  99.0"
+        # The 4th value is merged into the 3rd token, causing a float parse
+        # failure → substituted with null_value.
+        with mock.patch("pylasdev.data_reader.MAX_TOKENS_PER_LINE", 2):
+            data = read_las_file(test_file)
+            # Extra 4th value on each line should be silently handled
+            assert len(data["logs"]["DEPT"]) == 2
+            assert data["logs"]["DEPT"][0] == 100.0
+
+    def test_token_count_capped_in_wrapped_mode(self, tmp_path: Path) -> None:
+        """MAX_TOKENS_PER_LINE caps tokens in wrapped mode."""
+        from unittest import mock
+
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A\n"
+            "100.0\n"
+            "50.0  99.0  88.0\n"
+            "101.0\n"
+            "51.0\n"
+        )
+        test_file = tmp_path / "token_cap_wrapped.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Patch MAX_TOKENS_PER_LINE low: wrapped-mode split also capped
+        with mock.patch("pylasdev.data_reader.MAX_TOKENS_PER_LINE", 1):
+            data = read_las_file(test_file)
+            assert data["logs"]["DEPT"][0] == 100.0
+
+    def test_token_cap_dev_reader(self, tmp_path: Path) -> None:
+        """MAX_TOKENS_PER_LINE capped in DEV reader (dev_reader.py:719)."""
+        from unittest import mock
+
+        content = (
+            "MD TVD X Y Z\n"
+            "0.0 0.0 100.0 200.0 300.0\n"
+            "100.0 99.0 101.0 201.0 301.0\n"
+        )
+        test_file = tmp_path / "token_cap_dev.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Patch dev_reader's import — read_dev_file uses the module's constant
+        with mock.patch("pylasdev.dev_reader.MAX_TOKENS_PER_LINE", 2):
+            data = read_dev_file(test_file)
+            # split(maxsplit=2) produces at most 3 tokens from 5-space line
+            assert "MD" in data
+            assert "TVD" in data
+
+
+class TestMaxLimitsAtLimit:
+    """M69: At-limit tests for MAX_* reader guards.
+
+    All existing MAX_DATA_LINES, MAX_CURVES, and MAX_TOTAL_ELEMENTS
+    tests use mock values (0, 1) below actual content size. No test
+    verifies that exactly-at-limit passes correctly — off-by-one bug
+    risk (confirmed by F-I2-M32: >= vs > inconsistency across parser
+    and from_dict).
+    """
+
+    def test_max_curves_at_limit_passes(self, tmp_path: Path) -> None:
+        """MAX_CURVES set exactly to the file's curve count — must pass."""
+        from unittest import mock
+
+        # File has exactly 2 curves
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A  DEPT  DT\n"
+            "100.0  50.0\n"
+        )
+        test_file = tmp_path / "at_limit_curves.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        # MAX_CURVES=2 matches actual curve count — should pass
+        with mock.patch("pylasdev.data_reader.MAX_CURVES", 2):
+            data = read_las_file(test_file)
+            assert len(data["logs"]) == 2
+            assert data["logs"]["DEPT"][0] == 100.0
+
+    def test_max_data_lines_at_limit_passes(self, tmp_path: Path) -> None:
+        """MAX_DATA_LINES set exactly to the file's data line count — must pass."""
+        from unittest import mock
+
+        # File has exactly 1 data line
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~A  DEPT\n"
+            "100.0\n"
+        )
+        test_file = tmp_path / "at_limit_lines.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        # MAX_DATA_LINES=1 matches actual data line count — should pass
+        with mock.patch("pylasdev.data_reader.MAX_DATA_LINES", 1):
+            data = read_las_file(test_file)
+            assert len(data["logs"]["DEPT"]) == 1
+            assert data["logs"]["DEPT"][0] == 100.0
+
+    def test_max_total_elements_at_limit_passes(self, tmp_path: Path) -> None:
+        """MAX_TOTAL_ELEMENTS set exactly to curves*lines — must pass."""
+        from unittest import mock
+
+        # File has 2 curves x 1 data line = 2 elements
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A  DEPT  DT\n"
+            "100.0  50.0\n"
+        )
+        test_file = tmp_path / "at_limit_total.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        # MAX_TOTAL_ELEMENTS=2 matches curves*lines — should pass
+        with mock.patch("pylasdev.data_reader.MAX_TOTAL_ELEMENTS", 2):
+            data = read_las_file(test_file)
+            assert len(data["logs"]["DEPT"]) == 1
+            assert data["logs"]["DEPT"][0] == 100.0
+
+    def test_max_curves_wrapped_at_limit_passes(self, tmp_path: Path) -> None:
+        """MAX_CURVES at limit in wrapped mode — must pass."""
+        from unittest import mock
+
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A\n"
+            "100.0\n"
+            "50.0\n"
+        )
+        test_file = tmp_path / "at_limit_wrap_curves.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        # MAX_CURVES=2 matches actual — should pass
+        with mock.patch("pylasdev.data_reader.MAX_CURVES", 2):
+            data = read_las_file(test_file)
+            assert len(data["logs"]) == 2
+            assert data["logs"]["DEPT"][0] == 100.0

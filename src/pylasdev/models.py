@@ -442,31 +442,45 @@ class LASFile:
             well = _resolve_dict_entry(data, "well", dict, dict)
             # F-057: Bound check — parser has MAX_DEFERRED_WELL_ENTRIES on its
             # well re-processing path; from_dict previously had no bound at all.
-            if len(well) > MAX_WELL_ENTRIES:
+            if len(well) >= MAX_WELL_ENTRIES:
                 raise ValueError(
                     f"Number of well entries ({len(well)}) exceeds maximum "
                     f"allowed ({MAX_WELL_ENTRIES})"
                 )
             for key, value in well.items():
+                if not isinstance(key, str):
+                    raise TypeError(
+                        f"Well dict key must be str, got {type(key).__name__}: {key!r}"
+                    )
                 las_file.well[key] = _safe_str(value)
             # Restore well units if present (from v1.7+ roundtrip data)
             well_units = _resolve_dict_entry(data, "well_units", dict, dict)
-            if len(well_units) > MAX_WELL_ENTRIES:
+            if len(well_units) >= MAX_WELL_ENTRIES:
                 raise ValueError(
                     f"Number of well unit entries ({len(well_units)}) exceeds "
                     f"maximum allowed ({MAX_WELL_ENTRIES})"
                 )
             for key, unit in well_units.items():
+                if not isinstance(key, str):
+                    raise TypeError(
+                        f"Well unit dict key must be str, "
+                        f"got {type(key).__name__}: {key!r}"
+                    )
                 las_file.well.units[key] = _safe_str(unit)
 
             # Restore well descriptions if present (from v1.8+ roundtrip data)
             well_descriptions = _resolve_dict_entry(data, "well_descriptions", dict, dict)
-            if len(well_descriptions) > MAX_WELL_ENTRIES:
+            if len(well_descriptions) >= MAX_WELL_ENTRIES:
                 raise ValueError(
                     f"Number of well description entries ({len(well_descriptions)}) "
                     f"exceeds maximum allowed ({MAX_WELL_ENTRIES})"
                 )
             for key, desc in well_descriptions.items():
+                if not isinstance(key, str):
+                    raise TypeError(
+                        f"Well description dict key must be str, "
+                        f"got {type(key).__name__}: {key!r}"
+                    )
                 las_file.well.descriptions[key] = _safe_str(desc)
 
             curves_order = data.get("curves_order", [])
@@ -496,7 +510,7 @@ class LASFile:
             # and crashing at len(None).  Same pattern at 6 other sites below.
             curves_data = _resolve_dict_entry(data, "curves", list, list)
             # F-06: Resource-exhaustion guard — match parser's MAX_CURVES check.
-            if len(curves_data) > MAX_CURVES:
+            if len(curves_data) >= MAX_CURVES:
                 raise ValueError(
                     f"Number of curves ({len(curves_data)}) exceeds maximum "
                     f"allowed ({MAX_CURVES})"
@@ -510,13 +524,15 @@ class LASFile:
                         array_info = None
                         if "array_info" in curve_dict and isinstance(curve_dict["array_info"], dict):
                             ai = curve_dict["array_info"]
-                            array_info = ArrayElementInfo(
-                                base_name=_safe_str(ai.get("base_name")),
-                                index=_resolve_dict_entry(ai, "index", int, lambda: 0),
-                                # F2-002: Validate time_offset — int(offset) in
-                                # writer.py crashes on non-numeric values.
-                                time_offset=_resolve_dict_entry(ai, "time_offset", (int, float), lambda: None),
-                            )
+                            _base_name = _safe_str(ai.get("base_name"))
+                            if _base_name:
+                                array_info = ArrayElementInfo(
+                                    base_name=_base_name,
+                                    index=_resolve_dict_entry(ai, "index", int, lambda: 0),
+                                    # F2-002: Validate time_offset — int(offset) in
+                                    # writer.py crashes on non-numeric values.
+                                    time_offset=_resolve_dict_entry(ai, "time_offset", (int, float), lambda: None),
+                                )
                         las_file.curves.append(
                             CurveDefinition(
                                 mnemonic=_safe_str(curve_dict.get("mnemonic", "")),
@@ -541,7 +557,7 @@ class LASFile:
             # (reached when curves_data is empty list or falsy)
             if not las_file.curves:
                 # F-06: Resource-exhaustion guard for legacy curves_order path.
-                if len(curves_order) > MAX_CURVES:
+                if len(curves_order) >= MAX_CURVES:
                     raise ValueError(
                         f"Number of curves ({len(curves_order)}) exceeds maximum "
                         f"allowed ({MAX_CURVES})"
@@ -571,7 +587,7 @@ class LASFile:
             params = _resolve_dict_entry(data, "parameters", (dict, list), list)
             # F-06: Resource-exhaustion guard for parameters.
             _param_count = len(params)
-            if _param_count > MAX_PARAMETERS:
+            if _param_count >= MAX_PARAMETERS:
                 raise ValueError(
                     f"Number of parameters ({_param_count}) exceeds maximum "
                     f"allowed ({MAX_PARAMETERS})"
@@ -582,7 +598,7 @@ class LASFile:
                 # on roundtrip (e.g. array_index, zone, unit, description).
                 param_details = data.get("parameter_details")
                 if param_details:
-                    if len(param_details) > MAX_PARAMETERS:
+                    if len(param_details) >= MAX_PARAMETERS:
                         raise ValueError(
                             f"Number of parameter details ({len(param_details)}) exceeds maximum "
                             f"allowed ({MAX_PARAMETERS})"
@@ -616,10 +632,16 @@ class LASFile:
                 )
 
             # F-06: Resource-exhaustion guard for other section content.
-            _other_raw = str(data.get("other", ""))
-            if len(_other_raw) > MAX_OTHER_LINES:
+            # F-I2-M33: Count lines not characters (matching parser behavior).
+            # The parser counts len(list[str]) — individual lines appended to
+            # _other_lines.  from_dict previously counted len(str) — characters
+            # in the joined other-section string.  Using splitlines() aligns
+            # the guard: a file accepted by parse() is accepted by from_dict().
+            _other_str = str(data.get("other", ""))
+            _other_line_count = len(_other_str.splitlines())
+            if _other_line_count >= MAX_OTHER_LINES:
                 raise ValueError(
-                    f"Other section length ({len(_other_raw)} chars) exceeds "
+                    f"Other section line count ({_other_line_count}) exceeds "
                     f"maximum allowed ({MAX_OTHER_LINES})"
                 )
             las_file.other = _safe_str(data.get("other"), "")
@@ -629,7 +651,7 @@ class LASFile:
             # Restore LAS 3.0 data sections
             ds_data = _resolve_dict_entry(data, "data_sections", list, list)
             # F-06: Resource-exhaustion guard for data sections.
-            if len(ds_data) > MAX_DATA_SECTIONS:
+            if len(ds_data) >= MAX_DATA_SECTIONS:
                 raise ValueError(
                     f"Number of data sections ({len(ds_data)}) exceeds maximum "
                     f"allowed ({MAX_DATA_SECTIONS})"
@@ -646,7 +668,7 @@ class LASFile:
                 # iterable dict in from_dict() has a count guard (curves_data →
                 # MAX_CURVES, ds_data → MAX_CURVES, logs → MAX_CURVES, etc.);
                 # string_data was the sole unguarded iterable.
-                if len(_ds_string_raw) > MAX_CURVES:
+                if len(_ds_string_raw) >= MAX_CURVES:
                     ds_name = ds_dict.get("name", "<unknown>")
                     raise ValueError(
                         f"Number of string data curves ({len(_ds_string_raw)}) "
@@ -694,7 +716,7 @@ class LASFile:
                 # the same MAX_CURVES check used for top-level curves_data and
                 # curves_order.  The parser path has this guard (parser.py:1344);
                 # from_dict() was the sole unguarded path.
-                if len(_sc_raw) > MAX_CURVES:
+                if len(_sc_raw) >= MAX_CURVES:
                     ds_name = ds_dict.get("name", "<unknown>")
                     raise ValueError(
                         f"Number of section curves ({len(_sc_raw)}) in section "
@@ -708,13 +730,15 @@ class LASFile:
                     sc_array_info = None
                     if "array_info" in sc_dict and isinstance(sc_dict["array_info"], dict):
                         ai = sc_dict["array_info"]
-                        sc_array_info = ArrayElementInfo(
-                            base_name=_safe_str(ai.get("base_name")),
-                            index=_resolve_dict_entry(ai, "index", int, lambda: 0),
-                            # F2-002: Validate time_offset — int(offset) in
-                            # writer.py crashes on non-numeric values.
-                            time_offset=_resolve_dict_entry(ai, "time_offset", (int, float), lambda: None),
-                        )
+                        _sc_base_name = _safe_str(ai.get("base_name"))
+                        if _sc_base_name:
+                            sc_array_info = ArrayElementInfo(
+                                base_name=_sc_base_name,
+                                index=_resolve_dict_entry(ai, "index", int, lambda: 0),
+                                # F2-002: Validate time_offset — int(offset) in
+                                # writer.py crashes on non-numeric values.
+                                time_offset=_resolve_dict_entry(ai, "time_offset", (int, float), lambda: None),
+                            )
                     ds_section_curves.append(
                         CurveDefinition(
                             mnemonic=_safe_str(sc_dict.get("mnemonic", "")),
@@ -731,7 +755,7 @@ class LASFile:
                 # guards section count; per-array MAX_DATA_LINES guards element
                 # count.  Per-section curve entry count was unguarded — 1 section
                 # x 200K single-element arrays passes all existing guards.
-                if len(ds_data_raw) > MAX_CURVES:
+                if len(ds_data_raw) >= MAX_CURVES:
                     ds_name = ds_dict.get("name", "<unknown>")
                     raise ValueError(
                         f"Number of data curves ({len(ds_data_raw)}) in section "
@@ -778,6 +802,21 @@ class LASFile:
                             f"{_ds_total} elements) exceeds maximum allowed "
                             f"({MAX_TOTAL_ELEMENTS})"
                         )
+                # F-I2-M20: Cross-validate data and string_data key sets within
+                # the same DataSection.  When a curve name appears in both dicts,
+                # the writer silently discards one (string_data wins — writer.py
+                # line 703 checks string_data first).  Either way, data is lost.
+                # Reject the input so callers get a clear error instead of silent
+                # data discard on the roundtrip path.
+                if ds_data and ds_string_data:
+                    _colliding = set(ds_data.keys()) & set(ds_string_data.keys())
+                    if _colliding:
+                        ds_name = ds_dict.get("name", "<unknown>")
+                        raise ValueError(
+                            f"Section '{ds_name}': curve(s) {sorted(_colliding)} appear "
+                            f"in both 'data' and 'string_data'.  Each curve must appear "
+                            f"in exactly one collection."
+                        )
                 _ds_curves_order = ds_dict.get("curves_order", [])
                 # F2-22: Guard against non-list iterables for per-section
                 # curves_order — same bug as top-level F-21.
@@ -789,6 +828,60 @@ class LASFile:
                         f"curves_order in section '{ds_name}' must be a list, "
                         f"got str: {_ds_curves_order!r}"
                     )
+                # F-I2-M19: Detect duplicate curve names in section.  The parser
+                # calls _deduplicate_curves() at data-read time to rename
+                # collisions (append _2, _3 suffixes).  from_dict had zero dedup
+                # calls, so duplicates passed silently — the pairwise zip
+                # cross-validation (F-23 below) naturally pairs identical names
+                # at matching positions.  Raise a clear error instead of silently
+                # accepting duplicate curves.
+                if _ds_curves_order:
+                    _seen_n: set[str] = set()
+                    for _n in _ds_curves_order:
+                        if _n in _seen_n:
+                            ds_name = ds_dict.get("name", "<unknown>")
+                            raise ValueError(
+                                f"Duplicate curve name {_n!r} in section '{ds_name}' "
+                                f"curves_order.  Curve names must be unique within "
+                                f"a data section."
+                            )
+                        _seen_n.add(_n)
+                # Cross-validate string_data and data keys against
+                # curves_order.  Keys in either dict that do not appear
+                # in curves_order are orphaned — the writer silently
+                # drops them, producing data loss on roundtrip.
+                _curve_k = set(_ds_curves_order) if _ds_curves_order else set()
+                if ds_string_data:
+                    _str_orphaned = set(ds_string_data.keys()) - _curve_k
+                    if _str_orphaned:
+                        ds_name = ds_dict.get("name", "<unknown>")
+                        raise ValueError(
+                            f"string_data in section '{ds_name}' contains "
+                            f"keys not in curves_order: {sorted(_str_orphaned)}. "
+                            f"Each string_data key must correspond to a curve "
+                            f"mnemonic."
+                        )
+                if ds_data:
+                    _num_orphaned = set(ds_data.keys()) - _curve_k
+                    if _num_orphaned:
+                        ds_name = ds_dict.get("name", "<unknown>")
+                        raise ValueError(
+                            f"data in section '{ds_name}' contains "
+                            f"keys not in curves_order: {sorted(_num_orphaned)}. "
+                            f"Each data key must correspond to a curve mnemonic."
+                        )
+                if ds_section_curves:
+                    _sc_mnemonics = [sc.mnemonic for sc in ds_section_curves]
+                    _seen_m: set[str] = set()
+                    for _m in _sc_mnemonics:
+                        if _m in _seen_m:
+                            ds_name = ds_dict.get("name", "<unknown>")
+                            raise ValueError(
+                                f"Duplicate mnemonic {_m!r} in section '{ds_name}' "
+                                f"section_curves.  Curve mnemonics must be unique "
+                                f"within a data section."
+                            )
+                        _seen_m.add(_m)
                 # F-23: Cross-validate per-section curves_order with section_curves,
                 # matching the top-level cross-validation pattern.  from_dict builds
                 # these from independent dict keys; mismatched input would produce
@@ -818,7 +911,7 @@ class LASFile:
                 # empty the length cross-validation above gates out, leaving
                 # _ds_curves_order unbounded.  Every other iterable in from_dict
                 # has a count guard — this was the sole unguarded path.
-                if len(_ds_curves_order) > MAX_CURVES:
+                if len(_ds_curves_order) >= MAX_CURVES:
                     ds_name = ds_dict.get("name", "<unknown>")
                     raise ValueError(
                         f"Number of curves_order entries ({len(_ds_curves_order)}) "
@@ -874,7 +967,7 @@ class LASFile:
             sd = _resolve_dict_entry(data, "string_data", dict, dict)
             # F-24: Top-level string_data entry count guard — same gap as
             # the per-section path fixed above.
-            if len(sd) > MAX_CURVES:
+            if len(sd) >= MAX_CURVES:
                 raise ValueError(
                     f"Number of string data curves ({len(sd)}) exceeds "
                     f"maximum allowed ({MAX_CURVES})"
@@ -911,7 +1004,7 @@ class LASFile:
 
             logs = _resolve_dict_entry(data, "logs", dict, dict)
             # F-06: Resource-exhaustion guard for logs.
-            if len(logs) > MAX_CURVES:
+            if len(logs) >= MAX_CURVES:
                 raise ValueError(
                     f"Number of log curves ({len(logs)}) exceeds maximum "
                     f"allowed ({MAX_CURVES})"
@@ -987,9 +1080,25 @@ class LASFile:
                         f"{_log_rows} rows = {_log_total} elements) exceeds maximum "
                         f"allowed ({MAX_TOTAL_ELEMENTS})"
                     )
+            # F-I2-M19: Detect duplicate curve names at the top level
+            # for legacy (non-LAS-3.0) files.  LAS 3.0 files distribute
+            # curve data across multiple data_sections — the same curve
+            # name like "DEPT" legitimately appears in every section's
+            # curves_order, producing duplicates in the top-level list.
+            # The parser calls _deduplicate_curves() before data allocation
+            # for legacy files; from_dict rejects duplicates for these.
+            if las_file.curves_order and not las_file.data_sections:
+                _top_seen: set[str] = set()
+                for _n in las_file.curves_order:
+                    if _n in _top_seen:
+                        raise ValueError(
+                            f"Duplicate curve name {_n!r} in top-level "
+                            f"curves_order.  Curve names must be unique."
+                        )
+                    _top_seen.add(_n)
 
             return las_file
-        except ValueError as e:
+        except (ValueError, TypeError) as e:
             raise LASDataError(str(e)) from e
 
     @property
@@ -1074,7 +1183,7 @@ class DevFile:
 
             # F-M01: Resource-exhaustion guard — bound column count.
             _column_keys = [k for k in data if k not in metadata_keys]
-            if len(_column_keys) > MAX_CURVES:
+            if len(_column_keys) >= MAX_CURVES:
                 raise ValueError(
                     f"Number of columns ({len(_column_keys)}) exceeds maximum "
                     f"allowed ({MAX_CURVES})"
@@ -1092,7 +1201,13 @@ class DevFile:
                         elif isinstance(value, str):
                             dev.column_order = [value]
                         else:
-                            dev.column_order = list(value)
+                            _col_order = list(value)
+                            if len(_col_order) >= MAX_CURVES:
+                                raise ValueError(
+                                    f"column_order has {len(_col_order)} entries, "
+                                    f"maximum allowed is {MAX_CURVES - 1}."
+                                )
+                            dev.column_order = _col_order
                 else:
                     # F-I2-M02: None guard — np.array(None, dtype=np.float64)
                     # silently produces nan, consistent with string data guards.

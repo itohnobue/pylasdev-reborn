@@ -249,6 +249,7 @@ def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " "
         True if data is actually wrapped, False if non-wrapped despite header.
     """
     in_ascii = False
+    _first_wrap: bool | None = None  # None = not yet found
     for line in lines:
         stripped = line.strip()
 
@@ -298,18 +299,40 @@ def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " "
         # (the simpler path) when there is nothing to distinguish.
         if curve_count <= 1:
             return False
-        # F-023: For non-space delimiters (COMMA, TAB), trailing empty values
-        # can be omitted per CSV convention, making the first line appear
-        # shorter than curve_count.  Use a different heuristic: a wrapped
-        # depth line always has exactly 1 value; if the first data line has
-        # >1 values, it's non-wrapped regardless of curve_count.
+
+        if _first_wrap is None:
+            # First data line — determine initial wrap heuristic.
+            # F-023: For non-space delimiters (COMMA, TAB), trailing empty
+            # values can be omitted per CSV convention, making the first
+            # line appear shorter than curve_count.  Use a different
+            # heuristic: a wrapped depth line always has exactly 1 value;
+            # if the first data line has >1 values, it's non-wrapped
+            # regardless of curve_count.
+            if delimiter != " ":
+                _first_wrap = len(values) <= 1
+            else:
+                _first_wrap = len(values) < curve_count
+            if not _first_wrap:
+                return False  # Not wrapped — no need for second peek
+            # Wrapped — continue to second data line for corroboration
+            # (F-M16: secondary peek prevents sparse-first-line false
+            # positives).
+            continue
+
+        # Second data line — corroborate wrap detection (F-M16).
+        # If the first data line had fewer values than curve_count
+        # (suggesting wrapped), but the second data line has full
+        # values, the first line was sparse rather than wrapped.
         if delimiter != " ":
-            # A depth-only line in wrapped mode has exactly 1 value.
-            # Multiple values on the first data line → non-wrapped.
-            return len(values) <= 1
+            _corroborates = len(values) <= 1
         else:
-            # Space delimiter: traditional heuristic.
-            return len(values) < curve_count
+            _corroborates = len(values) < curve_count
+
+        if not _corroborates:
+            # Second line has full values — first line was sparse,
+            # not wrapped.
+            return False
+        return True  # Second line corroborates wrap
 
     return True  # No data found, default to wrapped
 

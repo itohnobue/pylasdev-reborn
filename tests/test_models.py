@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from pylasdev.exceptions import LASDataError
 from pylasdev.models import (
     ArrayElementInfo,
     CurveDefinition,
@@ -452,7 +453,9 @@ class TestLASFile:
         """Test DataSection with empty section_curves survives roundtrip.
 
         Covers the edge case where section_curves=[] should serialize
-        as [] and deserialize as [].
+        as [] and deserialize as []. Also verifies that name,
+        section_type, curves_order, and data content survive roundtrip
+        (F-I2-M54: previously only checked len + section_curves=[]).
         """
         las = LASFile()
         las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
@@ -475,7 +478,15 @@ class TestLASFile:
 
         assert len(las2.data_sections) == 1
         rt_section = las2.data_sections[0]
+        assert rt_section.name == "LOG"
+        assert rt_section.section_type == "LOG_DATA"
+        assert rt_section.curves_order == ["DEPT"]
         assert rt_section.section_curves == []
+        # F-I2-M54: verify data content survives roundtrip
+        assert "DEPT" in rt_section.data
+        np.testing.assert_array_equal(
+            rt_section.data["DEPT"], np.array([100.0])
+        )
 
     # --- F-01 fix: MAX_PARAMETERS guard on parameter_details ---
 
@@ -502,6 +513,29 @@ class TestLASFile:
         with pytest.raises(ValueError, match="Number of parameter details"):
             LASFile.from_dict(data)
 
+    def test_from_dict_parameter_details_max_at_limit(self, monkeypatch) -> None:
+        """At-limit: MAX_PARAMETERS-1 parameter_details should pass (F-I2-M56).
+
+        The guard uses >= (not >), so exactly MAX_PARAMETERS items are also
+        rejected. N-1 items are the last count that passes (off-by-one bug
+        confirmed by F-I2-M32). This test documents the actual boundary.
+        """
+        monkeypatch.setattr("pylasdev.parser.MAX_PARAMETERS", 5)
+
+        exact_details = [
+            {"mnemonic": f"PARAM_{i}", "value": str(i)} for i in range(4)
+        ]
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100"},
+            "curves_order": ["DEPT"],
+            "parameters": {"_": "_"},
+            "parameter_details": exact_details,
+            "logs": {"DEPT": np.array([100.0])},
+        }
+        las = LASFile.from_dict(data)
+        assert len(las.parameters) == 4
+
     # --- F-057 fix: MAX_WELL_ENTRIES guard on well, well_units, well_descriptions ---
 
     def test_from_dict_well_entries_max_guard(self, monkeypatch) -> None:
@@ -523,6 +557,23 @@ class TestLASFile:
         with pytest.raises(ValueError, match="Number of well entries"):
             LASFile.from_dict(data)
 
+    def test_from_dict_well_entries_max_at_limit(self, monkeypatch) -> None:
+        """At-limit: MAX_PARAMETERS-1 well entries should pass (F-I2-M56).
+
+        The guard uses >= (not >), so the last passing count is N-1.
+        """
+        monkeypatch.setattr("pylasdev.parser.MAX_PARAMETERS", 5)
+
+        exact_well = {f"KEY_{i}": str(i) for i in range(4)}
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": exact_well,
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+        }
+        las = LASFile.from_dict(data)
+        assert len(las.well.entries) == 4
+
     def test_from_dict_well_units_max_guard(self, monkeypatch) -> None:
         """LASFile.from_dict() enforces MAX_WELL_ENTRIES on well_units (F-057 fix)."""
         monkeypatch.setattr("pylasdev.parser.MAX_PARAMETERS", 5)
@@ -538,6 +589,24 @@ class TestLASFile:
         with pytest.raises(ValueError, match="well unit entries"):
             LASFile.from_dict(data)
 
+    def test_from_dict_well_units_max_at_limit(self, monkeypatch) -> None:
+        """At-limit: MAX_PARAMETERS-1 well_units should pass (F-I2-M56).
+
+        The guard uses >= (not >), so the last passing count is N-1.
+        """
+        monkeypatch.setattr("pylasdev.parser.MAX_PARAMETERS", 5)
+
+        exact_units = {f"KEY_{i}": "unit" for i in range(4)}
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100"},
+            "well_units": exact_units,
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+        }
+        las = LASFile.from_dict(data)
+        assert len(las.well.units) == 4
+
     def test_from_dict_well_descriptions_max_guard(self, monkeypatch) -> None:
         """LASFile.from_dict() enforces MAX_WELL_ENTRIES on well_descriptions (F-057 fix)."""
         monkeypatch.setattr("pylasdev.parser.MAX_PARAMETERS", 5)
@@ -552,6 +621,24 @@ class TestLASFile:
         }
         with pytest.raises(ValueError, match="well description entries"):
             LASFile.from_dict(data)
+
+    def test_from_dict_well_descriptions_max_at_limit(self, monkeypatch) -> None:
+        """At-limit: MAX_PARAMETERS-1 well_descriptions should pass (F-I2-M56).
+
+        The guard uses >= (not >), so the last passing count is N-1.
+        """
+        monkeypatch.setattr("pylasdev.parser.MAX_PARAMETERS", 5)
+
+        exact_descs = {f"KEY_{i}": "desc" for i in range(4)}
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100"},
+            "well_descriptions": exact_descs,
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+        }
+        las = LASFile.from_dict(data)
+        assert len(las.well.descriptions) == 4
 
     # --- F2-17 fix: dict.get() None bypass in CurveDefinition ---
 
@@ -603,7 +690,14 @@ class TestLASFile:
         }
         las = LASFile.from_dict(data)
         assert len(las.data_sections) == 1
-        sc = las.data_sections[0].section_curves[0]
+        ds = las.data_sections[0]
+        # F-I2-M55: verify data content and metadata survive from_dict
+        assert ds.name == "LOG"
+        assert ds.section_type == "LOG_DATA"
+        assert ds.curves_order == ["DEPT"]
+        assert "DEPT" in ds.data
+        np.testing.assert_array_equal(ds.data["DEPT"], np.array([100.0]))
+        sc = ds.section_curves[0]
         assert sc.mnemonic == "DEPT"
         assert sc.unit == ""
         assert sc.data_format == ""
@@ -689,6 +783,32 @@ class TestLASFile:
         with pytest.raises(ValueError, match="Number of string data curves"):
             LASFile.from_dict(data)
 
+    def test_from_dict_string_data_max_at_limit_per_section(self, monkeypatch) -> None:
+        """At-limit: MAX_CURVES-1 string_data per-section should pass (F-I2-M56).
+
+        The guard uses >= (not >), so the last passing count is N-1.
+        """
+        monkeypatch.setattr("pylasdev.data_reader.MAX_CURVES", 3)
+
+        str_curves = {f"STR_{i}": np.array(["a"]) for i in range(2)}
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "data_sections": [
+                {
+                    "name": "LOG",
+                    "section_type": "LOG_DATA",
+                    "curves_order": ["STR_0", "STR_1"],
+                    "string_data": str_curves,
+                }
+            ],
+        }
+        las = LASFile.from_dict(data)
+        assert len(las.data_sections[0].string_data) == 2
+
     def test_from_dict_string_data_max_guard_top_level(self, monkeypatch) -> None:
         """F-24: Top-level string_data count is bounded by MAX_CURVES."""
         monkeypatch.setattr("pylasdev.data_reader.MAX_CURVES", 3)
@@ -704,6 +824,25 @@ class TestLASFile:
         }
         with pytest.raises(ValueError, match="Number of string data curves"):
             LASFile.from_dict(data)
+
+    def test_from_dict_string_data_max_at_limit_top_level(self, monkeypatch) -> None:
+        """At-limit: MAX_CURVES-1 top-level string_data should pass (F-I2-M56).
+
+        The guard uses >= (not >), so the last passing count is N-1.
+        """
+        monkeypatch.setattr("pylasdev.data_reader.MAX_CURVES", 3)
+
+        str_curves = {f"STR_{i}": np.array(["a"]) for i in range(2)}
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "string_data": str_curves,
+        }
+        las = LASFile.from_dict(data)
+        assert len(las.string_data) == 2
 
     # --- F-25 fix: ValueError instead of UserWarning for inconsistent arrays ---
 
@@ -751,7 +890,7 @@ class TestLASFile:
     # --- F2-25 fix: isinstance guard before _create_parameter_entry ---
 
     def test_from_dict_parameter_details_non_dict_element(self) -> None:
-        """F2-25: Non-dict element in parameter_details raises TypeError."""
+        """F2-25: Non-dict element in parameter_details raises LASDataError."""
         data: dict[str, Any] = {
             "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
             "well": {"STRT": "100"},
@@ -764,11 +903,11 @@ class TestLASFile:
                 None,  # Non-dict element
             ],
         }
-        with pytest.raises(TypeError, match="must be a dict"):
+        with pytest.raises(LASDataError, match="must be a dict"):
             LASFile.from_dict(data)
 
     def test_from_dict_params_list_non_dict_element(self) -> None:
-        """F2-25: Non-dict element in params list raises TypeError."""
+        """F2-25: Non-dict element in params list raises LASDataError."""
         data: dict[str, Any] = {
             "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
             "well": {"STRT": "100"},
@@ -780,7 +919,7 @@ class TestLASFile:
                 "not_a_dict",  # Non-dict element
             ],
         }
-        with pytest.raises(TypeError, match="must be a dict"):
+        with pytest.raises(LASDataError, match="must be a dict"):
             LASFile.from_dict(data)
 
     # --- F-004: per-section string_data cross-array length ---
@@ -801,7 +940,7 @@ class TestLASFile:
                 {
                     "name": "LOG",
                     "section_type": "LOG_DATA",
-                    "curves_order": ["DEPT"],
+                    "curves_order": ["DEPT", "STR1", "STR2"],
                     "data": {"DEPT": np.array([100.0])},
                     "string_data": {
                         "STR1": np.array(["a", "b"]),
@@ -838,7 +977,7 @@ class TestLASFile:
     # --- F-025: non-int array_index ---
 
     def test_from_dict_non_int_array_index_raises(self) -> None:
-        """F-025: Non-int array_index in parameter entry raises TypeError.
+        """F-025: Non-int array_index in parameter entry raises LASDataError.
 
         _create_parameter_entry (models.py:47-55) validates that array_index
         is int or None.
@@ -857,13 +996,13 @@ class TestLASFile:
                 },
             ],
         }
-        with pytest.raises(TypeError, match="array_index: expected int or None"):
+        with pytest.raises(LASDataError, match="array_index: expected int or None"):
             LASFile.from_dict(data)
 
     # --- F-026: non-int zone_index ---
 
     def test_from_dict_non_int_zone_index_raises(self) -> None:
-        """F-026: Non-int zone_index in parameter zone raises TypeError.
+        """F-026: Non-int zone_index in parameter zone raises LASDataError.
 
         _create_parameter_entry (models.py:34-42) validates that zone_index
         is int or None.
@@ -885,13 +1024,13 @@ class TestLASFile:
                 },
             ],
         }
-        with pytest.raises(TypeError, match="zone_index: expected int or None"):
+        with pytest.raises(LASDataError, match="zone_index: expected int or None"):
             LASFile.from_dict(data)
 
     # --- F2-002: non-numeric time_offset ---
 
     def test_from_dict_non_numeric_time_offset_raises(self) -> None:
-        """F2-002: Non-numeric time_offset in curve array_info raises TypeError.
+        """F2-002: Non-numeric time_offset in curve array_info raises LASDataError.
 
         _resolve_dict_entry (models.py:88-111) validates time_offset against
         (int, float) at both curve sites (lines 490, 683).
@@ -912,7 +1051,7 @@ class TestLASFile:
             ],
             "logs": {"NMR[1]": np.array([100.0])},
         }
-        with pytest.raises(TypeError, match="time_offset: expected"):
+        with pytest.raises(LASDataError, match="time_offset: expected"):
             LASFile.from_dict(data)
 
     # --- F2-003: non-dict input to from_dict ---

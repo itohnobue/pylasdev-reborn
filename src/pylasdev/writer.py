@@ -85,6 +85,17 @@ def _sanitize_las_value(value: str) -> str:
     # injection — the parser treats _# as a normal value character.
     if value.startswith("#"):
         value = "_" + value
+    # F-I2-M12: After newline-to-space conversion above, the "#" character
+    # may be preceded by whitespace (e.g., "\n#comment" → " #comment"),
+    # bypassing the startswith("#") guard.  For COMMA/TAB-delimited output
+    # with single-curve data, this enables comment injection causing data
+    # loss on re-read.  Check for "#" after any leading whitespace and
+    # prefix with "_" to prevent this (SPACE delimiter is mitigated by
+    # the whitespace-to-underscore conversion in _format_data_rows).
+    elif value and value.lstrip().startswith("#"):
+        stripped = value.lstrip()
+        leading = value[:len(value) - len(stripped)]
+        value = leading + "_" + stripped
     return value
 
 
@@ -125,6 +136,22 @@ def _escape_colons_for_las_value(value: str) -> str:
     because that function also handles description text where ``": "``
     is a legitimate LAS spec formatting convention
     (e.g., ``"LAS 2.0 : CWLS LOG ASCII STANDARD"``).
+
+    .. important::
+
+        The underscore (``_``) characters inserted by this function are
+        **permanent** — they are NOT reversed during parsing.  Values
+        containing colons adjacent to whitespace (e.g., ``"Oil : Gas"``
+        → ``"Oil _:_ Gas"``) will NOT roundtrip to their original form.
+
+        This is a deliberate trade-off.  Without escaping, embedded colons
+        adjacent to whitespace would be misinterpreted as structural
+        separators, causing data truncation on re-read.  The underscore
+        artifacts are the lesser evil compared to data loss.
+
+        If roundtrip fidelity for colon-containing values is required,
+        consider adding an unescape step in the parser that reverses
+        this transformation (``_:_`` → `` : `` etc.).
     """
     # Step 1: Insert _ between whitespace and colon.
     # Prevents \\s+:\\s* from matching at embedded colons.
@@ -420,14 +447,34 @@ def _write_parameter_section(las_file: LASFile) -> list[str]:
         unit = _sanitize_las_value(param.unit) if param.unit else ""
         desc = param.description if param.description else ""
 
+        # F-M05: Emit data_format specifier in LAS 3.0 parameter lines,
+        # matching the curve writer pattern (_format_curve_line).  The
+        # parser strips the {F} specifier from the description and stores
+        # it in param.data_format; without this, {F} is irrevocably lost
+        # on roundtrip.
+        if is_las30 and param.data_format:
+            desc = f"{desc}  {{{param.data_format}}}"
+
         if is_las30 and param.zone:
             zone_str = f" | {param.zone.zone_name}"
             if param.zone.zone_index is not None:
                 zone_str += f"[{param.zone.zone_index}]"
             desc = f"{desc}{zone_str}"
 
+        # F-I2-M30: Escape colons in parameter values and descriptions
+        # after general sanitization.  Embedded colons with adjacent
+        # whitespace (": ") or trailing colons can be mistaken for the
+        # structural colon separator in the parser's DATA_LINE_PATTERN,
+        # causing truncation on re-read.  Well section handles this
+        # (_write_well_section lines 345-346); parameter section must
+        # do the same.
+        value = _sanitize_las_value(param.value)
+        desc = _sanitize_las_value(desc)
+        value = _escape_colons_for_las_value(value)
+        desc = _escape_colons_for_las_value(desc)
+
         lines.append(
-            f" {_sanitize_las_value(param.mnemonic)}.{unit}  {_sanitize_las_value(param.value)}  : {_sanitize_las_value(desc)}"
+            f" {_sanitize_las_value(param.mnemonic)}.{unit}  {value}  : {desc}"
         )
     lines.append("")
     return lines
@@ -542,8 +589,19 @@ def _format_curve_line(curve: CurveDefinition, is_las30: bool) -> str:
         format_str += "}"
         desc = f"{desc}  {format_str}"
 
-    api = f"  {_sanitize_las_value(curve.api_code)}" if curve.api_code else ""
-    return f" {_sanitize_las_value(curve.mnemonic)}.{unit}{api}  : {_sanitize_las_value(desc)}"
+    api_code = _sanitize_las_value(curve.api_code) if curve.api_code else ""
+    api = f"  {api_code}" if api_code else ""
+    # F-M10: Escape colons in the curve description after general
+    # sanitization.  Embedded colons with adjacent whitespace (e.g.,
+    # "Oil : Gas") can be mistaken for the structural colon separator
+    # in the parser's DATA_LINE_PATTERN, causing the description to
+    # be truncated on re-read (parser reads api_code="Oil", desc="Gas"
+    # instead of desc="Oil : Gas").  Well section handles this
+    # (_write_well_section lines 345-346); curve section must do the
+    # same.
+    desc = _sanitize_las_value(desc)
+    desc = _escape_colons_for_las_value(desc)
+    return f" {_sanitize_las_value(curve.mnemonic)}.{unit}{api}  : {desc}"
 
 
 def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str]:
