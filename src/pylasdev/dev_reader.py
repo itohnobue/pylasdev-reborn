@@ -939,7 +939,13 @@ def read_dev_file_as_object(
                         f"The file may be malformed or corrupt."
                     )
                 for name in names:
-                    dev.columns[name] = np.full(data_lines, np.nan, dtype=np.float64)
+                    try:
+                        dev.columns[name] = np.full(data_lines, np.nan, dtype=np.float64)
+                    except MemoryError as e:
+                        raise DEVReadError(
+                            f"Cannot allocate {data_lines} elements for column "
+                            f"'{name}' ({len(names)} columns total): out of memory"
+                        ) from e
                 dev.column_order = list(names)
                 # Store first data row.
                 for k in range(len(names)):
@@ -1016,7 +1022,13 @@ def read_dev_file_as_object(
                         f"The file may be malformed or corrupt."
                     )
                 for name in names:
-                    dev.columns[name] = np.full(data_lines, np.nan, dtype=np.float64)
+                    try:
+                        dev.columns[name] = np.full(data_lines, np.nan, dtype=np.float64)
+                    except MemoryError as e:
+                        raise DEVReadError(
+                            f"Cannot allocate {data_lines} elements for column "
+                            f"'{name}' ({len(names)} columns total): out of memory"
+                        ) from e
                 dev.column_order = list(names)
             else:
                 # Data lines.
@@ -1083,7 +1095,13 @@ def read_dev_file_as_object(
                         f"The file may be malformed or corrupt."
                     )
                 for name in names:
-                    dev.columns[name] = np.full(data_lines, np.nan, dtype=np.float64)
+                    try:
+                        dev.columns[name] = np.full(data_lines, np.nan, dtype=np.float64)
+                    except MemoryError as e:
+                        raise DEVReadError(
+                            f"Cannot allocate {data_lines} elements for column "
+                            f"'{name}' ({len(names)} columns total): out of memory"
+                        ) from e
                 dev.column_order = list(names)
             else:
                 # Data lines.

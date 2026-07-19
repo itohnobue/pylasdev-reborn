@@ -336,6 +336,26 @@ class TestDevSafetyGuards:
             with pytest.raises(DEVReadError, match="Cannot read file"):
                 read_dev_file(test_file)
 
+    def test_memory_error_allocation_wrapped_in_dev_read_error(self, tmp_path: Path) -> None:
+        """MemoryError from np.full() is wrapped in DEVReadError.
+
+        Exercises the three np.full() try/except blocks in dev_reader.py.
+        """
+        from unittest import mock
+
+        test_file = tmp_path / "oom.dev"
+        test_file.write_text(
+            "MD TVD X Y\n0.0 0.0 0.0 0.0\n1.0 1.0 1.0 1.0\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch(
+            "pylasdev.dev_reader.np.full",
+            side_effect=MemoryError("Cannot allocate memory"),
+        ):
+            with pytest.raises(DEVReadError, match="out of memory"):
+                read_dev_file(test_file)
+
     def test_max_data_lines_guard(self, tmp_path: Path) -> None:
         """MAX_DATA_LINES guard raises DEVReadError for excess data lines.
 

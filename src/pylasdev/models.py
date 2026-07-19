@@ -84,12 +84,15 @@ def _create_parameter_entry(param_dict: dict[str, Any]) -> ParameterEntry:
     _section_type = param_dict.get("section_type")
     if _section_type is not None and not isinstance(_section_type, str):
         _section_type = _safe_str(_section_type)
-    # I2F-08: Empty-string section_type is not normalized to None.
-    # ``""`` passes both guards (is not None, isinstance str), and the
-    # writer silently drops parameters with falsy section_type (line 532:
-    # ``if not section_type: continue``).  Normalize to None so that
-    # empty-string and absent are treated identically.
-    if _section_type == "":
+    # I2F-08 / F-M09: Empty-string and whitespace-only section_type is
+    # not normalized to None.  ``""`` passes both guards (is not None,
+    # isinstance str), and the writer silently drops parameters with
+    # falsy section_type (line 532: ``if not section_type: continue``).
+    # ``"  "`` (whitespace-only) passes all guards and survives
+    # roundtrip, producing unparseable ``~  _Parameter`` headers.
+    # Normalize both to None so that empty-string, whitespace-only,
+    # and absent are treated identically.
+    if _section_type is not None and _section_type.strip() == "":
         _section_type = None
     # F-118: Reject section_type values that could inject headers when
     # written.  The writer applies ``_sanitize_las_value`` which converts
@@ -533,6 +536,17 @@ class CurveDefinition:
     data_format: str = ""  # F, E, S, or A (from {F}, {E}, {S}, {A:x})
     array_info: ArrayElementInfo | None = None  # For array curves like NMR[1]
 
+    def __post_init__(self) -> None:
+        """Reject empty-or-whitespace mnemonic (F-M10).
+
+        Empty mnemonics produce malformed LAS output (`` .UNIT  : DESC``).
+        """
+        if not self.mnemonic or not self.mnemonic.strip():
+            raise ValueError(
+                f"CurveDefinition: mnemonic must not be empty or "
+                f"whitespace-only, got {self.mnemonic!r}"
+            )
+
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "mnemonic": self.mnemonic,
@@ -598,6 +612,17 @@ class ParameterEntry:
     # can reconstruct per-section parameter sections on roundtrip.
     # Parameters from a standard ~P/~Parameter section have section_type=None.
     section_type: str | None = None
+
+    def __post_init__(self) -> None:
+        """Reject empty-or-whitespace mnemonic (F-M10).
+
+        Empty mnemonics produce malformed LAS output.
+        """
+        if not self.mnemonic or not self.mnemonic.strip():
+            raise ValueError(
+                f"ParameterEntry: mnemonic must not be empty or "
+                f"whitespace-only, got {self.mnemonic!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -687,6 +712,26 @@ class DataSection:
                 f"curves_order: {_dups}"
             )
 
+        # F-M06 / F-M09: Validate and normalize section_type.
+        # _create_parameter_entry validates section_type for ParameterEntry
+        # (rejects newline/tilde) and normalizes whitespace-only to None;
+        # DataSection previously skipped both checks.  Mirror that
+        # validation here.
+        if self.section_type:
+            _stripped = self.section_type.strip()
+            if not _stripped:
+                # Whitespace-only → normalize to empty string.
+                # _safe_str ensures non-None; empty is a valid
+                # "no particular section type" value.
+                self.section_type = ""
+            elif '\n' in _stripped or '\r' in _stripped or '~' in _stripped:
+                raise LASDataError(
+                    f"DataSection '{self.name}': section_type contains "
+                    f"invalid characters (newline or tilde): "
+                    f"{self.section_type!r}.  section_type must be a "
+                    f"LAS identifier (alphanumeric + underscore)."
+                )
+
         # data keys ⊆ curves_order
         data_keys = set(self.data.keys())
         orphaned_data = data_keys - curve_set
@@ -712,6 +757,23 @@ class DataSection:
                 f"({len(self.section_curves)}) does not match curves_order "
                 f"length ({len(self.curves_order)})"
             )
+
+        # F-M04 / F-M21: Validate positional mnemonic alignment between
+        # section_curves and curves_order.  The from_dict path checks
+        # this (L1351-1360); direct DataSection construction previously
+        # bypassed.  Swapped mnemonics produce silently corrupted output.
+        if self.section_curves:
+            for _i, (_order_name, _sc) in enumerate(
+                zip(self.curves_order, self.section_curves, strict=True)
+            ):
+                if _order_name != _sc.mnemonic:
+                    raise LASDataError(
+                        f"DataSection '{self.name}': "
+                        f"curves_order[{_i}] = {_order_name!r} "
+                        f"does not match "
+                        f"section_curves[{_i}].mnemonic = "
+                        f"{_sc.mnemonic!r}"
+                    )
 
         # data and string_data must be disjoint — a curve name cannot
         # appear in both collections (writer silently picks one).
@@ -746,6 +808,22 @@ class DataSection:
                     f"string_data array lengths: {_string_lengths}"
                 )
 
+        # F-M22: Cross-group row-count validation.
+        # The from_dict path validates this (L1437-1445); direct
+        # DataSection construction previously bypassed.  The writer's
+        # _format_data_rows uses max() across all arrays — mismatched
+        # row counts between data and string_data produce semantically
+        # incorrect null-padded output.
+        if self.data and self.string_data:
+            _data_rows = max(len(arr) for arr in self.data.values())
+            _string_rows = max(len(arr) for arr in self.string_data.values())
+            if _data_rows != _string_rows:
+                raise LASDataError(
+                    f"DataSection '{self.name}': data row count "
+                    f"({_data_rows}) does not match string_data "
+                    f"row count ({_string_rows})"
+                )
+
 
 @dataclass(eq=False)
 class LASFile:
@@ -767,6 +845,81 @@ class LASFile:
     # LAS 3.0 specific fields
     data_sections: list[DataSection] = field(default_factory=list)
     string_data: dict[str, NDArray[np.str_]] = field(default_factory=dict)  # For {S} format curves
+
+    def __post_init__(self) -> None:
+        """Validate critical invariants after construction (F-M05).
+
+        ``from_dict`` validates 800+ lines of invariants; direct
+        ``LASFile`` construction previously bypassed all validation.
+        This catches the most egregious invalid states while allowing
+        incremental construction (empty collections skip validation).
+        """
+        # Deferred import to avoid circular dependencies.
+        from .exceptions import LASDataError
+
+        # --- curves_order / curves consistency ---
+        # Every name in curves_order must have a matching CurveDefinition
+        # at the same position.  Extra definitions (curves beyond
+        # curves_order length) are tolerated — they may be LAS 3.0
+        # per-section definitions also registered at the top level.
+        if self.curves_order and self.curves:
+            if len(self.curves) < len(self.curves_order):
+                raise LASDataError(
+                    f"LASFile: curves_order has "
+                    f"{len(self.curves_order)} entries but only "
+                    f"{len(self.curves)} curve definitions found"
+                )
+            for _i in range(len(self.curves_order)):
+                if self.curves_order[_i] != self.curves[_i].mnemonic:
+                    raise LASDataError(
+                        f"LASFile: curves_order[{_i}] = "
+                        f"{self.curves_order[_i]!r} does not match "
+                        f"curves[{_i}].mnemonic = "
+                        f"{self.curves[_i].mnemonic!r}"
+                    )
+
+        _order_set = set(self.curves_order) if self.curves_order else set()
+
+        # --- logs validation (skip when empty — allows incremental
+        # construction, e.g. LASFile() then attribute assignment) ---
+        if self.logs:
+            _log_keys = set(self.logs.keys())
+            _orphaned_logs = _log_keys - _order_set
+            if _orphaned_logs:
+                raise LASDataError(
+                    f"LASFile: logs contain keys not in "
+                    f"curves_order: {sorted(_orphaned_logs)}.  "
+                    f"Each log key must correspond to a curve "
+                    f"mnemonic."
+                )
+            if len(self.logs) > 1:
+                _log_len = {name: len(arr) for name, arr in self.logs.items()}
+                if len(set(_log_len.values())) > 1:
+                    raise LASDataError(
+                        f"LASFile: logs have inconsistent array "
+                        f"lengths: {_log_len}"
+                    )
+
+        # --- string_data validation (same skip-when-empty rule) ---
+        if self.string_data:
+            _str_keys = set(self.string_data.keys())
+            _orphaned_str = _str_keys - _order_set
+            if _orphaned_str:
+                raise LASDataError(
+                    f"LASFile: string_data contain keys not in "
+                    f"curves_order: {sorted(_orphaned_str)}.  "
+                    f"Each string_data key must correspond to a "
+                    f"curve mnemonic."
+                )
+            if len(self.string_data) > 1:
+                _str_len = {
+                    name: len(arr) for name, arr in self.string_data.items()
+                }
+                if len(set(_str_len.values())) > 1:
+                    raise LASDataError(
+                        f"LASFile: string_data have inconsistent "
+                        f"array lengths: {_str_len}"
+                    )
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to legacy dict format for backward compatibility.
@@ -1279,6 +1432,21 @@ class LASFile:
                         f"curves_order in section '{ds_name}' must be a list, "
                         f"got str: {_ds_curves_order!r}"
                     )
+                # F-I2E-05: Validate per-element types in per-section
+                # curves_order.  Container type is guarded (None / str / bytes
+                # above), but individual elements are not.  Non-string values
+                # (int, None, float) survive when section_curves is empty
+                # because the mnemonic cross-validation gate (L1496) is
+                # inactive.  str(123) → "123" becomes a column header on
+                # write; on re-read it looks like a genuine curve.
+                for _i, _item in enumerate(_ds_curves_order):
+                    if not isinstance(_item, (str, bytes)):
+                        ds_name = ds_dict.get("name", "<unknown>")
+                        raise TypeError(
+                            f"curves_order[{_i}] in section '{ds_name}' "
+                            f"must be str, got {type(_item).__name__}: "
+                            f"{_item!r}"
+                        )
                 # F-I2-M19: Detect duplicate curve names in section.  The parser
                 # calls _deduplicate_curves() at data-read time to rename
                 # collisions (append _2, _3 suffixes).  from_dict had zero dedup

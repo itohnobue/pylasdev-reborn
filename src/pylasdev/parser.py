@@ -127,6 +127,12 @@ SECTION_PATTERN = re.compile(r"^~([A-Za-z]\S*)(.*)")
 # separating value from description in standard "VALUE : DESCRIPTION" lines
 # and handling empty-value lines like "MNEM.UNIT       : DESCRIPTION".
 #
+# Per the CWLS LAS 2.0 specification, the LAST structurally-valid colon
+# is the delimiter.  The value group uses greedy (.*) matching so the
+# regex engine backtracks to the rightmost colon that meets the separator
+# criteria.  This correctly handles header lines with embedded colons in
+# description text (e.g., "MNEM.UNIT VAL : DESC : MORE" → desc="DESC : MORE").
+#
 # I2F-01: The previous alternation (\s+:\s*|\s*:\s+|:\s*$) had overlapping
 # alternatives (both \s+:\s* and \s*:\s+ match when whitespace exists on
 # both sides of the colon) that caused catastrophic O(n^3) regex
@@ -154,7 +160,7 @@ DATA_LINE_PATTERN = re.compile(
     r"\."  # literal dot separator
     r"(?P<unit>[\w\-/]*)"  # unit: optional, can include /
     r"\s+"  # whitespace separator
-    r"(?P<value>.*?)"  # value: everything up to the colon separator
+    r"(?P<value>.*)"  # value: greedy to find LAST structurally-valid colon (CWLS spec)
     r"(\s+:\s*|:(?=\s)|:\s*$)"  # colon separator (see I2F-01 comment above)
     r"(?P<description>.*?)"  # description: rest of line
     r"\s*$"
@@ -209,16 +215,24 @@ _DATA_SECTION_WORDS = {
     "CORE_DATA",  # Core data section (written form)
     "DRILLING",  # Drilling data section
     "DRILLING_DATA",  # Drilling data section (written form)
+    "FORMATION",  # Formation data section (LAS 3.0 spec) — F-M26
+    "FORMATION_DATA",  # Formation data section (written form)
     "INCLINOMETRY",  # Inclinometry data section
     "INCLINOMETRY_DATA",  # Inclinometry data section (written form)
-    "TOPS",  # Tops data section
-    "TOPS_DATA",  # Tops data section (written form)
-    "TEST",  # Test data section
-    "TEST_DATA",  # Test data section (written form)
-    "PERFORATIONS",  # Perforations data section
-    "PERFORATIONS_DATA",  # Perforations data section (written form)
     "LOG",  # LAS 3.0 shorthand ~Log alias for ~Log_Data / ~Ascii
     "LOG_DATA",  # Explicit log data section
+    "MUD",  # Mud data section (LAS 3.0 spec) — F-M26
+    "MUD_DATA",  # Mud data section (written form)
+    "PERFORATIONS",  # Perforations data section
+    "PERFORATIONS_DATA",  # Perforations data section (written form)
+    "RISK",  # Risk data section (LAS 3.0 spec) — F-M26
+    "RISK_DATA",  # Risk data section (written form)
+    "STRUCTURE",  # Structure data section (LAS 3.0 spec) — F-M26
+    "STRUCTURE_DATA",  # Structure data section (written form)
+    "TEST",  # Test data section
+    "TEST_DATA",  # Test data section (written form)
+    "TOPS",  # Tops data section
+    "TOPS_DATA",  # Tops data section (written form)
 }
 
 # LAS 3.0 data section types that support index notation (e.g., ~Core[1]).
@@ -229,16 +243,24 @@ _INDEXED_DATA_TYPES = frozenset(
         "CORE_DATA",
         "DRILLING",
         "DRILLING_DATA",
+        "FORMATION",
+        "FORMATION_DATA",
         "INCLINOMETRY",
         "INCLINOMETRY_DATA",
-        "TOPS",
-        "TOPS_DATA",
-        "TEST",
-        "TEST_DATA",
-        "PERFORATIONS",
-        "PERFORATIONS_DATA",
         "LOG",
         "LOG_DATA",
+        "MUD",
+        "MUD_DATA",
+        "PERFORATIONS",
+        "PERFORATIONS_DATA",
+        "RISK",
+        "RISK_DATA",
+        "STRUCTURE",
+        "STRUCTURE_DATA",
+        "TEST",
+        "TEST_DATA",
+        "TOPS",
+        "TOPS_DATA",
     }
 )
 
@@ -250,16 +272,24 @@ _SECTION_TYPE_MAP: dict[str, str] = {
     "CORE_DATA": "CORE_DATA",
     "DRILLING": "DRILLING_DATA",
     "DRILLING_DATA": "DRILLING_DATA",
+    "FORMATION": "FORMATION_DATA",
+    "FORMATION_DATA": "FORMATION_DATA",
     "INCLINOMETRY": "INCLINOMETRY_DATA",
     "INCLINOMETRY_DATA": "INCLINOMETRY_DATA",
-    "TOPS": "TOPS_DATA",
-    "TOPS_DATA": "TOPS_DATA",
-    "TEST": "TEST_DATA",
-    "TEST_DATA": "TEST_DATA",
-    "PERFORATIONS": "PERFORATIONS_DATA",
-    "PERFORATIONS_DATA": "PERFORATIONS_DATA",
     "LOG": "LOG_DATA",
     "LOG_DATA": "LOG_DATA",
+    "MUD": "MUD_DATA",
+    "MUD_DATA": "MUD_DATA",
+    "PERFORATIONS": "PERFORATIONS_DATA",
+    "PERFORATIONS_DATA": "PERFORATIONS_DATA",
+    "RISK": "RISK_DATA",
+    "RISK_DATA": "RISK_DATA",
+    "STRUCTURE": "STRUCTURE_DATA",
+    "STRUCTURE_DATA": "STRUCTURE_DATA",
+    "TEST": "TEST_DATA",
+    "TEST_DATA": "TEST_DATA",
+    "TOPS": "TOPS_DATA",
+    "TOPS_DATA": "TOPS_DATA",
 }
 
 
@@ -538,14 +568,16 @@ class LASParser:
             self._process_ascii_data()
 
         # Validate mandatory well fields (STRT, STOP, STEP, NULL).
-        # LAS 2.0 requires these fields; LAS 3.0 inherits the same
-        # mandatory well-field requirements from LAS 2.0.  Missing fields
-        # are a spec compliance gap.  The library handles missing fields
-        # gracefully (using defaults), so this is a warning, not an error.
+        # LAS 1.2 and 2.0 both require these fields; LAS 3.0 inherits the
+        # same mandatory well-field requirements from LAS 2.0.  Missing
+        # fields are a spec compliance gap.  The library handles missing
+        # fields gracefully (using defaults), so this is a warning, not an
+        # error.  F-M24: Previous check excluded LAS 1.2 despite the LAS
+        # 1.2 spec requiring STRT/STOP/STEP/NULL.
         # F-014: Previous version gate only checked startswith("2."),
         # silently skipping mandatory-field validation for LAS 3.0 files.
-        is_las20_or_las30 = self.las_file.version.vers.startswith(("2.", "3."))
-        if is_las20_or_las30 and self._version_found:
+        is_las12_or_later = self.las_file.version.vers.startswith(("1.", "2.", "3."))
+        if is_las12_or_later and self._version_found:
             _mandatory_fields = ["STRT", "STOP", "STEP", "NULL"]
             for field in _mandatory_fields:
                 if field not in self.las_file.well.entries:
@@ -1049,7 +1081,16 @@ class LASParser:
                     self._section_curve_end_idx = None
 
                 self._current_section = new_section
-                self._current_section_name = section_name.strip() if section_name else section_word
+                # F-M27: For parameter sections, _current_section_name must
+                # preserve the section_word (e.g., CORE_PARAMETERS) for type
+                # derivation in _parse_parameter_entry.  section_rest is
+                # annotation text, not the type identifier.
+                if new_section == "P" and (
+                    section_word.endswith("_PARAMETER") or section_word.endswith("_PARAMETERS")
+                ):
+                    self._current_section_name = section_word
+                else:
+                    self._current_section_name = section_name.strip() if section_name else section_word
                 # F-34: Track section sequence for cross-section validation.
                 # F-I2-M11: Use section_word (e.g. "CURVE", "VERSION")
                 # instead of just new_section (single letter "C", "V")
@@ -1112,19 +1153,24 @@ class LASParser:
     def _manual_colon_scan(line: str) -> dict[str, str] | None:
         """Manual scan for colon separator on long lines (I2F-01 defense).
 
-        Scans the line left-to-right for the FIRST colon that has
-        whitespace on at least one side (or is at end of line).  This is
-        O(n) with no backtracking — guaranteed safe regardless of input.
-        Returns a dict with 'mnemonic', 'unit', 'value', 'description'
-        keys, or None if the line doesn't match the data-line pattern.
+        Scans the line right-to-left for the LAST colon that has
+        whitespace on at least one side (or is at end of line).  Using
+        the LAST structurally-valid colon matches the CWLS LAS 2.0
+        specification and correctly handles header lines with embedded
+        colons in description fields (e.g., "MNEM.UNIT VAL : DESC : MORE"
+        → desc = "DESC : MORE").  O(n) with no backtracking — guaranteed
+        safe regardless of input.  Returns a dict with 'mnemonic',
+        'unit', 'value', 'description' keys, or None if the line doesn't
+        match the data-line pattern.
 
         Intended as a fallback for lines too long for safe regex matching
         (>_SAFE_REGEX_LINE_LENGTH).
         """
-        # Find the first colon that has whitespace on at least one side.
+        # Find the last colon that has whitespace on at least one side.
         colon_idx = -1
         stripped = line.rstrip()
-        for i, ch in enumerate(stripped):
+        for i in range(len(stripped) - 1, -1, -1):
+            ch = stripped[i]
             if ch == ":":
                 has_ws_before = i > 0 and stripped[i - 1].isspace()
                 has_ws_after = i + 1 < len(stripped) and stripped[i + 1].isspace()
@@ -1776,10 +1822,18 @@ class LASParser:
             # comparisons (string_curves at L1485, _KNOWN_CURVE_FORMATS at L1498,
             # and array-time-offset check at L1172) work regardless of input case.
             data_format = first_fmt.upper()
-            # F-088 / F-102: Validate curve data_format at parse time,
-            # not deferred to _process_ascii_data.  Ensures metadata-only
-            # LAS 3.0 files (no ~A section) still receive format validation.
+            # Normalize extended Fortran-style format specifiers (e.g., F8.3,
+            # E10.2, E0.00E+00, D0.00E+00) to single-letter codes (F, E, D)
+            # for roundtrip compatibility.  from_dict's _VALID_DATA_FORMATS
+            # only accepts single-letter codes; storing the extended form
+            # would cause parse→to_dict→from_dict ValueError (F-H01).
+            # F-REV-01: Validate the full format string BEFORE truncation
+            # so that non-format brace text (e.g. {Density}) is caught
+            # by _FORMAT_SPEC_RE rather than silently normalizing to a
+            # valid single-letter code (DENSITY → D).
             _validate_curve_data_format(data_format, raw_mnemonic)
+            if len(data_format) > 1:
+                data_format = data_format[0]
             if data_format == "A" and first_offset:
                 try:
                     array_time_offset = float(first_offset)

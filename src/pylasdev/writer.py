@@ -10,7 +10,9 @@ Supports LAS 1.2, 2.0, and 3.0 formats.
 from __future__ import annotations
 
 import math
+import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -291,7 +293,25 @@ def write_las_file(
         raise LASWriteError(f"Failed to generate LAS file content: {e}") from e
 
     try:
-        file_path.write_text(content, encoding=encoding)
+        # Atomic write: write content to a temporary file in the same
+        # directory as the target, then atomically replace the target.
+        # This prevents partial/corrupt files on I/O interruption,
+        # disk-full, or system crash mid-write.
+        target_dir = str(file_path.parent)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=target_dir, prefix=".tmp_", suffix=file_path.name
+        )
+        try:
+            with os.fdopen(fd, 'w', encoding=encoding, newline='') as f:
+                f.write(content)
+            os.replace(tmp_path, file_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
     except (OSError, UnicodeError, LookupError) as e:
         raise LASWriteError(f"Cannot write to {file_path}: {e}") from e
 
@@ -637,7 +657,14 @@ def _section_type_to_prefix(section_type: str) -> str:
     # section-header injection via from_dict() with malicious section_type
     # values containing newlines or control characters.
     if section_type.endswith("_DATA"):
-        return _sanitize_las_value(section_type)
+        # Strip pipe characters after sanitization.  Pipe (|) is
+        # intentionally excluded from _CONTROL_CHARS_RE because it is
+        # legitimate LAS 3.0 zone notation ("| RUN[1]"), but it MUST
+        # NOT appear in section type names — an embedded pipe in the
+        # section header creates ambiguous pipe targets that corrupt
+        # parser interpretation on re-read (e.g., "~MY|PIPE_DATA | CURVE"
+        # is parsed as section ~MY with a bogus pipe target).
+        return _sanitize_las_value(section_type).replace("|", "")
     # F-008: Warn about unknown section types — they fall back to the
     # ASCII data section header "A" for backward compatibility, but the
     # caller should be informed that the section type is not recognized.

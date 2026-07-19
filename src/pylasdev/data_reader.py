@@ -193,7 +193,12 @@ def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int) -
     _deduplicate_curves(las_file)
     curve_count = len(las_file.curves_order)
 
-    if curve_count > MAX_CURVES:
+    # F-M01: Use ``>=`` (not ``>``) for consistency with parser.py and models.py
+    # which already use ``>=`` for all MAX_CURVES guards.  Using ``>`` here
+    # allows exactly MAX_CURVES curves while from_dict rejects at the limit —
+    # a roundtrip divergence where a data_reader-accepted file is rejected by
+    # from_dict.  Synchronizing on ``>=`` closes the gap.
+    if curve_count >= MAX_CURVES:
         raise LASParseError(
             f"Curve count ({curve_count}) exceeds maximum allowed ({MAX_CURVES}). "
             f"The file may be malformed or corrupt."
@@ -485,7 +490,10 @@ def _read_normal(
     _deduplicate_curves(las_file)
     curve_count = len(las_file.curves_order)
 
-    if data_line_count > MAX_DATA_LINES:
+    # F-M01: Use ``>=`` (not ``>``) for consistency with parser.py and models.py
+    # which already use ``>=`` for MAX_DATA_LINES guards.  See comment at
+    # top-level MAX_CURVES check for full rationale.
+    if data_line_count >= MAX_DATA_LINES:
         raise LASParseError(
             f"Data line count ({data_line_count}) exceeds maximum allowed "
             f"({MAX_DATA_LINES}). The file may be malformed or corrupt."
@@ -561,6 +569,15 @@ def _read_normal(
             # Safety cap: prevent unbounded token count from malformed input,
             # matching the maxsplit behavior of str.split.
             values = row[: MAX_TOKENS_PER_LINE + 1]
+
+            # F-M03: Strip trailing empty strings from csv.reader output.
+            # Trailing delimiters (e.g. "100.0,") produce empty fields that
+            # inflate len(values), causing spurious "extra columns" warnings.
+            # Matches the stripping pattern used in _detect_actual_wrap and
+            # _read_wrapped.  Strip only TRAILING empties — middle empty
+            # fields are legitimate sparse data values.
+            while values and values[-1] == "":
+                values.pop()
 
         # Warn about extra columns being silently discarded
         if len(values) > curve_count and not warned_extra:

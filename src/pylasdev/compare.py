@@ -239,6 +239,72 @@ def _compare_arrays(
     return True
 
 
+def _compare_values(
+    a: Any,
+    b: Any,
+    label: str,
+    rtol: float,
+    atol: float,
+) -> bool:
+    """Compare two values, dispatching by type.
+
+    Handles numpy arrays, lists, dicts, and scalars recursively.
+    Calls to this function should be wrapped in try/except (ValueError,
+    TypeError) for defence-in-depth against numpy ambiguity.
+    """
+    if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+        return _compare_arrays(a, b, label, None, rtol, atol)
+    if isinstance(a, list) and isinstance(b, list):
+        return _compare_lists(a, b, label, rtol, atol)
+    if isinstance(a, dict) and isinstance(b, dict):
+        # F-M30: _compare_lists per-element fallback previously
+        # treated dict elements as scalars, delegating to
+        # _scalars_equal which returned False for equal dicts
+        # containing numpy arrays (ValueError caught by bare
+        # except).  Compare dicts key-by-key recursively.
+        if set(a.keys()) != set(b.keys()):
+            only_a = set(a.keys()) - set(b.keys())
+            only_b = set(b.keys()) - set(a.keys())
+            if only_a:
+                logger.warning(
+                    "Keys only in first dict at '%s': %s", label, only_a
+                )
+            if only_b:
+                logger.warning(
+                    "Keys only in second dict at '%s': %s", label, only_b
+                )
+            return False
+        for k in a:
+            if not _compare_values(a[k], b[k], f"{label}.{k}", rtol, atol):
+                return False
+        return True
+    if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+        logger.warning(
+            "Type mismatch at '%s': %s vs %s",
+            label,
+            type(a).__name__,
+            type(b).__name__,
+        )
+        return False
+    if isinstance(a, dict) or isinstance(b, dict):
+        logger.warning(
+            "Type mismatch at '%s': %s vs %s",
+            label,
+            type(a).__name__,
+            type(b).__name__,
+        )
+        return False
+    if isinstance(a, list) or isinstance(b, list):
+        logger.warning(
+            "Type mismatch at '%s': %s vs %s",
+            label,
+            type(a).__name__,
+            type(b).__name__,
+        )
+        return False
+    return _scalars_equal(a, b)
+
+
 def _compare_lists(
     l1: Any,
     l2: Any,
@@ -250,8 +316,8 @@ def _compare_lists(
 
     Tries direct list equality first.  When numpy arrays inside the list
     cause ValueError/TypeError (ambiguous truth value), falls back to
-    per-element comparison using _compare_arrays for ndarray pairs and
-    _scalars_equal for scalars.
+    per-element comparison using _compare_values which dispatches by
+    type — handling ndarrays, nested lists, dicts (F-M30), and scalars.
     """
     try:
         if l1 != l2:
@@ -275,31 +341,9 @@ def _compare_lists(
             return False
         for idx, (a, b) in enumerate(zip(l1, l2, strict=False)):
             try:
-                if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
-                    if not _compare_arrays(
-                        a, b, f"{label}[{idx}]", None, rtol, atol
-                    ):
-                        return False
-                elif isinstance(a, list) and isinstance(b, list):
-                    if not _compare_lists(a, b, f"{label}[{idx}]", rtol, atol):
-                        return False
-                elif isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
-                    logger.warning(
-                        "Type mismatch at '%s[%d]': %s vs %s",
-                        label,
-                        idx,
-                        type(a).__name__,
-                        type(b).__name__,
-                    )
-                    return False
-                elif not _scalars_equal(a, b):
-                    logger.warning(
-                        "List[%d] mismatch at '%s': %r vs %r",
-                        idx,
-                        label,
-                        a,
-                        b,
-                    )
+                if not _compare_values(
+                    a, b, f"{label}[{idx}]", rtol, atol
+                ):
                     return False
             except (ValueError, TypeError):
                 return False

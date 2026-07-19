@@ -1131,6 +1131,47 @@ class TestLAS30IntegerFormat:
         assert run_no.mnemonic == "RUN_NO"
         assert run_no.data_format == "I"
 
+    def test_las30_non_format_braces_rejected(self) -> None:
+        """F-REV-01: Non-format brace text (e.g. {Density}) is rejected.
+
+        Before the fix, truncation (data_format[0]) happened BEFORE
+        validation, so {Density} → "DENSITY" → "D" passed validation.
+        After the fix, validation happens first, so {Density} correctly
+        raises LASParseError.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   :\n"
+            " DLM.   COMMA :\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       : DEPTH  {F}\n"
+            " DENS.GCC3    : BULK DENSITY  {Density}\n"
+        )
+        parser = LASParser()
+        with pytest.raises(LASParseError, match="unsupported format specifier"):
+            parser.parse(content)
+
+    def test_las30_uppercase_non_format_braces_rejected(self) -> None:
+        """F-REV-01: Uppercase non-format brace text is also rejected.
+
+        Single-word braces starting with F/E/D/S/A/I that are NOT valid
+        format specifiers (e.g. {ENERGY}, {SATURATION}) are caught by
+        _FORMAT_SPEC_RE before truncation can normalize them.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   :\n"
+            " DLM.   COMMA :\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       : DEPTH  {F}\n"
+            " ENRG.MEV     : ENERGY LEVEL  {ENERGY}\n"
+        )
+        parser = LASParser()
+        with pytest.raises(LASParseError, match="unsupported format specifier"):
+            parser.parse(content)
+
 
 class TestUnknownSectionWarning:
     """F-031: Unknown section handler warning test."""

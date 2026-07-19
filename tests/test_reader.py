@@ -2068,15 +2068,14 @@ class TestMaxTokensPerLineGuard:
 class TestMaxLimitsAtLimit:
     """M69: At-limit tests for MAX_* reader guards.
 
-    All existing MAX_DATA_LINES, MAX_CURVES, and MAX_TOTAL_ELEMENTS
-    tests use mock values (0, 1) below actual content size. No test
-    verifies that exactly-at-limit passes correctly — off-by-one bug
-    risk (confirmed by F-I2-M32: >= vs > inconsistency across parser
-    and from_dict).
+    F-M01 changed data_reader.py operator from ``>`` to ``>=`` for
+    MAX_CURVES and MAX_DATA_LINES (matching parser.py and models.py).
+    At-limit cases now REJECT instead of passing — the limit is exclusive.
+    MAX_TOTAL_ELEMENTS still uses ``>`` so at-limit still passes.
     """
 
-    def test_max_curves_at_limit_passes(self, tmp_path: Path) -> None:
-        """MAX_CURVES set exactly to the file's curve count — must pass."""
+    def test_max_curves_at_limit_rejected(self, tmp_path: Path) -> None:
+        """MAX_CURVES set exactly to the file's curve count — must reject."""
         from unittest import mock
 
         # File has exactly 2 curves
@@ -2095,14 +2094,13 @@ class TestMaxLimitsAtLimit:
         test_file = tmp_path / "at_limit_curves.las"
         test_file.write_text(content, encoding="utf-8")
 
-        # MAX_CURVES=2 matches actual curve count — should pass
+        # MAX_CURVES=2 matches actual curve count — F-M01 now rejects at-limit
         with mock.patch("pylasdev.data_reader.MAX_CURVES", 2):
-            data = read_las_file(test_file)
-            assert len(data["logs"]) == 2
-            assert data["logs"]["DEPT"][0] == 100.0
+            with pytest.raises(LASParseError, match="exceeds maximum"):
+                read_las_file(test_file)
 
-    def test_max_data_lines_at_limit_passes(self, tmp_path: Path) -> None:
-        """MAX_DATA_LINES set exactly to the file's data line count — must pass."""
+    def test_max_data_lines_at_limit_rejected(self, tmp_path: Path) -> None:
+        """MAX_DATA_LINES set exactly to the file's data line count — must reject."""
         from unittest import mock
 
         # File has exactly 1 data line
@@ -2120,11 +2118,10 @@ class TestMaxLimitsAtLimit:
         test_file = tmp_path / "at_limit_lines.las"
         test_file.write_text(content, encoding="utf-8")
 
-        # MAX_DATA_LINES=1 matches actual data line count — should pass
+        # MAX_DATA_LINES=1 matches actual data line count — F-M01 now rejects at-limit
         with mock.patch("pylasdev.data_reader.MAX_DATA_LINES", 1):
-            data = read_las_file(test_file)
-            assert len(data["logs"]["DEPT"]) == 1
-            assert data["logs"]["DEPT"][0] == 100.0
+            with pytest.raises(LASParseError, match="exceeds maximum"):
+                read_las_file(test_file)
 
     def test_max_total_elements_at_limit_passes(self, tmp_path: Path) -> None:
         """MAX_TOTAL_ELEMENTS set exactly to curves*lines — must pass."""
@@ -2152,8 +2149,8 @@ class TestMaxLimitsAtLimit:
             assert len(data["logs"]["DEPT"]) == 1
             assert data["logs"]["DEPT"][0] == 100.0
 
-    def test_max_curves_wrapped_at_limit_passes(self, tmp_path: Path) -> None:
-        """MAX_CURVES at limit in wrapped mode — must pass."""
+    def test_max_curves_wrapped_at_limit_rejected(self, tmp_path: Path) -> None:
+        """MAX_CURVES at limit in wrapped mode — must reject."""
         from unittest import mock
 
         content = (
@@ -2172,8 +2169,7 @@ class TestMaxLimitsAtLimit:
         test_file = tmp_path / "at_limit_wrap_curves.las"
         test_file.write_text(content, encoding="utf-8")
 
-        # MAX_CURVES=2 matches actual — should pass
+        # MAX_CURVES=2 matches actual — F-M01 now rejects at-limit
         with mock.patch("pylasdev.data_reader.MAX_CURVES", 2):
-            data = read_las_file(test_file)
-            assert len(data["logs"]) == 2
-            assert data["logs"]["DEPT"][0] == 100.0
+            with pytest.raises(LASParseError, match="exceeds maximum"):
+                read_las_file(test_file)

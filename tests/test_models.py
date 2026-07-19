@@ -649,23 +649,26 @@ class TestLASFile:
     # --- F2-17 fix: dict.get() None bypass in CurveDefinition ---
 
     def test_from_dict_curve_none_in_get_guarded(self) -> None:
-        """LASFile.from_dict() handles None values in curve dict fields (F2-17 fix).
+        """LASFile.from_dict() handles None for optional curve string fields (F2-17 fix).
 
         curve_dict.get("mnemonic", "") returned stored None when key existed
         with value None. The fix wraps all string fields with _safe_str().
+        The mnemonic field now requires a non-empty value (F-M10 fix), so
+        we use a real mnemonic and test None→"" conversion on unit/description.
         """
         data: dict[str, Any] = {
             "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
             "well": {"STRT": "100"},
-            "curves_order": [""],  # _safe_str(None) → "" matches this
+            "curves_order": ["DEPT"],
             "curves": [
-                {"mnemonic": None, "unit": None, "description": None}
+                {"mnemonic": "DEPT", "unit": None, "description": None}
             ],
-            "logs": {"": np.array([100.0])},
+            "logs": {"DEPT": np.array([100.0])},
         }
         las = LASFile.from_dict(data)
-        # _safe_str(None) → "" for all string fields
-        assert las.curves[0].mnemonic == ""
+        # F-M10: mnemonic must be non-empty
+        assert las.curves[0].mnemonic == "DEPT"
+        # _safe_str(None) → "" for optional string fields
         assert las.curves[0].unit == ""
         assert las.curves[0].description == ""
 
@@ -760,6 +763,37 @@ class TestLASFile:
             ],
         }
         with pytest.raises(ValueError, match="does not match section_curves"):
+            LASFile.from_dict(data)
+
+    def test_from_dict_section_curves_order_non_string_element(
+        self,
+    ) -> None:
+        """F-I2E-05: Non-string element in per-section curves_order raises TypeError.
+
+        When section_curves is empty, the mnemonic cross-validation gate is
+        inactive, so non-string values (int, None) silently become str() column
+        headers on write.  The fix adds per-element type checking that runs
+        unconditionally, before the section_curves gate.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "data_sections": [
+                {
+                    "name": "LOG",
+                    "section_type": "LOG_DATA",
+                    "curves_order": ["GR", 123, None],
+                    "data": {
+                        "GR": np.array([50.0]),
+                    },
+                    "section_curves": [],
+                }
+            ],
+        }
+        with pytest.raises(LASDataError, match="must be str"):
             LASFile.from_dict(data)
 
     # --- F-24 fix: string_data count guard ---
