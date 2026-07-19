@@ -234,6 +234,10 @@ def _compare_arrays(
             logger.warning("Array values mismatch at '%s'", label)
             return False
     else:
+        if isinstance(arr1, np.ma.MaskedArray):
+            arr1 = arr1.astype(np.float64).filled(np.nan)  # type: ignore[attr-defined]  # MaskedArray.astype preserves mask
+        if isinstance(arr2, np.ma.MaskedArray):
+            arr2 = arr2.astype(np.float64).filled(np.nan)  # type: ignore[attr-defined]  # MaskedArray.astype preserves mask
         try:
             if not np.allclose(arr1, arr2, rtol=rtol, atol=atol, equal_nan=True):
                 logger.warning("Array values mismatch at '%s'", label)

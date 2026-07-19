@@ -614,7 +614,9 @@ class TestWriteLASFile:
         """Value starting with ``#`` is escaped with ``_`` prefix to
         prevent silent data loss on re-read.  The parser treats
         ``#``-prefixed lines as comments, so without the guard at
-        writer.py:86-87 the value would be dropped entirely."""
+        writer.py:86-87 the value would be dropped entirely.
+        F-007: The parser's _desanitize_las_value reverses this
+        transformation, restoring the original ``#``-prefixed value."""
         las = LASFile()
         las.version = VersionSection(vers="2.0")
         las.well["NULL"] = "-999.25"
@@ -632,9 +634,9 @@ class TestWriteLASFile:
         # The value should appear as _#TestCompany (escaped) — never as a
         # bare # at the start of a line, which the parser would skip.
         assert "_#TestCompany" in content
-        # Verify re-read: the value survives roundtrip
+        # F-007: Verify re-read restores original value
         reread = read_las_file(temp_file)
-        assert "_#TestCompany" in reread["well"]["COMP"]
+        assert "#TestCompany" == reread["well"]["COMP"]
 
     # --- TEST-06: zone_index=None branch (line 125->127) ---
     def test_write_zone_without_index(self, tmp_path: Path) -> None:

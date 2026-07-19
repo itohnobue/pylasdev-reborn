@@ -38,6 +38,10 @@ def _safe_str(
         raise ValueError(
             f"Cannot safely convert non-finite float {value} to string"
         )
+    if isinstance(value, bytes):
+        raise TypeError(
+            "Decode to str first: value.decode('utf-8')"
+        )
     result = str(value)
     if max_length is not None and len(result) > max_length:
         raise ValueError(
@@ -315,8 +319,8 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
         for i, cd in enumerate(curves):
             if isinstance(cd, dict) and "data_format" in cd:
                 _raw = cd.get("data_format")
-                if _raw is None:
-                    continue  # None means "not set" — same as absent
+                if _raw is None or isinstance(_raw, bool):
+                    continue  # None means "not set"; bool is not a data format
                 df = str(_raw).upper()
                 if df:
                     df = df[0]  # F-M-012: truncate extended format codes (parser accepts F8.3, etc.)
@@ -336,7 +340,7 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
                 for ci, sc in enumerate(scs):
                     if isinstance(sc, dict) and "data_format" in sc:
                         _raw = sc.get("data_format")
-                        if _raw is None:
+                        if _raw is None or isinstance(_raw, bool):
                             continue
                         df = str(_raw).upper()
                         if df:
@@ -446,8 +450,8 @@ def _check_df_vs_placement(
         if not isinstance(cd, dict):
             continue
         _raw_df = cd.get("data_format")
-        if _raw_df is None:
-            continue  # None means "not set" — skip cross-validation
+        if _raw_df is None or isinstance(_raw_df, bool):
+            continue  # None means "not set"; bool is not a data format
         df = str(_raw_df).upper()
         mnemonic = _safe_str(cd.get("mnemonic"))
         if not df or not mnemonic:
@@ -791,6 +795,34 @@ class ParameterEntry:
                 f"'{self.mnemonic}'.  Valid values: "
                 f"{', '.join(sorted(_VALID_DATA_FORMATS))}"
             )
+        # F-005: Validate array_index type (int | None).
+        if self.array_index is not None and type(self.array_index) is not int:
+            raise TypeError(
+                f"ParameterEntry.array_index must be int or None, "
+                f"got {type(self.array_index).__name__}"
+            )
+        # F-005: Validate zone type (ParameterZone | None).
+        if self.zone is not None and not isinstance(self.zone, ParameterZone):
+            raise TypeError(
+                f"ParameterEntry.zone must be ParameterZone or None, "
+                f"got {type(self.zone).__name__}"
+            )
+        # F-064: Validate section_type — reject newline/carriage-return/tilde,
+        # normalize whitespace-only to None.  Matches _create_parameter_entry
+        # validation (lines 91-118).
+        if self.section_type is not None:
+            if not isinstance(self.section_type, str):
+                self.section_type = _safe_str(self.section_type)
+            _stripped = self.section_type.strip()
+            if not _stripped:
+                self.section_type = None
+            else:
+                _sec_str = str(self.section_type)
+                if '\n' in _sec_str or '\r' in _sec_str or '~' in _sec_str:
+                    raise ValueError(
+                        f"ParameterEntry.section_type contains invalid "
+                        f"characters (newline or tilde): {_sec_str!r}"
+                    )
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -885,7 +917,7 @@ class DataSection:
         # (rejects newline/tilde) and normalizes whitespace-only to None;
         # DataSection previously skipped both checks.  Mirror that
         # validation here.
-        if self.section_type:
+        if self.section_type is not None:
             _stripped = self.section_type.strip()
             if not _stripped:
                 # Whitespace-only → normalize to empty string.
@@ -1721,8 +1753,9 @@ class LASFile:
                     # trigger MemoryError from np.array() before the
                     # downstream len() guard fires.
                     try:
+                        name = _norm_mnem(name)
                         ds_string_data[name] = np.atleast_1d(np.array(arr, dtype=np.str_))
-                    except (ValueError, TypeError, MemoryError) as e:
+                    except (ValueError, TypeError, MemoryError, OverflowError) as e:
                         ds_name = ds_dict.get("name", "<unknown>")
                         raise ValueError(
                             f"Cannot convert string data for section "
@@ -1827,8 +1860,9 @@ class LASFile:
                             f"({MAX_DATA_LINES})"
                         )
                     try:
+                        k = _norm_mnem(k)
                         ds_data[k] = np.atleast_1d(np.array(v, dtype=np.float64))
-                    except (ValueError, TypeError, MemoryError) as e:
+                    except (ValueError, TypeError, MemoryError, OverflowError) as e:
                         ds_name = ds_dict.get("name", "<unknown>")
                         raise ValueError(
                             f"Cannot convert data for section '{ds_name}', curve '{k}': {e}"
@@ -2140,8 +2174,9 @@ class LASFile:
                 # was missing it.  A huge list can trigger MemoryError
                 # from np.array() before the downstream len() guard fires.
                 try:
+                    name = _norm_mnem(name)
                     las_file.string_data[name] = np.atleast_1d(np.array(arr, dtype=np.str_))
-                except (ValueError, TypeError, MemoryError) as e:
+                except (ValueError, TypeError, MemoryError, OverflowError) as e:
                     raise ValueError(
                         f"Cannot convert string data for curve "
                         f"'{name}' to string array: {e}"
@@ -2192,8 +2227,9 @@ class LASFile:
                         f"({MAX_DATA_LINES})"
                     )
                 try:
+                    name = _norm_mnem(name)
                     las_file.logs[name] = np.atleast_1d(np.array(arr, dtype=np.float64))
-                except (ValueError, TypeError, MemoryError) as e:
+                except (ValueError, TypeError, MemoryError, OverflowError) as e:
                     raise ValueError(
                         f"Cannot convert log data for curve '{name}' to numeric array: {e}"
                     ) from e
@@ -2212,6 +2248,15 @@ class LASFile:
             # data_sections and string_data, so curves_order typically includes
             # curves whose data is in those sections, not in logs.
             if las_file.logs and not las_file.data_sections:
+                # G-015: Validate all log keys are strings before
+                # _norm_mnem normalisation, mirroring the well section
+                # key validation pattern (lines 1428-1433).
+                for _lk in las_file.logs:
+                    if not isinstance(_lk, str):
+                        raise TypeError(
+                            f"Log dict key must be str, "
+                            f"got {type(_lk).__name__}: {_lk!r}"
+                        )
                 # F-M-013: Normalize log keys through mnem_base before
                 # comparison.  curves_order is already normalized at
                 # construction (line ~1458), but logs dict uses raw keys.
@@ -2278,8 +2323,22 @@ class LASFile:
                         )
                     _top_seen.add(_n)
 
+            # G-008: Cross-group row count validation between logs and
+            # string_data.  Within-group row checks exist (above); this
+            # catches mismatched row counts across the two groups.  The
+            # per-section equivalent is in DataSection.__post_init__
+            # (lines 1015-1023) — same pattern.
+            if las_file.logs and las_file.string_data:
+                _max_log_rows = max(len(arr) for arr in las_file.logs.values())
+                _max_str_rows = max(len(arr) for arr in las_file.string_data.values())
+                if _max_log_rows != _max_str_rows:
+                    raise ValueError(
+                        f"Logs row count ({_max_log_rows}) does not match "
+                        f"string_data row count ({_max_str_rows})"
+                    )
+
             return las_file
-        except (ValueError, TypeError) as e:
+        except (ValueError, TypeError, OverflowError) as e:
             raise LASDataError(str(e)) from e
 
     @property
@@ -2388,6 +2447,27 @@ class DevFile:
             dev = cls()
             # Separate column arrays from metadata keys
             metadata_keys = {"encoding", "source_file", "column_order"}
+
+            # G-007/G-016: Validate all dict keys are strings before
+            # .startswith() is called in the list comprehension below.
+            # Non-str keys (int, tuple) raise AttributeError which
+            # escapes the except (ValueError, TypeError) wrapper.
+            for _k in data:
+                if not isinstance(_k, str):
+                    raise LASDataError(
+                        f"DevFile.from_dict: column keys must be "
+                        f"strings, got {type(_k).__name__}"
+                    )
+            # F-006: Normalize column names through _DEV_ALIASES before
+            # storage.  dev_reader.py normalizes during file parsing
+            # (line 1097, 1181); from_dict must do the same for
+            # programmatic construction.  Lazy import to avoid circular
+            # dependency (dev_reader imports DevFile from models).
+            from .dev_reader import _normalize_dev_column
+            for _raw_key in list(data.keys()):
+                _norm_key = _normalize_dev_column(_raw_key)
+                if _norm_key != _raw_key:
+                    data[_norm_key] = data.pop(_raw_key)
 
             # F-M01: Resource-exhaustion guard — bound column count.
             # Exclude _meta_-prefixed keys (metadata stored under prefix
@@ -2511,7 +2591,7 @@ class DevFile:
                         )
                     try:
                         dev.columns[key] = np.atleast_1d(np.array(value, dtype=np.float64))
-                    except (ValueError, TypeError, MemoryError) as e:
+                    except (ValueError, TypeError, MemoryError, OverflowError) as e:
                         raise ValueError(
                             f"Cannot convert data for column '{key}' to numeric array: {e}"
                         ) from e
@@ -2548,5 +2628,5 @@ class DevFile:
             if not dev.column_order:
                 dev.column_order = list(dev.columns.keys())
             return dev
-        except (ValueError, TypeError) as e:
+        except (ValueError, TypeError, OverflowError, ImportError) as e:
             raise LASDataError(str(e)) from e

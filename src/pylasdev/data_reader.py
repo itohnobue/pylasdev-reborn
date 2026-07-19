@@ -173,6 +173,8 @@ def _parse_float_with_d_notation(value_str: str) -> float:
     Raises:
         ValueError: If the string cannot be parsed as a float after
             D→E conversion.
+        OverflowError: If the string represents a number whose absolute
+            value exceeds the maximum representable finite float.
     """
     return float(value_str.replace("D", "E").replace("d", "e"))
 
@@ -248,7 +250,7 @@ def _to_finite_float(
         return null_value
     try:
         val = _parse_float_with_d_notation(value_str)
-    except ValueError:
+    except (ValueError, OverflowError):
         if _failure_counter is not None:
             _failure_counter[0] += 1
         return null_value
@@ -1029,6 +1031,8 @@ def _read_wrapped(
             # so stale flags from a previous step never persist into
             # the pathological-misalignment check for this step.
             depth_had_extra = False
+            if not values:
+                continue
             if len(values) > 1:
                 warnings.warn(
                     f"Wrapped mode: depth line has {len(values)} values, expected 1. "

@@ -17,7 +17,7 @@ import numpy as np
 
 from .data_reader import _to_finite_float
 from .encoding import read_with_encoding
-from .exceptions import DEVReadError, LASEncodingError  # noqa: F401
+from .exceptions import DEVReadError, LASDataError, LASEncodingError  # noqa: F401
 from .models import DevFile
 
 # Characters that Python's splitlines() treats as line breaks beyond \n and \r.
@@ -770,9 +770,11 @@ def read_dev_file_as_object(
     try:
         detected_encoding, content = read_with_encoding(file_path, encoding, max_file_size)
     except OSError as e:
-        raise DEVReadError(f"Cannot read file: {file_path}") from e
+        raise DEVReadError(f"Cannot read file (I/O error): {file_path}") from e
     except (ValueError, LookupError) as e:
-        raise DEVReadError(f"Cannot read file: {file_path}") from e
+        raise DEVReadError(
+            f"Cannot read file (size exceeded or invalid parameter): {file_path}"
+        ) from e
 
     # Sanitize control characters that Python's splitlines() treats as line
     # breaks before splitting.  This is the same protection used by reader.py
@@ -967,6 +969,9 @@ def read_dev_file_as_object(
             f"({MAX_DATA_LINES}). The file may be malformed or corrupt."
         )
 
+    if data_lines == 0:
+        raise LASDataError("No data lines found in DEV file")
+
     # --- Pass 2: Parse header and data ---
     dev = DevFile()
     dev.source_file = str(file_path)
@@ -1023,10 +1028,7 @@ def read_dev_file_as_object(
                 # Store first data row (G-04 bounds guard).
                 if current_line < data_lines:
                     for k in range(len(names)):
-                        try:
-                            dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
-                        except IndexError:
-                            pass
+                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
                     current_line += 1
                 else:
                     discarded_lines += 1
@@ -1058,10 +1060,7 @@ def read_dev_file_as_object(
                         else:
                             short_row_count += 1
                     for k in range(min(len(values), len(names))):
-                        try:
-                            dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
-                        except IndexError:
-                            pass
+                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
                     current_line += 1
                 else:
                     discarded_lines += 1
@@ -1145,10 +1144,7 @@ def read_dev_file_as_object(
                         else:
                             short_row_count += 1
                     for k in range(min(len(values), len(names))):
-                        try:
-                            dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
-                        except IndexError:
-                            pass
+                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
                     current_line += 1
                 else:
                     discarded_lines += 1
@@ -1229,10 +1225,7 @@ def read_dev_file_as_object(
                         else:
                             short_row_count += 1
                     for k in range(min(len(values), len(names))):
-                        try:
-                            dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
-                        except IndexError:
-                            pass
+                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
                     current_line += 1
                 else:
                     discarded_lines += 1

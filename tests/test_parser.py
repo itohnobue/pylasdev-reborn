@@ -1132,12 +1132,13 @@ class TestLAS30IntegerFormat:
         assert run_no.data_format == "I"
 
     def test_las30_non_format_braces_rejected(self) -> None:
-        """F-REV-01: Non-format brace text (e.g. {Density}) is rejected.
+        """F-REV-01 + F-003 + G-003: Non-format brace text (e.g. {Density})
+        is preserved in the description and does NOT cause a parse error.
 
-        Before the fix, truncation (data_format[0]) happened BEFORE
-        validation, so {Density} → "DENSITY" → "D" passed validation.
-        After the fix, validation happens first, so {Density} correctly
-        raises LASParseError.
+        Previously _validate_curve_data_format rejected {Density} with
+        LASParseError.  Now non-format braces pass through as metadata
+        (matching the parameter handler behavior) and are kept in the
+        description via targeted format-stripping.
         """
         content = (
             "~VERSION INFORMATION\n"
@@ -1149,15 +1150,20 @@ class TestLAS30IntegerFormat:
             " DENS.GCC3    : BULK DENSITY  {Density}\n"
         )
         parser = LASParser()
-        with pytest.raises(LASParseError, match="unsupported format specifier"):
-            parser.parse(content)
+        las = parser.parse(content)
+        # {F} was a valid format specifier — stripped from description
+        assert las.curves[0].data_format == "F"
+        # {Density} was non-format — preserved in description
+        assert "{Density}" in las.curves[1].description
+        assert las.curves[1].data_format == ""
 
     def test_las30_uppercase_non_format_braces_rejected(self) -> None:
-        """F-REV-01: Uppercase non-format brace text is also rejected.
+        """F-REV-01 + F-003 + G-003: Uppercase non-format brace text is
+        preserved in the description and does NOT cause a parse error.
 
         Single-word braces starting with F/E/D/S/A/I that are NOT valid
-        format specifiers (e.g. {ENERGY}, {SATURATION}) are caught by
-        _FORMAT_SPEC_RE before truncation can normalize them.
+        format specifiers (e.g. {ENERGY}) are kept as metadata, matching
+        the parameter handler behavior.
         """
         content = (
             "~VERSION INFORMATION\n"
@@ -1169,8 +1175,12 @@ class TestLAS30IntegerFormat:
             " ENRG.MEV     : ENERGY LEVEL  {ENERGY}\n"
         )
         parser = LASParser()
-        with pytest.raises(LASParseError, match="unsupported format specifier"):
-            parser.parse(content)
+        las = parser.parse(content)
+        # {F} was a valid format specifier
+        assert las.curves[0].data_format == "F"
+        # {ENERGY} was non-format — preserved in description
+        assert "{ENERGY}" in las.curves[1].description
+        assert las.curves[1].data_format == ""
 
 
 class TestUnknownSectionWarning:

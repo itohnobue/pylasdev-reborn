@@ -363,6 +363,10 @@ def _write_version_section(las_file: LASFile) -> list[str]:
     # An empty vers produces a malformed version line with an empty value.
     vers = las_file.version.vers or "2.0"
     lines.append(f" VERS.   {_sanitize_las_value(vers)}  : {vers_desc}")
+    # G-018: Save the original wrap value before any override path mutates
+    # it.  Restored at the end of this function so the las_file model
+    # matches the original state after writing.
+    original_wrap = las_file.version.wrap
     # F-05 / F-01: The writer cannot produce wrapped output (we always write
     # one line per depth step).  If the source has WRAP=YES, override it to
     # NO so the header declaration matches the actual data layout.  Emit a
@@ -412,6 +416,11 @@ def _write_version_section(las_file: LASFile) -> list[str]:
             f" DLM .                        {_sanitize_las_value(las_file.version.dlm)} : {dlm_desc}"
         )
     lines.append("")
+    # G-018: Restore the original wrap value so the las_file model matches
+    # its pre-write state.  The override paths above (WRAP=YES → NO and
+    # LAS 3.0 non-NO → NO) mutate las_file.version.wrap directly — this
+    # restores it so the caller's model is unchanged after writing.
+    las_file.version.wrap = original_wrap
     return lines
 
 
@@ -528,7 +537,7 @@ def _write_curve_section(las_file: LASFile) -> list[str]:
         # F2-006: Normalize section_type to uppercase — from_dict does not
         # normalize, so programmatically constructed files may have lowercase.
         log_section = next(
-            (ds for ds in las_file.data_sections if ds.section_type.upper() == "LOG_DATA"),
+            (ds for ds in las_file.data_sections if (ds.section_type or "LOG_DATA").upper() == "LOG_DATA"),
             None,
         )
         curves_to_emit = (
@@ -803,227 +812,270 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
         )
         delimiter = " "
 
-    # F-I2-M17 / F-019: Guard against data_sections in non-LAS-3.0 files.
-    # from_dict populates data_sections from the input dict unconditionally
-    # (regardless of LAS version).  Multiple sections on a non-LAS-3.0 file
-    # cause guaranteed roundtrip data loss (parser skips all data for
-    # non-LAS-3.0 settings).  A single section can safely fall back to
-    # legacy ~A format.
-    if las_file.data_sections and not is_las30:
-        if len(las_file.data_sections) > 1:
-            raise LASWriteError(
-                f"Multiple data_sections ({len(las_file.data_sections)}) "
-                f"are only supported for LAS 3.0 files, but version is "
-                f"{las_file.version.vers!r}. Cannot safely write multi-section "
-                f"data for non-LAS-3.0 format."
-            )
-        warnings.warn(
-            "data_sections are only supported for LAS 3.0 files. "
-            "Falling back to single-section ~A format. "
-            "Single-section data will be preserved.",
-            stacklevel=3,
-        )
+    # R8-007: Save original values before data_sections copy-back mutates the model.
+    # The legacy fallback path below (lines ~846-857) copies data_sections[0] contents
+    # to las_file.logs, string_data, curves_order, and curves.  These are bare
+    # mutations — restored here so the caller's LASFile is unchanged after writing.
+    _saved_logs = dict(las_file.logs)
+    _saved_string_data = dict(las_file.string_data)
+    _saved_curves_order = list(las_file.curves_order)
+    _saved_curves = list(las_file.curves)
 
-        # F-067/F-111: Copy data_sections[0] contents to legacy attributes so
-        # the legacy writer path at line 868+ reads the correct data.  Without
-        # this copy-back, the single-section warning's promise ("data will be
-        # preserved") is broken — the legacy path sees empty logs/string_data/
-        # curves_order.  Use .update() for logs/string_data to preserve any
-        # metadata entries (STRT, STOP, STEP, etc.) the user may have set.
-        # Only copy if legacy attributes are not already populated — respect
-        # user data.  curves_order is a list, so assignment is correct.
-        # Each attribute has its own destination guard (not just logs) so
-        # that pre-populated attributes are not silently overwritten.
-        _ds = las_file.data_sections[0]
-        if not las_file.logs and _ds.data:
-            las_file.logs.update(_ds.data)
-        if not las_file.string_data and _ds.string_data:
-            las_file.string_data.update(_ds.string_data)
-        if not las_file.curves_order and _ds.curves_order:
-            las_file.curves_order = list(_ds.curves_order)
-        # F-ITER2-W-R07: Also copy per-section curve definitions
-        # (units, descriptions, API codes, data_formats) to the
-        # top-level curves list so the legacy path preserves metadata.
-        if not las_file.curves and _ds.section_curves:
-            las_file.curves = list(_ds.section_curves)
-
-        # F-R-05: Check for curves/curves_order mismatch after copy-back.
-        # Independent per-attribute guards can produce len(curves) !=
-        # len(curves_order) when one is pre-populated but the other is
-        # copied from data_sections.
-        if (
-            las_file.curves
-            and las_file.curves_order
-            and len(las_file.curves) != len(las_file.curves_order)
-        ):
-            raise LASDataError(
-                f"curves count ({len(las_file.curves)}) does not match "
-                f"curves_order count ({len(las_file.curves_order)}) "
-                f"after copy-back. This indicates inconsistent "
-                f"LASFile construction."
+    try:
+        # F-I2-M17 / F-019: Guard against data_sections in non-LAS-3.0 files.
+        # from_dict populates data_sections from the input dict unconditionally
+        # (regardless of LAS version).  Multiple sections on a non-LAS-3.0 file
+        # cause guaranteed roundtrip data loss (parser skips all data for
+        # non-LAS-3.0 settings).  A single section can safely fall back to
+        # legacy ~A format.
+        if las_file.data_sections and not is_las30:
+            if len(las_file.data_sections) > 1:
+                raise LASWriteError(
+                    f"Multiple data_sections ({len(las_file.data_sections)}) "
+                    f"are only supported for LAS 3.0 files, but version is "
+                    f"{las_file.version.vers!r}. Cannot safely write multi-section "
+                    f"data for non-LAS-3.0 format."
+                )
+            warnings.warn(
+                "data_sections are only supported for LAS 3.0 files. "
+                "Falling back to single-section ~A format. "
+                "Single-section data will be preserved.",
+                stacklevel=3,
             )
 
-    if las_file.data_sections and is_las30:
-        # F-ITER2-W-M01 / F-ITER2-W-R08: The LAS 3.0 writer path only
-        # iterates data_sections and never reads las_file.logs.  If
-        # las_file.logs contains curve data not covered by any
-        # data_section's data or string_data, that data is silently
-        # discarded on write.  Emit a warning so the caller knows.
-        if las_file.logs:
-            # Collect all curve names present in any data_section.
-            _ds_covered: set[str] = set()
-            for _ds in las_file.data_sections:
-                _ds_covered.update(_ds.data.keys())
-                _ds_covered.update(_ds.string_data.keys())
-            _orphaned_logs = set(las_file.logs.keys()) - _ds_covered
-            if _orphaned_logs:
-                warnings.warn(
-                    f"Top-level logs contain curve(s) not present in any "
-                    f"data_section: {sorted(_orphaned_logs)}.  The LAS 3.0 "
-                    f"writer path only writes data from data_sections; "
-                    f"these curves' data will NOT appear in the output file.",
-                    stacklevel=3,
-                )
-        # LAS 3.0: Multiple data sections with typed headers.
-        # F-042: emitted_defs maps def_prefix -> {curve_signature -> def_section_name}.
-        # Two sections of the same type with IDENTICAL curve definitions share
-        # one Definition block (dedup).  When curve definitions differ between
-        # same-type sections, a new numbered Definition block is emitted.
-        emitted_defs: dict[str, dict[tuple[tuple[str, str, str, str], ...], str]] = {}
-        for section in las_file.data_sections:
-            # F2-006: Normalize section_type to uppercase — from_dict does
-            # not normalize, so programmatically constructed LASFile objects
-            # may have lowercase section_type values (e.g., "log_data").
-            # Normalize once at the top of the loop for all comparisons.
-            sec_type = section.section_type.upper()
-            section_prefix = _section_type_to_prefix(sec_type)
-            # I2F-18: Strip pipe characters from section names before
-            # constructing the pipe-delimited header.  A pipe in the
-            # section name (e.g., " | CURVE") would create a spurious
-            # pipe target, causing the parser to locate the wrong
-            # definition on re-read.  Pipe is NOT in _CONTROL_CHARS_RE
-            # because it is a legitimate LAS 3.0 zone notation character
-            # ("| RUN[1]") in value/description fields.
-            raw_section_name = (
-                f" {_sanitize_las_value(section.name).replace('|', '')}"
-                if section.name else ""
-            )
-            section_name = raw_section_name
+            # F-067/F-111: Copy data_sections[0] contents to legacy attributes so
+            # the legacy writer path at line 868+ reads the correct data.  Without
+            # this copy-back, the single-section warning's promise ("data will be
+            # preserved") is broken — the legacy path sees empty logs/string_data/
+            # curves_order.  Use .update() for logs/string_data to preserve any
+            # metadata entries (STRT, STOP, STEP, etc.) the user may have set.
+            # Only copy if legacy attributes are not already populated — respect
+            # user data.  curves_order is a list, so assignment is correct.
+            # Each attribute has its own destination guard (not just logs) so
+            # that pre-populated attributes are not silently overwritten.
+            _ds = las_file.data_sections[0]
+            if not las_file.logs and _ds.data:
+                las_file.logs.update(_ds.data)
+            if not las_file.string_data and _ds.string_data:
+                las_file.string_data.update(_ds.string_data)
+            if not las_file.curves_order and _ds.curves_order:
+                las_file.curves_order = list(_ds.curves_order)
+            # F-ITER2-W-R07: Also copy per-section curve definitions
+            # (units, descriptions, API codes, data_formats) to the
+            # top-level curves list so the legacy path preserves metadata.
+            if not las_file.curves and _ds.section_curves:
+                las_file.curves = list(_ds.section_curves)
 
-            # F-16: Compute definition prefix for non-LOG_DATA LAS 3.0
-            # sections.  Used for both the _Definition section header and
-            # the pipe notation on the data section header so the parser
-            # can re-associate per-section curves on re-read.
-            def_prefix: str | None = None
-            if is_las30 and sec_type != "LOG_DATA":
-                def_prefix = _SECTION_TYPE_TO_DEFINITION_PREFIX.get(sec_type)
-                if def_prefix is None:
-                    if sec_type.endswith("_DATA"):
-                        # F-D3-M01: Auto-derive Definition prefix for user-defined
-                        # _DATA section types not in the hardcoded mapping.
-                        # Strip _DATA suffix and title-case the root
-                        # (e.g., "CUSTOM_DATA" → "Custom").
-                        root = sec_type[: -len("_DATA")]
-                        root = _sanitize_las_value(root)
-                        def_prefix = root.title().replace("_", "")
-                    elif section.section_curves:
-                        # I2F-21: Unknown non-_DATA section type with per-section
-                        # curves.  Derive a definition prefix from the section type
-                        # name so that curve metadata is preserved on roundtrip.
-                        # Without this, unknown section types silently lose their
-                        # per-section curve definitions.
-                        import warnings
+            # F-R-05: Check for curves/curves_order mismatch after copy-back.
+            # Independent per-attribute guards can produce len(curves) !=
+            # len(curves_order) when one is pre-populated but the other is
+            # copied from data_sections.
+            if (
+                las_file.curves
+                and las_file.curves_order
+                and len(las_file.curves) != len(las_file.curves_order)
+            ):
+                raise LASDataError(
+                    f"curves count ({len(las_file.curves)}) does not match "
+                    f"curves_order count ({len(las_file.curves_order)}) "
+                    f"after copy-back. This indicates inconsistent "
+                    f"LASFile construction."
+                )
 
-                        warnings.warn(
-                            f"Unknown section type '{sec_type}' has per-section "
-                            f"curve definitions.  Deriving definition prefix from "
-                            f"section type name to preserve curve metadata.",
-                            stacklevel=3,
-                        )
-                        st = _sanitize_las_value(sec_type)
-                        def_prefix = st.title().replace("_", "")
+            # F-063: Check for uncovered curves after legacy copy-back.
+            # Independent per-attribute guards (lines 838-848) can produce
+            # curves_order entries without corresponding data in logs or
+            # string_data.  The writer pads uncovered curves with null_value
+            # silently — warn so the caller knows data was not propagated.
+            if las_file.curves_order and (las_file.logs or las_file.string_data):
+                _log_keys = set(las_file.logs.keys()) if las_file.logs else set()
+                _str_keys = (
+                    set(las_file.string_data.keys()) if las_file.string_data
+                    else set()
+                )
+                _order_set = set(las_file.curves_order)
+                _uncovered = _order_set - _log_keys - _str_keys
+                if _uncovered:
+                    warnings.warn(
+                        f"Curve(s) {sorted(_uncovered)} appear in "
+                        f"curves_order but have no data in 'logs' or "
+                        f"'string_data' after copy-back.  The writer will "
+                        f"pad these curves with null_value.",
+                        stacklevel=3,
+                    )
 
-            # For non-LOG_DATA sections: emit per-section Definition section
-            # so that the parser can correctly re-associate per-section curve
-            # names on re-read.  Without this, all data sections get the
-            # global curve set on roundtrip.
-            # F-042: Dedup by curve identity, not just prefix.
-            # Only skip definitions when another section of the same type
-            # has IDENTICAL curve definitions (same mnemonics, units,
-            # descriptions, data_formats).  Different curve sets on the
-            # same section type get separate numbered Definition blocks
-            # (e.g., Core_Definition, Core_Definition_2).
-            pipe_def_name: str | None = None
-            if is_las30 and sec_type != "LOG_DATA" and section.section_curves:
-                # Build a curve identity signature from the visible fields
-                # that distinguish one curve set from another.
-                sig = tuple(
-                    (curve.mnemonic, curve.unit or "", curve.description or "", curve.data_format or "")
-                    for curve in section.section_curves
+        if las_file.data_sections and is_las30:
+            # F-ITER2-W-M01 / F-ITER2-W-R08: The LAS 3.0 writer path only
+            # iterates data_sections and never reads las_file.logs.  If
+            # las_file.logs contains curve data not covered by any
+            # data_section's data or string_data, that data is silently
+            # discarded on write.  Emit a warning so the caller knows.
+            if las_file.logs:
+                # Collect all curve names present in any data_section.
+                _ds_covered: set[str] = set()
+                for _ds in las_file.data_sections:
+                    _ds_covered.update(_ds.data.keys())
+                    _ds_covered.update(_ds.string_data.keys())
+                _orphaned_logs = set(las_file.logs.keys()) - _ds_covered
+                if _orphaned_logs:
+                    warnings.warn(
+                        f"Top-level logs contain curve(s) not present in any "
+                        f"data_section: {sorted(_orphaned_logs)}.  The LAS 3.0 "
+                        f"writer path only writes data from data_sections; "
+                        f"these curves' data will NOT appear in the output file.",
+                        stacklevel=3,
+                    )
+            # LAS 3.0: Multiple data sections with typed headers.
+            # F-042: emitted_defs maps def_prefix -> {curve_signature -> def_section_name}.
+            # Two sections of the same type with IDENTICAL curve definitions share
+            # one Definition block (dedup).  When curve definitions differ between
+            # same-type sections, a new numbered Definition block is emitted.
+            emitted_defs: dict[str, dict[tuple[tuple[str, str, str, str], ...], str]] = {}
+            for section in las_file.data_sections:
+                # F2-006: Normalize section_type to uppercase — from_dict does
+                # not normalize, so programmatically constructed LASFile objects
+                # may have lowercase section_type values (e.g., "log_data").
+                # Normalize once at the top of the loop for all comparisons.
+                sec_type = (section.section_type or "LOG_DATA").upper()
+                section_prefix = _section_type_to_prefix(sec_type)
+                # I2F-18: Strip pipe characters from section names before
+                # constructing the pipe-delimited header.  A pipe in the
+                # section name (e.g., " | CURVE") would create a spurious
+                # pipe target, causing the parser to locate the wrong
+                # definition on re-read.  Pipe is NOT in _CONTROL_CHARS_RE
+                # because it is a legitimate LAS 3.0 zone notation character
+                # ("| RUN[1]") in value/description fields.
+                raw_section_name = (
+                    f" {_sanitize_las_value(section.name).replace('|', '')}"
+                    if section.name else ""
                 )
-                if def_prefix:
-                    if def_prefix not in emitted_defs:
-                        emitted_defs[def_prefix] = {}
-                    sig_map = emitted_defs[def_prefix]
-                    if sig not in sig_map:
-                        emit_idx = len(sig_map) + 1
-                        def_section_name = (
-                            f"{def_prefix}_Definition"
-                            if emit_idx == 1
-                            else f"{def_prefix}_Definition_{emit_idx}"
-                        )
-                        sig_map[sig] = def_section_name
-                        lines.append(f"~{def_section_name}")
-                        for curve in section.section_curves:
-                            lines.append(_format_curve_line(curve, is_las30))
-                        lines.append("")  # blank line after definition
-                    pipe_def_name = sig_map[sig]
+                section_name = raw_section_name
 
-            # Data section header with pipe notation for curve association.
-            # LOG_DATA sections reference "| CURVE" so the parser scopes
-            # curves to only the global ~CURVE set on re-read.  Non-LOG_DATA
-            # sections reference "| {Name}_Definition" for per-section curve
-            # reassociation (F-16).
-            # F-010/F-042: Only emit the pipe reference when the corresponding
-            # Definition section was actually written above (tracked via
-            # pipe_def_name).  Without this guard, a section with a valid
-            # def_prefix but empty section_curves would emit a phantom
-            # pipe reference to a non-existent Definition section.
-            if sec_type == "LOG_DATA" and is_las30:
-                lines.append(f"~{section_prefix}{section_name} | CURVE")
-            elif is_las30 and sec_type != "LOG_DATA" and pipe_def_name:
-                lines.append(
-                    f"~{section_prefix}{section_name} | {pipe_def_name}"
+                # F-16: Compute definition prefix for non-LOG_DATA LAS 3.0
+                # sections.  Used for both the _Definition section header and
+                # the pipe notation on the data section header so the parser
+                # can re-associate per-section curves on re-read.
+                def_prefix: str | None = None
+                if is_las30 and sec_type != "LOG_DATA":
+                    def_prefix = _SECTION_TYPE_TO_DEFINITION_PREFIX.get(sec_type)
+                    if def_prefix is None:
+                        if sec_type.endswith("_DATA"):
+                            # F-D3-M01: Auto-derive Definition prefix for user-defined
+                            # _DATA section types not in the hardcoded mapping.
+                            # Strip _DATA suffix and title-case the root
+                            # (e.g., "CUSTOM_DATA" → "Custom").
+                            root = sec_type[: -len("_DATA")]
+                            root = _sanitize_las_value(root)
+                            def_prefix = root.title().replace("_", "")
+                        elif section.section_curves:
+                            # I2F-21: Unknown non-_DATA section type with per-section
+                            # curves.  Derive a definition prefix from the section type
+                            # name so that curve metadata is preserved on roundtrip.
+                            # Without this, unknown section types silently lose their
+                            # per-section curve definitions.
+                            import warnings
+
+                            warnings.warn(
+                                f"Unknown section type '{sec_type}' has per-section "
+                                f"curve definitions.  Deriving definition prefix from "
+                                f"section type name to preserve curve metadata.",
+                                stacklevel=3,
+                            )
+                            st = _sanitize_las_value(sec_type)
+                            def_prefix = st.title().replace("_", "")
+
+                # For non-LOG_DATA sections: emit per-section Definition section
+                # so that the parser can correctly re-associate per-section curve
+                # names on re-read.  Without this, all data sections get the
+                # global curve set on roundtrip.
+                # F-042: Dedup by curve identity, not just prefix.
+                # Only skip definitions when another section of the same type
+                # has IDENTICAL curve definitions (same mnemonics, units,
+                # descriptions, data_formats).  Different curve sets on the
+                # same section type get separate numbered Definition blocks
+                # (e.g., Core_Definition, Core_Definition_2).
+                pipe_def_name: str | None = None
+                if is_las30 and sec_type != "LOG_DATA" and section.section_curves:
+                    # Build a curve identity signature from the visible fields
+                    # that distinguish one curve set from another.
+                    sig = tuple(
+                        (curve.mnemonic, curve.unit or "", curve.description or "", curve.data_format or "")
+                        for curve in section.section_curves
+                    )
+                    if def_prefix:
+                        if def_prefix not in emitted_defs:
+                            emitted_defs[def_prefix] = {}
+                        sig_map = emitted_defs[def_prefix]
+                        if sig not in sig_map:
+                            emit_idx = len(sig_map) + 1
+                            def_section_name = (
+                                f"{def_prefix}_Definition"
+                                if emit_idx == 1
+                                else f"{def_prefix}_Definition_{emit_idx}"
+                            )
+                            sig_map[sig] = def_section_name
+                            lines.append(f"~{def_section_name}")
+                            for curve in section.section_curves:
+                                lines.append(_format_curve_line(curve, is_las30))
+                            lines.append("")  # blank line after definition
+                        pipe_def_name = sig_map[sig]
+
+                # Data section header with pipe notation for curve association.
+                # LOG_DATA sections reference "| CURVE" so the parser scopes
+                # curves to only the global ~CURVE set on re-read.  Non-LOG_DATA
+                # sections reference "| {Name}_Definition" for per-section curve
+                # reassociation (F-16).
+                # F-010/F-042: Only emit the pipe reference when the corresponding
+                # Definition section was actually written above (tracked via
+                # pipe_def_name).  Without this guard, a section with a valid
+                # def_prefix but empty section_curves would emit a phantom
+                # pipe reference to a non-existent Definition section.
+                if sec_type == "LOG_DATA" and is_las30:
+                    lines.append(f"~{section_prefix}{section_name} | CURVE")
+                elif is_las30 and sec_type != "LOG_DATA" and pipe_def_name:
+                    lines.append(
+                        f"~{section_prefix}{section_name} | {pipe_def_name}"
+                    )
+                else:
+                    lines.append(f"~{section_prefix}{section_name}")
+                lines.extend(
+                    _format_data_rows(
+                        section.curves_order,
+                        section.data,
+                        section.string_data,
+                        null_value,
+                        delimiter,
+                        precision,
+                        is_las12=is_las12,
+                    )
                 )
-            else:
-                lines.append(f"~{section_prefix}{section_name}")
-            lines.extend(
-                _format_data_rows(
-                    section.curves_order,
-                    section.data,
-                    section.string_data,
-                    null_value,
-                    delimiter,
-                    precision,
-                    is_las12=is_las12,
+        else:
+            # Legacy single data section (~A).
+            curve_names = las_file.curves_order
+            if any(name in las_file.logs or name in las_file.string_data for name in curve_names):
+                lines.append("~A  " + "  ".join(_sanitize_las_value(name) for name in curve_names))
+                lines.extend(
+                    _format_data_rows(
+                        curve_names,
+                        las_file.logs,
+                        las_file.string_data,
+                        null_value,
+                        delimiter,
+                        precision,
+                        is_las12=is_las12,
+                    )
                 )
-            )
-    else:
-        # Legacy single data section (~A).
-        curve_names = las_file.curves_order
-        if any(name in las_file.logs or name in las_file.string_data for name in curve_names):
-            lines.append("~A  " + "  ".join(_sanitize_las_value(name) for name in curve_names))
-            lines.extend(
-                _format_data_rows(
-                    curve_names,
-                    las_file.logs,
-                    las_file.string_data,
-                    null_value,
-                    delimiter,
-                    precision,
-                    is_las12=is_las12,
-                )
-            )
+
+    finally:
+        # R8-007: Restore original model state after copy-back write completes.
+        # The save above captured the pre-mutation values of las_file.logs,
+        # string_data, curves_order, and curves.  Restoring them ensures the
+        # caller's LASFile is unchanged regardless of which write path executed.
+        las_file.logs = _saved_logs
+        las_file.string_data = _saved_string_data
+        las_file.curves_order = _saved_curves_order
+        las_file.curves = _saved_curves
+
     return lines
 
 

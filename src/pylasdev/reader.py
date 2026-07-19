@@ -26,7 +26,14 @@ logger = logging.getLogger(__name__)
 # these; this makes the read path symmetric.
 # Characters: \x00-\x08, \x0B (VT), \x0C (FF), \x0E-\x1F (FS/GS/RS/etc.),
 # \x7F (DEL), \x85 (NEL), \u2028 (LINE SEPARATOR), \u2029 (PARAGRAPH SEPARATOR).
-_SPLITLINES_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85\u2028\u2029]")
+# F-001: Also include the 13 Unicode whitespace characters that the writer's
+# _CONTROL_CHARS_RE strips (\u00A0, \u2000-\u200A, \u202F, \u205F, \u3000)
+# so the write→read roundtrip is symmetric.
+_SPLITLINES_CHARS_RE = re.compile(
+    r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85"
+    r"\u2028\u2029"
+    r"\u00A0\u2000-\u200A\u202F\u205F\u3000]"
+)
 
 
 def read_las_file(

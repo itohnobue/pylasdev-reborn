@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from pylasdev import read_dev_file, read_dev_file_as_object
-from pylasdev.exceptions import DEVReadError
+from pylasdev.exceptions import DEVReadError, LASDataError
 from pylasdev.models import DevFile
 
 
@@ -190,24 +190,16 @@ class TestReadDEVFile:
     def test_header_only_dev_file(self, tmp_path: Path) -> None:
         """Test reading a DEV file with only a header line, no data.
 
-        Exercises dev_reader.py:86-96 — the header-only path where
-        data_lines is 0.
+        G-019: Empty/header-only files now raise LASDataError instead of
+        returning empty data.  See dev_reader.py:973.
         """
         content = "MD TVD X Y\n"
         test_file = tmp_path / "header_only.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        data = read_dev_file(test_file)
-        assert isinstance(data, dict)
-        assert "MD" in data
-        assert "TVD" in data
-        assert "X" in data
-        assert "Y" in data
-        # All columns should be empty (0-length)
-        assert len(data["MD"]) == 0
-        assert len(data["TVD"]) == 0
-        assert len(data["X"]) == 0
-        assert len(data["Y"]) == 0
+        # G-019: No data lines — must raise LASDataError
+        with pytest.raises(LASDataError, match="No data lines found"):
+            read_dev_file(test_file)
 
     # --- F-50: Extra columns in data row vs header ---
     def test_extra_columns_in_data_row(self, tmp_path: Path) -> None:
@@ -411,14 +403,12 @@ class TestDevSafetyGuards:
                 read_dev_file(test_file)
 
     def test_index_error_handler_caught_by_safety_net(self, tmp_path: Path) -> None:
-        """IndexError in _to_finite_float is caught by safety net.
+        """IndexError from _to_finite_float now propagates (handler removed).
 
-        Exercises dev_reader.py:225-226.  The IndexError handler is a
-        safety net for pass-1/pass-2 line-count inconsistency.  Under
-        normal conditions both passes process the same lines identically
-        so the handler is unreachable.  We trigger it by mocking
-        ``_to_finite_float`` to raise IndexError, which the handler
-        catches and substitutes ``np.nan``.
+        G-012: The dead ``try/except IndexError: pass`` wrappers were
+        removed at 4 sites in dev_reader.py.  An IndexError from
+        ``_to_finite_float`` is no longer silently swallowed — it
+        propagates to the caller.
         """
         from unittest import mock
 
@@ -426,19 +416,17 @@ class TestDevSafetyGuards:
         test_file = tmp_path / "index_err.dev"
         test_file.write_text(content, encoding="utf-8")
 
+        # G-012: IndexError handler removed — error now propagates
         with mock.patch(
             "pylasdev.dev_reader._to_finite_float",
             side_effect=IndexError("simulated"),
-        ):
-            data = read_dev_file(test_file)
-            # Values should be NaN (substituted by handler)
-            assert np.isnan(data["MD"][0])
-            assert np.isnan(data["TVD"][0])
+        ), pytest.raises(IndexError, match="simulated"):
+            read_dev_file(test_file)
 
     def test_index_error_handler_read_dev_file_as_object(self, tmp_path: Path) -> None:
-        """IndexError safety net also covers read_dev_file_as_object path.
+        """IndexError from _to_finite_float propagates via as_object path.
 
-        Same as above but exercises the read_dev_file_as_object API.
+        G-012: Same as above but exercises the read_dev_file_as_object API.
         """
         from unittest import mock
 
@@ -446,13 +434,12 @@ class TestDevSafetyGuards:
         test_file = tmp_path / "index_err2.dev"
         test_file.write_text(content, encoding="utf-8")
 
+        # G-012: IndexError handler removed — error now propagates
         with mock.patch(
             "pylasdev.dev_reader._to_finite_float",
             side_effect=IndexError("simulated"),
-        ):
-            dev = read_dev_file_as_object(test_file)
-            assert np.isnan(dev.columns["X"][0])
-            assert np.isnan(dev.columns["Y"][0])
+        ), pytest.raises(IndexError, match="simulated"):
+            read_dev_file_as_object(test_file)
 
     # ── F-R-08: MAX_DATA_LINES at-limit acceptance ───────────────────
 
@@ -696,14 +683,18 @@ class TestDugFormat:
         assert data["INC"][1] == 1.5
 
     def test_dug_format_no_data(self, tmp_path: Path) -> None:
-        """DUG format with header but no data rows."""
+        """DUG format with header but no data rows.
+
+        G-019: No data lines — now raises LASDataError instead of
+        returning empty columns.
+        """
         content = "Survey\n4\nMD TVD X Y\n"
         test_file = tmp_path / "dug_no_data.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        data = read_dev_file(test_file)
-        assert list(data.keys()) == ["MD", "TVD", "X", "Y"]
-        assert len(data["MD"]) == 0
+        # G-019: No data lines — must raise LASDataError
+        with pytest.raises(LASDataError, match="No data lines found"):
+            read_dev_file(test_file)
 
     def test_dug_format_falls_to_simple_when_header_is_numeric(self, tmp_path: Path) -> None:
         """DUG format with genuinely empty header parsed as simple format.
@@ -889,48 +880,36 @@ class TestHeaderlessFormat:
         assert data["col_1"][1] == 1020.02
 
     def test_headerless_empty_file_returns_empty_data(self, tmp_path: Path) -> None:
-        """Test that an empty DEV file (zero content entries) returns empty data.
+        """Test that an empty DEV file raises LASDataError.
 
-        Exercises dev_reader.py:163-164 — the empty content_entries path
-        where _detect_dev_format returns ("simple", 1).  With no content
-        lines in either pass, the reader produces an empty DevFile.
+        G-019: Empty files (zero data lines) now raise LASDataError
+        instead of returning empty data.  See dev_reader.py:973.
         """
         test_file = tmp_path / "empty.dev"
         test_file.write_text("", encoding="utf-8")
 
-        # read_dev_file should return an empty dict
-        data = read_dev_file(test_file)
-        assert isinstance(data, dict)
-        assert len(data) == 0
+        # G-019: No data lines — must raise LASDataError
+        with pytest.raises(LASDataError, match="No data lines found"):
+            read_dev_file(test_file)
 
-        # read_dev_file_as_object should return an empty DevFile
-        dev = read_dev_file_as_object(test_file)
-        assert isinstance(dev, DevFile)
-        assert dev.column_order == []
-        assert len(dev.columns) == 0
-        assert dev.source_file != ""
-        assert dev.encoding != ""
+        with pytest.raises(LASDataError, match="No data lines found"):
+            read_dev_file_as_object(test_file)
 
     def test_whitespace_only_dev_file(self, tmp_path: Path) -> None:
-        """Test that a whitespace-only DEV file returns empty data.
+        """Test that a whitespace-only DEV file raises LASDataError.
 
-        Whitespace-only lines are stripped to empty strings and skipped
-        by the content scanner (line 315), producing empty content_entries
-        just like an empty file.
+        G-019: Whitespace-only files (zero data lines after stripping)
+        now raise LASDataError instead of returning empty data.
         """
         test_file = tmp_path / "whitespace.dev"
         test_file.write_text("   \n\t\n   \n", encoding="utf-8")
 
-        data = read_dev_file(test_file)
-        assert isinstance(data, dict)
-        assert len(data) == 0
+        # G-019: No data lines — must raise LASDataError
+        with pytest.raises(LASDataError, match="No data lines found"):
+            read_dev_file(test_file)
 
-        dev = read_dev_file_as_object(test_file)
-        assert isinstance(dev, DevFile)
-        assert dev.column_order == []
-        assert len(dev.columns) == 0
-        assert dev.source_file != ""
-        assert dev.encoding != ""
+        with pytest.raises(LASDataError, match="No data lines found"):
+            read_dev_file_as_object(test_file)
 
 
 class TestFormatAutoDetection:
@@ -1263,16 +1242,18 @@ class TestEmptyColumnNames:
     """
 
     def test_trailing_comma_no_data(self, tmp_path: Path) -> None:
-        """Trailing comma in header should be ignored (header-only file)."""
-        # Before fix: "MD,TVD," → ["MD","TVD",""] → columns: MD, TVD, ""
+        """Trailing comma in header with no data rows raises LASDataError.
+
+        G-019: No data lines — now raises LASDataError instead of
+        returning empty columns.
+        """
         content = "MD,TVD,\n"
         test_file = tmp_path / "f2_11_trail_no_data.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        data = read_dev_file(test_file)
-        # Only 2 valid columns, empty string filtered out
-        assert list(data.keys()) == ["MD", "TVD"]
-        assert len(data["MD"]) == 0
+        # G-019: No data lines — must raise LASDataError
+        with pytest.raises(LASDataError, match="No data lines found"):
+            read_dev_file(test_file)
 
     def test_trailing_comma_with_data(self, tmp_path: Path) -> None:
         """Trailing comma in header with data rows works correctly."""
@@ -1376,14 +1357,18 @@ class TestColumnsKeywordFormat:
         assert data["GR"][0] == 75.0
 
     def test_columns_header_only_no_data(self, tmp_path: Path) -> None:
-        """*COLUMNS header with no data rows produces empty columns."""
+        """*COLUMNS header with no data rows raises LASDataError.
+
+        G-019: No data lines — now raises LASDataError instead of
+        returning empty columns.
+        """
         content = "*COLUMNS *MD *TVD *X *Y\n"
         test_file = tmp_path / "columns_no_data.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        data = read_dev_file(test_file)
-        assert list(data.keys()) == ["MD", "TVD", "X", "Y"]
-        assert len(data["MD"]) == 0
+        # G-019: No data lines — must raise LASDataError
+        with pytest.raises(LASDataError, match="No data lines found"):
+            read_dev_file(test_file)
 
     def test_columns_with_comments(self, tmp_path: Path) -> None:
         """*COLUMNS format with comment lines interspersed."""

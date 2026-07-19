@@ -99,7 +99,14 @@ _SAFE_REGEX_LINE_LENGTH = 2_000
 #   that the writer strips but the parser/reader previously passed through.
 # Characters: \x00-\x08, \x0B (VT), \x0C (FF), \x0E-\x1F (FS/GS/RS/etc.),
 # \x7F (DEL), \x85 (NEL), \u2028 (LINE SEPARATOR), \u2029 (PARAGRAPH SEPARATOR).
-_SPLITLINES_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85\u2028\u2029]")
+# F-001: Also include the 13 Unicode whitespace characters that the writer's
+# _CONTROL_CHARS_RE strips (\u00A0, \u2000-\u200A, \u202F, \u205F, \u3000)
+# so the write→read roundtrip is symmetric.
+_SPLITLINES_CHARS_RE = re.compile(
+    r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85"
+    r"\u2028\u2029"
+    r"\u00A0\u2000-\u200A\u202F\u205F\u3000]"
+)
 
 # Section header: line starting with ~, followed by section keyword and trailing content.
 # Captures the full section word (e.g., "VERSION", "Core_Definition", "Core[1]")
@@ -337,6 +344,30 @@ def _unescape_colons_for_las_value(value: str) -> str:
     # Undo step 1: remove ``_`` between whitespace and colon
     # (`` _:`` → `` :``, ``\t_:`` → ``\t:``).
     value = re.sub(r"(\s+)_:", r"\1:", value)
+    return value
+
+
+def _desanitize_las_value(value: str) -> str:
+    """Reverse the _sanitize_las_value ``#``-prefix escape.
+
+    The writer prefixes ``#``-starting values with ``_`` to prevent the
+    parser from interpreting them as comment lines.  This function strips
+    that prefix, restoring the original ``#``-prefixed value.
+
+    Two cases (matching writer's ``_sanitize_las_value``):
+
+    1. ``value.startswith("#")`` → writer prepends ``_`` → ``"_#..."``
+       → reverse: strip the leading ``_``.
+    2. ``value.lstrip().startswith("#")`` → writer inserts ``_`` after
+       leading whitespace → ``" _#..."`` → reverse: remove the ``_``
+       between whitespace and ``#``.
+    """
+    if value.startswith("_#"):
+        return value[1:]
+    # Case 2: whitespace-prefixed value with sanitized _# (e.g., " _#comment")
+    idx = value.find("_#")
+    if idx > 0 and value[idx - 1].isspace():
+        return value[:idx] + value[idx + 1 :]
     return value
 
 
@@ -1445,9 +1476,9 @@ class LASParser:
         # _escape_colons_for_las_value BEFORE the CWLS/lasio swap logic.
         # Escaped patterns like " _:_ " would confuse the space/digit
         # heuristics used in auto-mode detection.
-        value = _unescape_colons_for_las_value(value)
+        value = _desanitize_las_value(_unescape_colons_for_las_value(value))
         if description is not None:
-            description = _unescape_colons_for_las_value(description)
+            description = _desanitize_las_value(_unescape_colons_for_las_value(description))
 
         # F-P06 / R7F-05: Bare-colon CWLS detection moved from _parse_well into
         # _store_well_entry so deferred well entries (parsed before ~V is known)
@@ -1466,7 +1497,13 @@ class LASParser:
                 and bool(re.search(r"T\d{2}:", value))
             )
             if not _is_timestamp:
-                _time_match = re.search(r"\b\d{1,2}:\d{2}(:\d{2})?\b", value)
+                # F-002: Scope the timestamp regex to the portion after
+                # the first colon to avoid false positives like "15:01"
+                # inside a date such as "15/01/2001" in CWLS well entries.
+                _time_match = re.search(
+                    r"\b\d{1,2}:\d{2}(:\d{2})?\b",
+                    value[value.index(":") + 1 :],
+                )
                 _is_timestamp = _time_match is not None
 
             if not _is_timestamp:
@@ -1607,7 +1644,7 @@ class LASParser:
             )
         # F-022: Unescape colon artifacts inserted by the writer's
         # _escape_colons_for_las_value (e.g., " _:_ " → " : ").
-        actual_value = _unescape_colons_for_las_value(actual_value)
+        actual_value = _desanitize_las_value(_unescape_colons_for_las_value(actual_value))
         self.las_file.well[mnemonic] = actual_value
         # F-008: Use `is not None` instead of truthiness check.  An empty
         # string is a semantically meaningful unit (e.g., unitless well
@@ -1845,8 +1882,8 @@ class LASParser:
         # F-022: Unescape colon artifacts inserted by the writer's
         # _escape_colons_for_las_value.  Curve descriptions and API codes
         # may contain escaped colons from a prior write→read roundtrip.
-        api_code = _unescape_colons_for_las_value(api_code)
-        description = _unescape_colons_for_las_value(description)
+        api_code = _desanitize_las_value(_unescape_colons_for_las_value(api_code))
+        description = _desanitize_las_value(_unescape_colons_for_las_value(description))
 
         # LAS 3.0: Extract format specifier from description
         data_format = ""
@@ -1871,7 +1908,18 @@ class LASParser:
             # so that non-format brace text (e.g. {Density}) is caught
             # by _FORMAT_SPEC_RE rather than silently normalizing to a
             # valid single-letter code (DENSITY → D).
-            _validate_curve_data_format(data_format, raw_mnemonic)
+            # I2-XWP-02: Multi-character patterns that do NOT match
+            # _FORMAT_SPEC_RE (e.g., {DD/MM/YYYY}, {DEG}) are metadata
+            # templates and pass through unchanged — same behavior
+            # as the parameter path (line ~2077).
+            try:
+                _validate_curve_data_format(data_format, raw_mnemonic)
+            except LASParseError:
+                # Not a valid data format — clear it so CurveDefinition
+                # __post_init__ does not reject the multi-char string.
+                # The non-format text is preserved in the description
+                # via _keep_non_format below.
+                data_format = ""
             if len(data_format) > 1:
                 data_format = data_format[0]
             if data_format == "A" and first_offset:
@@ -1900,8 +1948,23 @@ class LASParser:
                     data_format,
                     extra_formats,
                 )
-            # Remove all format specifiers from description
-            description = FORMAT_SPEC_PATTERN.sub("", description).strip()
+            # F-REV-01: Only strip validated format specifiers from
+            # description.  FORMAT_SPEC_PATTERN.sub("") blindly strips
+            # ALL brace-enclosed text — including non-format metadata
+            # like {Density}, {GAPI}, {Well}.  Use a callback-based sub
+            # so each match is individually validated before stripping.
+            def _keep_non_format(m: re.Match[str]) -> str:
+                try:
+                    _validate_curve_data_format(
+                        m.group("format").upper(), raw_mnemonic
+                    )
+                    return ""  # Valid format specifier → strip it
+                except LASParseError:
+                    return m.group(0)  # Non-format text → keep it
+
+            description = FORMAT_SPEC_PATTERN.sub(
+                _keep_non_format, description
+            ).strip()
 
         # LAS 3.0: Check for array notation in mnemonic
         array_info: ArrayElementInfo | None = None
@@ -1988,7 +2051,7 @@ class LASParser:
         # fields.  All 6 other fields (value, description across well,
         # curve, parameter) have paired unescape.  Adding this closes the
         # seventh and final gap, ensuring "kg : m" survives write→re-parse.
-        unit = _unescape_colons_for_las_value(unit)
+        unit = _desanitize_las_value(_unescape_colons_for_las_value(unit))
         value = match.group("value").strip()
         description = (
             match.group("description").strip()
@@ -2000,8 +2063,8 @@ class LASParser:
         # _escape_colons_for_las_value BEFORE format-specifier extraction.
         # Escaped patterns like " _:_ " in parameter values and descriptions
         # should be restored to their original colon-separated form.
-        value = _unescape_colons_for_las_value(value)
-        description = _unescape_colons_for_las_value(description)
+        value = _desanitize_las_value(_unescape_colons_for_las_value(value))
+        description = _desanitize_las_value(_unescape_colons_for_las_value(description))
 
         # M-PB2: Strip LAS 3.0 format specifiers from parameter
         # descriptions, mirroring _parse_curve logic (lines 877-899).
@@ -2052,7 +2115,23 @@ class LASParser:
                         f"Valid LAS data format codes: "
                         f"{', '.join(sorted(_VALID_DATA_FORMATS))}"
                     )
-        description = FORMAT_SPEC_PATTERN.sub("", description).strip()
+        # F-REV-01: Only strip validated format specifiers from
+        # description — matching the curve path.  FORMAT_SPEC_PATTERN.sub("")
+        # blindly strips ALL brace-enclosed text including non-format
+        # metadata like {Density}, {GAPI}, {Note}.  Use a callback-based
+        # sub so each match is individually validated.
+        def _keep_non_format_param(m: re.Match[str]) -> str:
+            try:
+                _validate_curve_data_format(
+                    m.group("format").upper(), raw_mnemonic
+                )
+                return ""  # Valid format specifier → strip it
+            except LASParseError:
+                return m.group(0)  # Non-format text → keep it
+
+        description = FORMAT_SPEC_PATTERN.sub(
+            _keep_non_format_param, description
+        ).strip()
 
         # LAS 3.0: Check for zone association in description
         zone: ParameterZone | None = None
@@ -2581,6 +2660,8 @@ class LASParser:
 
             for i in range(num_curves):
                 val_str = values[i].strip()
+                # F-007: Reverse the writer's _sanitize_las_value #-prefix escape
+                val_str = _desanitize_las_value(val_str)
                 if string_curves.get(i, False):
                     string_data_lists[i].append(val_str)
                 else:
@@ -2684,6 +2765,12 @@ class LASParser:
             _defs_seen: set[str] = set()
             per_type_data_before_def: list[str] = []
 
+            # F-004: Track parameter sections per type group, parallel to
+            # _defs_seen.  LAS 3.0 requires Parameter→Definition→Data
+            # order.  Warn when a Parameter section follows its Definition
+            # (out-of-order group).
+            per_type_param_after_def: list[str] = []
+
             for label in self._section_sequence:
                 section_word = label.split(":")[0]
                 is_data = (
@@ -2694,6 +2781,13 @@ class LASParser:
                 is_curve = (
                     section_word in {"C", "CURVE"}
                     or section_word.endswith("_DEFINITION")
+                )
+                # F-004: Identify parameter sections (both LAS 1.2/2.0 ~P
+                # and LAS 3.0 type-prefixed ~Core_Parameter etc.)
+                is_param = (
+                    section_word == "P"
+                    or section_word.endswith("_PARAMETER")
+                    or section_word.endswith("_PARAMETERS")
                 )
 
                 if is_data:
@@ -2737,13 +2831,43 @@ class LASParser:
                         # ~C or ~CURVE — covers all global definitions.
                         _defs_seen.add("__MAIN__")
 
-            # Emit per-type warnings.
+                # F-004: Track parameter sections and detect Parameter-after-
+                # Definition ordering.  When a parameter section appears in
+                # the sequence AFTER its corresponding definition section,
+                # the LAS 3.0 Parameter→Definition→Data order is violated.
+                if is_param:
+                    # Derive the expected definition type for this parameter
+                    # section (e.g., CORE_PARAMETER → CORE_DEFINITION).
+                    if section_word.endswith("_PARAMETERS"):
+                        _def_type = section_word.replace("_PARAMETERS", "_DEFINITION")
+                    elif section_word.endswith("_PARAMETER"):
+                        _def_type = section_word.replace("_PARAMETER", "_DEFINITION")
+                    else:
+                        # ~P — global parameter section, covers all
+                        _def_type = "__MAIN__"
+                    if _def_type in _defs_seen:
+                        per_type_param_after_def.append(
+                            f"~{section_word} after ~{_def_type}"
+                        )
+
+            # Emit per-type data-before-definition warnings.
             for msg in per_type_data_before_def:
                 logger.warning(
                     "LAS 3.0 data section %s. "
                     "Data sections without preceding curve definitions "
                     "will have no curves to reference and may produce "
                     "empty or truncated output.",
+                    msg,
+                )
+
+            # F-004: Emit parameter-after-definition warnings.
+            for msg in per_type_param_after_def:
+                logger.warning(
+                    "LAS 3.0 parameter section %s. "
+                    "Parameter sections should precede their definition "
+                    "sections per the LAS 3.0 specification. "
+                    "Definitions seen before parameters may cause "
+                    "metadata loss.",
                     msg,
                 )
 
