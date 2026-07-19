@@ -526,75 +526,76 @@ def _validate_dev_data(
     contains quality issues.
     """
     # --- Check MD column exists ---
-    if "MD" not in dev.columns:
-        return
+    # Each validation block independently guards its prerequisite
+    # columns; azimuth and inclination range checks still run when
+    # MD is absent but those columns are present.
+    if "MD" in dev.columns:
+        md = dev.columns["MD"]
+        total = len(md)
+        if total < 2:
+            # Need at least 2 stations for monotonicity and repeat checks.
+            # NaN-density check still applies for single-row files.
+            if total == 1 and np.isnan(md[0]):
+                warnings.warn(
+                    "MD column has 1/1 NaN value. "
+                    "Possible delimiter mismatch: data may have been parsed "
+                    "with the wrong separator. Specify the correct delimiter "
+                    "explicitly.",
+                    stacklevel=_stacklevel,
+                )
+            return
 
-    md = dev.columns["MD"]
-    total = len(md)
-    if total < 2:
-        # Need at least 2 stations for monotonicity and repeat checks.
-        # NaN-density check still applies for single-row files.
-        if total == 1 and np.isnan(md[0]):
+        # --- 1. Check NaN density (> 50% NaN suggests delimiter mismatch) ---
+        nan_count = int(np.isnan(md).sum())
+        if nan_count / total > 0.5:
             warnings.warn(
-                "MD column has 1/1 NaN value. "
-                "Possible delimiter mismatch: data may have been parsed "
-                "with the wrong separator. Specify the correct delimiter "
-                "explicitly.",
+                f"MD column has {nan_count}/{total} ({nan_count / total:.1%}) "
+                f"NaN values. Possible delimiter mismatch: data may have been "
+                f"parsed with the wrong separator. Specify the correct "
+                f"delimiter explicitly.",
                 stacklevel=_stacklevel,
             )
-        return
 
-    # --- 1. Check NaN density (> 50% NaN suggests delimiter mismatch) ---
-    nan_count = int(np.isnan(md).sum())
-    if nan_count / total > 0.5:
-        warnings.warn(
-            f"MD column has {nan_count}/{total} ({nan_count / total:.1%}) "
-            f"NaN values. Possible delimiter mismatch: data may have been "
-            f"parsed with the wrong separator. Specify the correct "
-            f"delimiter explicitly.",
-            stacklevel=_stacklevel,
-        )
+        # Filter to finite values for monotonicity and duplicate checks.
+        finite_mask = ~np.isnan(md)
+        if not np.any(finite_mask):
+            return
 
-    # Filter to finite values for monotonicity and duplicate checks.
-    finite_mask = ~np.isnan(md)
-    if not np.any(finite_mask):
-        return
+        finite_md = md[finite_mask]
+        if len(finite_md) < 2:
+            return
 
-    finite_md = md[finite_mask]
-    if len(finite_md) < 2:
-        return
+        # --- 2. Check MD monotonicity (strictly non-decreasing) ---
+        diffs = np.diff(finite_md)
+        non_monotonic = diffs < 0
+        if np.any(non_monotonic):
+            n_violations = int(np.sum(non_monotonic))
+            violations = np.where(non_monotonic)[0]
+            example_lines = []
+            for idx in violations[:3]:
+                example_lines.append(f"{finite_md[idx]} -> {finite_md[idx + 1]}")
+            warnings.warn(
+                f"MD values are not monotonically increasing: "
+                f"{n_violations} decrease(s) found. "
+                f"First violations: {', '.join(example_lines)}. "
+                f"Unsorted MD values can cause inaccurate trajectory "
+                f"calculations.",
+                stacklevel=_stacklevel,
+            )
 
-    # --- 2. Check MD monotonicity (strictly non-decreasing) ---
-    diffs = np.diff(finite_md)
-    non_monotonic = diffs < 0
-    if np.any(non_monotonic):
-        n_violations = int(np.sum(non_monotonic))
-        violations = np.where(non_monotonic)[0]
-        example_lines = []
-        for idx in violations[:3]:
-            example_lines.append(f"{finite_md[idx]} -> {finite_md[idx + 1]}")
-        warnings.warn(
-            f"MD values are not monotonically increasing: "
-            f"{n_violations} decrease(s) found. "
-            f"First violations: {', '.join(example_lines)}. "
-            f"Unsorted MD values can cause inaccurate trajectory "
-            f"calculations.",
-            stacklevel=_stacklevel,
-        )
-
-    # --- 3. Check repeated station MD values ---
-    unique_md, counts = np.unique(finite_md, return_counts=True)
-    duplicates = unique_md[counts > 1]
-    if len(duplicates) > 0:
-        n_dup = len(duplicates)
-        example_vals = sorted(duplicates)[:3]
-        warnings.warn(
-            f"Found {n_dup} repeated MD station value(s): "
-            f"{', '.join(str(v) for v in example_vals)}"
-            f"{'...' if n_dup > 3 else ''}. "
-            f"Repeated stations may indicate merged multi-tool surveys.",
-            stacklevel=_stacklevel,
-        )
+        # --- 3. Check repeated station MD values ---
+        unique_md, counts = np.unique(finite_md, return_counts=True)
+        duplicates = unique_md[counts > 1]
+        if len(duplicates) > 0:
+            n_dup = len(duplicates)
+            example_vals = sorted(duplicates)[:3]
+            warnings.warn(
+                f"Found {n_dup} repeated MD station value(s): "
+                f"{', '.join(str(v) for v in example_vals)}"
+                f"{'...' if n_dup > 3 else ''}. "
+                f"Repeated stations may indicate merged multi-tool surveys.",
+                stacklevel=_stacklevel,
+            )
 
     # --- 4. Check azimuth range [0, 360] ---
     _azi_names = ("AZI", "AZIM", "AZ", "AZM", "AZIMUTH")
@@ -932,6 +933,17 @@ def read_dev_file_as_object(
         raise DEVReadError(
             "Delimiter must be a non-empty string (e.g., ' ' for "
             "whitespace, ',' for comma). Received an empty string."
+        )
+
+    # Guard against multi-character delimiter — Python's csv.reader
+    # raises TypeError on multi-char delimiters at iteration time,
+    # which is not caught by the csv.Error handler in
+    # _split_delimited_line.
+    if len(delimiter) != 1:
+        raise DEVReadError(
+            f"Delimiter must be a single character (e.g., ' ' for "
+            f"whitespace, ',' for comma). Got {delimiter!r} "
+            f"({len(delimiter)} characters)."
         )
 
     # --- Pass 1: Count data lines ---

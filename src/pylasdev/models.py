@@ -59,7 +59,7 @@ def _create_parameter_entry(param_dict: dict[str, Any]) -> ParameterEntry:
         # F-026: Type validation for zone_index — raw dict values
         # pass through without type checking, violating the int | None
         # contract on ParameterZone.zone_index.
-        if _zone_index is not None and not isinstance(_zone_index, int):
+        if _zone_index is not None and type(_zone_index) is not int:
             raise TypeError(
                 f"zone_index: expected int or None, "
                 f"got {type(_zone_index).__name__}"
@@ -81,7 +81,7 @@ def _create_parameter_entry(param_dict: dict[str, Any]) -> ParameterEntry:
     # F-025: Type validation for array_index — raw dict values
     # pass through without type checking, violating the int | None
     # contract on ParameterEntry.array_index.
-    if _array_index is not None and not isinstance(_array_index, int):
+    if _array_index is not None and type(_array_index) is not int:
         raise TypeError(
             f"array_index: expected int or None, "
             f"got {type(_array_index).__name__}"
@@ -191,6 +191,20 @@ def _resolve_dict_entry(
     if not isinstance(value, expected_type):
         raise TypeError(
             f"{key}: expected {expected_type}, got {type(value).__name__}"
+        )
+    # F-9-002: Reject bool when int is expected — bool subclasses int so
+    # isinstance(True, int) is True, but bool is semantically not an int.
+    # Consistent with type() is not int guards at lines 62, 84, 717.
+    if (
+        value is not None
+        and isinstance(value, bool)
+        and (
+            expected_type is int
+            or (isinstance(expected_type, tuple) and int in expected_type)
+        )
+    ):
+        raise TypeError(
+            f"{key}: expected {expected_type}, got bool"
         )
     # I2F-13: Non-finite floats (inf, nan) slip past the isinstance
     # gate — isinstance(float('inf'), (int, float)) is True, but the
@@ -304,6 +318,8 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
                 if _raw is None:
                     continue  # None means "not set" — same as absent
                 df = str(_raw).upper()
+                if df:
+                    df = df[0]  # F-M-012: truncate extended format codes (parser accepts F8.3, etc.)
                 if df and df not in _VALID_DATA_FORMATS:
                     raise ValueError(
                         f"curves[{i}]: invalid data_format '{cd['data_format']}'. "
@@ -323,6 +339,8 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
                         if _raw is None:
                             continue
                         df = str(_raw).upper()
+                        if df:
+                            df = df[0]  # F-M-012: truncate extended format codes (parser accepts F8.3, etc.)
                         if df and df not in _VALID_DATA_FORMATS:
                             raise ValueError(
                                 f"data_sections[{si}].section_curves[{ci}]: "
@@ -365,17 +383,27 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
         _logs_raw = data.get("logs")
         if isinstance(_logs_raw, dict) and _logs_raw:
             # Collect all curve names referenced in data_sections.
+            # F-M-015: Apply case normalization (upper()) before overlap
+            # check.  mnem_base maps semantically-equal keys with different
+            # cases to the same canonical name — raw-key intersection
+            # produces false negatives when mnem_base normalization is active.
             _ds_curve_names: set[str] = set()
             for _ds in data_sections:
                 if isinstance(_ds, dict):
-                    _ds_curve_names.update(_ds.get("curves_order", []))
+                    _ds_curve_names.update(
+                        str(s).upper() for s in _ds.get("curves_order", [])
+                    )
                     _ds_data = _ds.get("data")
                     if isinstance(_ds_data, dict):
-                        _ds_curve_names.update(_ds_data.keys())
+                        _ds_curve_names.update(
+                            str(k).upper() for k in _ds_data.keys()
+                        )
                     _ds_str = _ds.get("string_data")
                     if isinstance(_ds_str, dict):
-                        _ds_curve_names.update(_ds_str.keys())
-            _log_curve_names = set(_logs_raw.keys())
+                        _ds_curve_names.update(
+                            str(k).upper() for k in _ds_str.keys()
+                        )
+            _log_curve_names = {str(k).upper() for k in _logs_raw.keys()}
             _overlap = _log_curve_names & _ds_curve_names
             if _overlap:
                 # F-115: Warn rather than reject — the parser roundtrip
@@ -491,6 +519,20 @@ class VersionSection:
         if self.dlm:
             _dlm = self.dlm.upper()
             is_las12 = self.vers.strip().startswith("1")
+            # F-I2-MD3-01: Validate DLM value first, then check LAS
+            # version compatibility.  The previous if/elif structure
+            # warned for LAS 1.2 with non-SPACE DLM but skipped the
+            # validity rejection when the DLM was completely invalid
+            # (e.g. "FOO").  Ensuring the validity check runs
+            # unconditionally before the version-specific warning
+            # guarantees that invalid DLMs are always rejected.
+            # Mirroring the fix from _validate_from_dict_input
+            # (lines 265-282).
+            if _dlm not in {"SPACE", "TAB", "COMMA"}:
+                raise ValueError(
+                    f"VersionSection: invalid DLM value "
+                    f"{self.dlm!r}.  Expected SPACE, TAB, or COMMA."
+                )
             if is_las12 and _dlm != "SPACE":
                 import warnings as _w
                 _w.warn(
@@ -498,11 +540,6 @@ class VersionSection:
                     f"(spec requires SPACE).  The file will use "
                     f"SPACE delimiter on write.",
                     stacklevel=2,
-                )
-            elif _dlm not in {"SPACE", "TAB", "COMMA"}:
-                raise ValueError(
-                    f"VersionSection: invalid DLM value "
-                    f"{self.dlm!r}.  Expected SPACE, TAB, or COMMA."
                 )
 
     def to_dict(self) -> dict[str, str]:
@@ -547,6 +584,25 @@ class WellSection:
     descriptions: dict[str, str] = field(
         default_factory=dict
     )  # CWLS description text for well fields
+
+    def __post_init__(self) -> None:
+        """Validate entries dict contains only string keys (F-M-008).
+
+        Direct construction bypasses parser and from_dict paths which
+        already validate key types.  Non-string keys cause the writer
+        to crash on ``key.upper()``.
+        """
+        if not isinstance(self.entries, dict):
+            raise TypeError(
+                f"WellSection: entries must be a dict, "
+                f"got {type(self.entries).__name__}"
+            )
+        for _key in self.entries:
+            if not isinstance(_key, str):
+                raise TypeError(
+                    f"WellSection: all entry keys must be str, "
+                    f"got {type(_key).__name__} ({_key!r})"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to legacy dict format, including non-empty units and descriptions."""
@@ -665,6 +721,20 @@ class ParameterZone:
     zone_name: str = ""
     zone_index: int | None = None
 
+    def __post_init__(self) -> None:
+        """Validate zone_index is int or None (F-M-010).
+
+        Direct construction bypasses parser and from_dict paths which
+        already validate the zone_index type.  A non-int value would
+        pass silently and produce incorrect output.
+        """
+        if self.zone_index is not None and type(self.zone_index) is not int:
+            raise TypeError(
+                f"ParameterZone: zone_index must be int or None, "
+                f"got {type(self.zone_index).__name__} "
+                f"({self.zone_index!r})"
+            )
+
 
 @dataclass
 class ParameterEntry:
@@ -703,6 +773,23 @@ class ParameterEntry:
                 f"ParameterEntry: mnemonic must not be empty, "
                 f"whitespace-only, or contain spaces, "
                 f"got {self.mnemonic!r}"
+            )
+        # F-M-009: Validate data_format when provided, mirroring
+        # CurveDefinition.__post_init__ (lines 619-624) and the
+        # from_dict parameter path (lines 125-137).  Only validate
+        # single-character values — multi-character strings like
+        # "DD/MM/YYYY" are metadata descriptors, not LAS format
+        # specifiers.  Single-character non-format values like "X"
+        # would be propagated as {X} format specifiers and produce
+        # corrupted LAS output.
+        if (self.data_format
+                and len(self.data_format) == 1
+                and self.data_format not in _VALID_DATA_FORMATS):
+            raise ValueError(
+                f"ParameterEntry: invalid data_format "
+                f"'{self.data_format}' for parameter "
+                f"'{self.mnemonic}'.  Valid values: "
+                f"{', '.join(sorted(_VALID_DATA_FORMATS))}"
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -905,6 +992,29 @@ class DataSection:
                     f"row count ({_string_rows})"
                 )
 
+        # F-M-036: Detect uncovered curves — curves in curves_order that
+        # have no data in either 'data' or 'string_data'.  The writer pads
+        # uncovered curves with null_value, so this is recoverable (warning
+        # only).  Both the __post_init__ (here) and the from_dict path
+        # (below) were unidirectional before — only orphaned data was
+        # checked (data_keys - curve_set), not uncovered curves
+        # (curve_set - data_keys - string_keys).
+        #
+        # When BOTH data and string_data are empty, this indicates deferred
+        # population (e.g. parser constructs DataSection before populating
+        # data).  Skip the warning in this case — curves_order entries will
+        # be covered once data is populated externally.
+        if self.data or self.string_data:
+            uncovered = curve_set - data_keys - string_keys
+            if uncovered:
+                warnings.warn(
+                    f"DataSection '{self.name}': curve(s) "
+                    f"{sorted(uncovered)} appear in curves_order but "
+                    f"have no data in 'data' or 'string_data'.  The "
+                    f"writer will pad these curves with null_value.",
+                    stacklevel=2,
+                )
+
 
 @dataclass(eq=False)
 class LASFile:
@@ -1067,6 +1177,25 @@ class LASFile:
                     f"LASFile: curves {sorted(_overlap)} appear in "
                     f"both logs and string_data.  Each curve may "
                     f"only be stored in one location."
+                )
+            # F-M-031: Cross-group row-count validation.
+            # The within-group checks above verify that all arrays in
+            # 'logs' have the same length, and all arrays in
+            # 'string_data' have the same length — but no cross-check
+            # verifies that logs rows and string_data rows match.
+            # A LASFile with 100-row numeric logs and 50-row string_data
+            # passes all existing validation.  The writer's
+            # ``_format_data_rows`` uses ``max()`` across all arrays,
+            # so one group's shorter arrays get padded — producing
+            # semantically incorrect output.
+            _log_row_count = len(next(iter(self.logs.values())))
+            _str_row_count = len(next(iter(self.string_data.values())))
+            if _log_row_count != _str_row_count:
+                raise LASDataError(
+                    f"LASFile: logs row count ({_log_row_count}) does "
+                    f"not match string_data row count "
+                    f"({_str_row_count}).  Both must have the same "
+                    f"number of rows."
                 )
 
         # --- data_sections validation (F-MD4-01) ---
@@ -1260,7 +1389,16 @@ class LASFile:
 
             if mnem_base:
                 _raw_up: dict[str, str] = {}
-                for _k, _v in mnem_base.items():
+                # F-M-037: Sort mnem_base items before iteration to
+                # guarantee deterministic first-wins semantics.  Without
+                # this sort, a dict where lowercase aliases (e.g. "bk")
+                # precede canonical entries ("BK") could break chain
+                # resolution.  Mirroring parser.py:438-440.
+                _sorted_items = sorted(
+                    mnem_base.items(),
+                    key=lambda item: (not item[0].isupper(), item[0]),
+                )
+                for _k, _v in _sorted_items:
                     _key = _k.upper()
                     if _key not in _raw_up:
                         _raw_up[_key] = _v
@@ -1351,6 +1489,17 @@ class LASFile:
                     f"curves_order must be an iterable, "
                     f"got {type(curves_order).__name__}"
                 )
+            # F-M-014 / F-M-016: Validate per-element types in curves_order.
+            # Non-string elements (int, None) crash _norm_mnem().upper()
+            # when mnem_base is active, and silently produce integer curve
+            # names when mnem_base is None (e.g. curves_order=range(5)
+            # passes the iterable guard but produces [0,1,2,3,4]).
+            for _i, _name in enumerate(curves_order):
+                if not isinstance(_name, (str, bytes)):
+                    raise TypeError(
+                        f"curves_order[{_i}] must be str, "
+                        f"got {type(_name).__name__}: {_name!r}"
+                    )
             las_file.curves_order = [
                 _norm_mnem(name) for name in curves_order
             ]
@@ -1804,6 +1953,25 @@ class LASFile:
                             f"keys not in curves_order: {sorted(_num_orphaned)}. "
                             f"Each data key must correspond to a curve mnemonic."
                         )
+                # F-M-036: Detect uncovered curves in from_dict path.
+                # The above checks detect orphaned data (data_keys - curve_set)
+                # but not the reverse (curve_set - data_keys - string_keys).
+                # Uncovered curves are recoverable (writer pads null_value)
+                # so emit a warning rather than raising.
+                _num_keys = set(ds_data.keys()) if ds_data else set()
+                _str_keys = set(ds_string_data.keys()) if ds_string_data else set()
+                if _curve_k:
+                    _uncovered = _curve_k - _num_keys - _str_keys
+                    if _uncovered:
+                        ds_name = ds_dict.get("name", "<unknown>")
+                        warnings.warn(
+                            f"Section '{ds_name}': curve(s) "
+                            f"{sorted(_uncovered)} appear in curves_order "
+                            f"but have no data in 'data' or "
+                            f"'string_data'.  The writer will pad these "
+                            f"curves with null_value.",
+                            stacklevel=2,
+                        )
                 if ds_section_curves:
                     _sc_mnemonics = [sc.mnemonic for sc in ds_section_curves]
                     _seen_m: set[str] = set()
@@ -2044,7 +2212,13 @@ class LASFile:
             # data_sections and string_data, so curves_order typically includes
             # curves whose data is in those sections, not in logs.
             if las_file.logs and not las_file.data_sections:
-                _log_keys = set(las_file.logs.keys())
+                # F-M-013: Normalize log keys through mnem_base before
+                # comparison.  curves_order is already normalized at
+                # construction (line ~1458), but logs dict uses raw keys.
+                # Without normalization, mnem_base-active environments
+                # produce false "Extra keys / Missing keys" errors when
+                # semantically-equivalent keys differ in case.
+                _log_keys = {_norm_mnem(k) for k in las_file.logs.keys()}
                 _order_keys = set(las_file.curves_order)
                 if _log_keys != _order_keys:
                     raise ValueError(

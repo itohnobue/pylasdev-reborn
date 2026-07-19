@@ -9,6 +9,10 @@ variant normalizes to an intermediate name, which further normalizes to
 a canonical name.  Use :func:`resolve_mnemonic` to walk these chains.
 """
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 MNEM_BASE: dict[str, str] = {
     "AHF30": "AHF20",
     "AHF60": "AHF20",
@@ -218,14 +222,12 @@ MNEM_BASE: dict[str, str] = {
     "Depth7": "DEPT",
     "Depth8": "DEPT",
     "Depth9": "DEPT",
-    "Ds": "DS",
     "Ds1": "DS",
     "Dsm": "DS",
     "Dsm1": "DS",
     "Dsm2": "DS",
     "Dsm3": "DS",
     "Dsm4": "DS",
-    "DT": "DT",
     "GAMMA": "GK",
     "GGK1": "GGK",
     "GGK11": "GGK",
@@ -256,7 +258,6 @@ MNEM_BASE: dict[str, str] = {
     "GGKocore2": "GGK",
     "GGKp": "GGK",
     "GGKq": "GGK",
-    "GGKs": "GGKS",
     "GGKsmall": "GGK",
     "GK0": "GK",
     "GK1": "GK",
@@ -288,7 +289,6 @@ MNEM_BASE: dict[str, str] = {
     "GKS2": "GK",
     "GKS3": "GK",
     "GKS4": "GK",
-    "GKST": "GKST",
     "GKST1": "GKST",
     "GKST2": "GKST",
     "GKTC": "GK",
@@ -806,7 +806,6 @@ MNEM_BASE: dict[str, str] = {
     "KWO1": "KW",
     "KWPLAST": "KW",
     "KWplast": "KW",
-    "Kgl": "KGL",
     "Kglcore": "KGL",
     "Kn": "KNG",
     "Kn1": "KNG",
@@ -815,7 +814,6 @@ MNEM_BASE: dict[str, str] = {
     "Kn4": "KNG",
     "Kn5": "KNG",
     "Kn6": "KNG",
-    "Kp": "KP",
     "Kp1": "KP",
     "Kp11": "KP",
     "Kp2": "KP",
@@ -860,7 +858,6 @@ MNEM_BASE: dict[str, str] = {
     "Kpoa12": "KNG",
     "Kpob10": "KNG",
     "Kpor": "KP",
-    "Kpr": "KPR",
     "Kpr1": "KPR",
     "Kpr11": "KPR",
     "Kpr2": "KPR",
@@ -894,7 +891,6 @@ MNEM_BASE: dict[str, str] = {
     "Kv3": "DS",
     "Kv4": "DS",
     "Kv5": "DS",
-    "Kw": "KW",
     "Kw11": "KW",
     "KwHx": "KW",
     "KwNh": "KW",
@@ -1154,7 +1150,6 @@ MNEM_BASE: dict[str, str] = {
     "NKTm": "NKTS",
     "NKTpk3": "NKT",
     "NKTq": "NKT",
-    "NKTs": "NKTS",
     "NKTs1": "NKTS",
     "NKTs11": "NKTS",
     "NKTs2": "NKTS",
@@ -1242,7 +1237,6 @@ MNEM_BASE: dict[str, str] = {
     "GZ2": "PZ",
     "GZ3": "PZ",
     "GZ4": "PZ",
-    "PZ": "PZ",
     "PZ-6": "PZ",
     "PZ1": "PZ",
     "PZ10": "PZ",
@@ -1276,7 +1270,6 @@ MNEM_BASE: dict[str, str] = {
     "PZk": "PZ",
     "Perm": "KPR",
     "Permcore": "KPR",
-    "PhiT": "PHIT",
     "Poreak": "KP",
     "Poreggk": "KP",
     "PoreggkT2": "KP",
@@ -1292,7 +1285,6 @@ MNEM_BASE: dict[str, str] = {
     "Porsp": "KP",
     "Ps": "SP",
     "Ps1": "SP",
-    "Pz": "PZ",
     "Pz1": "PZ",
     "QCZ": "OGZ",
     "R0": "IK",
@@ -1415,9 +1407,7 @@ MNEM_BASE: dict[str, str] = {
     "RoKIK3": "VIKIZ2",
     "RoKIK4": "VIKIZ3",
     "RoKIK5": "VIKIZ4",
-    "Rp": "RP",
     "Rp1": "RP",
-    "Rs": "RS",
     "Rt": "RP",
     "Rt1": "RP",
     "Rt2": "RP",
@@ -1466,14 +1456,12 @@ MNEM_BASE: dict[str, str] = {
     "SProcore2": "SP",
     "SPv": "SP",
     "SPk": "SP",
-    "SP": "SP",
     "STD1": "STD",
     "STD2": "STD",
     "STD3": "STD",
     "STD4": "STD",
     "SWHILT": "SW",
     "SWI": "SW",
-    "Sw": "SW",
     "Swarch": "SW",
     "Swb": "SW",
     "Swb1": "SW",
@@ -1660,8 +1648,6 @@ MNEM_BASE: dict[str, str] = {
     "AGK": "GK",
     "aGK": "GK",
     "aNGK": "NGK",
-    "bk": "BK",
-    "gk": "GK",
     "gk1": "GK",
     "gk2": "GK",
     "gk3": "GK",
@@ -1670,8 +1656,6 @@ MNEM_BASE: dict[str, str] = {
     "gk6": "GK",
     "gk7": "GK",
     "gk8": "GK",
-    "gz5": "GZ5",
-    "ks": "KS",
     "ks1": "KS",
     "ks2": "KS",
     "ks3": "KS",
@@ -1679,7 +1663,6 @@ MNEM_BASE: dict[str, str] = {
     "ks5": "KS",
     "ks6": "KS",
     "lito": "LIT",
-    "ngk": "NGK",
     "ngk1": "NGK",
     "ngk2": "NGK",
     "ngk3": "NGK",
@@ -1696,7 +1679,6 @@ MNEM_BASE: dict[str, str] = {
     "ps5": "SP",
     "ps6": "SP",
     "res": "RS",
-    "Agk": "GRO",
     "Agk1": "GRO",
     "АГК": "GRO",
     "АГК1": "GRO",
@@ -1873,7 +1855,6 @@ MNEM_BASE: dict[str, str] = {
     "ИКрк4": "VIKIZ4",
     "ИКрк5": "VIKIZ5",
     "ИКскин": "IK",
-    "KPR": "KPR",
     "КВ": "KW",
     "КВ1": "KW",
     "КВ2": "KW",
@@ -2051,7 +2032,14 @@ def resolve_mnemonic(
         nxt = mnem_base[current]
         if nxt in seen:
             # Cycle detected — return current as-is
+            logger.warning(
+                "Mnemonic cycle detected for %r at %r", mnemonic, current
+            )
             return current
         seen.add(current)
         current = nxt
+    logger.warning(
+        "Mnemonic resolution exceeded max_depth=%d for %r",
+        max_depth, mnemonic,
+    )
     return current

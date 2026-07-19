@@ -1456,6 +1456,48 @@ class TestEmptyDelimiterGuard:
         assert list(data.keys()) == ["MD", "TVD", "X"]
 
 
+class TestMultiCharDelimiterGuard:
+    """F-H-007: Tests for multi-character delimiter guard at dev_reader.py:938-947.
+
+    Python's csv.reader raises TypeError on multi-character delimiters at
+    iteration time, which is not caught by the csv.Error handler.  The guard
+    explicitly validates len(delimiter) == 1 before reaching csv.reader.
+    """
+
+    def test_multi_char_delimiter_raises_error(self, tmp_path: Path) -> None:
+        """Passing delimiter='::' raises DEVReadError."""
+        content = "MD::TVD::X\n0.0::0.0::100.0\n"
+        test_file = tmp_path / "multi_char_delim.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with pytest.raises(
+            DEVReadError,
+            match="Delimiter must be a single character",
+        ):
+            read_dev_file(test_file, delimiter="::")
+
+    def test_multi_char_delimiter_as_object(self, tmp_path: Path) -> None:
+        """Passing delimiter='::' to read_dev_file_as_object raises DEVReadError."""
+        content = "MD::TVD\n0.0::0.0\n"
+        test_file = tmp_path / "multi_char_delim_obj.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with pytest.raises(
+            DEVReadError,
+            match="Delimiter must be a single character",
+        ):
+            read_dev_file_as_object(test_file, delimiter="::")
+
+    def test_single_char_delimiter_still_works(self, tmp_path: Path) -> None:
+        """Single-char delimiter (',') still works after adding the guard."""
+        content = "MD,TVD,X\n0.0,0.0,100.0\n"
+        test_file = tmp_path / "single_char_delim.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file, delimiter=",")
+        assert list(data.keys()) == ["MD", "TVD", "X"]
+
+
 class TestDelimiterAutoCorrectionHeader:
     """F-01: Tests for delimiter auto-correction preserving header column names.
 

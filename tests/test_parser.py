@@ -2068,6 +2068,102 @@ class TestValueOnlyPattern:
         assert _is_indexed_data_section("LOG_DATA[1]") is True
 
 
+    # --- F-8-003: WRAP=YES trailing-comma regression ---
+
+    def test_las30_wrap_yes_multi_curve_trailing_comma_raises(self) -> None:
+        """F-8-003: WRAP=YES single-value line with trailing comma correctly detected.
+
+        When WRAP=YES with 2+ curves and COMMA delimiter, a data line containing
+        a single value plus a trailing comma (e.g. "1670.0,") would produce
+        ["1670.0", ""] → len=2 tokens.  Without the F-7-003 fix stripping
+        trailing empty tokens, len(_tokens) == 1 is False, incorrectly classifying
+        the wrapped data as non-wrapped.  After the fix, trailing empties are
+        stripped and the line is correctly identified as wrapped.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            " DLM.    COMMA : DELIMITING CHARACTER\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth {F}\n"
+            " GR.API       :  Gamma Ray {F}\n"
+            "~ASCII\n"
+            " 1670.0,\n"  # single value + trailing comma → wrapped data
+        )
+        parser = LASParser()
+        with pytest.raises(LASParseError, match="WRAP=YES"):
+            parser.parse(content)
+
+    def test_las30_wrap_yes_multi_curve_full_row_no_raise(self) -> None:
+        """F-8-003: WRAP=YES with full multi-curve row does NOT raise.
+
+        When WRAP=YES in header but data rows have >= curve_count values
+        (non-wrapped data), the heuristic correctly detects the inconsistency
+        and allows parsing to proceed.  This test verifies the heuristic's
+        negative path — the trailing-empty-strip fix does NOT cause false
+        positives on clean data.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            " DLM.    COMMA : DELIMITING CHARACTER\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth {F}\n"
+            " GR.API       :  Gamma Ray {F}\n"
+            "~ASCII\n"
+            " 1670.0,45.5\n"
+            " 1670.5,46.0\n"
+        )
+        parser = LASParser()
+        las = parser.parse(content)
+        # Should parse without raising LASParseError(WRAP=YES)
+        assert "DEPT" in las.logs
+        assert "GR" in las.logs
+
+    # --- F-7-004: deferred-population uncovered-curve guard ---
+
+    def test_las30_no_uncovered_curve_warning_on_normal_parse(
+        self, caplog
+    ) -> None:
+        """F-7-004: Normal LAS 3.0 parse does NOT emit uncovered-curve warnings.
+
+        DataSection.__post_init__ (models.py:989-993) has a guard that skips
+        the F-M-036 uncovered-curve warning when BOTH data and string_data are
+        empty — the deferred-population case.  The parser constructs DataSection
+        before populating data, so the warning must not fire during normal parse.
+        Without this guard, every LAS 3.0 parse would emit spurious warnings
+        about uncovered curves for every curve after the first data section.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA : DELIMITING CHARACTER\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth {F}\n"
+            " GR.API       :  Gamma Ray {F}\n"
+            "~ASCII\n"
+            " 1670.0,45.5\n"
+        )
+        parser = LASParser()
+        with caplog.at_level(logging.WARNING):
+            parser.parse(content)
+        uncovered_warnings = [
+            r.message
+            for r in caplog.records
+            if "uncovered" in r.message.lower()
+        ]
+        assert not uncovered_warnings, (
+            f"Unexpected uncovered-curve warnings: {uncovered_warnings}"
+        )
+
+
 class TestMaxGuardLimits:
     """F-I2-M42: MAX_* guard tests for parser.py.
 

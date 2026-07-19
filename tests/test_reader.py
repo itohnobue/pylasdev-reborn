@@ -179,6 +179,67 @@ class TestReadLASFile:
             "be in string_data"
         )
 
+    # --- F-H-006: string curve multi-char value preservation ---
+
+    def test_string_curve_multi_char_values_preserved(
+        self, tmp_path: Path
+    ) -> None:
+        """F-H-006: String curve values > 1 char are preserved in string_data.
+
+        Before the fix at data_reader.py:634, string curve arrays were
+        pre-allocated with dtype=np.str_ which defaults to a single-character
+        fixed-width Unicode type (U1), truncating values to their first
+        character.  After the fix, dtype=object preserves arbitrary-length
+        strings.
+
+        This test uses a LAS 3.0 file with {S}-format curve containing
+        multi-character lithology names like "Sandstone" and "Limestone".
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA : DELIMITING CHARACTER\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth {F}\n"
+            " LITH .       :  Lithology {S}\n"
+            "~ASCII\n"
+            " 100.0,Sandstone\n"
+            " 200.0,Limestone\n"
+            " 300.0,Dolomite\n"
+        )
+        test_file = tmp_path / "string_curve_multi_char.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+
+        # String curve must be in string_data
+        assert "LITH" in data["string_data"], (
+            "String curve 'LITH' missing from string_data"
+        )
+        lith_values = data["string_data"]["LITH"]
+        assert len(lith_values) == 3, (
+            f"Expected 3 LITH values, got {len(lith_values)}"
+        )
+        np.testing.assert_array_equal(
+            lith_values,
+            np.array(["Sandstone", "Limestone", "Dolomite"]),
+        )
+        # Verify no single-char truncation (before the data_reader fix,
+        # dtype=np.str_ pre-allocation at U1 would truncate multi-char values
+        # to their first character — "Sandstone" → "S").
+        # For LAS 3.0 parser path, np.str_ auto-sizes to fit longest value,
+        # so dtype may be U9 or similar.  The critical check is that values
+        # are full length, validated by assert_array_equal above.
+
+        # Float curve should be correct
+        assert "DEPT" in data["logs"]
+        np.testing.assert_array_equal(
+            data["logs"]["DEPT"],
+            np.array([100.0, 200.0, 300.0]),
+        )
+
     def test_encoding_parameter(self, test_data_dir: Path) -> None:
         """Test that explicit encoding parameter works."""
         sample = test_data_dir / "sample.las"

@@ -249,3 +249,41 @@ class TestResolveMnemonic:
         """Parametrized test for mnemonic chain resolution across multiple configurations."""
         result = resolve_mnemonic(mnem_base, key)
         assert result == expected
+
+    # --- F-H-004: AGK/Agk collision fix ---
+
+    def test_agk_collision_fix(self) -> None:
+        """F-H-004: AGK/Agk/aGK all resolve to 'GK', not 'GRO'.
+
+        Before the fix, the MNEM_BASE ordering caused case-variant AGK entries
+        to collide with Agk1→GRO via the uppercased first-wins algorithm,
+        silently mapping AGK to GRO.  After the fix, AGK/Agk/aGK all route
+        to the GK family.
+        """
+        uppered = _build_uppercased_first_wins(MNEM_BASE)
+        assert resolve_mnemonic(uppered, "AGK") == "GK", (
+            "AGK must resolve to GK, not GRO"
+        )
+        assert resolve_mnemonic(uppered, "Agk") == "GK", (
+            "Agk must resolve to GK, not GRO"
+        )
+        assert resolve_mnemonic(uppered, "aGK") == "GK", (
+            "aGK must resolve to GK, not GRO"
+        )
+
+    # --- F-H-005: BK collision fix ---
+
+    def test_bk_collision_fix(self) -> None:
+        """F-H-005: BK/bk resolve to 'BFV'.
+
+        Before the fix, the first-wins collision between Cyrillic БК→BK and
+        the canonical BK→BFV caused lowercase 'bk' lookups to resolve
+        incorrectly.  After the fix, both casing variants resolve to BFV.
+        """
+        uppered = _build_uppercased_first_wins(MNEM_BASE)
+        assert resolve_mnemonic(uppered, "BK") == "BFV", (
+            "BK must resolve to BFV"
+        )
+        assert resolve_mnemonic(uppered, "bk") == "BFV", (
+            "bk must resolve to BFV"
+        )

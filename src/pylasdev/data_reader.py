@@ -631,8 +631,8 @@ def _read_normal(
     _string_curve_map: dict[int, str] = {}  # index → curve_name for fast lookup
     for i, curve_name in enumerate(las_file.curves_order):
         if i in _string_curve_indices:
-            las_file.string_data[curve_name] = np.empty(
-                data_line_count, dtype=np.str_
+            las_file.string_data[curve_name] = np.full(
+                data_line_count, "", dtype=object
             )
             _string_curve_map[i] = curve_name
         else:
@@ -1233,4 +1233,4 @@ def _read_wrapped(
             _sl = _sl + [""] * (_max_len - len(_sl))
         elif len(_sl) > _max_len:
             _sl = _sl[:_max_len]
-        las_file.string_data[_name] = np.array(_sl, dtype=np.str_)
+        las_file.string_data[_name] = np.array(_sl, dtype=object)

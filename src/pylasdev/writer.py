@@ -382,6 +382,21 @@ def _write_version_section(las_file: LASFile) -> list[str]:
         # LASFile agrees with the file on disk.  Without this, a
         # subsequent write or to_dict() would still report WRAP=YES.
         las_file.version.wrap = "NO"
+    # F-M-027: LAS 3.0 requires one data row per line (non-wrapped output).
+    # Force WRAP=NO regardless of user-supplied wrap parameter to prevent
+    # data rows from being joined inline, which would produce a single
+    # giant line that downstream parsers reject.
+    if is_las30 and actual_wrap != "NO":
+        import warnings
+
+        warnings.warn(
+            f"LAS 3.0 WRAP={actual_wrap} overridden to WRAP=NO. "
+            "LAS 3.0 requires one data row per line. "
+            "The data will be written in non-wrapped format.",
+            stacklevel=3,
+        )
+        actual_wrap = "NO"
+        las_file.version.wrap = "NO"
     wrap_desc = (
         "ONE LINE PER DEPTH STEP" if actual_wrap == "NO" else "MULTIPLE LINES PER DEPTH STEP"
     )
@@ -415,6 +430,16 @@ def _write_well_section(las_file: LASFile) -> list[str]:
     # so that programmatically-constructed LAS files don't silently produce
     # semantically non-compliant output.  No exception raised; consistent
     # with the parser's read-time validation pattern.
+    # F-M-028: Validate well entry keys are strings before any .upper() call.
+    # Non-string keys (e.g., from WellSection(entries={123: "val"})) crash
+    # on key.upper() with confusing AttributeError.  Raise a clear TypeError.
+    # This is defense-in-depth — F-M-008 adds __post_init__ validation at
+    # the model layer; this protects the writer when that layer is bypassed.
+    for key in las_file.well.entries:
+        if not isinstance(key, str):
+            raise TypeError(
+                f"WellSection entry key must be str, got {type(key).__name__}: {key!r}"
+            )
     mandatory_fields = {"STRT", "STOP", "STEP", "NULL"}
     present_fields = {k.upper() for k in las_file.well.entries}
     for field in mandatory_fields:

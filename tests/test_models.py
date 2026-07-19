@@ -1067,6 +1067,45 @@ class TestLASFile:
         with pytest.raises(LASDataError, match="zone_index: expected int or None"):
             LASFile.from_dict(data)
 
+    # --- F-7-001: ParameterZone rejects bool (type() is not int guard) ---
+
+    def test_parameter_zone_rejects_bool_true_zone_index(self) -> None:
+        """F-7-001: ParameterZone(zone_index=True) raises TypeError.
+
+        Direct construction bypasses the from_dict validation path.
+        The __post_init__ guard at models.py:717 uses type() is not int
+        which correctly rejects bool (bool subclasses int, so isinstance
+        would NOT reject it).
+        """
+        from pylasdev.models import ParameterZone
+
+        with pytest.raises(TypeError, match="zone_index must be int or None"):
+            ParameterZone(zone_index=True)
+
+    def test_parameter_zone_rejects_bool_false_zone_index(self) -> None:
+        """F-7-001: ParameterZone(zone_index=False) raises TypeError.
+
+        Both True and False are subclasses of int; both must be rejected.
+        """
+        from pylasdev.models import ParameterZone
+
+        with pytest.raises(TypeError, match="zone_index must be int or None"):
+            ParameterZone(zone_index=False)
+
+    # --- F-8-001: _create_parameter_entry rejects bool array_index ---
+
+    def test_create_parameter_entry_rejects_bool_array_index(self) -> None:
+        """F-8-001: _create_parameter_entry with array_index=True raises TypeError.
+
+        The guard at models.py:84 was changed from isinstance to type()
+        to reject bool values (bool subclasses int).  This matches the
+        pattern at lines 62 and 717.
+        """
+        from pylasdev.models import _create_parameter_entry
+
+        with pytest.raises(TypeError, match="array_index: expected int or None"):
+            _create_parameter_entry({"mnemonic": "TEST", "array_index": True})
+
     # --- F2-002: non-numeric time_offset ---
 
     def test_from_dict_non_numeric_time_offset_raises(self) -> None:
@@ -1093,6 +1132,43 @@ class TestLASFile:
         }
         with pytest.raises(LASDataError, match="time_offset: expected"):
             LASFile.from_dict(data)
+
+    # --- F-9-002: _resolve_dict_entry rejects bool for int ---
+
+    def test_resolve_dict_entry_rejects_bool_for_int(self) -> None:
+        """F-9-002: _resolve_dict_entry must reject bool when expected_type
+        includes int.
+
+        bool subclasses int in Python, so isinstance(True, int) is True.
+        When callers pass expected_type=int or expected_type=(int, float),
+        _resolve_dict_entry must reject True/False to prevent silent
+        acceptance of bool where a numeric value is required.
+        This protects from_dict index=True → 1, time_offset=True → 1ms
+        semantic corruption.
+        """
+        from pylasdev.models import _resolve_dict_entry
+
+        # bool should be rejected for int
+        with pytest.raises(TypeError, match=r"index.*got bool"):
+            _resolve_dict_entry({"index": True}, "index", int, lambda: 0)
+
+        # bool should be rejected for (int, float)
+        with pytest.raises(TypeError, match=r"time_offset.*got bool"):
+            _resolve_dict_entry(
+                {"time_offset": True}, "time_offset", (int, float), lambda: None
+            )
+
+        # int and float should still work
+        assert _resolve_dict_entry({"index": 5}, "index", int, lambda: 0) == 5
+        assert (
+            _resolve_dict_entry(
+                {"time_offset": 1.5}, "time_offset", (int, float), lambda: None
+            )
+            == 1.5
+        )
+
+        # None default should still work
+        assert _resolve_dict_entry({}, "index", int, lambda: 0) == 0
 
     # --- F2-003: non-dict input to from_dict ---
 

@@ -1626,6 +1626,17 @@ class LASParser:
         and replayed here after the version is known.
         """
         if self._deferred_well_entries:
+            # F-M-006: Combined-count guard before replay.  well.entries
+            # may already contain entries + _deferred_well_entries may
+            # independently have up to MAX_DEFERRED_WELL_ENTRIES (100K),
+            # creating a transient memory pool of up to ~200K dict entries.
+            combined = len(self.las_file.well.entries) + len(self._deferred_well_entries)
+            if combined > 2 * MAX_DEFERRED_WELL_ENTRIES:
+                raise LASDataError(
+                    f"Combined well entry count ({combined}) exceeds maximum "
+                    f"allowed ({2 * MAX_DEFERRED_WELL_ENTRIES}). "
+                    f"The file may be malformed or corrupt."
+                )
             is_las12 = self.las_file.version.vers.startswith("1.")
             for entry in self._deferred_well_entries:
                 self._store_well_entry(
@@ -1909,19 +1920,35 @@ class LASParser:
                 index=index,
                 time_offset=array_time_offset,
             )
+        elif "[" in raw_mnemonic:
+            # F-M-007: Warn when mnemonic contains "[" but doesn't match
+            # ARRAY_MNEMONIC_PATTERN (e.g., NMR[-1], NMR[abc], NMR[]).
+            logger.warning(
+                "Mnemonic %r contains '[' but does not match array notation "
+                "pattern; treated as standalone curve.",
+                raw_mnemonic,
+            )
 
         # Apply mnemonic normalization from mnem_base
         normalized = self._mnem_base_upper.get(raw_mnemonic, raw_mnemonic)
 
-        curve = CurveDefinition(
-            mnemonic=normalized,
-            unit=unit,
-            api_code=api_code,
-            description=description,
-            original_mnemonic=_original_cased if _original_cased.upper() != normalized else "",
-            data_format=data_format,
-            array_info=array_info,
-        )
+        # F-M-026: Wrap CurveDefinition construction to catch ValueError
+        # from __post_init__ validation (e.g., empty mnemonic after
+        # mnem_base normalization) and re-raise as LASParseError.
+        try:
+            curve = CurveDefinition(
+                mnemonic=normalized,
+                unit=unit,
+                api_code=api_code,
+                description=description,
+                original_mnemonic=_original_cased if _original_cased.upper() != normalized else "",
+                data_format=data_format,
+                array_info=array_info,
+            )
+        except ValueError as e:
+            raise LASParseError(
+                f"Invalid curve definition for mnemonic {raw_mnemonic!r}: {e}"
+            ) from e
         # F-28: Guard against unbounded curve accumulation during ~C parsing.
         # Without this check, a metadata-only LAS 3.0 file can accumulate
         # unlimited CurveDefinition objects without triggering any bounds
@@ -2060,6 +2087,14 @@ class LASParser:
                     f"Invalid array index '{array_match.group('index')}' in "
                     f"parameter mnemonic '{raw_mnemonic}'"
                 ) from exc
+        elif "[" in raw_mnemonic:
+            # F-M-007: Warn when mnemonic contains "[" but doesn't match
+            # ARRAY_MNEMONIC_PATTERN (e.g., NMR[-1], NMR[abc], NMR[]).
+            logger.warning(
+                "Mnemonic %r contains '[' but does not match array notation "
+                "pattern; treated as standalone parameter.",
+                raw_mnemonic,
+            )
 
         # Apply mnemonic normalization from mnem_base (same as curve handling)
         normalized = self._mnem_base_upper.get(raw_mnemonic, raw_mnemonic)
@@ -2083,15 +2118,23 @@ class LASParser:
         if _section_type is not None:
             _section_type = _section_type.replace("~", "")
 
-        param = ParameterEntry(
-            mnemonic=normalized,
-            unit=unit,
-            value=value,
-            description=description,
-            array_index=array_index,
-            zone=zone,
-            section_type=_section_type,
-        )
+        # F-M-026: Wrap ParameterEntry construction to catch ValueError
+        # from __post_init__ validation (e.g., empty mnemonic after
+        # mnem_base normalization) and re-raise as LASParseError.
+        try:
+            param = ParameterEntry(
+                mnemonic=normalized,
+                unit=unit,
+                value=value,
+                description=description,
+                array_index=array_index,
+                zone=zone,
+                section_type=_section_type,
+            )
+        except ValueError as e:
+            raise LASParseError(
+                f"Invalid parameter entry for mnemonic {raw_mnemonic!r}: {e}"
+            ) from e
         # F-M15: Store data_format as an instance attribute for roundtrip
         # fidelity.  Forward-compatible — works before and after the field
         # is added to the ParameterEntry dataclass.
@@ -2262,19 +2305,44 @@ class LASParser:
         if not self._ascii_data_lines:
             return
 
-        # F-003: LAS 3.0 WRAP=YES is unsupported — wrapped-mode data
-        # processing is not implemented.  The previous logger.warning was
-        # insufficient: it acknowledged the gap but allowed corrupt data
-        # to be parsed, producing phantom rows and misaligned values.
-        # Raising LASParseError prevents silent data corruption and makes
-        # the limitation explicit.  Users must convert wrapped files to
-        # unwrapped format (one line per depth step) or set WRAP=NO.
+        # F-M-004: LAS 3.0 WRAP=YES check — detect actual wrap from data
+        # lines before rejecting.  Files with WRAP=YES in the header but
+        # non-wrapped data (one full row per line) should parse normally.
+        # The heuristic mirrors _detect_actual_wrap in data_reader.py:
+        # first data line with >= curve_count values → non-wrapped.
+        # Single-curve files cannot distinguish wrap mode so keep the reject.
         if self.las_file.version.wrap.upper() == "YES":
-            raise LASParseError(
-                "LAS 3.0 WRAP=YES is not supported by pylasdev.  "
-                "Convert the file to unwrapped format (one line per "
-                "depth step) before parsing, or set WRAP to NO."
-            )
+            if self._section_curve_end_idx is not None:
+                n_curves = len(self.las_file.curves[self._section_curve_start_idx : self._section_curve_end_idx])
+            else:
+                n_curves = len(self.las_file.curves[self._section_curve_start_idx :])
+            actual_wrap = True
+            if n_curves > 1:
+                delimiter = self.las_file.version.delimiter_char
+                for line in self._ascii_data_lines:
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    if delimiter == " ":
+                        actual_wrap = len(stripped.split(maxsplit=_resolve_max_tokens_per_line())) < n_curves
+                    else:
+                        _tokens = stripped.split(delimiter, maxsplit=_resolve_max_tokens_per_line())
+                        # F8M-02: Strip trailing empty strings before wrap check.
+                        # Trailing delimiters (e.g. "100.0,") produce empty fields that
+                        # inflate len(tokens), causing false-negative wrap detection:
+                        # len(["100.0", ""]) = 2 → incorrectly detected as non-wrapped.
+                        # Strip only TRAILING empties — middle empty fields represent
+                        # legitimate sparse data values that must be preserved.
+                        while _tokens and _tokens[-1] == "":
+                            _tokens.pop()
+                        actual_wrap = len(_tokens) == 1
+                    break
+            if actual_wrap:
+                raise LASParseError(
+                    "LAS 3.0 WRAP=YES is not supported by pylasdev.  "
+                    "Convert the file to unwrapped format (one line per "
+                    "depth step) before parsing, or set WRAP to NO."
+                )
 
         # Get delimiter character
         delimiter = self.las_file.version.delimiter_char
