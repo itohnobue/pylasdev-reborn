@@ -1063,11 +1063,12 @@ class TestLASFile:
     # --- F2-003: non-dict input to from_dict ---
 
     def test_from_dict_rejects_non_dict_input(self) -> None:
-        """F2-003: LASFile.from_dict() raises TypeError for non-dict input.
+        """F-008/F2-003: LASFile.from_dict() wraps TypeError as LASDataError.
 
-        models.py:400-401 validates the top-level data argument.
+        models.py:741-742 validates isinstance(data, dict) inside try block;
+        models.py:1468-1469 catches (ValueError, TypeError) and re-raises as LASDataError.
         """
-        with pytest.raises(TypeError, match="Expected dict, got"):
+        with pytest.raises(LASDataError, match="Expected dict, got"):
             LASFile.from_dict("not_a_dict")
 
     # --- F-017: Mandatory well field validation ---
@@ -1248,9 +1249,53 @@ class TestLASFile:
         las = LASFile.from_dict(data)
         assert len(las.data_sections) == 2
 
-    # --- IF-026: data_format/placement cross-validation ---
+    # --- R7F-02: Cumulative allocation guard uses sum, not max ---
 
-    def test_from_dict_string_format_in_numeric_data_raises(self) -> None:
+    def test_from_dict_cumulative_guard_ds_data_plus_string_data(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R7F-02: Cumulative allocation check must sum ds_data + ds_string_data
+        rather than taking max().  Both data types coexist in the same section
+        and allocate separate arrays — the total is the sum, not the max.
+
+        The old code used ``_section_total = max(_section_total, ...)`` which
+        could be bypassed when both ds_data and ds_string_data individually pass
+        their per-section checks but their combined total exceeds the limit.
+
+        This test sets MAX_TOTAL_ELEMENTS small (100) and constructs a section
+        where ds_data=60 elements and ds_string_data=60 elements individually
+        pass per-section (60 < 100) but combined=120 > 100.
+        """
+        monkeypatch.setattr("pylasdev.data_reader.MAX_TOTAL_ELEMENTS", 100)
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT", "CDES"],
+            "curves": [
+                {"mnemonic": "DEPT", "unit": "M", "data_format": "F"},
+                {"mnemonic": "CDES", "unit": "", "data_format": "S"},
+            ],
+            "logs": {"DEPT": np.zeros(60, dtype=np.float64)},
+            "data_sections": [
+                {
+                    "name": "Section1",
+                    "section_type": "LOG_DATA",
+                    "curves_order": ["DEPT", "CDES"],
+                    "section_curves": [
+                        {"mnemonic": "DEPT", "unit": "M", "data_format": "F"},
+                        {"mnemonic": "CDES", "unit": "", "data_format": "S"},
+                    ],
+                    "data": {
+                        "DEPT": np.zeros(60, dtype=np.float64),
+                    },
+                    "string_data": {
+                        "CDES": np.array(["desc"] * 60),
+                    },
+                },
+            ],
+        }
+        with pytest.raises(ValueError, match="Cumulative cross-section allocation"):
+            LASFile.from_dict(data)
         """IF-026: Curve with data_format='S' in logs (numeric) raises ValueError.
 
         _check_df_vs_placement verifies that {S} format curves appear in
@@ -1490,9 +1535,131 @@ class TestDevFile:
     # --- F2-003: non-dict input to DevFile.from_dict ---
 
     def test_dev_file_from_dict_rejects_non_dict_input(self) -> None:
-        """F2-003: DevFile.from_dict() raises TypeError for non-dict input.
+        """F-008/F2-003: DevFile.from_dict() wraps TypeError as LASDataError.
 
-        models.py:1017-1018 validates the top-level data argument.
+        models.py:1572-1573 validates isinstance(data, dict) inside try block;
+        models.py:1661-1662 catches (ValueError, TypeError) and re-raises as LASDataError.
         """
-        with pytest.raises(TypeError, match="Expected dict, got"):
+        with pytest.raises(LASDataError, match="Expected dict, got"):
             DevFile.from_dict(42)
+
+    # --- R7F-01: _meta_ prefix roundtrip (models.py:1592-1620) ---
+
+    def test_dev_file_meta_prefix_roundtrip_source_file(self) -> None:
+        """R7F-01: DevFile roundtrip with column named 'source_file' (metadata
+        key collision).  to_dict() stores metadata under _meta_ prefix;
+        from_dict() must recognise and reverse the prefix without crashing.
+
+        Before the R7F-01 fix, from_dict() would try np.array(str_metadata,
+        dtype=np.float64) on _meta_-prefixed keys and crash with LASDataError.
+        The fix adds _meta_ prefix recognition before the metadata_keys check.
+
+        NOTE: Column data under a key that collides with a metadata key name
+        is currently NOT preserved through the roundtrip.  When from_dict()
+        sees the bare "source_file" key, it is in metadata_keys and gets
+        treated as metadata (overwriting the actual source_file with the
+        column array's string representation, which is then overwritten by
+        the _meta_ value).  The column itself is lost.  This is a remaining
+        gap — a complete fix would need to skip the metadata branch for a
+        bare key when a corresponding _meta_ key exists in the dict.
+        """
+        import warnings
+
+        dev = DevFile()
+        dev.columns["source_file"] = np.array([0.0, 100.0, 200.0])
+        dev.columns["TVD"] = np.array([0.0, 99.0, 198.0])
+        dev.source_file = "/path/to/real_source.dev"
+        dev.encoding = "latin-1"
+
+        # to_dict() should warn about collision and store metadata under
+        # _meta_ prefix
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            d = dev.to_dict()
+            meta_warnings = [
+                x for x in w
+                if "storing metadata as '_meta_" in str(x.message)
+            ]
+            assert len(meta_warnings) >= 1, (
+                f"Expected _meta_ collision warning, got warnings: "
+                f"{[str(x.message) for x in w]}"
+            )
+
+        # _meta_ keys exist; column data is under bare key
+        assert "_meta_source_file" in d, f"Keys: {list(d.keys())}"
+        assert "source_file" in d  # column data preserved in to_dict output
+        assert "TVD" in d
+
+        # from_dict() should NOT crash on _meta_ keys (the original HIGH bug)
+        dev2 = DevFile.from_dict(d)
+
+        # Metadata restored from _meta_ keys
+        assert dev2.source_file == "/path/to/real_source.dev"
+        assert dev2.encoding == "latin-1"
+
+        # Non-colliding column data survives
+        np.testing.assert_array_equal(
+            dev2.columns["TVD"], np.array([0.0, 99.0, 198.0])
+        )
+
+        # R7F-01-gap fix: column "source_file" survives the roundtrip
+        np.testing.assert_array_equal(
+            dev2.columns["source_file"], np.array([0.0, 100.0, 200.0])
+        )
+
+    def test_dev_file_meta_prefix_roundtrip_encoding(self) -> None:
+        """R7F-01: collision on 'encoding' metadata key — from_dict must
+        not crash when processing _meta_-prefixed keys."""
+        import warnings
+
+        dev = DevFile()
+        dev.columns["encoding"] = np.array([10.0, 20.0])
+        dev.columns["MD"] = np.array([0.0, 100.0])
+        dev.source_file = "test.dev"
+        dev.encoding = "cp1251"
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            d = dev.to_dict()
+            meta_warnings = [
+                x for x in w
+                if "storing metadata as '_meta_" in str(x.message)
+            ]
+            assert len(meta_warnings) >= 1
+
+        assert "_meta_encoding" in d
+
+        # Must not crash (the original HIGH bug)
+        dev2 = DevFile.from_dict(d)
+        assert dev2.encoding == "cp1251"
+        assert dev2.source_file == "test.dev"
+        # Non-colliding columns survive
+        np.testing.assert_array_equal(
+            dev2.columns["MD"], np.array([0.0, 100.0])
+        )
+        # R7F-01-gap fix: column "encoding" survives the roundtrip
+        np.testing.assert_array_equal(
+            dev2.columns["encoding"], np.array([10.0, 20.0])
+        )
+
+    def test_dev_file_meta_prefix_roundtrip_no_collision(self) -> None:
+        """R7F-01: when there is no collision, to_dict()/from_dict() work
+        normally (no _meta_ keys produced or expected)."""
+        dev = DevFile()
+        dev.columns["MD"] = np.array([0.0, 100.0])
+        dev.columns["TVD"] = np.array([0.0, 99.0])
+        dev.source_file = "normal.dev"
+        dev.encoding = "utf-8"
+
+        d = dev.to_dict()
+        # No _meta_ keys when no collision
+        assert "_meta_source_file" not in d
+        assert "_meta_encoding" not in d
+        assert "source_file" in d
+        assert "encoding" in d
+
+        dev2 = DevFile.from_dict(d)
+        assert dev2.source_file == "normal.dev"
+        assert dev2.encoding == "utf-8"
+        np.testing.assert_array_equal(dev2.columns["MD"], np.array([0.0, 100.0]))
+        np.testing.assert_array_equal(dev2.columns["TVD"], np.array([0.0, 99.0]))

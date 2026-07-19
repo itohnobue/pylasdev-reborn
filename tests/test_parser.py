@@ -1053,6 +1053,57 @@ class TestLAS12WellSectionSwap:
         las = parser.parse(las12)
         assert las.well["COMP"] == "Test Oil Company Ltd."
 
+    # --- R7F-05: Deferred CWLS bare-colon (parser.py:1339-1362) ---
+
+    def test_las12_deferred_well_bare_colon_split(self) -> None:
+        """R7F-05: When ~W appears before ~V in a LAS 1.2 CWLS file,
+        bare-colon well entries (e.g., 'LOG DATE:15/01/2001') must be
+        correctly split into description and value.
+
+        Before the fix, bare-colon detection ran in _parse_well before
+        the version was known, so is_las12 defaulted to False and no split
+        occurred.  Deferred entries were replayed without splitting,
+        storing the raw colon-bearing string as the value.
+
+        The fix moves bare-colon detection into _store_well_entry which
+        always receives the correct is_las12 flag.
+        """
+        content = (
+            # ~W BEFORE ~V — triggers deferred well entry path
+            "~WELL INFORMATION\n"
+            " DATE.    LOG DATE:15/01/2001\n"
+            " COMP.    COMPANY : Test Oil Company Ltd.\n"
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+        )
+        parser = LASParser()
+        las = parser.parse(content)
+
+        # R7F-05 fix: bare-colon entry "LOG DATE:15/01/2001" should be
+        # split into description="LOG DATE" and value="15/01/2001".
+        assert las.well["DATE"] == "15/01/2001", (
+            f"Expected split value '15/01/2001', got {las.well['DATE']!r}"
+        )
+        # Non-bare-colon entries should still work
+        assert las.well["COMP"] == "Test Oil Company Ltd."
+
+    def test_las12_normal_order_bare_colon_split(self) -> None:
+        """R7F-05: When ~V appears before ~W (normal order), bare-colon
+        entries in LAS 1.2 are also correctly split — no regression."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " DATE.    LOG DATE:15/01/2001\n"
+            " COMP.    COMPANY : Test Oil Company Ltd.\n"
+        )
+        parser = LASParser()
+        las = parser.parse(content)
+        assert las.well["DATE"] == "15/01/2001"
+        assert las.well["COMP"] == "Test Oil Company Ltd."
+
 
 class TestLAS30IntegerFormat:
     """T3/F-16: LAS 3.0 {I} integer format specifier."""
@@ -2205,6 +2256,86 @@ class TestPipeDelimitedSectionHeaders:
         # Data should still parse (uses default curve scope)
         assert len(las.data_sections) == 1
         assert las.data_sections[0].data["DEPT"][0] == 100.0
+
+
+class TestIndexedSectionOrdering:
+    """R7F-04: Indexed data sections (e.g., CORE[1]) resolve to their
+    definition type in section ordering checks.
+
+    Before the fix, CORE[1] fell through the _SECTION_TYPE_MAP resolution
+    chain to __MAIN__ because only unindexed keys exist in the map.  The
+    fix strips the bracket suffix to extract the base type before lookup.
+    """
+
+    def test_indexed_section_before_definition_emits_warning(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """CORE[1] data section before ~CORE_DEFINITION should emit a
+        per-type ordering warning."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~Core[1]
+ 2.5,0.15
+ 3.1,0.18
+~CORE_DEFINITION
+ RHOZ.OHMM       :  RESISTIVITY  {F}
+ PHIZ.V/V        :  POROSITY  {F}
+~Core[2]
+ 4.0,0.20
+"""
+        parser = LASParser()
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            las = parser.parse(content)
+            warning_text = caplog.text
+            # Should warn about CORE[1] before ~CORE_DEFINITION
+            assert "~CORE[1] before ~CORE_DEFINITION" in warning_text, (
+                f"Expected ordering warning for CORE[1]; got: {warning_text}"
+            )
+
+        # CORE[1] data before definition is discarded (no curves available);
+        # CORE[2] data after definition is properly stored.
+        assert len(las.data_sections) == 1
+        assert las.data_sections[0].name == "CORE[2]"
+        assert las.data_sections[0].data["RHOZ"][0] == 4.0
+        assert las.data_sections[0].data["PHIZ"][0] == 0.2
+
+    def test_indexed_section_after_definition_no_warning(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """CORE[1] after ~CORE_DEFINITION (correct order) — no warning."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~CORE_DEFINITION
+ RHOZ.OHMM       :  RESISTIVITY  {F}
+ PHIZ.V/V        :  POROSITY  {F}
+~Core[1]
+ 2.5,0.15
+ 3.1,0.18
+"""
+        parser = LASParser()
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            las = parser.parse(content)
+            warning_text = caplog.text
+            # No per-type ordering warning for CORE[1] (correct order)
+            assert "before ~CORE_DEFINITION" not in warning_text, (
+                f"Unexpected ordering warning: {warning_text}"
+            )
+
+        assert len(las.data_sections) == 1
+        # Data is correctly stored when section follows definition
+        assert las.data_sections[0].name == "CORE[1]"
+        assert las.data_sections[0].data["RHOZ"][0] == 2.5
+        assert las.data_sections[0].data["PHIZ"][0] == 0.15
+        assert las.data_sections[0].data["RHOZ"][1] == 3.1
+        assert las.data_sections[0].data["PHIZ"][1] == 0.18
 
 
 class TestNonLetterTildeHeaders:

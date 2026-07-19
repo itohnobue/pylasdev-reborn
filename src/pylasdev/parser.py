@@ -31,6 +31,7 @@ from .data_reader import (
 from .exceptions import LASParseError
 from .mnem_base import resolve_mnemonic
 from .models import (
+    _VALID_DATA_FORMATS,
     ArrayElementInfo,
     CurveDefinition,
     DataSection,
@@ -85,6 +86,15 @@ MAX_LINE_LENGTH = 50_000
 # independently.  Overridable at module level.
 MAX_FIELD_LENGTH = 100_000
 
+# I2F-01: Maximum line length for safe regex matching without risk of
+# catastrophic backtracking.  Lines exceeding this threshold bypass the
+# regex entirely and use a manual scan for the colon separator.  This
+# provides defense-in-depth against regex DoS — the regex itself is
+# already fixed (non-backtracking lookahead), but a manual scan is
+# guaranteed O(n) regardless of regex engine edge cases.
+# Overridable at module level.
+_SAFE_REGEX_LINE_LENGTH = 2_000
+
 # F-32 + G-17 + F-I2-M04 + F-I2-M05: Control characters that appear in file
 # content and must be stripped before splitlines() to prevent section-header
 # injection and silent data corruption.  The writer's _CONTROL_CHARS_RE strips
@@ -111,12 +121,32 @@ SECTION_PATTERN = re.compile(r"^~([A-Za-z]\S*)(.*)")
 # Uses \w which matches Unicode (including Cyrillic) in Python 3
 # Note: LAS files commonly have spaces between mnemonic and dot (e.g., "DT  .US/M")
 #
-# The colon separator uses (\s+:\s*|\s*:\s+) which requires whitespace on
-# at least one side of the colon.  This prevents false matches on bare
-# colons in values (timestamps like "12:34:56") and LAS 3.0 format
-# specifiers ({A:0}), while still correctly separating value from
-# description in standard "VALUE : DESCRIPTION" lines and handling
-# empty-value lines like "MNEM.UNIT       : DESCRIPTION".
+# The colon separator requires whitespace on at least one side of the colon.
+# This prevents false matches on bare colons in values (timestamps like
+# "12:34:56") and LAS 3.0 format specifiers ({A:0}), while still correctly
+# separating value from description in standard "VALUE : DESCRIPTION" lines
+# and handling empty-value lines like "MNEM.UNIT       : DESCRIPTION".
+#
+# I2F-01: The previous alternation (\s+:\s*|\s*:\s+|:\s*$) had overlapping
+# alternatives (both \s+:\s* and \s*:\s+ match when whitespace exists on
+# both sides of the colon) that caused catastrophic O(n^3) regex
+# backtracking on long lines with many spaces and colons.
+#
+# The fix uses non-overlapping alternatives:
+#   (1) \s+:\s*  — at least one whitespace BEFORE colon, optional after
+#   (2) :(?=\s)  — colon followed by whitespace (matched when (1) fails
+#                  because there's no whitespace before the colon)
+#   (3) :\s*$    — colon at end of line (partial-data-line detection)
+#
+# Alternatives (1) and (2) are mutually exclusive at any given position:
+# (1) requires whitespace before colon; (2) uses a lookahead (inherently
+# atomic — no backtracking) to check for whitespace after colon, and is
+# only tried when (1) fails.  This eliminates the backtracking explosion
+# while preserving the original matching semantics — the separator does
+# NOT match at a colon that has no surrounding whitespace.
+#
+# For additional defense-in-depth, _match_data_line uses a manual scan
+# fallback for lines >2000 chars to bypass regex entirely.
 DATA_LINE_PATTERN = re.compile(
     r"^\s*"
     r"(?P<mnemonic>[\w\-]+(?:\[\d+\])?)"  # mnemonic: word chars + hyphen + optional [N] array index
@@ -125,7 +155,7 @@ DATA_LINE_PATTERN = re.compile(
     r"(?P<unit>[\w\-/]*)"  # unit: optional, can include /
     r"\s+"  # whitespace separator
     r"(?P<value>.*?)"  # value: everything up to the colon separator
-    r"(\s+:\s*|\s*:\s+|:\s*$)"  # colon separator (see detailed comment above)
+    r"(\s+:\s*|:(?=\s)|:\s*$)"  # colon separator (see I2F-01 comment above)
     r"(?P<description>.*?)"  # description: rest of line
     r"\s*$"
 )
@@ -250,6 +280,40 @@ def _is_indexed_data_section(section_word: str) -> bool:
         return False
     base = section_word[:bracket_idx]
     return base in _INDEXED_DATA_TYPES
+
+
+def _unescape_colons_for_las_value(value: str) -> str:
+    """Reverse the ``_escape_colons_for_las_value`` transformation.
+
+    The writer applies a two-step colon escape to prevent the parser from
+    misinterpreting embedded colons as structural separators:
+
+    1. Insert ``_`` between whitespace and colon: ``" :"`` → ``" _:"``
+    2. Insert ``_`` after colon followed by whitespace or end: ``": "`` → ``":_ "``
+
+    The combined effect on ``" : "`` produces ``" _:_ "``.
+
+    This function reverses both steps in the opposite order (step 2 first,
+    then step 1), restoring the original colon-separated text.  It is
+    applied during parsing to all values and descriptions that may have
+    been escaped by the writer — well entries, parameter values, curve
+    descriptions, and curve API codes.
+
+    .. note::
+
+       Legitimate underscore characters that happen to form the escape
+       pattern (e.g., ``tag_:`` in original data) will be incorrectly
+       unescaped.  This is the same trade-off acknowledged by the writer's
+       docstring — the roundtrip loss is limited to the contrived case
+       where user data naturally contains the escape-artifact patterns.
+    """
+    # Undo step 2 first: remove ``_`` after colon when followed by
+    # whitespace or end-of-string (``:_ `` → ``: ``, ``:_$`` → ``:$``).
+    value = re.sub(r":_(?=\s|$)", ":", value)
+    # Undo step 1: remove ``_`` between whitespace and colon
+    # (`` _:`` → `` :``, ``\t_:`` → ``\t:``).
+    value = re.sub(r"(\s+)_:", r"\1:", value)
+    return value
 
 
 class LASParser:
@@ -427,17 +491,21 @@ class LASParser:
         if self.las_file.version.is_las30:
             self._process_ascii_data()
 
-        # Validate mandatory LAS 2.0 well fields (STRT, STOP, STEP, NULL).
-        # LAS 2.0 requires these fields; missing fields are a spec compliance
-        # gap.  The library handles missing fields gracefully (using defaults),
-        # so this is a warning, not an error.
-        is_las20 = self.las_file.version.vers.startswith("2.")
-        if is_las20 and self._version_found:
+        # Validate mandatory well fields (STRT, STOP, STEP, NULL).
+        # LAS 2.0 requires these fields; LAS 3.0 inherits the same
+        # mandatory well-field requirements from LAS 2.0.  Missing fields
+        # are a spec compliance gap.  The library handles missing fields
+        # gracefully (using defaults), so this is a warning, not an error.
+        # F-014: Previous version gate only checked startswith("2."),
+        # silently skipping mandatory-field validation for LAS 3.0 files.
+        is_las20_or_las30 = self.las_file.version.vers.startswith(("2.", "3."))
+        if is_las20_or_las30 and self._version_found:
             _mandatory_fields = ["STRT", "STOP", "STEP", "NULL"]
             for field in _mandatory_fields:
                 if field not in self.las_file.well.entries:
                     warnings.warn(
-                        f"LAS 2.0 file missing mandatory well field: {field}",
+                        f"LAS {self.las_file.version.vers} file missing "
+                        f"mandatory well field: {field}",
                         stacklevel=2,
                     )
 
@@ -990,13 +1058,77 @@ class LASParser:
             )
         self._other_lines.append(line)
 
+    @staticmethod
+    def _manual_colon_scan(line: str) -> dict[str, str] | None:
+        """Manual scan for colon separator on long lines (I2F-01 defense).
+
+        Scans the line left-to-right for the FIRST colon that has
+        whitespace on at least one side (or is at end of line).  This is
+        O(n) with no backtracking — guaranteed safe regardless of input.
+        Returns a dict with 'mnemonic', 'unit', 'value', 'description'
+        keys, or None if the line doesn't match the data-line pattern.
+
+        Intended as a fallback for lines too long for safe regex matching
+        (>_SAFE_REGEX_LINE_LENGTH).
+        """
+        # Find the first colon that has whitespace on at least one side.
+        colon_idx = -1
+        stripped = line.rstrip()
+        for i, ch in enumerate(stripped):
+            if ch == ":":
+                has_ws_before = i > 0 and stripped[i - 1].isspace()
+                has_ws_after = i + 1 < len(stripped) and stripped[i + 1].isspace()
+                # Also accept colon at end of line with optional trailing space.
+                rest_after = stripped[i + 1 :].strip()
+                if has_ws_before or has_ws_after or not rest_after:
+                    colon_idx = i
+                    break
+        if colon_idx < 0:
+            return None
+
+        # Split at the colon separator.
+        prefix = stripped[:colon_idx].rstrip()
+        description = stripped[colon_idx + 1 :].strip()
+
+        # Parse mnemonic and unit from the prefix.
+        # Format: [whitespace] MNEMONIC [whitespace] . UNIT [whitespace] VALUE
+        dot_idx = prefix.find(".")
+        if dot_idx < 0:
+            return None
+
+        mnemonic = prefix[:dot_idx].strip()
+        after_dot = prefix[dot_idx + 1 :].strip()
+
+        # Unit is the contiguous word chars + hyphens + slashes before the
+        # first value whitespace.  Value is everything after that whitespace.
+        unit_match_result = re.match(r"([\w\-/]*)", after_dot)
+        if unit_match_result:
+            unit = unit_match_result.group(1)
+            value = after_dot[len(unit) :].strip()
+        else:
+            unit = ""
+            value = after_dot.strip()
+
+        return {
+            "mnemonic": mnemonic,
+            "unit": unit,
+            "value": value,
+            "description": description,
+        }
+
     def _match_data_line(self, line: str) -> re.Match[str] | None:
         """Try to match a header data line with colon, then without.
 
         F-I2-M07: Validates captured group lengths after a successful
         match to prevent unbounded string allocation from crafted files
         with 500MB values or descriptions.
+
+        I2F-01: Lines exceeding _SAFE_REGEX_LINE_LENGTH bypass regex
+        matching and use a manual O(n) colon scan to prevent
+        catastrophic backtracking.
         """
+        if len(line) > _SAFE_REGEX_LINE_LENGTH:
+            return self._match_data_line_manual(line)
         match = DATA_LINE_PATTERN.match(line)
         if match:
             self._validate_data_line_fields(match)
@@ -1005,6 +1137,45 @@ class LASParser:
         if match:
             self._validate_data_line_fields(match)
             return match
+        return None
+
+    def _match_data_line_manual(self, line: str) -> re.Match[str] | None:
+        """Match a data line using manual scan (long-line fallback, I2F-01)."""
+        colon_result = self._manual_colon_scan(line)
+        if colon_result is not None:
+            # Wrap the result in a dict-like object that quacks like a
+            # regex match for the groupdict()/group() protocol used by
+            # callers in _parse_version, _parse_well, _parse_curve,
+            # and _parse_parameter.
+            class _ManualMatch:
+                """Minimal regex-match duck-type for manual scan results."""
+                __slots__ = ("_data",)
+
+                def __init__(self, data: dict[str, str]) -> None:
+                    self._data = data
+
+                def group(self, name: str) -> str:
+                    return self._data.get(name, "")
+
+                def groupdict(self) -> dict[str, str]:
+                    return dict(self._data)
+
+                def __getitem__(self, name: str) -> str:
+                    return self._data[name]
+
+            match: re.Match[str] = _ManualMatch(colon_result)  # type: ignore[assignment]
+            self._validate_data_line_fields(match)
+            return match
+
+        # Try without colon (VALUE_ONLY_PATTERN equivalent).
+        # Match mnemonic.unit value format.
+        m = re.match(
+            r"^\s*(?P<mnemonic>[\w\-]+(?:\[\d+\])?)\s*\.(?P<unit>[\w\-/]*)\s+(?P<value>.+?)\s*$",
+            line,
+        )
+        if m:
+            self._validate_data_line_fields(m)
+            return m
         return None
 
     def _validate_data_line_fields(self, match: re.Match[str]) -> None:
@@ -1066,6 +1237,23 @@ class LASParser:
             # warn and default to "2.0".
             vers_normalized = value.strip()
             if vers_normalized in {"1.2", "2.0", "3.0"}:
+                self.las_file.version.vers = vers_normalized
+            elif vers_normalized.startswith("3."):
+                # I2F-02: LAS 3.x draft versions (e.g., "3.1beta",
+                # "3.0-draft").  The is_las30 property (models.py:300)
+                # explicitly documents acceptance of any string starting
+                # with '3' as LAS 3.0 to support draft/development
+                # versions.  Without this branch, values like "3.1beta"
+                # failed the ^\d+\.\d+$ regex (beta is non-numeric) and
+                # silently defaulted to "2.0", completely disabling
+                # LAS 3.0 processing.
+                warnings.warn(
+                    f"Non-standard VERS value '{value}'. "
+                    f"Expected '3.0'. Accepting as LAS 3.x for "
+                    f"compatibility with draft/development versions.",
+                    UserWarning,
+                    stacklevel=2,
+                )
                 self.las_file.version.vers = vers_normalized
             elif re.match(r"^\d+\.\d+$", vers_normalized):
                 # Version-like but non-standard (e.g., "1.20", "4.0") —
@@ -1140,6 +1328,39 @@ class LASParser:
         Extracted from _parse_well to support deferred well processing when
         ~W appears before ~V (the version check is deferred until ~V is parsed).
         """
+        # F-022: Unescape colon artifacts inserted by the writer's
+        # _escape_colons_for_las_value BEFORE the CWLS/lasio swap logic.
+        # Escaped patterns like " _:_ " would confuse the space/digit
+        # heuristics used in auto-mode detection.
+        value = _unescape_colons_for_las_value(value)
+        if description is not None:
+            description = _unescape_colons_for_las_value(description)
+
+        # F-P06 / R7F-05: Bare-colon CWLS detection moved from _parse_well into
+        # _store_well_entry so deferred well entries (parsed before ~V is known)
+        # always receive correct handling.  _store_well_entry receives the
+        # authoritative `is_las12` flag regardless of when the version is
+        # resolved.  When description is None and value contains a bare colon,
+        # this may be a CWLS/lasio "DESCRIPTION : VALUE" format with no
+        # whitespace around the colon.  Split at the first colon so the CWLS
+        # swap logic below (which requires `description is not None`) can
+        # trigger.  Timestamp/datetime values like "12:34:56" or
+        # "2026-07-19T12:34:56" must NOT be split.
+        if is_las12 and description is None and ":" in value:
+            _is_timestamp = (
+                ":" in value
+                and "T" in value
+                and bool(re.search(r"T\d{2}:", value))
+            )
+            if not _is_timestamp:
+                _time_match = re.search(r"\b\d{1,2}:\d{2}(:\d{2})?\b", value)
+                _is_timestamp = _time_match is not None
+
+            if not _is_timestamp:
+                colon_idx = value.index(":")
+                description = value[colon_idx + 1 :].strip()
+                value = value[:colon_idx].strip()
+
         # F-37-upgrade: Guard against unbounded well entry accumulation.
         # models.py:from_dict() has 3 MAX_WELL_ENTRIES checks (in
         # _validate_single_section, _validate_top_level, and per-section
@@ -1271,6 +1492,9 @@ class LASParser:
                 UserWarning,
                 stacklevel=2,
             )
+        # F-022: Unescape colon artifacts inserted by the writer's
+        # _escape_colons_for_las_value (e.g., " _:_ " → " : ").
+        actual_value = _unescape_colons_for_las_value(actual_value)
         self.las_file.well[mnemonic] = actual_value
         # F-008: Use `is not None` instead of truthiness check.  An empty
         # string is a semantically meaningful unit (e.g., unitless well
@@ -1403,19 +1627,14 @@ class LASParser:
         else:
             description = None  # VALUE_ONLY_PATTERN — no colon in line
 
-        # F-H03: Secondary colon-split fallback when VALUE_ONLY_PATTERN matched
-        # and the value contains a bare colon (no surrounding whitespace).
-        # CWLS/lasio files use "DESCRIPTION : VALUE" format where the colon
-        # separates description from value, but DATA_LINE_PATTERN requires
-        # whitespace on at least one side of the colon.  Bare-colon lines
-        # like "DATE. LOG DATE:15/01/2001" fall through to VALUE_ONLY_PATTERN,
-        # placing the entire string in *value* and setting *description* to
-        # None — bypassing the CWLS/lasio swap logic entirely.
-        if description is None and ":" in value:
-            colon_idx = value.index(":")
-            description = value[colon_idx + 1 :].strip()
-            value = value[:colon_idx].strip()
-
+        # F-H03: Bare-colon CWLS/lasio lines (e.g., "DATE. LOG DATE:15/01/2001")
+        # where the colon lacks surrounding whitespace fall through to
+        # VALUE_ONLY_PATTERN with description=None.  The bare-colon detection
+        # has been moved into _store_well_entry (see F-P06 / R7F-05 fix) so
+        # that deferred well entries (parsed before ~V is known) always use
+        # the correct `is_las12` flag.  _store_well_entry splits bare-colon
+        # values when is_las12=True and description is None, with timestamp/
+        # datetime guards to avoid corrupting "12:34:56" or ISO datetimes.
         is_las12 = self.las_file.version.vers.startswith("1.")
 
         # F-P06: When ~W appears before ~V, the version defaults to "2.0" and
@@ -1486,6 +1705,12 @@ class LASParser:
             if "description" in match.groupdict() and match.group("description")
             else ""
         )
+
+        # F-022: Unescape colon artifacts inserted by the writer's
+        # _escape_colons_for_las_value.  Curve descriptions and API codes
+        # may contain escaped colons from a prior write→read roundtrip.
+        api_code = _unescape_colons_for_las_value(api_code)
+        description = _unescape_colons_for_las_value(description)
 
         # LAS 3.0: Extract format specifier from description
         data_format = ""
@@ -1599,6 +1824,13 @@ class LASParser:
             if "description" in match.groupdict() and match.group("description")
             else ""
         )
+
+        # F-022: Unescape colon artifacts inserted by the writer's
+        # _escape_colons_for_las_value BEFORE format-specifier extraction.
+        # Escaped patterns like " _:_ " in parameter values and descriptions
+        # should be restored to their original colon-separated form.
+        value = _unescape_colons_for_las_value(value)
+        description = _unescape_colons_for_las_value(description)
 
         # M-PB2: Strip LAS 3.0 format specifiers from parameter
         # descriptions, mirroring _parse_curve logic (lines 877-899).
@@ -1940,14 +2172,17 @@ class LASParser:
             if fmt and not (
                 fmt in _KNOWN_CURVE_FORMATS or _FORMAT_SPEC_RE.match(fmt)
             ):
-                logger.warning(
-                    "Curve '%s' has unsupported format specifier '{%s}'. "
-                    "Non-numeric format types (e.g., {DEG}, date "
-                    "templates) cannot be converted to float in the LAS "
-                    "3.0 parser and will produce null values for every "
-                    "data point.",
-                    curve.mnemonic,
-                    fmt,
+                # F-039: Reject unsupported format specifiers instead of
+                # just warning.  from_dict() raises ValueError for invalid
+                # data_format; the parser must be equally strict to ensure
+                # roundtrip safety — a parse→to_dict→from_dict cycle must
+                # not produce a file that from_dict rejects.
+                raise LASParseError(
+                    f"Curve '{curve.mnemonic}' has unsupported format "
+                    f"specifier '{{{fmt}}}'. Non-numeric format types "
+                    f"(e.g., {{DEG}}, date templates) are not valid LAS "
+                    f"data format specifiers. "
+                    f"Valid values: {', '.join(sorted(_VALID_DATA_FORMATS))}"
                 )
 
         # Get null value (shared utility, used by parser, data_reader, writer)
@@ -1999,12 +2234,17 @@ class LASParser:
                 f"The file may be malformed or corrupt."
             )
 
-        if actual_count > MAX_DATA_LINES:
+        # F-038: Use ``>=`` (not ``>``) for consistency with models.py:from_dict()
+        # which already uses ``>=`` for all MAX_CURVES guards.  Using ``>`` here
+        # allows exactly MAX_CURVES curves while from_dict rejects at the limit —
+        # a roundtrip divergence where a parser-accepted file is rejected by
+        # from_dict.  Synchronizing on ``>=`` closes the gap.
+        if actual_count >= MAX_DATA_LINES:
             raise LASParseError(
                 f"ASCII data line count ({actual_count}) exceeds maximum allowed "
                 f"({MAX_DATA_LINES}). The file may be malformed or corrupt."
             )
-        if num_curves > MAX_CURVES:
+        if num_curves >= MAX_CURVES:
             raise LASParseError(
                 f"Curve count ({num_curves}) exceeds maximum allowed "
                 f"({MAX_CURVES}). The file may be malformed or corrupt."
@@ -2180,18 +2420,23 @@ class LASParser:
                 )
 
         # (2) LAS 3.0 section ordering — data sections before curves.
+        # F-013: Per-type ordering check.  The previous code used a single
+        # boolean flag (curve_seen) that only caught the case where ANY
+        # data section appeared before ANY curve definition.  It did not
+        # catch per-type ordering violations where, e.g., ~Core_Data
+        # appears before ~Core_Definition but ~Drilling_Definition
+        # appeared earlier covering a different type.  The fix tracks
+        # which definition types have been seen using _definition_curve_ranges
+        # and warns on the FIRST occurrence of a data section whose
+        # corresponding definition type hasn't been seen.
         if self.las_file.version.is_las30:
-            data_before_curves = False
-            curve_seen = False
+            # Track which definition types have been encountered.
+            # Keys: definition type names (e.g., "CORE_DEFINITION",
+            # "DRILLING_DEFINITION") or "__MAIN__" for global curves.
+            _defs_seen: set[str] = set()
+            per_type_data_before_def: list[str] = []
+
             for label in self._section_sequence:
-                # F-M02: Extract section_word from the label (which may
-                # include a ":section_name" suffix) instead of using
-                # label[0].  The prior code assumed single-letter codes
-                # (e.g., "A" for data, "C" for curves), but commit 6156a03
-                # changed _section_sequence to store full section words
-                # (e.g., "CORE_DATA", "CORE_DEFINITION").  CORE_DATA[0]="C"
-                # was miscategorized as a curve section, producing
-                # false-negative data-before-curves warnings.
                 section_word = label.split(":")[0]
                 is_data = (
                     section_word in _DATA_SECTION_WORDS
@@ -2202,17 +2447,56 @@ class LASParser:
                     section_word in {"C", "CURVE"}
                     or section_word.endswith("_DEFINITION")
                 )
-                if is_data and not curve_seen:
-                    data_before_curves = True
-                    break
+
+                if is_data:
+                    # Normalize indexed section words (e.g., "CORE[1]" → "CORE")
+                    # before resolving definition type.  _SECTION_TYPE_MAP only
+                    # contains unindexed keys, and the endswith("_DATA") check
+                    # cannot match bracketed forms.
+                    _type_word = section_word
+                    if _is_indexed_data_section(section_word):
+                        _type_word = section_word[: section_word.find("[")].upper()
+
+                    # Determine expected definition type for this data section.
+                    if _type_word.endswith("_DATA"):
+                        _def_type = _type_word.replace("_DATA", "_DEFINITION")
+                    elif _type_word in _SECTION_TYPE_MAP:
+                        _canonical = _SECTION_TYPE_MAP[_type_word]
+                        if _canonical.endswith("_DATA"):
+                            _def_type = _canonical.replace("_DATA", "_DEFINITION")
+                        else:
+                            _def_type = "__MAIN__"
+                    elif _type_word in {"A", "ASCII", "LOG", "LOG_DATA"}:
+                        _def_type = "__MAIN__"
+                    else:
+                        _def_type = "__MAIN__"
+
+                    if _def_type not in _defs_seen:
+                        _def_display = (
+                            f"~{_def_type}"
+                            if _def_type != "__MAIN__"
+                            else "the main curve definition (~C or ~CURVE)"
+                        )
+                        per_type_data_before_def.append(
+                            f"~{section_word} before {_def_display}"
+                        )
+
                 if is_curve:
-                    curve_seen = True
-            if data_before_curves:
+                    # Mark this definition type as seen.
+                    if section_word.endswith("_DEFINITION"):
+                        _defs_seen.add(section_word)
+                    else:
+                        # ~C or ~CURVE — covers all global definitions.
+                        _defs_seen.add("__MAIN__")
+
+            # Emit per-type warnings.
+            for msg in per_type_data_before_def:
                 logger.warning(
-                    "LAS 3.0 file contains data sections before curve "
-                    "definition sections. Data sections without preceding "
-                    "curve definitions will have no curves to reference "
-                    "and may produce empty or truncated output."
+                    "LAS 3.0 data section %s. "
+                    "Data sections without preceding curve definitions "
+                    "will have no curves to reference and may produce "
+                    "empty or truncated output.",
+                    msg,
                 )
 
         # (3) Duplicate section headers.

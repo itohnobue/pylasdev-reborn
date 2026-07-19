@@ -290,6 +290,15 @@ def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " "
             # matching the maxsplit behavior of str.split.
             values = row[: MAX_TOKENS_PER_LINE + 1]
 
+            # I2F-24: Strip trailing empty strings from csv.reader output.
+            # Trailing delimiters (e.g. "100.0,") produce empty fields that
+            # inflate len(values), causing false-negative wrap detection:
+            # len(["100.0", ""])=2 > 1 → incorrectly detected as non-wrapped.
+            # Strip only TRAILING empties — middle empty fields represent
+            # legitimate sparse data values that must be preserved.
+            while values and values[-1] == "":
+                values.pop()
+
         # F-M20: When curve_count is 1, wrapped and non-wrapped modes are
         # equivalent — every line holds exactly one value regardless of
         # mode.  The space-delimiter heuristic ``len(values) < curve_count``
@@ -751,6 +760,16 @@ def _read_wrapped(
             # Safety cap: prevent unbounded token count from malformed input,
             # matching the maxsplit behavior of str.split.
             values = row[: MAX_TOKENS_PER_LINE + 1]
+
+            # I2F-25: Strip trailing empty strings from csv.reader output.
+            # Trailing delimiters produce empty fields that flow into
+            # _to_finite_float("") → null_value, and consume curve slots
+            # via counter += 1.  This fills the last curve of each depth
+            # step with null_value instead of real data.  Strip only
+            # TRAILING empties — middle empty fields are legitimate
+            # sparse data.
+            while values and values[-1] == "":
+                values.pop()
 
         if depth_line:
             # Depth line: single value = depth for this step.

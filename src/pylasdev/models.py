@@ -5,6 +5,7 @@ Supports LAS 1.2, 2.0, and 3.0 formats.
 
 from __future__ import annotations
 
+import math
 import warnings
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -13,15 +14,30 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+# I2F-09: Maximum field length for string values — matches parser's limit
+# (parser.py:86).  Without this, from_dict paths accept arbitrarily-long
+# strings that bypass all item-count and element-count guards.
+MAX_FIELD_LENGTH = 100_000
 
-def _safe_str(value: Any, default: str = "") -> str:
+
+def _safe_str(
+    value: Any, default: str = "", max_length: int | None = MAX_FIELD_LENGTH
+) -> str:
     """Convert value to str, returning *default* when *value* is None.
 
     Prevents ``str(None)`` → ``"None"`` in dict roundtrip paths.
+    When *max_length* is not ``None``, raises ``ValueError`` if the result
+    exceeds the limit (I2F-09: unbounded string lengths).
     """
     if value is None:
         return default
-    return str(value)
+    result = str(value)
+    if max_length is not None and len(result) > max_length:
+        raise ValueError(
+            f"String value length {len(result)} exceeds maximum allowed "
+            f"({max_length})"
+        )
+    return result
 
 
 def _create_parameter_entry(param_dict: dict[str, Any]) -> ParameterEntry:
@@ -68,12 +84,38 @@ def _create_parameter_entry(param_dict: dict[str, Any]) -> ParameterEntry:
     _section_type = param_dict.get("section_type")
     if _section_type is not None and not isinstance(_section_type, str):
         _section_type = _safe_str(_section_type)
+    # I2F-08: Empty-string section_type is not normalized to None.
+    # ``""`` passes both guards (is not None, isinstance str), and the
+    # writer silently drops parameters with falsy section_type (line 532:
+    # ``if not section_type: continue``).  Normalize to None so that
+    # empty-string and absent are treated identically.
+    if _section_type == "":
+        _section_type = None
+    # I2F-12: Validate parameter data_format against the same valid set
+    # used for curve data_format.  Curve validation runs in two places
+    # (_validate_from_dict_input lines 227-237 and 241-257).  Parameter
+    # data_format had zero validation — any string was silently accepted
+    # and propagated through writer as a {XYZ} format specifier.
+    #
+    # Only validate single-character values — multi-character strings
+    # like "DD/MM/YYYY" are metadata (date format descriptors, etc.)
+    # stored under the data_format key by real-world LAS files, not
+    # LAS format specifiers.  Single-character non-format values like
+    # "X" or "G" would be propagated as {X} / {G} format specifiers
+    # and produce corrupted LAS output.
+    _data_format = _safe_str(param_dict.get("data_format"), "")
+    if _data_format and len(_data_format) == 1 and _data_format not in _VALID_DATA_FORMATS:
+        raise ValueError(
+            f"Invalid data_format '{_data_format}' for parameter "
+            f"'{param_dict.get('mnemonic', '?')}'. "
+            f"Valid values: {', '.join(sorted(_VALID_DATA_FORMATS))}"
+        )
     return ParameterEntry(
         mnemonic=_safe_str(param_dict.get("mnemonic", "")),
         unit=_safe_str(param_dict.get("unit", "")),
         value=_safe_str(param_dict.get("value", "")),
         description=_safe_str(param_dict.get("description", "")),
-        data_format=_safe_str(param_dict.get("data_format"), ""),
+        data_format=_data_format,
         array_index=_array_index,
         zone=zone,
         section_type=_section_type,
@@ -125,6 +167,15 @@ def _resolve_dict_entry(
         raise TypeError(
             f"{key}: expected {expected_type}, got {type(value).__name__}"
         )
+    # I2F-13: Non-finite floats (inf, nan) slip past the isinstance
+    # gate — isinstance(float('inf'), (int, float)) is True, but the
+    # writer crashes at int(float('inf')) → OverflowError.  The parser
+    # has np.isfinite protection; from_dict lacked it.
+    if isinstance(value, float) and (math.isinf(value) or math.isnan(value)):
+        raise ValueError(
+            f"{key}: non-finite float values (inf, -inf, nan) are "
+            f"not allowed"
+        )
     return value
 
 
@@ -157,16 +208,57 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
                 stacklevel=3,
             )
 
-    # --- F-018: DLM validation ---
+    # --- I2F-11: VERS presence check ---
+    # The parser raises LASParseError for missing VERS (parser.py:406-409).
+    # from_dict previously silently defaulted to "2.0" via _safe_str(),
+    # manufacturing version metadata on roundtrip gaps.
     version = data.get("version")
+    if isinstance(version, dict):
+        if "VERS" not in version:
+            raise ValueError(
+                "Missing required VERS field in version section. "
+                "VERS must be present (e.g. '1.2', '2.0', '3.0')."
+            )
+
+    # --- F-018: DLM validation ---
     if isinstance(version, dict):
         dlm_raw = version.get("DLM")
         if dlm_raw is not None and dlm_raw != "":
             dlm_upper = str(dlm_raw).upper()
-            if dlm_upper not in {"SPACE", "TAB", "COMMA"}:
+            # F-003: DLM validation lacks LAS version awareness.
+            # LAS 1.2 only supports SPACE; TAB and COMMA are spec
+            # violations.  The parser silently accepts them on LAS 1.2
+            # files but writes LAS 2.0-compatible output.  Emit a
+            # warning rather than rejecting — matching writer behavior
+            # which downgrades TLS to SPACE for 1.2 output.
+            vers_raw = version.get("VERS")
+            vers = str(vers_raw).strip() if vers_raw else ""
+            is_las12 = vers.startswith("1")
+            if is_las12 and dlm_upper != "SPACE":
+                warnings.warn(
+                    f"DLM '{dlm_raw}' is not valid for LAS 1.2 "
+                    f"(spec requires SPACE).  The file will use "
+                    f"SPACE delimiter on write.",
+                    stacklevel=3,
+                )
+            elif dlm_upper not in {"SPACE", "TAB", "COMMA"}:
                 raise ValueError(
                     f"Invalid DLM value '{dlm_raw}'. "
                     f"Expected SPACE, TAB, or COMMA."
+                )
+
+        # F-006: WRAP not validated against {YES, NO} in from_dict.
+        # The parser enforces WRAP ∈ {YES, NO} (parser.py:1097-1108).
+        # from_dict previously accepted any string, matching the
+        # parser's strictness to prevent silently-corrupted WRAP
+        # values propagating through roundtrip.
+        wrap_raw = version.get("WRAP")
+        if wrap_raw is not None:
+            wrap_str = str(wrap_raw).upper()
+            if wrap_str not in {"YES", "NO"}:
+                raise ValueError(
+                    f"Invalid WRAP value '{wrap_raw}'. "
+                    f"Expected YES or NO."
                 )
 
     # --- IF-015: data_format validation ---
@@ -263,7 +355,13 @@ def _check_df_vs_placement(
                 f"data_format='S' but is in logs (numeric data). "
                 f"String-format curves must be in string_data."
             )
-        if df != "S" and mnemonic in string_data_keys:
+        # I2F-37: Broaden the string-format exemption from "S" only to
+        # "S" and "A".  The parser (parser.py:1905-1909) routes both
+        # {S} and {A} (without array_info) format curves to string_data.
+        # The previous guard rejected {A}-format curves in string_data
+        # because "A" != "S", breaking the roundtrip path.  Numeric
+        # formats (F, E, D) remain correctly rejected from string_data.
+        if df not in ("S", "A") and mnemonic in string_data_keys:
             raise ValueError(
                 f"{context} curve '{mnemonic}' (index {i}) has "
                 f"data_format='{df}' but is in string_data. "
@@ -500,6 +598,54 @@ class DataSection:
             "section_curves": [c.to_dict() for c in self.section_curves],
         }
 
+    def __post_init__(self) -> None:
+        """Validate invariants after construction (F-001).
+
+        DataSection is a public API type — direct construction bypasses
+        the validation in ``LASFile.from_dict``.  This __post_init__
+        catches invalid state that would cause silent data loss on write.
+        """
+        # Deferred import to avoid circular dependencies.
+        from .exceptions import LASDataError
+
+        curve_set = set(self.curves_order)
+
+        # data keys ⊆ curves_order
+        data_keys = set(self.data.keys())
+        orphaned_data = data_keys - curve_set
+        if orphaned_data:
+            raise LASDataError(
+                f"DataSection '{self.name}': data keys not in curves_order: "
+                f"{sorted(orphaned_data)}"
+            )
+
+        # string_data keys ⊆ curves_order
+        string_keys = set(self.string_data.keys())
+        orphaned_string = string_keys - curve_set
+        if orphaned_string:
+            raise LASDataError(
+                f"DataSection '{self.name}': string_data keys not in "
+                f"curves_order: {sorted(orphaned_string)}"
+            )
+
+        # section_curves length must match curves_order (when specified)
+        if self.section_curves and len(self.section_curves) != len(self.curves_order):
+            raise LASDataError(
+                f"DataSection '{self.name}': section_curves length "
+                f"({len(self.section_curves)}) does not match curves_order "
+                f"length ({len(self.curves_order)})"
+            )
+
+        # data and string_data must be disjoint — a curve name cannot
+        # appear in both collections (writer silently picks one).
+        colliding = data_keys & string_keys
+        if colliding:
+            raise LASDataError(
+                f"DataSection '{self.name}': curve(s) {sorted(colliding)} "
+                f"appear in both data and string_data.  Each curve must "
+                f"be in exactly one collection."
+            )
+
 
 @dataclass(eq=False)
 class LASFile:
@@ -573,13 +719,12 @@ class LASFile:
         The method is naturally long due to covering all these variants in a
         single backwards-compatible code path.
         """
-        if not isinstance(data, dict):
-            raise TypeError(f"Expected dict, got {type(data).__name__}")
-
-        # F-017/F-018/IF-015/IF-026/F-019: Pre-construction validation layer.
-        # Closes Pattern #7 (from_dict validation gaps) structurally.
-        _validate_from_dict_input(data)
-
+        # F-08: Pre-try errors escape PylasdevError wrapping.  The
+        # isinstance check and _validate_from_dict_input were previously
+        # outside the try block — TypeErrors from those calls escaped
+        # without being wrapped in LASDataError, violating the method's
+        # documented contract.  Move them inside so ALL validation errors
+        # get the LASDataError wrapper.
         # F-06: Deferred imports to avoid circular dependencies
         # (models.py ← parser.py/data_reader.py which import from models.py).
         from .data_reader import MAX_CURVES, MAX_DATA_LINES, MAX_TOTAL_ELEMENTS
@@ -591,6 +736,15 @@ class LASFile:
         MAX_WELL_ENTRIES = MAX_PARAMETERS
 
         try:
+            # F-008: isinstance and validation inside try block so
+            # TypeError/ValueError get wrapped in LASDataError.
+            if not isinstance(data, dict):
+                raise TypeError(f"Expected dict, got {type(data).__name__}")
+
+            # F-017/F-018/IF-015/IF-026/F-019: Pre-construction validation layer.
+            # Closes Pattern #7 (from_dict validation gaps) structurally.
+            _validate_from_dict_input(data)
+
             las_file = cls()
 
             version = _resolve_dict_entry(data, "version", dict, dict)
@@ -822,6 +976,13 @@ class LASFile:
             # paths (parameter_details and params) both raised TypeError.
             # Using the shared helper also adds a missing list-type check.
             ds_data = _validate_iterable_of_dicts(ds_data, "data_sections")
+            # I2F-15: Cross-section cumulative allocation counter.
+            # Each section independently passes MAX_TOTAL_ELEMENTS checks,
+            # but there is no running total across ALL sections.  1,000
+            # sections * 10M elements = 10B elements (~80 GB) passes all
+            # per-section guards.  Track cumulative elements to prevent
+            # multi-section allocation DoS.
+            _cumulative_elements = 0
             for ds_dict in ds_data:
                 ds_string_data = {}
                 _ds_string_raw = _resolve_dict_entry(ds_dict, "string_data", dict, dict)
@@ -933,9 +1094,20 @@ class LASFile:
                             f"Numeric data for curve '{k}' in section "
                             f"'{ds_name}' is None"
                         )
+                    # F-012: Pre-allocation size check.  np.array() allocates
+                    # BEFORE the downstream len() guard — a huge list triggers
+                    # MemoryError (or system OOM) before the guard catches it.
+                    # Check len() before allocation when possible.
+                    if hasattr(v, '__len__') and len(v) > MAX_DATA_LINES:
+                        ds_name = ds_dict.get("name", "<unknown>")
+                        raise ValueError(
+                            f"Array length ({len(v)}) for curve '{k}' in "
+                            f"section '{ds_name}' exceeds maximum allowed "
+                            f"({MAX_DATA_LINES})"
+                        )
                     try:
                         ds_data[k] = np.atleast_1d(np.array(v, dtype=np.float64))
-                    except (ValueError, TypeError) as e:
+                    except (ValueError, TypeError, MemoryError) as e:
                         ds_name = ds_dict.get("name", "<unknown>")
                         raise ValueError(
                             f"Cannot convert data for section '{ds_name}', curve '{k}': {e}"
@@ -1079,6 +1251,31 @@ class LASFile:
                         f"in section '{ds_name}' exceeds maximum allowed "
                         f"({MAX_CURVES})"
                     )
+                # I2F-15: Cumulative cross-section allocation check.
+                # Each section's per-section total is validated above, but
+                # multiple sections can collectively exceed MAX_TOTAL_ELEMENTS.
+                # Compute this section's element total and check against the
+                # running cumulative count BEFORE allocating the DataSection.
+                _section_total = 0
+                if ds_data:
+                    _section_total += (
+                        len(ds_data) * max(len(arr) for arr in ds_data.values())
+                    )
+                if ds_string_data:
+                    _section_total += (
+                        len(ds_string_data)
+                        * max(len(arr) for arr in ds_string_data.values())
+                    )
+                if _cumulative_elements + _section_total > MAX_TOTAL_ELEMENTS:
+                    ds_name = ds_dict.get("name", "<unknown>")
+                    raise ValueError(
+                        f"Cumulative cross-section allocation "
+                        f"({_cumulative_elements}+{_section_total} = "
+                        f"{_cumulative_elements + _section_total} elements) "
+                        f"in section '{ds_name}' exceeds maximum allowed "
+                        f"({MAX_TOTAL_ELEMENTS})"
+                    )
+                _cumulative_elements += _section_total
                 ds = DataSection(
                     name=_safe_str(ds_dict.get("name"), ""),
                     section_type=_safe_str(ds_dict.get("section_type"), "LOG_DATA"),
@@ -1177,9 +1374,18 @@ class LASFile:
                     raise ValueError(
                         f"Log data for curve '{name}' is None"
                     )
+                # F-012: Pre-allocation size check (same pattern as ds_data
+                # above).  np.array() allocates before the downstream len()
+                # guard catches oversized inputs.
+                if hasattr(arr, '__len__') and len(arr) > MAX_DATA_LINES:
+                    raise ValueError(
+                        f"Array length ({len(arr)}) for log "
+                        f"'{name}' exceeds maximum allowed "
+                        f"({MAX_DATA_LINES})"
+                    )
                 try:
                     las_file.logs[name] = np.atleast_1d(np.array(arr, dtype=np.float64))
-                except (ValueError, TypeError) as e:
+                except (ValueError, TypeError, MemoryError) as e:
                     raise ValueError(
                         f"Cannot convert log data for curve '{name}' to numeric array: {e}"
                     ) from e
@@ -1314,11 +1520,35 @@ class DevFile:
     encoding: str = "utf-8"
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to legacy dict format, including file metadata."""
+        """Convert to legacy dict format, including file metadata.
+
+        Metadata keys (source_file, encoding, column_order) are stored in
+        the flat dict alongside column data.  When a column name collides
+        with a metadata key, the metadata is stored under a ``_meta_``
+        prefix to avoid silently overwriting column data (I2F-28).
+        """
         result: dict[str, Any] = {k: v.copy() for k, v in self.columns.items()}
-        result["source_file"] = self.source_file
-        result["encoding"] = self.encoding
-        result["column_order"] = list(self.column_order)
+        # I2F-28: Detect column name collisions with metadata keys.
+        # Without this check, a column named "source_file", "encoding", or
+        # "column_order" is silently overwritten by metadata — and on
+        # roundtrip through read_dev_file() the key is stripped entirely
+        # (dev_reader.py:522-524), producing double data loss.
+        _metadata_assignments = {
+            "source_file": self.source_file,
+            "encoding": self.encoding,
+            "column_order": list(self.column_order),
+        }
+        for mk, mv in _metadata_assignments.items():
+            if mk in self.columns:
+                warnings.warn(
+                    f"DevFile column name '{mk}' collides with metadata key — "
+                    f"storing metadata as '_meta_{mk}' to avoid data loss. "
+                    f"Column data is preserved unchanged.",
+                    stacklevel=2,
+                )
+                result[f"_meta_{mk}"] = mv
+            else:
+                result[mk] = mv
         return result
 
     @classmethod
@@ -1331,19 +1561,33 @@ class DevFile:
         Returns:
             DevFile with columns populated from the dict.
         """
-        if not isinstance(data, dict):
-            raise TypeError(f"Expected dict, got {type(data).__name__}")
-
+        # F-008: isinstance check moved inside try block so TypeError
+        # gets wrapped in LASDataError, matching LASFile.from_dict's
+        # documented contract.
         from .data_reader import MAX_CURVES, MAX_DATA_LINES, MAX_TOTAL_ELEMENTS
         from .exceptions import LASDataError
 
         try:
+            if not isinstance(data, dict):
+                raise TypeError(f"Expected dict, got {type(data).__name__}")
+
             dev = cls()
             # Separate column arrays from metadata keys
             metadata_keys = {"encoding", "source_file", "column_order"}
 
             # F-M01: Resource-exhaustion guard — bound column count.
-            _column_keys = [k for k in data if k not in metadata_keys]
+            # Exclude _meta_-prefixed keys (metadata stored under prefix
+            # to avoid column-name collisions — I2F-28); they are not
+            # columns and must not count toward the column limit.
+            # R7F-01-gap: When both a bare metadata key (e.g. "source_file")
+            # and its _meta_-prefixed counterpart exist, the bare key is
+            # column data (the _meta_ key carries the real metadata).
+            # Count the bare key as a column in the collision case.
+            _column_keys = [
+                k for k in data
+                if not k.startswith("_meta_")
+                and (k not in metadata_keys or f"_meta_{k}" in data)
+            ]
             if len(_column_keys) >= MAX_CURVES:
                 raise ValueError(
                     f"Number of columns ({len(_column_keys)}) exceeds maximum "
@@ -1351,7 +1595,42 @@ class DevFile:
                 )
 
             for key, value in data.items():
-                if key in metadata_keys:
+                # R7F-01: _meta_ prefix roundtrip.  When to_dict detects a
+                # column name collision with a metadata key (I2F-28), it
+                # stores metadata under ``_meta_``-prefixed keys (e.g.,
+                # ``_meta_source_file``).  from_dict must recognise and
+                # reverse that prefix so the roundtrip contract is preserved.
+                if key.startswith("_meta_"):
+                    real_key = key[6:]  # strip ``_meta_`` prefix
+                    if real_key == "encoding":
+                        dev.encoding = _safe_str(value, "utf-8")
+                    elif real_key == "source_file":
+                        dev.source_file = _safe_str(value)
+                    elif real_key == "column_order":
+                        if value is None:
+                            dev.column_order = []
+                        elif isinstance(value, str):
+                            dev.column_order = [value]
+                        else:
+                            _col_order = list(value)
+                            if len(_col_order) >= MAX_CURVES:
+                                raise ValueError(
+                                    f"column_order has {len(_col_order)} entries, "
+                                    f"maximum allowed is {MAX_CURVES - 1}."
+                                )
+                            dev.column_order = _col_order
+                    # unrecognised _meta_ key → skip silently (preserves
+                    # forward-compatibility; a future metadata key added to
+                    # to_dict but not recognised here won't crash)
+                    continue
+                # R7F-01-gap: When to_dict detects a column-name collision
+                # with a metadata key (e.g. column named "source_file"),
+                # it stores both the bare key (column data) and a
+                # _meta_-prefixed key (real metadata).  Check whether the
+                # corresponding _meta_ key exists — if so, the bare key
+                # is column data, not metadata.
+                _is_collision = f"_meta_{key}" in data
+                if key in metadata_keys and not _is_collision:
                     if key == "encoding":
                         dev.encoding = _safe_str(value, "utf-8")
                     elif key == "source_file":
@@ -1376,9 +1655,19 @@ class DevFile:
                         raise ValueError(
                             f"Numeric data for column '{key}' is None"
                         )
+                    # I2F-14: Pre-allocation size check.  np.array() allocates
+                    # BEFORE the downstream len() guard — a huge list triggers
+                    # MemoryError before the guard catches it.  Check len()
+                    # first when the input supports it (matches ds_data pattern
+                    # at lines 1057-1063).
+                    if hasattr(value, '__len__') and len(value) > MAX_DATA_LINES:
+                        raise ValueError(
+                            f"Column '{key}' length ({len(value)}) exceeds "
+                            f"maximum allowed ({MAX_DATA_LINES})"
+                        )
                     try:
                         dev.columns[key] = np.atleast_1d(np.array(value, dtype=np.float64))
-                    except (ValueError, TypeError) as e:
+                    except (ValueError, TypeError, MemoryError) as e:
                         raise ValueError(
                             f"Cannot convert data for column '{key}' to numeric array: {e}"
                         ) from e

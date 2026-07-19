@@ -275,14 +275,23 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
     first_tokens = content_entries[0][1].split()
 
     # F-019: Check for comma-delimited headerless data BEFORE any format
-    # detection.  When the first content line contains commas and all
-    # comma-separated tokens parse as floats, it is headerless
+    # detection.  When any of the first few content lines contains commas
+    # and all comma-separated tokens parse as floats, it is headerless
     # comma-delimited data — not a header row.  Without this pre-check,
     # whitespace-based split() produces a single token like "1.0,2.0,3.0"
     # that fails _is_float_token, causing the line to be consumed as a
     # header and silently losing the first data row.
-    if "," in content_entries[0][1]:
-        comma_tokens = [t.strip() for t in content_entries[0][1].split(",") if t.strip()]
+    #
+    # I2F-30: Inspect the first 3 content lines for comma presence, not
+    # just the first.  A headerless comma-delimited file where the first
+    # line is a column count (e.g. "4\\n1.0,2.0,3.0,4.0") has no comma on
+    # line 1, causing the original check to miss the comma and fall through
+    # to DUG Pattern A detection, consuming the first data row as a header.
+    _comma_texts = [entry[1] for entry in content_entries[:3] if "," in entry[1]]
+    if _comma_texts:
+        # Use the first comma-containing line for token analysis.
+        _comma_text = _comma_texts[0]
+        comma_tokens = [t.strip() for t in _comma_text.split(",") if t.strip()]
         if comma_tokens:
             float_tokens = [t for t in comma_tokens if _is_float_token(t)]
             all_float = len(float_tokens) == len(comma_tokens)
@@ -519,9 +528,13 @@ def read_dev_file(
     # column_order) that are strings/lists, not numpy arrays.  Strip
     # them here to maintain the documented contract: "Dictionary mapping
     # column names to numpy arrays."
+    # R7F-01: Also strip _meta_-prefixed keys — to_dict stores metadata
+    # under _meta_ prefix when a column name collides with a metadata
+    # key (I2F-28), and the returned dict must not leak those.
     _metadata_keys = {"encoding", "source_file", "column_order"}
     result = dev.to_dict()
-    return {k: v for k, v in result.items() if k not in _metadata_keys}
+    return {k: v for k, v in result.items()
+            if k not in _metadata_keys and not k.startswith("_meta_")}
 
 
 def read_dev_file_as_object(
@@ -623,11 +636,24 @@ def read_dev_file_as_object(
         # Use the actual header line for delimiter detection:
         # - simple:   first content line
         # - dug:      third content line (the header — skip title+count)
-        # - headerless: first content line (the data)
+        # - headerless: first content line (the data), but when the first
+        #   line has no commas and a later line does (e.g. column-count
+        #   prefix like "4\\n1.0,2.0,3.0,4.0"), use the first
+        #   comma-containing line for delimiter detection.  (I2F-30)
         if format_type == "dug" and len(content_entries) > skip_content_lines - 1:
             hdr = content_entries[skip_content_lines - 1][1]
         elif content_entries:
-            hdr = content_entries[0][1]
+            _first = content_entries[0][1]
+            if format_type == "headerless" and "," not in _first:
+                # Headerless format where the first line is a column count
+                # (no commas).  Check subsequent lines for comma presence.
+                _comma_hdr = next(
+                    (entry[1] for entry in content_entries[1:3] if "," in entry[1]),
+                    None,
+                )
+                hdr = _comma_hdr if _comma_hdr else _first
+            else:
+                hdr = _first
         else:
             hdr = ""
 

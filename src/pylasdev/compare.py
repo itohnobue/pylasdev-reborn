@@ -46,7 +46,10 @@ def _scalars_equal(a: Any, b: Any) -> bool:
     if isinstance(a, (float, np.floating)) and isinstance(b, (float, np.floating)):
         if math.isnan(a) and math.isnan(b):
             return True
-    return bool(a == b)
+    try:
+        return bool(a == b)
+    except Exception:
+        return False
 
 
 def compare_las_dicts(
@@ -215,7 +218,7 @@ def _compare_arrays(
 
     # F-4: np.allclose() fails on string/object arrays (e.g. string_data).
     # Use np.array_equal for non-numeric dtypes.
-    if arr1.dtype.kind in ("U", "S", "O") or arr2.dtype.kind in ("U", "S", "O"):
+    if arr1.dtype.kind in ("U", "S", "O", "V", "M", "m", "b") or arr2.dtype.kind in ("U", "S", "O", "V", "M", "m", "b"):
         if not np.array_equal(arr1, arr2):
             logger.warning("Array values mismatch at '%s'", label)
             return False
@@ -224,7 +227,7 @@ def _compare_arrays(
             if not np.allclose(arr1, arr2, rtol=rtol, atol=atol, equal_nan=True):
                 logger.warning("Array values mismatch at '%s'", label)
                 return False
-        except ValueError:
+        except (ValueError, TypeError):
             # F2-009: np.allclose raises ValueError when arrays have
             # incompatible broadcast shapes (e.g., same .size but
             # different .shape that cannot broadcast).  The .shape
@@ -271,28 +274,34 @@ def _compare_lists(
             )
             return False
         for idx, (a, b) in enumerate(zip(l1, l2, strict=False)):
-            if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
-                if not _compare_arrays(
-                    a, b, f"{label}[{idx}]", None, rtol, atol
-                ):
+            try:
+                if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+                    if not _compare_arrays(
+                        a, b, f"{label}[{idx}]", None, rtol, atol
+                    ):
+                        return False
+                elif isinstance(a, list) and isinstance(b, list):
+                    if not _compare_lists(a, b, f"{label}[{idx}]", rtol, atol):
+                        return False
+                elif isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+                    logger.warning(
+                        "Type mismatch at '%s[%d]': %s vs %s",
+                        label,
+                        idx,
+                        type(a).__name__,
+                        type(b).__name__,
+                    )
                     return False
-            elif isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
-                logger.warning(
-                    "Type mismatch at '%s[%d]': %s vs %s",
-                    label,
-                    idx,
-                    type(a).__name__,
-                    type(b).__name__,
-                )
-                return False
-            elif not _scalars_equal(a, b):
-                logger.warning(
-                    "List[%d] mismatch at '%s': %r vs %r",
-                    idx,
-                    label,
-                    a,
-                    b,
-                )
+                elif not _scalars_equal(a, b):
+                    logger.warning(
+                        "List[%d] mismatch at '%s': %r vs %r",
+                        idx,
+                        label,
+                        a,
+                        b,
+                    )
+                    return False
+            except (ValueError, TypeError):
                 return False
     return True
 

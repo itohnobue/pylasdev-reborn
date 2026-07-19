@@ -30,6 +30,10 @@ from .models import CurveDefinition, LASFile, ParameterEntry
 # \u2028 (LINE SEPARATOR), and \u2029 (PARAGRAPH SEPARATOR).
 # The Unicode line break characters are treated as line breaks by Python's
 # splitlines() but are not caught by \n/\r replacement.
+# NOTE: Pipe (|, 0x7C) is NOT included here because it is a legitimate
+# structural character in LAS 3.0 zone notation ("| RUN[1]").  Pipe
+# stripping for section-name injection prevention is handled at the
+# point of use in _write_ascii_sections.
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85\u2028\u2029]")
 
 # F-86: Previous pattern ^~([A-Za-z]) only matched a leading tilde.
@@ -283,7 +287,7 @@ def write_las_file(
     # PylasdevError subclasses from models.py validation.
     try:
         content = _generate_las_content(las_file, precision)
-    except (ValueError, TypeError, KeyError, AttributeError, PylasdevError) as e:
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError, PylasdevError) as e:
         raise LASWriteError(f"Failed to generate LAS file content: {e}") from e
 
     try:
@@ -488,6 +492,11 @@ def _write_parameter_section(las_file: LASFile) -> list[str]:
     def _format_one_param(param: ParameterEntry) -> str:
         """Format a single parameter line (common to all section types)."""
         unit = _sanitize_las_value(param.unit) if param.unit else ""
+        # I2F-19: Escape colons in the unit field.  The unit appears between
+        # the mnemonic and the value in the output (MNEM.UNIT  VALUE  : DESC),
+        # BEFORE the structural colon.  A unit containing " : " creates a
+        # spurious structural separator that misroutes parser split results.
+        unit = _escape_colons_for_las_value(unit) if unit else ""
         desc = param.description if param.description else ""
 
         # F-M05: Emit data_format specifier in LAS 3.0 parameter lines.
@@ -515,7 +524,12 @@ def _write_parameter_section(las_file: LASFile) -> list[str]:
         # dict preserves insertion order in Python 3.8+.
         sections: dict[str | None, list[ParameterEntry]] = {}
         for param in las_file.parameters:
-            sections.setdefault(param.section_type, []).append(param)
+            # F-047: Normalize section_type to uppercase for case-insensitive
+            # grouping, matching how DataSection.section_type is handled at
+            # lines 455, 616, and 734.  Without this, "CORE" and "core" become
+            # separate dict entries producing duplicate parameter section blocks.
+            st_key = param.section_type.upper() if param.section_type else None
+            sections.setdefault(st_key, []).append(param)
 
         # Emit standard ~PARAMETER INFORMATION first (section_type=None).
         std_params = sections.pop(None, [])
@@ -648,10 +662,13 @@ def _format_curve_line(curve: CurveDefinition, is_las30: bool) -> str:
         format_str = f"{{{curve.data_format}"
         if curve.array_info and curve.array_info.time_offset is not None:
             offset = curve.array_info.time_offset
-            if offset == int(offset):
-                format_str += f":{int(offset)}"
-            else:
-                format_str += f":{offset}"
+            # F-024: Guard against non-finite time_offsets (inf, nan) that
+            # cause OverflowError in int(offset) or produce invalid LAS values.
+            if math.isfinite(offset):
+                if offset == int(offset):
+                    format_str += f":{int(offset)}"
+                else:
+                    format_str += f":{offset}"
         format_str += "}"
         desc = f"{desc}  {format_str}"
 
@@ -725,7 +742,11 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
 
     if las_file.data_sections and is_las30:
         # LAS 3.0: Multiple data sections with typed headers.
-        emitted_defs: set[str] = set()
+        # F-042: emitted_defs maps def_prefix -> {curve_signature -> def_section_name}.
+        # Two sections of the same type with IDENTICAL curve definitions share
+        # one Definition block (dedup).  When curve definitions differ between
+        # same-type sections, a new numbered Definition block is emitted.
+        emitted_defs: dict[str, dict[tuple[tuple[str, str, str, str], ...], str]] = {}
         for section in las_file.data_sections:
             # F2-006: Normalize section_type to uppercase — from_dict does
             # not normalize, so programmatically constructed LASFile objects
@@ -733,7 +754,18 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
             # Normalize once at the top of the loop for all comparisons.
             sec_type = section.section_type.upper()
             section_prefix = _section_type_to_prefix(sec_type)
-            section_name = f" {_sanitize_las_value(section.name)}" if section.name else ""
+            # I2F-18: Strip pipe characters from section names before
+            # constructing the pipe-delimited header.  A pipe in the
+            # section name (e.g., " | CURVE") would create a spurious
+            # pipe target, causing the parser to locate the wrong
+            # definition on re-read.  Pipe is NOT in _CONTROL_CHARS_RE
+            # because it is a legitimate LAS 3.0 zone notation character
+            # ("| RUN[1]") in value/description fields.
+            raw_section_name = (
+                f" {_sanitize_las_value(section.name).replace('|', '')}"
+                if section.name else ""
+            )
+            section_name = raw_section_name
 
             # F-16: Compute definition prefix for non-LOG_DATA LAS 3.0
             # sections.  Used for both the _Definition section header and
@@ -742,42 +774,83 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
             def_prefix: str | None = None
             if is_las30 and sec_type != "LOG_DATA":
                 def_prefix = _SECTION_TYPE_TO_DEFINITION_PREFIX.get(sec_type)
-                # F-D3-M01: Auto-derive Definition prefix for user-defined _DATA
-                # section types not in the hardcoded mapping.  Strip _DATA suffix
-                # and title-case the root (e.g., "CUSTOM_DATA" → "Custom").
-                if def_prefix is None and sec_type.endswith("_DATA"):
-                    root = sec_type[: -len("_DATA")]
-                    root = _sanitize_las_value(root)
-                    def_prefix = root.title().replace("_", "")
+                if def_prefix is None:
+                    if sec_type.endswith("_DATA"):
+                        # F-D3-M01: Auto-derive Definition prefix for user-defined
+                        # _DATA section types not in the hardcoded mapping.
+                        # Strip _DATA suffix and title-case the root
+                        # (e.g., "CUSTOM_DATA" → "Custom").
+                        root = sec_type[: -len("_DATA")]
+                        root = _sanitize_las_value(root)
+                        def_prefix = root.title().replace("_", "")
+                    elif section.section_curves:
+                        # I2F-21: Unknown non-_DATA section type with per-section
+                        # curves.  Derive a definition prefix from the section type
+                        # name so that curve metadata is preserved on roundtrip.
+                        # Without this, unknown section types silently lose their
+                        # per-section curve definitions.
+                        import warnings
+
+                        warnings.warn(
+                            f"Unknown section type '{sec_type}' has per-section "
+                            f"curve definitions.  Deriving definition prefix from "
+                            f"section type name to preserve curve metadata.",
+                            stacklevel=3,
+                        )
+                        st = _sanitize_las_value(sec_type)
+                        def_prefix = st.title().replace("_", "")
 
             # For non-LOG_DATA sections: emit per-section Definition section
             # so that the parser can correctly re-associate per-section curve
             # names on re-read.  Without this, all data sections get the
-            # global curve set on roundtrip.  Only emit once per section type
-            # (e.g., one Core_Definition for both Core[1] and Core[2]).
+            # global curve set on roundtrip.
+            # F-042: Dedup by curve identity, not just prefix.
+            # Only skip definitions when another section of the same type
+            # has IDENTICAL curve definitions (same mnemonics, units,
+            # descriptions, data_formats).  Different curve sets on the
+            # same section type get separate numbered Definition blocks
+            # (e.g., Core_Definition, Core_Definition_2).
+            pipe_def_name: str | None = None
             if is_las30 and sec_type != "LOG_DATA" and section.section_curves:
-                if def_prefix and def_prefix not in emitted_defs:
-                    emitted_defs.add(def_prefix)
-                    lines.append(f"~{def_prefix}_Definition")
-                    for curve in section.section_curves:
-                        lines.append(_format_curve_line(curve, is_las30))
-                    lines.append("")  # blank line after definition
+                # Build a curve identity signature from the visible fields
+                # that distinguish one curve set from another.
+                sig = tuple(
+                    (curve.mnemonic, curve.unit or "", curve.description or "", curve.data_format or "")
+                    for curve in section.section_curves
+                )
+                if def_prefix:
+                    if def_prefix not in emitted_defs:
+                        emitted_defs[def_prefix] = {}
+                    sig_map = emitted_defs[def_prefix]
+                    if sig not in sig_map:
+                        emit_idx = len(sig_map) + 1
+                        def_section_name = (
+                            f"{def_prefix}_Definition"
+                            if emit_idx == 1
+                            else f"{def_prefix}_Definition_{emit_idx}"
+                        )
+                        sig_map[sig] = def_section_name
+                        lines.append(f"~{def_section_name}")
+                        for curve in section.section_curves:
+                            lines.append(_format_curve_line(curve, is_las30))
+                        lines.append("")  # blank line after definition
+                    pipe_def_name = sig_map[sig]
 
             # Data section header with pipe notation for curve association.
             # LOG_DATA sections reference "| CURVE" so the parser scopes
             # curves to only the global ~CURVE set on re-read.  Non-LOG_DATA
             # sections reference "| {Name}_Definition" for per-section curve
             # reassociation (F-16).
-            # F-010: Only emit the pipe reference when the corresponding
+            # F-010/F-042: Only emit the pipe reference when the corresponding
             # Definition section was actually written above (tracked via
-            # emitted_defs).  Without this guard, a section with a valid
+            # pipe_def_name).  Without this guard, a section with a valid
             # def_prefix but empty section_curves would emit a phantom
             # pipe reference to a non-existent Definition section.
             if sec_type == "LOG_DATA" and is_las30:
                 lines.append(f"~{section_prefix}{section_name} | CURVE")
-            elif is_las30 and sec_type != "LOG_DATA" and def_prefix and def_prefix in emitted_defs:
+            elif is_las30 and sec_type != "LOG_DATA" and pipe_def_name:
                 lines.append(
-                    f"~{section_prefix}{section_name} | {def_prefix}_Definition"
+                    f"~{section_prefix}{section_name} | {pipe_def_name}"
                 )
             else:
                 lines.append(f"~{section_prefix}{section_name}")

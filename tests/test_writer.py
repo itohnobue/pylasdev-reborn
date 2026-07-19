@@ -1969,11 +1969,11 @@ class TestColonEscaping:
         assert result == "Oil"
 
     def test_roundtrip_colon_space(self, tmp_path: Path) -> None:
-        """"Oil: Gas Corp" (colon-space) survives roundtrip (escaped form)."""
+        """"Oil: Gas Corp" (colon-space) survives roundtrip — parser now un-escapes."""
         result = self._roundtrip_well_value(tmp_path, "Oil: Gas Corp")
-        # Value is preserved (not truncated), though in escaped form.
-        # The parser does not un-escape — that is a separate enhancement.
-        assert result == "Oil:_ Gas Corp"
+        # F-022: The parser now un-escapes colon artifacts inserted by
+        # _escape_colons_for_las_value, restoring the original value.
+        assert result == "Oil: Gas Corp"
         assert "Oil" in result  # Not truncated to just "Oil"
 
     def test_roundtrip_space_colon_space(self, tmp_path: Path) -> None:
