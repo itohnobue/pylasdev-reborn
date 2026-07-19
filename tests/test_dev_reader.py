@@ -1452,3 +1452,132 @@ class TestDelimiterAutoCorrectionHeader:
         data = read_dev_file(test_file)
         assert list(data.keys()) == ["MD", "TVD", "X"]
         assert len(data["MD"]) == 2
+
+
+class TestValidateDevData:
+    """Tests for _validate_dev_data() — F-008/F-201 validation rules.
+
+    Covers NaN-density, MD monotonicity, repeated stations, azimuth range,
+    and edge cases (no MD column, single-row, all-NaN, no azimuth column).
+    """
+
+    # ── edge cases (no warning expected) ─────────────────────────────
+
+    def test_no_md_column_no_warning(self) -> None:
+        """No MD column → validation is a no-op (returns immediately)."""
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile()
+        dev.columns["TVD"] = np.array([0.0, 100.0])
+        dev.columns["X"] = np.array([100.0, 101.0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _validate_dev_data(dev)
+
+    def test_single_row_non_nan_no_warning(self) -> None:
+        """Single-row file with valid MD → returns early, no warning."""
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile()
+        dev.columns["MD"] = np.array([100.0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _validate_dev_data(dev)
+
+    def test_single_row_nan_warns(self) -> None:
+        """Single-row file with NaN MD → warns about NaN density."""
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile()
+        dev.columns["MD"] = np.array([np.nan])
+        with pytest.warns(UserWarning, match="1/1 NaN"):
+            _validate_dev_data(dev)
+
+    # ── NaN density (> 50%) ─────────────────────────────────────────
+
+    def test_nan_density_above_50_percent_warns(self) -> None:
+        """>50% NaN in MD column warns about delimiter mismatch."""
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile()
+        # 4 NaN out of 5 total = 80% → triggers warning
+        dev.columns["MD"] = np.array([100.0, np.nan, np.nan, np.nan, np.nan])
+        with pytest.warns(UserWarning, match="NaN values.*delimiter mismatch"):
+            _validate_dev_data(dev)
+
+    # ── MD monotonicity ─────────────────────────────────────────────
+
+    def test_md_non_monotonic_warns(self) -> None:
+        """MD going backwards (100→200→150) triggers non-monotonic warning."""
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile()
+        dev.columns["MD"] = np.array([100.0, 200.0, 150.0, 300.0])
+        with pytest.warns(UserWarning, match="not monotonically increasing"):
+            _validate_dev_data(dev)
+
+    # ── repeated station MD ─────────────────────────────────────────
+
+    def test_repeated_station_md_warns(self) -> None:
+        """Repeated MD values (200.0 appears twice) trigger duplicates warning."""
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile()
+        dev.columns["MD"] = np.array([100.0, 200.0, 200.0, 300.0])
+        with pytest.warns(UserWarning, match="repeated MD station"):
+            _validate_dev_data(dev)
+
+    # ── azimuth out of range ────────────────────────────────────────
+
+    def test_azimuth_out_of_range_warns(self) -> None:
+        """Azimuth outside [0, 360] (370, -5) triggers azimuth warning."""
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile()
+        dev.columns["MD"] = np.array([100.0, 200.0, 300.0])
+        dev.columns["AZIM"] = np.array([10.0, 370.0, -5.0])
+        with pytest.warns(UserWarning, match="Azimuth.*outside.*0, 360"):
+            _validate_dev_data(dev)
+
+    # ── clean data (no warnings) ────────────────────────────────────
+
+    def test_clean_data_no_warnings(self) -> None:
+        """Clean monotonic MD with valid azimuth produces no warnings."""
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile()
+        dev.columns["MD"] = np.array([100.0, 200.0, 300.0, 400.0])
+        dev.columns["AZIM"] = np.array([10.0, 90.0, 180.0, 350.0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _validate_dev_data(dev)
+
+    # ── all-NaN MD ──────────────────────────────────────────────────
+
+    def test_all_nan_md_warns_and_returns_early(self) -> None:
+        """All-NaN MD → NaN-density warning fires, then returns early.
+
+        No monotonicity/azimuth checks follow because there are no
+        finite values to check.
+        """
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile()
+        dev.columns["MD"] = np.array([np.nan, np.nan, np.nan])
+        dev.columns["AZIM"] = np.array([10.0, 20.0, 30.0])
+        # Only NaN-density warning fires; no subsequent warnings
+        with pytest.warns(UserWarning, match="NaN values.*delimiter mismatch") as w:
+            _validate_dev_data(dev)
+        assert len(w) == 1
+
+    # ── no azimuth column ───────────────────────────────────────────
+
+    def test_no_azimuth_column_no_warning(self) -> None:
+        """No azimuth column → no azimuth range check (graceful skip)."""
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile()
+        dev.columns["MD"] = np.array([100.0, 200.0, 300.0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _validate_dev_data(dev)

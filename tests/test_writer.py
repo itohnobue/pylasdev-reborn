@@ -2134,3 +2134,161 @@ class TestLeadingSectionRegex:
         [A-Za-z] — leading whitespace + tilde preserved."""
         result = _sanitize_las_value("  ~1 numeric")
         assert result == "  ~1 numeric"
+
+
+class TestSingleDataSectionFallback:
+    """Tests for F-067/F-111/F-208 — copy-back from data_sections to legacy attrs.
+
+    When a non-LAS-3.0 file has exactly one DataSection and empty logs,
+    the writer copies data_sections[0].data → las.logs (and similarly
+    string_data and curves_order) so the legacy ~A write path can
+    emit the data.
+
+    Regression risk: a refactor that breaks the condition at
+    writer.py:751 (``if not las_file.logs:``) would silently lose
+    data on write.
+    """
+
+    # ── helpers ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _make_las2_with_single_section() -> LASFile:
+        """Return a LASFile(vers='2.0') with one DataSection, no logs."""
+        las = LASFile()
+        las.version = VersionSection(vers="2.0", wrap="NO", dlm="SPACE")
+        las.well["STRT"] = "100.0"
+        las.well["STOP"] = "300.0"
+        las.well["STEP"] = "100.0"
+        las.well["NULL"] = "-999.25"
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.curves.append(CurveDefinition(mnemonic="GR", unit="API"))
+
+        ds = DataSection(
+            name="LOG_DATA",
+            curves_order=["DEPT", "GR"],
+            data={
+                "DEPT": np.array([100.0, 200.0, 300.0]),
+                "GR": np.array([50.0, 60.0, 70.0]),
+            },
+        )
+        las.data_sections.append(ds)
+        return las
+
+    # ── tests ───────────────────────────────────────────────────────
+
+    def test_copy_back_fires_and_data_is_preserved(self, tmp_path: Path) -> None:
+        """LAS 2.0 with single DataSection + empty logs → copy-back fires,
+        data appears in output file."""
+        las = self._make_las2_with_single_section()
+
+        output_file = tmp_path / "test.las"
+        with pytest.warns(
+            UserWarning,
+            match="data_sections are only supported for LAS 3.0",
+        ):
+            write_las_file(str(output_file), las)
+
+        content = output_file.read_text()
+        # Data section values are present in the output
+        assert "100" in content
+        assert "50" in content
+
+        # Re-parse and verify the data roundtrips
+        reparsed = read_las_file(str(output_file))
+        logs = reparsed.get("logs", {})
+        assert "DEPT" in logs, f"Expected 'DEPT' in reparsed logs, got {list(logs.keys())}"
+        np.testing.assert_array_almost_equal(
+            logs["DEPT"], np.array([100.0, 200.0, 300.0])
+        )
+        assert "GR" in logs, f"Expected 'GR' in reparsed logs, got {list(logs.keys())}"
+        np.testing.assert_array_almost_equal(
+            logs["GR"], np.array([50.0, 60.0, 70.0])
+        )
+
+    def test_copy_back_warning_emitted(self, tmp_path: Path) -> None:
+        """The single-section fallback warning is emitted when
+        data_sections exist in a non-LAS-3.0 file."""
+        las = self._make_las2_with_single_section()
+
+        output_file = tmp_path / "warn.las"
+        with pytest.warns(
+            UserWarning,
+            match="data_sections are only supported for LAS 3.0",
+        ):
+            write_las_file(str(output_file), las)
+
+    def test_copy_back_not_overwrite_user_logs(self, tmp_path: Path) -> None:
+        """If user pre-populates las.logs, copy-back does NOT fire
+        — user data is preserved."""
+        las = LASFile()
+        las.version = VersionSection(vers="2.0", wrap="NO", dlm="SPACE")
+        las.well["STRT"] = "100.0"
+        las.well["STOP"] = "300.0"
+        las.well["STEP"] = "100.0"
+        las.well["NULL"] = "-999.25"
+
+        # User-populated curves and logs (different from data_sections)
+        las.curves_order = ["DEPT", "DT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.curves.append(CurveDefinition(mnemonic="DT", unit="US/M"))
+        las.logs["DEPT"] = np.array([1000.0, 2000.0, 3000.0])
+        las.logs["DT"] = np.array([400.0, 500.0, 600.0])
+
+        # DataSection with conflicting data — should be ignored
+        # because las.logs is already populated
+        ds = DataSection(
+            name="LOG_DATA",
+            curves_order=["DEPT", "GR"],
+            data={
+                "DEPT": np.array([100.0, 200.0, 300.0]),
+                "GR": np.array([50.0, 60.0, 70.0]),
+            },
+        )
+        las.data_sections.append(ds)
+
+        output_file = tmp_path / "user_logs.las"
+        with pytest.warns(
+            UserWarning,
+            match="data_sections are only supported for LAS 3.0",
+        ):
+            write_las_file(str(output_file), las)
+
+        # Verify user's DT data is in the output (from las.logs, not data_sections)
+        content = output_file.read_text()
+        assert "DT" in content
+
+        # Re-parse: DEPT values should be user's (1000, 2000, 3000),
+        # not data_sections' (100, 200, 300)
+        reparsed = read_las_file(str(output_file))
+        logs = reparsed.get("logs", {})
+        assert "DEPT" in logs, "Expected DEPT in reparsed logs"
+        assert logs["DEPT"][0] == 1000.0, (
+            f"Expected user DEPT value 1000.0, "
+            f"got {logs['DEPT'][0]}"
+        )
+        # GR should NOT be present — it was in data_sections only,
+        # and copy-back was blocked by pre-populated las.logs
+        assert "GR" not in logs, (
+            f"GR should NOT be in output (copy-back blocked), "
+            f"but found in {list(logs.keys())}"
+        )
+
+    def test_copy_back_preserves_curves_order(self, tmp_path: Path) -> None:
+        """Copy-back sets las.curves_order from data_sections[0].curves_order."""
+        las = self._make_las2_with_single_section()
+
+        output_file = tmp_path / "order.las"
+        with pytest.warns(
+            UserWarning,
+            match="data_sections are only supported for LAS 3.0",
+        ):
+            write_las_file(str(output_file), las)
+
+        content = output_file.read_text()
+        # Verify both curves appear in the output in expected order
+        dept_pos = content.index("DEPT")
+        gr_pos = content.index("GR")
+        assert dept_pos < gr_pos, (
+            f"Expected DEPT before GR in output, "
+            f"but DEPT at {dept_pos}, GR at {gr_pos}"
+        )

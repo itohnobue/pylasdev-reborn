@@ -740,6 +740,23 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
             stacklevel=3,
         )
 
+        # F-067/F-111: Copy data_sections[0] contents to legacy attributes so
+        # the legacy writer path at line 868+ reads the correct data.  Without
+        # this copy-back, the single-section warning's promise ("data will be
+        # preserved") is broken — the legacy path sees empty logs/string_data/
+        # curves_order.  Use .update() for logs/string_data to preserve any
+        # metadata entries (STRT, STOP, STEP, etc.) the user may have set.
+        # Only copy if legacy attributes are not already populated — respect
+        # user data.  curves_order is a list, so assignment is correct.
+        if not las_file.logs:
+            _ds = las_file.data_sections[0]
+            if _ds.data:
+                las_file.logs.update(_ds.data)
+            if _ds.string_data:
+                las_file.string_data.update(_ds.string_data)
+            if _ds.curves_order:
+                las_file.curves_order = list(_ds.curves_order)
+
     if las_file.data_sections and is_las30:
         # LAS 3.0: Multiple data sections with typed headers.
         # F-042: emitted_defs maps def_prefix -> {curve_signature -> def_section_name}.

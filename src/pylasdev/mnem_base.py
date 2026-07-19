@@ -1657,6 +1657,7 @@ MNEM_BASE: dict[str, str] = {
     "WOD": "KP",
     "WOD1": "KP",
     "ZV3": "ZV",
+    "AGK": "GK",
     "aGK": "GK",
     "aNGK": "NGK",
     "bk": "BK",
@@ -2010,7 +2011,7 @@ MNEM_BASE: dict[str, str] = {
     "XN3": "SAT",
     "ХН": "SAT",
     "бк": "BK",
-    "юОЯ": "ALPS",
+    "ЮОЯ": "ALPS",
 }
 
 
@@ -2041,6 +2042,7 @@ def resolve_mnemonic(
     Returns:
         Fully resolved canonical mnemonic.
     """
+    mnemonic = mnemonic.upper()
     current = mnemonic
     seen: set[str] = set()
     for _ in range(max_depth):

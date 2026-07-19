@@ -486,6 +486,129 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
     return ("simple", 1)
 
 
+def _validate_dev_data(
+    dev: DevFile, *, _stacklevel: int = 3
+) -> None:
+    """Validate parsed DEV data for common data-quality issues.
+
+    Performs post-read validation checks and emits warnings for:
+
+    * Non-monotonically increasing MD values (unsorted MD can cause
+      inaccurate trajectory calculations per the 3dwellbore.com spec).
+    * Azimuth values outside the expected ``[0, 360]`` range.
+    * Repeated station MD values (may indicate merged multi-tool
+      surveys).
+    * MD column with high NaN density (> 50%), which often indicates
+      a delimiter mismatch where data was parsed with the wrong
+      separator.
+
+    All violations emit :func:`warnings.warn` rather than raising
+    exceptions so that users can inspect raw data even when it
+    contains quality issues.
+    """
+    # --- Check MD column exists ---
+    if "MD" not in dev.columns:
+        return
+
+    md = dev.columns["MD"]
+    total = len(md)
+    if total < 2:
+        # Need at least 2 stations for monotonicity and repeat checks.
+        # NaN-density check still applies for single-row files.
+        if total == 1 and np.isnan(md[0]):
+            warnings.warn(
+                "MD column has 1/1 NaN value. "
+                "Possible delimiter mismatch: data may have been parsed "
+                "with the wrong separator. Specify the correct delimiter "
+                "explicitly.",
+                stacklevel=_stacklevel,
+            )
+        return
+
+    # --- 1. Check NaN density (> 50% NaN suggests delimiter mismatch) ---
+    nan_count = int(np.isnan(md).sum())
+    if nan_count / total > 0.5:
+        warnings.warn(
+            f"MD column has {nan_count}/{total} ({nan_count / total:.1%}) "
+            f"NaN values. Possible delimiter mismatch: data may have been "
+            f"parsed with the wrong separator. Specify the correct "
+            f"delimiter explicitly.",
+            stacklevel=_stacklevel,
+        )
+
+    # Filter to finite values for monotonicity and duplicate checks.
+    finite_mask = ~np.isnan(md)
+    if not np.any(finite_mask):
+        return
+
+    finite_md = md[finite_mask]
+    if len(finite_md) < 2:
+        return
+
+    # --- 2. Check MD monotonicity (strictly non-decreasing) ---
+    diffs = np.diff(finite_md)
+    non_monotonic = diffs < 0
+    if np.any(non_monotonic):
+        n_violations = int(np.sum(non_monotonic))
+        violations = np.where(non_monotonic)[0]
+        example_lines = []
+        for idx in violations[:3]:
+            example_lines.append(f"{finite_md[idx]} -> {finite_md[idx + 1]}")
+        warnings.warn(
+            f"MD values are not monotonically increasing: "
+            f"{n_violations} decrease(s) found. "
+            f"First violations: {', '.join(example_lines)}. "
+            f"Unsorted MD values can cause inaccurate trajectory "
+            f"calculations.",
+            stacklevel=_stacklevel,
+        )
+
+    # --- 3. Check repeated station MD values ---
+    unique_md, counts = np.unique(finite_md, return_counts=True)
+    duplicates = unique_md[counts > 1]
+    if len(duplicates) > 0:
+        n_dup = len(duplicates)
+        example_vals = sorted(duplicates)[:3]
+        warnings.warn(
+            f"Found {n_dup} repeated MD station value(s): "
+            f"{', '.join(str(v) for v in example_vals)}"
+            f"{'...' if n_dup > 3 else ''}. "
+            f"Repeated stations may indicate merged multi-tool surveys.",
+            stacklevel=_stacklevel,
+        )
+
+    # --- 4. Check azimuth range [0, 360] ---
+    _azi_names = ("AZI", "AZIM", "AZ", "AZM", "AZIMUTH")
+    for azi_name in _azi_names:
+        if azi_name not in dev.columns:
+            continue
+        azi = dev.columns[azi_name]
+        azi_finite = azi[~np.isnan(azi)]
+        if len(azi_finite) == 0:
+            continue
+        out_of_range = (azi_finite < 0) | (azi_finite > 360)
+        if np.any(out_of_range):
+            n_bad = int(np.sum(out_of_range))
+            bad_vals = azi_finite[out_of_range][:3]
+            warnings.warn(
+                f"Azimuth column '{azi_name}' has {n_bad} value(s) "
+                f"outside [0, 360]: "
+                f"{', '.join(str(v) for v in bad_vals)}"
+                f"{'...' if n_bad > 3 else ''}. "
+                f"Azimuth values outside [0, 360] can cause inaccurate "
+                f"trajectory calculations.",
+                stacklevel=_stacklevel,
+            )
+        break  # Found one recognised azimuth column — done checking.
+
+    # --- 5. Check MD NaN density (already checked above; note that
+    #       the NaN-density check on the full md array covers all
+    #       data including non-MD columns that may be NaN due to
+    #       delimiter mismatch, but the MD column is the most
+    #       reliable indicator — if MD is >50% NaN, the file is
+    #       almost certainly misparsed.) ---
+
+
 def read_dev_file(
     file_path: str | Path,
     encoding: str | None = None,
@@ -987,4 +1110,5 @@ def read_dev_file_as_object(
                         dev.columns[names[k]][current_line] = np.nan
                 current_line += 1
 
+    _validate_dev_data(dev, _stacklevel=3)
     return dev

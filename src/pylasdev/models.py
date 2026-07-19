@@ -91,6 +91,21 @@ def _create_parameter_entry(param_dict: dict[str, Any]) -> ParameterEntry:
     # empty-string and absent are treated identically.
     if _section_type == "":
         _section_type = None
+    # F-118: Reject section_type values that could inject headers when
+    # written.  The writer applies ``_sanitize_las_value`` which converts
+    # ``\n`` → space, then ``_LEADING_SECTION_RE`` only strips tilde at
+    # the STRING START — embedded ``~VERSION`` survives.  The emitted
+    # header ``~CORE ~VERSION_Parameter`` is misrouted as a DATA section
+    # by the parser.  Reject these values at construction time.
+    if _section_type is not None:
+        _sec_str = str(_section_type)
+        if '\n' in _sec_str or '\r' in _sec_str or '~' in _sec_str:
+            raise ValueError(
+                f"section_type contains invalid characters "
+                f"(newline or tilde): {_sec_str!r}.  "
+                f"section_type must be a LAS identifier "
+                f"(alphanumeric + underscore)."
+            )
     # I2F-12: Validate parameter data_format against the same valid set
     # used for curve data_format.  Curve validation runs in two places
     # (_validate_from_dict_input lines 227-237 and 241-257).  Parameter
@@ -180,7 +195,7 @@ def _resolve_dict_entry(
 
 
 # Valid data_format values for LAS curves (LAS 3.0 spec).
-_VALID_DATA_FORMATS = frozenset({"F", "E", "D", "A", "S"})
+_VALID_DATA_FORMATS = frozenset({"F", "E", "D", "A", "S", "I"})
 
 
 def _validate_from_dict_input(data: dict[str, Any]) -> None:
@@ -192,8 +207,11 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
     closing Pattern #7 (from_dict validation gaps) structurally.
     """
     # --- F-017: Mandatory well fields (STRT, STOP, STEP, NULL) ---
+    # F-028: Truthiness-based asymmetry — ``and well`` skipped the check
+    # for ``well={}`` (empty dict is falsy) while ``well={"STRT": "0"}``
+    # (populated but incomplete) triggered it.  Both are equally invalid.
     well = data.get("well")
-    if isinstance(well, dict) and well:
+    if isinstance(well, dict):
         _mandatory = {"STRT", "STOP", "STEP", "NULL"}
         _well_keys = {k.upper() for k in well if isinstance(k, str)}
         _missing = _mandatory - _well_keys
@@ -318,6 +336,47 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
                 f"supported for LAS 3.0 files, but version is {vers!r}. "
                 f"Use a single section for LAS 1.2/2.0."
             )
+
+    # F-115: Detect ambiguous curve placement — when the same curve name
+    # appears in both ``logs`` and ``data_sections[*]``, the writer
+    # checks data_sections first (writer.py:743) and uses the LAS 3.0
+    # path, silently ignoring the logs value.  Reject the ambiguous
+    # input so callers get a clear error instead of silent data discard.
+    # LAS 3.0 roundtrip legitimately produces both keys when logs
+    # (top-level curves) and data_sections (section-level curves)
+    # contain different curve names — that is not ambiguous.
+    if isinstance(data_sections, list) and data_sections:
+        _logs_raw = data.get("logs")
+        if isinstance(_logs_raw, dict) and _logs_raw:
+            # Collect all curve names referenced in data_sections.
+            _ds_curve_names: set[str] = set()
+            for _ds in data_sections:
+                if isinstance(_ds, dict):
+                    _ds_curve_names.update(_ds.get("curves_order", []))
+                    _ds_data = _ds.get("data")
+                    if isinstance(_ds_data, dict):
+                        _ds_curve_names.update(_ds_data.keys())
+                    _ds_str = _ds.get("string_data")
+                    if isinstance(_ds_str, dict):
+                        _ds_curve_names.update(_ds_str.keys())
+            _log_curve_names = set(_logs_raw.keys())
+            _overlap = _log_curve_names & _ds_curve_names
+            if _overlap:
+                # F-115: Warn rather than reject — the parser roundtrip
+                # legitimately produces both logs and data_sections with
+                # overlapping curve names (same data, different storage).
+                # Rejection would break LAS 3.0 roundtrips.  The warning
+                # alerts users to potential silent data discard when
+                # manually constructed dicts conflict.
+                warnings.warn(
+                    f"Curve(s) {sorted(_overlap)} appear in both "
+                    f"'logs' and 'data_sections'.  The writer uses "
+                    f"data_sections when both are present, ignoring "
+                    f"the logs values for these curves.  Place each "
+                    f"curve in exactly one location to avoid data "
+                    f"loss.",
+                    stacklevel=2,
+                )
 
 
 def _check_df_vs_placement(
@@ -610,6 +669,24 @@ class DataSection:
 
         curve_set = set(self.curves_order)
 
+        # F-105: Reject duplicate curve names in curves_order.
+        # The from_dict path has explicit dedup checks (lines 1171-1181),
+        # but direct DataSection construction bypasses those entirely.
+        # ``DataSection(curves_order=["GR","GR","DT"])`` passes silently
+        # and the writer produces duplicate columns in output.
+        if len(self.curves_order) != len(curve_set):
+            _seen: set[str] = set()
+            _dups: list[str] = []
+            for c in self.curves_order:
+                if c in _seen:
+                    _dups.append(c)
+                else:
+                    _seen.add(c)
+            raise LASDataError(
+                f"DataSection '{self.name}': duplicate curve names in "
+                f"curves_order: {_dups}"
+            )
+
         # data keys ⊆ curves_order
         data_keys = set(self.data.keys())
         orphaned_data = data_keys - curve_set
@@ -645,6 +722,29 @@ class DataSection:
                 f"appear in both data and string_data.  Each curve must "
                 f"be in exactly one collection."
             )
+
+        # F-027 / F-079: Validate within-group array lengths.
+        # The from_dict path has cross-array length checks (lines 1292-1308),
+        # but direct DataSection construction bypasses those entirely.
+        # Arrays of different lengths pass silently — the writer pads
+        # shorter arrays with null_value, producing semantically incorrect
+        # output.
+        if self.data:
+            _data_lengths = {name: len(arr) for name, arr in self.data.items()}
+            if len(set(_data_lengths.values())) > 1:
+                raise LASDataError(
+                    f"DataSection '{self.name}' has inconsistent "
+                    f"array lengths: {_data_lengths}"
+                )
+        if self.string_data:
+            _string_lengths = {
+                name: len(arr) for name, arr in self.string_data.items()
+            }
+            if len(set(_string_lengths.values())) > 1:
+                raise LASDataError(
+                    f"DataSection '{self.name}' has inconsistent "
+                    f"string_data array lengths: {_string_lengths}"
+                )
 
 
 @dataclass(eq=False)
@@ -805,7 +905,16 @@ class LASFile:
             # because both curves_order and curves get corrupted the same way.
             if curves_order is None:
                 curves_order = []
-            elif isinstance(curves_order, str):
+            elif isinstance(curves_order, (str, bytes)):
+                # F-110: ``isinstance(bytes, str)`` is False in Python 3,
+                # so bytes bypassed the str guard.  ``list(b"GR")`` →
+                # ``[71, 82]`` (integers), which propagate as curve names.
+                if isinstance(curves_order, bytes):
+                    raise TypeError(
+                        "curves_order must be a list of strings, "
+                        "got bytes.  Decode to str first: "
+                        "curves_order.decode('utf-8')"
+                    )
                 raise ValueError(
                     f"curves_order must be a list, got str: "
                     f"{curves_order!r}"
@@ -1155,8 +1264,17 @@ class LASFile:
                 # curves_order — same bug as top-level F-21.
                 if _ds_curves_order is None:
                     _ds_curves_order = []
-                elif isinstance(_ds_curves_order, str):
+                elif isinstance(_ds_curves_order, (str, bytes)):
+                    # F-110: Same bytes bypass as top-level curves_order
+                    # guard (line 808).  ``list(b"GR")`` → ``[71, 82]``
+                    # produces integer curve names in a data section.
                     ds_name = ds_dict.get("name", "<unknown>")
+                    if isinstance(_ds_curves_order, bytes):
+                        raise TypeError(
+                            f"curves_order in section '{ds_name}' must be "
+                            f"a list of strings, got bytes.  Decode to "
+                            f"str first: curves_order.decode('utf-8')"
+                        )
                     raise ValueError(
                         f"curves_order in section '{ds_name}' must be a list, "
                         f"got str: {_ds_curves_order!r}"
@@ -1305,6 +1423,25 @@ class LASFile:
                         raise ValueError(
                             f"Data section '{ds.name}' has inconsistent "
                             f"string_data array lengths: {_sds_len}"
+                        )
+                # F-037: Cross-group row-count consistency.
+                # The within-group checks above validate that all arrays
+                # in 'data' have the same length, and all arrays in
+                # 'string_data' have the same length — but no cross-check
+                # verifies that data rows and string_data rows match.
+                # A DataSection with 100-row numeric data and 50-row
+                # string_data passes all existing validation.  The writer's
+                # ``_format_data_rows`` uses ``max()`` across all arrays,
+                # so one group's shorter arrays get padded — producing
+                # semantically incorrect output.
+                if ds.data and ds.string_data:
+                    _data_rows = max(len(arr) for arr in ds.data.values())
+                    _string_rows = max(len(arr) for arr in ds.string_data.values())
+                    if _data_rows != _string_rows:
+                        raise ValueError(
+                            f"DataSection '{ds.name}': data row count "
+                            f"({_data_rows}) does not match string_data "
+                            f"row count ({_string_rows})"
                         )
 
             # F-I2-M17: Cross-validate data_sections with LAS version.
@@ -1609,7 +1746,14 @@ class DevFile:
                     elif real_key == "column_order":
                         if value is None:
                             dev.column_order = []
-                        elif isinstance(value, str):
+                        elif isinstance(value, (str, bytes)):
+                            # F-110: bytes bypasses the str guard in Python 3.
+                            if isinstance(value, bytes):
+                                raise TypeError(
+                                    "column_order must be a list of strings, "
+                                    "got bytes.  Decode to str first: "
+                                    "value.decode('utf-8')"
+                                )
                             dev.column_order = [value]
                         else:
                             _col_order = list(value)
@@ -1638,7 +1782,14 @@ class DevFile:
                     elif key == "column_order":
                         if value is None:
                             dev.column_order = []
-                        elif isinstance(value, str):
+                        elif isinstance(value, (str, bytes)):
+                            # F-110: bytes bypasses the str guard in Python 3.
+                            if isinstance(value, bytes):
+                                raise TypeError(
+                                    "column_order must be a list of strings, "
+                                    "got bytes.  Decode to str first: "
+                                    "value.decode('utf-8')"
+                                )
                             dev.column_order = [value]
                         else:
                             _col_order = list(value)

@@ -316,6 +316,47 @@ def _unescape_colons_for_las_value(value: str) -> str:
     return value
 
 
+# F-088 / F-102: Shared format specifier validation — extracted from
+# _process_ascii_data so _parse_curve can also invoke it.  This closes
+# the deferred-validation gap where metadata-only LAS 3.0 files (no ~A
+# data section) bypassed format checking because the validator sat inside
+# data-processing code.  Also used by _process_ascii_data (replaces the
+# inlined check) so both call sites share the same validator.
+def _validate_curve_data_format(data_format: str, mnemonic: str) -> None:
+    """Validate a curve data_format against known LAS format specifiers.
+
+    Accepts single-letter codes (F, E, D, S, A) and extended Fortran-style
+    format specifiers (e.g., "F8.3", "E10.2", "E0.00E+00").  Rejects
+    non-numeric templates such as "DEG", "DD/MM/YYYY" which are metadata
+    strings, not LAS data format specifiers.
+
+    Args:
+        data_format: The format specifier string (already uppercased).
+        mnemonic: The curve mnemonic for error messages.
+
+    Raises:
+        LASParseError: If the format specifier is not a recognised single-letter
+            code or valid extended format.
+    """
+    if not data_format:
+        return
+    _KNOWN_CURVE_FORMATS: frozenset[str] = frozenset({"F", "E", "D", "S", "A", "I"})
+    # Accept single-letter codes OR extended format: [FEDI] + optional
+    # width[.precision][±exponent], or bare [SA] (no numeric suffix).
+    _FORMAT_SPEC_RE = re.compile(
+        r"^(?:[FEDI](?:\d+(?:\.\d+)?(?:[ED][+-]?\d+)?)?|[SA])$"
+    )
+    if data_format in _KNOWN_CURVE_FORMATS or _FORMAT_SPEC_RE.match(data_format):
+        return
+    raise LASParseError(
+        f"Curve '{mnemonic}' has unsupported format "
+        f"specifier '{{{data_format}}}'. Non-numeric format types "
+        f"(e.g., {{DEG}}, date templates) are not valid LAS "
+        f"data format specifiers. "
+        f"Valid values: {', '.join(sorted(_VALID_DATA_FORMATS))}"
+    )
+
+
 class LASParser:
     """Regex-based LAS file parser.
 
@@ -426,6 +467,11 @@ class LASParser:
         # F-34: Track section headers encountered (in order) for cross-section
         # consistency validation: duplicate detection and LAS 3.0 ordering check.
         self._section_sequence: list[str] = []
+        # F-048/F-103: Parallel list tracking semantic section type codes
+        # ("V", "W", "C", "P", "O", "A") for duplicate detection normalization.
+        # Label-based counting (above) misses semantically-duplicate sections
+        # that differ only by section_name (e.g., ~V = "V:" vs ~VERSION = "VERSION:").
+        self._section_type_sequence: list[str] = []
 
     @property
     def data_line_count(self) -> int:
@@ -1022,6 +1068,10 @@ class LASParser:
                         f"The file may be malformed or corrupt."
                     )
                 self._section_sequence.append(section_label)
+                # F-048/F-103: Track semantic section type for duplicate detection.
+                # Labels differ for same type (e.g., "V:" vs "VERSION:INFORMATION")
+                # but new_section is the normalized type code ("V").
+                self._section_type_sequence.append(new_section)
                 return
 
         if COMMENT_PATTERN.match(line) or EMPTY_PATTERN.match(line):
@@ -1726,6 +1776,10 @@ class LASParser:
             # comparisons (string_curves at L1485, _KNOWN_CURVE_FORMATS at L1498,
             # and array-time-offset check at L1172) work regardless of input case.
             data_format = first_fmt.upper()
+            # F-088 / F-102: Validate curve data_format at parse time,
+            # not deferred to _process_ascii_data.  Ensures metadata-only
+            # LAS 3.0 files (no ~A section) still receive format validation.
+            _validate_curve_data_format(data_format, raw_mnemonic)
             if data_format == "A" and first_offset:
                 try:
                     array_time_offset = float(first_offset)
@@ -1818,6 +1872,13 @@ class LASParser:
         _original_cased = match.group("mnemonic").strip()
         raw_mnemonic = _original_cased.upper()
         unit = match.group("unit") or ""
+        # F-116: Unescape colon artifacts in parameter units.
+        # The writer escapes colons (writer.py:498-499) but the parser
+        # did not unescape — the sole one-way path across 7 colon-escaped
+        # fields.  All 6 other fields (value, description across well,
+        # curve, parameter) have paired unescape.  Adding this closes the
+        # seventh and final gap, ensuring "kg : m" survives write→re-parse.
+        unit = _unescape_colons_for_las_value(unit)
         value = match.group("value").strip()
         description = (
             match.group("description").strip()
@@ -1854,6 +1915,20 @@ class LASParser:
                     param_data_format,
                     extra_formats,
                 )
+            # F-101: Validate single-character parameter data_format codes at
+            # parse time — mirroring from_dict's check at models.py:107.
+            # Multi-character patterns ({DD/MM/YYYY}, {DEG}) are metadata
+            # strings and pass through (same as from_dict behavior).
+            # Single-char non-FEDAS codes ({X}, {G}) must be rejected to
+            # ensure parse→to_dict→from_dict roundtrip compatibility.
+            if param_data_format and len(param_data_format) == 1:
+                if param_data_format not in _VALID_DATA_FORMATS:
+                    raise LASParseError(
+                        f"Parameter '{raw_mnemonic}' has unsupported data "
+                        f"format specifier '{{{param_data_format}}}'. "
+                        f"Valid LAS data format codes: "
+                        f"{', '.join(sorted(_VALID_DATA_FORMATS))}"
+                    )
         description = FORMAT_SPEC_PATTERN.sub("", description).strip()
 
         # LAS 3.0: Check for zone association in description
@@ -2143,47 +2218,12 @@ class LASParser:
         # F2-05: Validate curve format types — unrecognized formats silently
         # produce null data when routed through _to_finite_float().  Known
         # numeric format types are F (float), E (exponential), D (Fortran
-        # double), and S (string).  The empty string (no format specifier)
-        # defaults to numeric.  Non-numeric formats ({DEG}, date templates
-        # like {DD/MM/YYYY}) route through float() and produce null_value
-        # for every data point without any warning.
-        #
-        # F-M03: Validate the FULL format specifier, not just the first
-        # character.  The prior `fmt[0]` check passed both "D" (valid
-        # Fortran double) and "DEG"/"DD/MM/YYYY" (non-numeric templates)
-        # since all start with "D".  Now we require the format to either
-        # be a single known type letter, or a known letter followed by a
-        # valid width.precision pattern (e.g., "F8.3", "E10.2").
-        _KNOWN_CURVE_FORMATS: frozenset[str] = frozenset({"F", "E", "D", "S", "A"})
-        # F-M03: Match full numeric format specifiers — single letter or
-        # letter + width[.precision][±exponent] (e.g., "F8.3", "E0.00E+00").
-        # Non-numeric templates like "DEG" and "DD/MM/YYYY" fail because
-        # the second character is a letter or slash, not a digit.
-        # F-M03 / R9-018: S and A are bare format specifiers with no
-        # numeric width suffix (LAS spec).  The previous character class
-        # [FEDS] incorrectly accepted "S10" as valid, causing string
-        # curves to be classified as numeric and their values to become
-        # NaN.  Split into: [FED] with optional width, or [SA] bare.
-        _FORMAT_SPEC_RE = re.compile(
-            r"^(?:[FED](?:\d+(?:\.\d+)?(?:[ED][+-]?\d+)?)?|[SA])$"
-        )
+        # F-088: Validate curve data formats via shared helper (also called
+        # from _parse_curve).  The helper accepts single-letter codes
+        # (F, E, D, S, A) and extended Fortran-style specifiers (F8.3, etc.)
+        # while rejecting non-numeric templates like {DEG} or {DD/MM/YYYY}.
         for curve in section_curves:
-            fmt = curve.data_format
-            if fmt and not (
-                fmt in _KNOWN_CURVE_FORMATS or _FORMAT_SPEC_RE.match(fmt)
-            ):
-                # F-039: Reject unsupported format specifiers instead of
-                # just warning.  from_dict() raises ValueError for invalid
-                # data_format; the parser must be equally strict to ensure
-                # roundtrip safety — a parse→to_dict→from_dict cycle must
-                # not produce a file that from_dict rejects.
-                raise LASParseError(
-                    f"Curve '{curve.mnemonic}' has unsupported format "
-                    f"specifier '{{{fmt}}}'. Non-numeric format types "
-                    f"(e.g., {{DEG}}, date templates) are not valid LAS "
-                    f"data format specifiers. "
-                    f"Valid values: {', '.join(sorted(_VALID_DATA_FORMATS))}"
-                )
+            _validate_curve_data_format(curve.data_format, curve.mnemonic)
 
         # Get null value (shared utility, used by parser, data_reader, writer)
         null_value = _get_null_value(self.las_file.well)
@@ -2499,16 +2539,43 @@ class LASParser:
                     msg,
                 )
 
-        # (3) Duplicate section headers.
-        name_counts: dict[str, int] = {}
-        for label in self._section_sequence:
-            name_counts[label] = name_counts.get(label, 0) + 1
-        for label, count in name_counts.items():
-            if count > 1:
+        # (3) Duplicate section headers — detect by semantic section TYPE,
+        # not by label string.  Label-based counting (prior implementation)
+        # missed semantically-duplicate sections that differ only by
+        # section_name: ~V (label "V:") and ~VERSION (label "VERSION:")
+        # both dispatch to _parse_version but produced different labels.
+        # Similarly, ~V and ~V INFORMATION both route to "V" but produce
+        # different labels ("V:" vs "V:INFORMATION").
+        #
+        # Single-occurrence reserved sections:
+        #   V (VERSION), W (WELL) — always single occurrence per spec.
+        #   O (OTHER) — always single occurrence.
+        #   C (CURVE), P (PARAMETER), A (ASCII) — only in non-LAS 3.0.
+        #   In LAS 3.0, multiple ~C (per Definition), ~P (per typed group),
+        #   and ~A (per data section) are valid.
+        _is_las30 = self.las_file.version.is_las30
+        _reserved_single: set[str] = {"V", "W", "O"}
+        if not _is_las30:
+            _reserved_single.update({"C", "P", "A"})
+
+        _type_counts: dict[str, int] = {}
+        for stype in self._section_type_sequence:
+            _type_counts[stype] = _type_counts.get(stype, 0) + 1
+
+        for stype, count in _type_counts.items():
+            if count > 1 and stype in _reserved_single:
+                _duplicates = [
+                    lbl for lbl, st in zip(
+                        self._section_sequence, self._section_type_sequence, strict=True
+                    ) if st == stype
+                ]
+                _dup_labels = ", ".join(f"'~{d}'" for d in _duplicates)
                 logger.warning(
-                    "Duplicate section header '~%s' encountered %d times. "
-                    "Repeated sections may indicate a malformed file or "
-                    "cause data from earlier instances to be overwritten.",
-                    label,
+                    "Duplicate reserved section type '~%s' encountered "
+                    "%d times: %s. Repeated reserved sections may "
+                    "indicate a malformed file or cause data from earlier "
+                    "instances to be overwritten.",
+                    stype,
                     count,
+                    _dup_labels,
                 )
