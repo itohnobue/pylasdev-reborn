@@ -20,15 +20,9 @@ from typing import ClassVar
 
 import numpy as np
 
-from .data_reader import (
-    MAX_CURVES,
-    MAX_DATA_LINES,
-    MAX_TOKENS_PER_LINE,
-    MAX_TOTAL_ELEMENTS,
-    _get_null_value,
-    _to_finite_float,
-)
-from .exceptions import LASParseError
+from . import data_reader as _data_reader
+from .data_reader import _get_null_value, _resolve_max_tokens_per_line, _to_finite_float
+from .exceptions import LASDataError, LASParseError
 from .mnem_base import resolve_mnemonic
 from .models import (
     _VALID_DATA_FORMATS,
@@ -43,12 +37,12 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 # F-26: Global aggregate limit on data sections to prevent multi-section DoS.
-# Each section passes per-section bounds (MAX_DATA_LINES, MAX_CURVES,
-# MAX_TOTAL_ELEMENTS) but no global cap existed — an attacker could craft N
+# Each section passes per-section bounds (_data_reader.MAX_DATA_LINES, _data_reader.MAX_CURVES,
+# _data_reader.MAX_TOTAL_ELEMENTS) but no global cap existed — an attacker could craft N
 # data sections cumulatively exhausting memory.  Overridable at module level.
 MAX_DATA_SECTIONS = 1_000
 
-# F-29: Maximum parameter entries per file.  Curves have MAX_CURVES (100K)
+# F-29: Maximum parameter entries per file.  Curves have _data_reader.MAX_CURVES (100K)
 # checked in 3 locations; parameters had zero protection anywhere.
 MAX_PARAMETERS = 100_000
 
@@ -373,8 +367,12 @@ def _validate_curve_data_format(data_format: str, mnemonic: str) -> None:
     _KNOWN_CURVE_FORMATS: frozenset[str] = frozenset({"F", "E", "D", "S", "A", "I"})
     # Accept single-letter codes OR extended format: [FEDI] + optional
     # width[.precision][±exponent], or bare [SA] (no numeric suffix).
+    # PD2-02: Also accept array spacing indicators (LAS 3.0) — format
+    # codes may be multi-letter (e.g. ``AF``, ``AS``) optionally followed
+    # by semicolon-separated parameters (e.g. ``AF;50ms;5ft``).  The
+    # caller truncates to the first character after validation.
     _FORMAT_SPEC_RE = re.compile(
-        r"^(?:[FEDI](?:\d+(?:\.\d+)?(?:[ED][+-]?\d+)?)?|[SA])$"
+        r"^(?:[FEDI](?:\d+(?:\.\d+)?(?:[ED][+-]?\d+)?)?|[SA]\w*(?:;[\w.]+)*)$"
     )
     if data_format in _KNOWN_CURVE_FORMATS or _FORMAT_SPEC_RE.match(data_format):
         return
@@ -488,12 +486,15 @@ class LASParser:
         # F-M12: Raw ASCII data lines are buffered when data sections (~A,
         # ~ASCII, etc.) appear before ~V so they can be re-processed after
         # the version (and hence is_las30) is known.
-        # F-H01: Each entry is a (section_type, section_name, section_idx,
-        # raw_line) tuple to preserve per-section boundaries across the
-        # deferred replay.  section_idx distinguishes consecutive sections
-        # that happen to have the same section_type and section_name
-        # (e.g., two bare ~A sections).
-        self._deferred_ascii_data_lines: list[tuple[str, str, int, str]] = []
+        # F-H01 / I2-D2-01: Each entry is a (section_type, section_name,
+        # section_idx, raw_line, curve_start_idx, curve_end_idx) tuple to
+        # preserve per-section boundaries AND pipe-target curve scoping
+        # across the deferred replay.  section_idx distinguishes
+        # consecutive sections that happen to have the same section_type
+        # and section_name (e.g., two bare ~A sections).
+        self._deferred_ascii_data_lines: list[
+            tuple[str, str, int, str, int, int | None]
+        ] = []
         # F-34: Track section headers encountered (in order) for cross-section
         # consistency validation: duplicate detection and LAS 3.0 ordering check.
         self._section_sequence: list[str] = []
@@ -532,6 +533,15 @@ class LASParser:
         # pre-allocation (using the count from Pass 1) BEFORE Pass 3 fills them.
         if lines is None:
             lines = _SPLITLINES_CHARS_RE.sub(" ", content).splitlines()
+        else:
+            # I2-XPD-01: When lines are provided externally (e.g., from
+            # reader.py's PERF-01 optimization), apply _SPLITLINES_CHARS_RE
+            # sanitization to each line to prevent null-byte-prefixed
+            # section-header injection.  The content-level substitution
+            # was already applied by the caller, but per-line cleaning
+            # ensures defense-in-depth against stale or unsanitized
+            # externally-supplied line lists.
+            lines = [_SPLITLINES_CHARS_RE.sub(" ", ln) for ln in lines]
         self._pre_scan(lines)
 
         for line in lines:
@@ -1193,11 +1203,18 @@ class LASParser:
             return None
 
         mnemonic = prefix[:dot_idx].strip()
+        # PXM-03: A line starting with a dot produces an empty mnemonic
+        # which would cause CurveDefinition.__post_init__ to raise an
+        # uncaught ValueError escaping the parser boundary.
+        if not mnemonic:
+            return None
         after_dot = prefix[dot_idx + 1 :].strip()
 
         # Unit is the contiguous word chars + hyphens + slashes before the
         # first value whitespace.  Value is everything after that whitespace.
-        unit_match_result = re.match(r"([\w\-/]*)", after_dot)
+        # PD1-01: Require letter start so a purely numeric value string
+        # (e.g. ``123.45``) is not greedily consumed as a unit name.
+        unit_match_result = re.match(r"([a-zA-Z][\w\-/]*)", after_dot)
         if unit_match_result:
             unit = unit_match_result.group(1)
             value = after_dot[len(unit) :].strip()
@@ -1621,23 +1638,33 @@ class LASParser:
             self._deferred_well_entries.clear()
 
         # F-M12: Replay deferred data lines if the file is LAS 3.0.
-        # F-H01: Each deferred entry is a (section_type, section_name,
-        # section_idx, line) tuple.  Group by (section_type, section_name,
-        # section_idx) to create one DataSection per original pre-~V data
-        # section.  section_idx disambiguates consecutive bare sections
-        # that share the same type and name.
+        # F-H01 / I2-D2-01: Each deferred entry is a (section_type,
+        # section_name, section_idx, line, curve_start, curve_end)
+        # tuple.  Group by (section_type, section_name, section_idx)
+        # to create one DataSection per original pre-~V data section.
+        # curve_start/curve_end preserve pipe-target scoping through
+        # the deferred replay so that |CURVE and |X_Definition pipe
+        # associations are not lost.
         if self._deferred_ascii_data_lines:
             if self.las_file.version.is_las30:
                 # Build groups from per-line tuple storage.
                 # itertools.groupby groups consecutive lines with the same
                 # key — correct since deferred lines are appended in file
                 # order and section boundaries are naturally contiguous.
-                groups: list[tuple[tuple[str, str, int], list[str]]] = []
+                groups: list[
+                    tuple[tuple[str, str, int], list[str], int, int | None]
+                ] = []
                 for key, group_iter in groupby(
                     self._deferred_ascii_data_lines,
                     key=lambda t: (t[0], t[1], t[2]),
                 ):
-                    groups.append((key, [line for _, _, _, line in group_iter]))
+                    rows = list(group_iter)
+                    groups.append((
+                        key,
+                        [r[3] for r in rows],
+                        rows[0][4],       # curve_start_idx
+                        rows[0][5],       # curve_end_idx
+                    ))
 
                 # Save current state before processing deferred groups.
                 saved_lines = self._ascii_data_lines
@@ -1647,10 +1674,12 @@ class LASParser:
                 saved_section_name = self._current_section_name
 
                 # Process each deferred group as its own DataSection.
-                for (section_type, _section_name, _section_idx), raw_lines in groups:
-                    # Use default curve indices (full range).
-                    self._section_curve_start_idx = 0
-                    self._section_curve_end_idx = None
+                for (section_type, _section_name, _section_idx), raw_lines, curve_start, curve_end in groups:
+                    # I2-D2-01: Restore pipe-target curve scoping stored
+                    # at defer time, preserving |CURVE and
+                    # |X_Definition associations.
+                    self._section_curve_start_idx = curve_start
+                    self._section_curve_end_idx = curve_end
                     # Pre-~V section type may be stale — use stored value.
                     self._current_data_section_type = section_type or "LOG_DATA"
                     # Preserve user-provided section names when available.
@@ -1896,12 +1925,12 @@ class LASParser:
         # F-28: Guard against unbounded curve accumulation during ~C parsing.
         # Without this check, a metadata-only LAS 3.0 file can accumulate
         # unlimited CurveDefinition objects without triggering any bounds
-        # check (MAX_CURVES was only checked later in _process_ascii_data,
+        # check (_data_reader.MAX_CURVES was only checked later in _process_ascii_data,
         # which early-returns when no data section exists).
-        if len(self.las_file.curves) >= MAX_CURVES:
+        if len(self.las_file.curves) >= _data_reader.MAX_CURVES:
             raise LASParseError(
                 f"Curve count ({len(self.las_file.curves) + 1}) exceeds maximum "
-                f"allowed ({MAX_CURVES}). The file may be malformed or corrupt."
+                f"allowed ({_data_reader.MAX_CURVES}). The file may be malformed or corrupt."
             )
         self.las_file.curves.append(curve)
         self.las_file.curves_order.append(normalized)
@@ -1971,12 +2000,25 @@ class LASParser:
                 )
             # F-101: Validate single-character parameter data_format codes at
             # parse time — mirroring from_dict's check at models.py:107.
-            # Multi-character patterns ({DD/MM/YYYY}, {DEG}) are metadata
-            # strings and pass through (same as from_dict behavior).
-            # Single-char non-FEDAS codes ({X}, {G}) must be rejected to
-            # ensure parse→to_dict→from_dict roundtrip compatibility.
-            if param_data_format and len(param_data_format) == 1:
-                if param_data_format not in _VALID_DATA_FORMATS:
+            if param_data_format:
+                # I2-XWP-02: Truncate extended Fortran-style format
+                # specifiers (F8.3, E10.2, D0.00E+00) to single-letter
+                # codes for roundtrip compatibility with from_dict's
+                # _VALID_DATA_FORMATS.  This matches the curve path's
+                # behavior (line ~1861).  Multi-character patterns that
+                # do NOT match _FORMAT_SPEC_RE (e.g., {DD/MM/YYYY},
+                # {DEG}) are metadata templates and pass through
+                # unchanged — same as the existing documented behavior.
+                if len(param_data_format) > 1:
+                    try:
+                        _validate_curve_data_format(param_data_format, raw_mnemonic)
+                    except LASParseError:
+                        pass  # Not a valid data format — pass through as metadata
+                    else:
+                        param_data_format = param_data_format[0]
+                # Single-char non-FEDAS codes ({X}, {G}) must be rejected
+                # to ensure parse→to_dict→from_dict roundtrip compatibility.
+                if len(param_data_format) == 1 and param_data_format not in _VALID_DATA_FORMATS:
                     raise LASParseError(
                         f"Parameter '{raw_mnemonic}' has unsupported data "
                         f"format specifier '{{{param_data_format}}}'. "
@@ -2033,6 +2075,13 @@ class LASParser:
             _section_type = _sect_name[: -len("_PARAMETER")]
         elif _sect_name.endswith("_PARAMETERS"):
             _section_type = _sect_name[: -len("_PARAMETERS")]
+        # I2-XPM-01: Sanitize section_type — tildes can appear in
+        # section_type when a section header like ~C~ORE_PARAMETER is
+        # parsed (SECTION_PATTERN captures C~ORE_PARAMETER as the word).
+        # Tildes are the LAS section marker and must not leak into model
+        # metadata (ParameterEntry.section_type, writer section_type).
+        if _section_type is not None:
+            _section_type = _section_type.replace("~", "")
 
         param = ParameterEntry(
             mnemonic=normalized,
@@ -2049,7 +2098,7 @@ class LASParser:
         if param_data_format:
             param.data_format = param_data_format
         # F-29: Guard against unbounded parameter accumulation.
-        # Curves have MAX_CURVES checked in 3 locations; parameters had zero
+        # Curves have _data_reader.MAX_CURVES checked in 3 locations; parameters had zero
         # protection anywhere despite following the same append pattern.
         if len(self.las_file.parameters) >= MAX_PARAMETERS:
             raise LASParseError(
@@ -2078,22 +2127,26 @@ class LASParser:
             # discarded.  After ~V is parsed, _replay_deferred_well replays
             # them if the file is LAS 3.0; if not, they are discarded.
             if not self._version_found:
-                if len(self._deferred_ascii_data_lines) >= MAX_DATA_LINES:
+                if len(self._deferred_ascii_data_lines) > _data_reader.MAX_DATA_LINES:
                     raise LASParseError(
                         f"Deferred ASCII data line count exceeds maximum "
-                        f"allowed ({MAX_DATA_LINES}). "
+                        f"allowed ({_data_reader.MAX_DATA_LINES}). "
                         f"The file may be malformed or corrupt."
                     )
                 # F-H01: Store per-line (section_type, section_name,
-                # section_idx, line) so _replay_deferred_well can
-                # reconstruct per-section grouping.  section_idx
-                # disambiguates consecutive bare sections.
+                # section_idx, curve_start, curve_end, line) so
+                # _replay_deferred_well can reconstruct per-section
+                # grouping.  section_idx disambiguates consecutive bare
+                # sections.  curve_start/curve_end preserve pipe-target
+                # scoping across the deferred replay (I2-D2-01).
                 self._deferred_ascii_data_lines.append(
                     (
                         self._current_data_section_type,
                         self._current_section_name,
                         self._current_data_section_idx,
                         line,
+                        self._section_curve_start_idx,
+                        self._section_curve_end_idx,
                     )
                 )
             return
@@ -2101,10 +2154,10 @@ class LASParser:
         # list grows unbounded.  The main check in _process_ascii_data runs
         # AFTER all lines are collected, offering no protection during the
         # accumulation phase itself.
-        if len(self._ascii_data_lines) >= MAX_DATA_LINES:
+        if len(self._ascii_data_lines) > _data_reader.MAX_DATA_LINES:
             raise LASParseError(
                 f"ASCII data line count exceeds maximum allowed "
-                f"({MAX_DATA_LINES}) during accumulation. "
+                f"({_data_reader.MAX_DATA_LINES}) during accumulation. "
                 f"The file may be malformed or corrupt."
             )
         self._ascii_data_lines.append(line)
@@ -2226,6 +2279,10 @@ class LASParser:
         # Get delimiter character
         delimiter = self.las_file.version.delimiter_char
 
+        # Resolve MAX_TOKENS_PER_LINE — data_reader now uses a sentinel
+        # (None → _data_reader.MAX_CURVES) so overrides propagate correctly at runtime.
+        _max_tokens = _resolve_max_tokens_per_line()
+
         # F1: Get per-section curves — only curves defined since the
         # most recent ~C block.  For the first data section (no ~C
         # encountered or _section_curve_start_idx == 0), this is the
@@ -2282,13 +2339,34 @@ class LASParser:
         # Get null value (shared utility, used by parser, data_reader, writer)
         null_value = _get_null_value(self.las_file.well)
 
+        # F-PXR-05: Warn when null value defaults to -999.25 because the
+        # NULL key was not set in the well section.  This typically occurs
+        # when the data section (~A/ASCII) precedes the ~Well section in
+        # LAS 3.0 files, causing section-ordering-dependent null value.
+        if self.las_file.well.get("NULL") is None:
+            logger.warning(
+                "NULL value not found in well section for data section '%s'; "
+                "using default null value (%.4g). This may indicate that the "
+                "data section precedes the ~Well section in the file.",
+                self._current_section_name or "ASCII",
+                null_value,
+            )
+
         # Create data section with per-section curves.
-        data_section = DataSection(
-            name=self._current_section_name or f"Section_{self._current_data_section_idx}",
-            section_type=self._current_data_section_type,
-            curves_order=deduped_order,
-            section_curves=list(section_curves),
-        )
+        # PXM-02: wrap LASDataError from DataSection.__post_init__ so
+        # the parser boundary only raises LASParseError.
+        try:
+            data_section = DataSection(
+                name=self._current_section_name or f"Section_{self._current_data_section_idx}",
+                section_type=self._current_data_section_type,
+                curves_order=deduped_order,
+                section_curves=list(section_curves),
+            )
+        except LASDataError as exc:
+            raise LASParseError(
+                f"Data section '{self._current_section_name or self._current_data_section_idx}' "
+                f"validation failed: {exc}"
+            ) from exc
 
         num_curves = len(section_curves)
 
@@ -2301,8 +2379,8 @@ class LASParser:
 
         # F-I2-M09: Guard against zero data rows.  When actual_count is 0
         # (all lines are comments/blanks), num_curves * 0 = 0 always passes
-        # MAX_TOTAL_ELEMENTS check, but np.zeros(0) still allocates an empty
-        # ndarray per curve — up to MAX_CURVES per section and MAX_DATA_SECTIONS
+        # _data_reader.MAX_TOTAL_ELEMENTS check, but np.zeros(0) still allocates an empty
+        # ndarray per curve — up to _data_reader.MAX_CURVES per section and MAX_DATA_SECTIONS
         # sections can produce GB-scale allocations within guard limits.
         # A section with zero data rows has nothing to process; return early.
         if actual_count == 0:
@@ -2317,8 +2395,8 @@ class LASParser:
             return
 
         # F-26: Global aggregate limit across ALL data sections.
-        # Each section passes per-section bounds (MAX_DATA_LINES, MAX_CURVES,
-        # MAX_TOTAL_ELEMENTS) individually, but an attacker can craft N
+        # Each section passes per-section bounds (_data_reader.MAX_DATA_LINES, _data_reader.MAX_CURVES,
+        # _data_reader.MAX_TOTAL_ELEMENTS) individually, but an attacker can craft N
         # sections (each just under the limits) to cumulatively exhaust
         # memory.  This caps the total number of data sections processed.
         if self._current_data_section_idx >= MAX_DATA_SECTIONS:
@@ -2328,29 +2406,26 @@ class LASParser:
                 f"The file may be malformed or corrupt."
             )
 
-        # F-038: Use ``>=`` (not ``>``) for consistency with models.py:from_dict()
-        # which already uses ``>=`` for all MAX_CURVES guards.  Using ``>`` here
-        # allows exactly MAX_CURVES curves while from_dict rejects at the limit —
-        # a roundtrip divergence where a parser-accepted file is rejected by
-        # from_dict.  Synchronizing on ``>=`` closes the gap.
-        if actual_count >= MAX_DATA_LINES:
+        # Use ``>`` for consistency with data_reader.py and models.py which use ``>``
+        # throughout all MAX_DATA_LINES guards (accepts files at exactly MAX_DATA_LINES).
+        if actual_count > _data_reader.MAX_DATA_LINES:
             raise LASParseError(
                 f"ASCII data line count ({actual_count}) exceeds maximum allowed "
-                f"({MAX_DATA_LINES}). The file may be malformed or corrupt."
+                f"({_data_reader.MAX_DATA_LINES}). The file may be malformed or corrupt."
             )
-        if num_curves >= MAX_CURVES:
+        if num_curves >= _data_reader.MAX_CURVES:
             raise LASParseError(
                 f"Curve count ({num_curves}) exceeds maximum allowed "
-                f"({MAX_CURVES}). The file may be malformed or corrupt."
+                f"({_data_reader.MAX_CURVES}). The file may be malformed or corrupt."
             )
 
         # Combined bound: protect against combination attacks where individual
         # curve_count and data_line_count checks pass but product exhausts memory.
-        if num_curves * actual_count > MAX_TOTAL_ELEMENTS:
+        if num_curves * actual_count > _data_reader.MAX_TOTAL_ELEMENTS:
             raise LASParseError(
                 f"Total allocation ({num_curves} curves x {actual_count} lines = "
                 f"{num_curves * actual_count} elements) exceeds maximum allowed "
-                f"({MAX_TOTAL_ELEMENTS}). The file may be malformed or corrupt."
+                f"({_data_reader.MAX_TOTAL_ELEMENTS}). The file may be malformed or corrupt."
             )
 
         # PERF-03: Pre-allocate numpy arrays for numeric curves.
@@ -2372,8 +2447,8 @@ class LASParser:
             for i, c in enumerate(section_curves)
         ]
         idx = 0
-        warned_extra = False  # Track extra-column warning per section
-        warned_short = False  # F-11: Track short-row warning per section
+        extra_count = 0  # I2-XPD-03: Row-count accumulator for extra columns
+        short_count = 0  # I2-XPD-03: Row-count accumulator for short rows
         for line in self._ascii_data_lines:
             # Skip comment lines and blank/whitespace-only lines.
             # F-32: EMPTY_PATTERN was defined at module level but never
@@ -2395,7 +2470,7 @@ class LASParser:
             # quoting: fields are quoted only when they contain the
             # delimiter, quotechar, or line terminator.
             if delimiter == " ":
-                values = line.split(maxsplit=MAX_TOKENS_PER_LINE)
+                values = line.split(maxsplit=_max_tokens)
             else:
                 # F-I2-M12: Wrap csv.reader in try/except csv.Error.
                 # csv.Error (e.g. unclosed quotes, field-size overflow)
@@ -2407,42 +2482,30 @@ class LASParser:
                     )
                     row = next(reader)
                 except csv.Error as exc:
+                    # I2-D2-04: Include line index and content so
+                    # malformed TAB/COMMA data lines can be diagnosed.
+                    _line_preview = line.strip()[:200]
                     raise LASParseError(
-                        f"CSV parsing error in data section "
-                        f"'{self._current_section_name or 'ASCII'}': {exc}"
+                        f"CSV parsing error at data line {idx} in section "
+                        f"'{self._current_section_name or 'ASCII'}': {exc} "
+                        f"(line content: {_line_preview!r})"
                     ) from exc
                 # Safety cap: prevent unbounded token count from malformed
                 # input, matching the maxsplit behavior of str.split.
-                values = row[: MAX_TOKENS_PER_LINE + 1]
+                values = row[: _max_tokens + 1]
 
             # Warn about extra columns being silently discarded
-            if len(values) > num_curves and not warned_extra:
-                warned_extra = True
-                logger.warning(
-                    "Data line in section '%s' has %d values but only "
-                    "%d curves declared. Extra columns are discarded.",
-                    self._current_section_name or "ASCII",
-                    len(values),
-                    num_curves,
-                )
+            if len(values) > num_curves:
+                extra_count += 1
 
             # F-11: Warn when non-wrapped data lines have fewer values than
             # declared curves.  Short rows in wrapped mode are expected
             # (values span multiple lines), so this warning only fires in
             # non-wrapped (WRAP=NO) mode.
-            if len(values) < num_curves and not warned_short:
+            if len(values) < num_curves:
                 is_not_wrapped = self.las_file.version.wrap.upper() != "YES"
                 if is_not_wrapped:
-                    warned_short = True
-                    logger.warning(
-                        "Data line in section '%s' has %d values but %d "
-                        "curves declared. Missing values are filled with "
-                        "the null value (%s).",
-                        self._current_section_name or "ASCII",
-                        len(values),
-                        num_curves,
-                        null_value,
-                    )
+                    short_count += 1
 
             # Pad with null values if needed
             while len(values) < num_curves:
@@ -2462,6 +2525,29 @@ class LASParser:
                     arr[idx] = val
 
             idx += 1
+
+        # I2-XPD-03: Emit per-section summary warnings with total affected
+        # row counts, replacing the previous boolean-once pattern that
+        # suppressed all diagnostics after the first occurrence.  This
+        # allows automated data quality tools to enumerate affected rows.
+        if extra_count > 0:
+            logger.warning(
+                "Data section '%s': %d row(s) had more values than the %d "
+                "declared curves. Extra columns were silently discarded.",
+                self._current_section_name or "ASCII",
+                extra_count,
+                num_curves,
+            )
+        if short_count > 0:
+            logger.warning(
+                "Data section '%s': %d row(s) had fewer values than the %d "
+                "declared curves. Missing values are filled with the null "
+                "value (%s).",
+                self._current_section_name or "ASCII",
+                short_count,
+                num_curves,
+                null_value,
+            )
 
         # F2-014: Copy filled numeric arrays from data_section.data to
         # las_file.logs for independent views.  The allocation above only

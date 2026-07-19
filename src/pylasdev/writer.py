@@ -20,7 +20,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .data_reader import _get_null_value
-from .exceptions import LASWriteError, PylasdevError
+from .exceptions import LASDataError, LASWriteError, PylasdevError
 from .models import CurveDefinition, LASFile, ParameterEntry
 
 # Control characters except space and tab (which are valid LAS whitespace).
@@ -32,11 +32,21 @@ from .models import CurveDefinition, LASFile, ParameterEntry
 # \u2028 (LINE SEPARATOR), and \u2029 (PARAGRAPH SEPARATOR).
 # The Unicode line break characters are treated as line breaks by Python's
 # splitlines() but are not caught by \n/\r replacement.
+# Also matches Unicode whitespace characters that Python's str.split()
+# treats as field separators but are not in the ASCII control range:
+# \u00A0 (NO-BREAK SPACE), \u2000-\u200A (EN QUAD..HAIR SPACE),
+# \u202F (NARROW NO-BREAK SPACE), \u205F (MEDIUM MATHEMATICAL SPACE),
+# and \u3000 (IDEOGRAPHIC SPACE).  These cause phantom field splits on
+# re-read via str.split(), corrupting parsed structure.
 # NOTE: Pipe (|, 0x7C) is NOT included here because it is a legitimate
 # structural character in LAS 3.0 zone notation ("| RUN[1]").  Pipe
 # stripping for section-name injection prevention is handled at the
 # point of use in _write_ascii_sections.
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85\u2028\u2029]")
+_CONTROL_CHARS_RE = re.compile(
+    r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85"
+    r"\u2028\u2029"
+    r"\u00A0\u2000-\u200A\u202F\u205F\u3000]"
+)
 
 # F-86: Previous pattern ^~([A-Za-z]) only matched a leading tilde.
 # Values like "\t~Version" or "  ~Curve" bypassed section-header
@@ -89,6 +99,10 @@ def _sanitize_las_value(value: str) -> str:
     # A value starting with # would be silently dropped on re-read, creating
     # data loss.  Prefix with _ to preserve it while preventing comment
     # injection — the parser treats _# as a normal value character.
+    # F-I2-XWP-01 (coordinate with s6-fix-parser-b): The leading underscore
+    # is a permanently one-way transformation — the parser has no
+    # _desanitize function to strip it on re-read.  Parser-side reversal
+    # is needed for full roundtrip fidelity of _# values.
     if value.startswith("#"):
         value = "_" + value
     # F-I2-M12: After newline-to-space conversion above, the "#" character
@@ -284,6 +298,16 @@ def write_las_file(
             f"write_las_file expects a dict or LASFile, got {type(las_data).__name__}"
         )
 
+    # F-I2-W-02: Ensure the output directory exists BEFORE generating
+    # content.  Content generation can be expensive (large files), so
+    # failing fast on directory creation avoids wasted computation.
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise LASWriteError(
+            f"Cannot create output directory {file_path.parent}: {e}"
+        ) from e
+
     # Always write with the specified encoding (default: utf-8).
     # F-I2-M04: Also catch PylasdevError — content generation may raise
     # PylasdevError subclasses from models.py validation.
@@ -298,7 +322,6 @@ def write_las_file(
         # This prevents partial/corrupt files on I/O interruption,
         # disk-full, or system crash mid-write.
         target_dir = str(file_path.parent)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(
             dir=target_dir, prefix=".tmp_", suffix=file_path.name
         )
@@ -355,6 +378,10 @@ def _write_version_section(las_file: LASFile) -> list[str]:
             stacklevel=3,
         )
         actual_wrap = "NO"
+        # F-ITER2-W-M08: Write back to the model so the in-memory
+        # LASFile agrees with the file on disk.  Without this, a
+        # subsequent write or to_dict() would still report WRAP=YES.
+        las_file.version.wrap = "NO"
     wrap_desc = (
         "ONE LINE PER DEPTH STEP" if actual_wrap == "NO" else "MULTIPLE LINES PER DEPTH STEP"
     )
@@ -548,7 +575,15 @@ def _write_parameter_section(las_file: LASFile) -> list[str]:
             # grouping, matching how DataSection.section_type is handled at
             # lines 455, 616, and 734.  Without this, "CORE" and "core" become
             # separate dict entries producing duplicate parameter section blocks.
-            st_key = param.section_type.upper() if param.section_type else None
+            # F-I2-XWM-01: Strip pipe character from section_type.  Pipe (|)
+            # is a legitimate LAS 3.0 structural zone-notation character but
+            # MUST NOT appear in section type names — an embedded pipe in a
+            # section header creates ambiguous pipe targets that corrupt
+            # parser interpretation on re-read.  Replace with underscore.
+            st_key = (
+                param.section_type.upper().replace("|", "_")
+                if param.section_type else None
+            )
             sections.setdefault(st_key, []).append(param)
 
         # Emit standard ~PARAMETER INFORMATION first (section_type=None).
@@ -728,6 +763,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
     delimiter = las_file.version.delimiter_char
     is_las30 = las_file.is_las30
     is_las12 = las_file.version.vers.startswith("1.")
+    import warnings  # consolidated — shared by all warning paths below
 
     # F-04: LAS 1.2 only supports SPACE delimiter per spec.  The header
     # correctly suppresses non-SPACE DLM emission for LAS 1.2 (see
@@ -735,8 +771,6 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
     # delimiter from delimiter_char, creating a header/data mismatch
     # that would corrupt roundtrip re-reads.  Force SPACE and warn.
     if is_las12 and delimiter != " ":
-        import warnings
-
         warnings.warn(
             f"LAS 1.2 does not support the '{las_file.version.dlm}' delimiter. "
             "Forcing SPACE delimiter for data rows to match the header section.",
@@ -758,8 +792,6 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
                 f"{las_file.version.vers!r}. Cannot safely write multi-section "
                 f"data for non-LAS-3.0 format."
             )
-        import warnings
-
         warnings.warn(
             "data_sections are only supported for LAS 3.0 files. "
             "Falling back to single-section ~A format. "
@@ -775,16 +807,58 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
         # metadata entries (STRT, STOP, STEP, etc.) the user may have set.
         # Only copy if legacy attributes are not already populated — respect
         # user data.  curves_order is a list, so assignment is correct.
-        if not las_file.logs:
-            _ds = las_file.data_sections[0]
-            if _ds.data:
-                las_file.logs.update(_ds.data)
-            if _ds.string_data:
-                las_file.string_data.update(_ds.string_data)
-            if _ds.curves_order:
-                las_file.curves_order = list(_ds.curves_order)
+        # Each attribute has its own destination guard (not just logs) so
+        # that pre-populated attributes are not silently overwritten.
+        _ds = las_file.data_sections[0]
+        if not las_file.logs and _ds.data:
+            las_file.logs.update(_ds.data)
+        if not las_file.string_data and _ds.string_data:
+            las_file.string_data.update(_ds.string_data)
+        if not las_file.curves_order and _ds.curves_order:
+            las_file.curves_order = list(_ds.curves_order)
+        # F-ITER2-W-R07: Also copy per-section curve definitions
+        # (units, descriptions, API codes, data_formats) to the
+        # top-level curves list so the legacy path preserves metadata.
+        if not las_file.curves and _ds.section_curves:
+            las_file.curves = list(_ds.section_curves)
+
+        # F-R-05: Check for curves/curves_order mismatch after copy-back.
+        # Independent per-attribute guards can produce len(curves) !=
+        # len(curves_order) when one is pre-populated but the other is
+        # copied from data_sections.
+        if (
+            las_file.curves
+            and las_file.curves_order
+            and len(las_file.curves) != len(las_file.curves_order)
+        ):
+            raise LASDataError(
+                f"curves count ({len(las_file.curves)}) does not match "
+                f"curves_order count ({len(las_file.curves_order)}) "
+                f"after copy-back. This indicates inconsistent "
+                f"LASFile construction."
+            )
 
     if las_file.data_sections and is_las30:
+        # F-ITER2-W-M01 / F-ITER2-W-R08: The LAS 3.0 writer path only
+        # iterates data_sections and never reads las_file.logs.  If
+        # las_file.logs contains curve data not covered by any
+        # data_section's data or string_data, that data is silently
+        # discarded on write.  Emit a warning so the caller knows.
+        if las_file.logs:
+            # Collect all curve names present in any data_section.
+            _ds_covered: set[str] = set()
+            for _ds in las_file.data_sections:
+                _ds_covered.update(_ds.data.keys())
+                _ds_covered.update(_ds.string_data.keys())
+            _orphaned_logs = set(las_file.logs.keys()) - _ds_covered
+            if _orphaned_logs:
+                warnings.warn(
+                    f"Top-level logs contain curve(s) not present in any "
+                    f"data_section: {sorted(_orphaned_logs)}.  The LAS 3.0 "
+                    f"writer path only writes data from data_sections; "
+                    f"these curves' data will NOT appear in the output file.",
+                    stacklevel=3,
+                )
         # LAS 3.0: Multiple data sections with typed headers.
         # F-042: emitted_defs maps def_prefix -> {curve_signature -> def_section_name}.
         # Two sections of the same type with IDENTICAL curve definitions share
@@ -1013,7 +1087,12 @@ def _format_data_rows(
                                 "delimiter for files with string curves.",
                                 stacklevel=4,
                             )
-                            warned_delim_str = True
+                        warned_delim_str = True
+                        # F-I2-XWP-04: Whitespace→underscore replacement is
+                        # permanently one-way — the parser has no mechanism to
+                        # recover the original whitespace characters from
+                        # underscores.  Full roundtrip fidelity requires
+                        # parser-side _desanitize reversal.
                         val = re.sub(r"\s", "_", val)
                 elif raw_has_delim:
                     # COMMA or TAB delimiter: the delimiter character itself
@@ -1046,6 +1125,10 @@ def _format_data_rows(
                 # ["a", "b"] — one column permanently lost.  Replace with "-"
                 # (traditional LAS placeholder for missing data).  COMMA/TAB
                 # delimiters are unaffected — empty fields survive split(",").
+                # F-I2-XWP-03: The "-" sentinel is a permanently one-way
+                # transformation — the parser cannot distinguish an original
+                # "-" value from an originally-empty one.  Full roundtrip
+                # fidelity requires parser-side _desanitize reversal.
                 if not val and delimiter == " ":
                     val = "-"
                 row_values.append(val)

@@ -1378,7 +1378,10 @@ class TestLAS30AsciiDataBranches:
         parser = LASParser()
         with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
             las = parser.parse(content)
-            assert "Extra columns are discarded" in caplog.text
+            # I2-XPD-03: Summary warning with total row count —
+            # the old boolean-once "Extra columns are discarded" message
+            # is now a per-section summary with the affected row count.
+            assert "Extra columns were silently discarded" in caplog.text
 
         assert len(las.data_sections) == 1
         # Extra values are truncated — only first 2 (matching curve count) kept
@@ -2076,7 +2079,7 @@ class TestMaxGuardLimits:
 
     def test_max_curves_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """MAX_CURVES guard raises LASParseError when curve count exceeds limit."""
-        monkeypatch.setattr("pylasdev.parser.MAX_CURVES", 1)
+        monkeypatch.setattr("pylasdev.data_reader.MAX_CURVES", 1)
         content = """~VERSION INFORMATION
  VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
  WRAP.   NO   :
@@ -2155,7 +2158,7 @@ class TestMaxGuardLimits:
 
     def test_max_data_lines_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """MAX_DATA_LINES guard raises LASParseError when data lines exceed limit."""
-        monkeypatch.setattr("pylasdev.parser.MAX_DATA_LINES", 1)
+        monkeypatch.setattr("pylasdev.data_reader.MAX_DATA_LINES", 1)
         content = """~VERSION INFORMATION
  VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
  WRAP.   NO   :
@@ -2171,6 +2174,31 @@ class TestMaxGuardLimits:
         parser = LASParser()
         with pytest.raises(LASParseError, match=r"ASCII data line count.*exceeds"):
             parser.parse(content)
+
+    def test_max_data_lines_at_limit_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """MAX_DATA_LINES set exactly to the file's data line count — must accept.
+
+        F-R-01: parser.py MAX_DATA_LINES guards now use ``>`` for consistency
+        with data_reader.py and models.py (accepts at exactly MAX_DATA_LINES).
+        Tests both the accumulation guard (line 2157) and the _process_ascii_data
+        guard (line 2414) via a single parse call.
+        """
+        monkeypatch.setattr("pylasdev.data_reader.MAX_DATA_LINES", 1)
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+~A
+100.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.logs) == 1
+        assert len(las.logs["DEPT"]) == 1
 
     # ── MAX_DATA_SECTIONS (parser.py:1920) ───────────────────────
 

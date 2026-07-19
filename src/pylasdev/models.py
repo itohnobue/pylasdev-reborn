@@ -31,6 +31,13 @@ def _safe_str(
     """
     if value is None:
         return default
+    # F-I2-MD3-03: str(float('nan')) → "nan", str(float('inf')) → "inf".
+    # Non-finite float values produce corrupted string representations
+    # that propagate silently through from_dict roundtrip paths.
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(
+            f"Cannot safely convert non-finite float {value} to string"
+        )
     result = str(value)
     if max_length is not None and len(result) > max_length:
         raise ValueError(
@@ -255,17 +262,23 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
             vers_raw = version.get("VERS")
             vers = str(vers_raw).strip() if vers_raw else ""
             is_las12 = vers.startswith("1")
+            # F-I2-MD3-01: Validate DLM value first, then check LAS
+            # version compatibility.  The previous if/elif structure
+            # warned for LAS 1.2 with non-SPACE DLM but skipped the
+            # validity rejection when the DLM was completely invalid
+            # (e.g. "FOO").  Flipping the order guarantees that
+            # invalid DLMs are always rejected regardless of version.
+            if dlm_upper not in {"SPACE", "TAB", "COMMA"}:
+                raise ValueError(
+                    f"Invalid DLM value '{dlm_raw}'. "
+                    f"Expected SPACE, TAB, or COMMA."
+                )
             if is_las12 and dlm_upper != "SPACE":
                 warnings.warn(
                     f"DLM '{dlm_raw}' is not valid for LAS 1.2 "
                     f"(spec requires SPACE).  The file will use "
                     f"SPACE delimiter on write.",
                     stacklevel=3,
-                )
-            elif dlm_upper not in {"SPACE", "TAB", "COMMA"}:
-                raise ValueError(
-                    f"Invalid DLM value '{dlm_raw}'. "
-                    f"Expected SPACE, TAB, or COMMA."
                 )
 
         # F-006: WRAP not validated against {YES, NO} in from_dict.
@@ -408,15 +421,22 @@ def _check_df_vs_placement(
         if _raw_df is None:
             continue  # None means "not set" — skip cross-validation
         df = str(_raw_df).upper()
-        mnemonic = str(cd.get("mnemonic", ""))
+        mnemonic = _safe_str(cd.get("mnemonic"))
         if not df or not mnemonic:
             continue
-        if df == "S" and mnemonic in logs_keys:
-            raise ValueError(
-                f"{context} curve '{mnemonic}' (index {i}) has "
-                f"data_format='S' but is in logs (numeric data). "
-                f"String-format curves must be in string_data."
-            )
+        # I2F-37 broadened string-format exemption to {A} in the
+        # string_data direction (line 426) but missed the logs direction.
+        # {A}-format curves WITHOUT array_info are string-format and
+        # must be rejected from numeric logs.  {A}-format curves WITH
+        # array_info (e.g. NMR[1]) are genuinely numeric (float64) and
+        # belong in logs/data.  (F-I2-MD4-02)
+        if mnemonic in logs_keys:
+            if df == "S" or (df == "A" and not cd.get("array_info")):
+                raise ValueError(
+                    f"{context} curve '{mnemonic}' (index {i}) has "
+                    f"data_format='{df}' but is in logs (numeric data). "
+                    f"String-format curves must be in string_data."
+                )
         # I2F-37: Broaden the string-format exemption from "S" only to
         # "S" and "A".  The parser (parser.py:1905-1909) routes both
         # {S} and {A} (without array_info) format curves to string_data.
@@ -441,6 +461,49 @@ class VersionSection:
     vers: str = "2.0"
     wrap: str = "NO"
     dlm: str = "SPACE"  # LAS 2.0+: SPACE, TAB, or COMMA
+
+    def __post_init__(self) -> None:
+        """Validate VERS, WRAP, and DLM after construction.
+
+        from_dict and the parser apply these checks before construction;
+        direct ``VersionSection()`` construction previously bypassed them.
+        Empty string values are tolerated (treated as "not specified"
+        — the dataclass defaults apply).
+        """
+        # VERS: reject whitespace-only version strings when non-empty.
+        if self.vers and not self.vers.strip():
+            raise ValueError(
+                f"VersionSection: VERS must not be whitespace-only, "
+                f"got {self.vers!r}"
+            )
+        # WRAP: validate non-empty values against YES/NO
+        # (matching parser.py:1097-1108).  Empty string = not specified.
+        if self.wrap:
+            _wrap = self.wrap.upper()
+            if _wrap not in {"YES", "NO"}:
+                raise ValueError(
+                    f"VersionSection: invalid WRAP value "
+                    f"{self.wrap!r}.  Expected YES or NO."
+                )
+        # DLM: validate non-empty values against SPACE/TAB/COMMA
+        # (matching _validate_from_dict_input lines 246-269).
+        # Empty string = not specified.
+        if self.dlm:
+            _dlm = self.dlm.upper()
+            is_las12 = self.vers.strip().startswith("1")
+            if is_las12 and _dlm != "SPACE":
+                import warnings as _w
+                _w.warn(
+                    f"DLM '{self.dlm}' is not valid for LAS 1.2 "
+                    f"(spec requires SPACE).  The file will use "
+                    f"SPACE delimiter on write.",
+                    stacklevel=2,
+                )
+            elif _dlm not in {"SPACE", "TAB", "COMMA"}:
+                raise ValueError(
+                    f"VersionSection: invalid DLM value "
+                    f"{self.dlm!r}.  Expected SPACE, TAB, or COMMA."
+                )
 
     def to_dict(self) -> dict[str, str]:
         """Convert to legacy dict format for backward compatibility."""
@@ -537,14 +600,27 @@ class CurveDefinition:
     array_info: ArrayElementInfo | None = None  # For array curves like NMR[1]
 
     def __post_init__(self) -> None:
-        """Reject empty-or-whitespace mnemonic (F-M10).
+        """Reject empty-or-whitespace mnemonic and invalid data_format.
 
         Empty mnemonics produce malformed LAS output (`` .UNIT  : DESC``).
+        An invalid data_format propagates through the writer as a
+        ``{INVALID}`` format specifier, producing corrupted LAS output.
         """
-        if not self.mnemonic or not self.mnemonic.strip():
+        # F-I2-MD3-07: Reject mnemonics with embedded spaces.
+        # strip() catches leading/trailing whitespace but "GR 1"
+        # passes — embedded spaces survive to produce corrupted
+        # LAS output (space is the field delimiter).
+        if not self.mnemonic or not self.mnemonic.strip() or ' ' in self.mnemonic.strip():
             raise ValueError(
-                f"CurveDefinition: mnemonic must not be empty or "
-                f"whitespace-only, got {self.mnemonic!r}"
+                f"CurveDefinition: mnemonic must not be empty, "
+                f"whitespace-only, or contain spaces, "
+                f"got {self.mnemonic!r}"
+            )
+        if self.data_format and self.data_format not in _VALID_DATA_FORMATS:
+            raise ValueError(
+                f"CurveDefinition: invalid data_format "
+                f"'{self.data_format}' for curve '{self.mnemonic}'. "
+                f"Valid values: {', '.join(sorted(_VALID_DATA_FORMATS))}"
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -618,10 +694,15 @@ class ParameterEntry:
 
         Empty mnemonics produce malformed LAS output.
         """
-        if not self.mnemonic or not self.mnemonic.strip():
+        # F-I2-MD3-07: Reject mnemonics with embedded spaces.
+        # strip() catches leading/trailing whitespace but "GR 1"
+        # passes — embedded spaces survive to produce corrupted
+        # LAS output (space is the field delimiter).
+        if not self.mnemonic or not self.mnemonic.strip() or ' ' in self.mnemonic.strip():
             raise ValueError(
-                f"ParameterEntry: mnemonic must not be empty or "
-                f"whitespace-only, got {self.mnemonic!r}"
+                f"ParameterEntry: mnemonic must not be empty, "
+                f"whitespace-only, or contain spaces, "
+                f"got {self.mnemonic!r}"
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -880,6 +961,23 @@ class LASFile:
 
         _order_set = set(self.curves_order) if self.curves_order else set()
 
+        # --- duplicate curve name detection (F-MD4-06) ---
+        # DataSection.__post_init__ has this check for per-section orders.
+        # from_dict has it at lines 1755-1770 for legacy top-level orders.
+        # LASFile.__post_init__ previously lacked it entirely.
+        # For LAS 3.0 files with data_sections, skip the top-level
+        # duplicate check — the same curve name legitimately appears in
+        # each section's curves_order, producing duplicates at top level.
+        if self.curves_order and not self.data_sections:
+            _seen: set[str] = set()
+            for _n in self.curves_order:
+                if _n in _seen:
+                    raise LASDataError(
+                        f"LASFile: duplicate curve name {_n!r} in "
+                        f"curves_order.  Curve names must be unique."
+                    )
+                _seen.add(_n)
+
         # --- logs validation (skip when empty — allows incremental
         # construction, e.g. LASFile() then attribute assignment) ---
         if self.logs:
@@ -892,6 +990,27 @@ class LASFile:
                     f"Each log key must correspond to a curve "
                     f"mnemonic."
                 )
+            # F-I2-MD4-04: Detect missing keys — curves in curves_order
+            # that have no corresponding log entry.  Skip when
+            # data_sections is non-empty (LAS 3.0 files store curve data
+            # per-section, not in the top-level logs dict).  Skip when
+            # string_data covers the missing keys (the curve lives in
+            # string_data, not logs).
+            if not self.data_sections and self.curves_order:
+                _missing_logs = _order_set - _log_keys
+                _str_keys_for_missing = (
+                    set(self.string_data.keys()) if self.string_data
+                    else set()
+                )
+                _missing_logs -= _str_keys_for_missing
+                if _missing_logs:
+                    raise LASDataError(
+                        f"LASFile: curves_order has keys not found in "
+                        f"logs: {sorted(_missing_logs)}.  Each curve "
+                        f"mnemonic in curves_order must have a "
+                        f"corresponding log entry (or string_data entry "
+                        f"for string-format curves)."
+                    )
             if len(self.logs) > 1:
                 _log_len = {name: len(arr) for name, arr in self.logs.items()}
                 if len(set(_log_len.values())) > 1:
@@ -911,6 +1030,22 @@ class LASFile:
                     f"Each string_data key must correspond to a "
                     f"curve mnemonic."
                 )
+            # F-I2-MD4-04: Detect missing keys — curves in curves_order
+            # that have no corresponding string_data entry.  Guarded
+            # the same way as logs above.
+            if not self.data_sections and self.curves_order:
+                _missing_str = _order_set - _str_keys
+                _log_keys_for_missing = (
+                    set(self.logs.keys()) if self.logs else set()
+                )
+                _missing_str -= _log_keys_for_missing
+                if _missing_str:
+                    raise LASDataError(
+                        f"LASFile: curves_order has keys not found in "
+                        f"string_data: {sorted(_missing_str)}.  Each "
+                        f"curve mnemonic in curves_order must have a "
+                        f"corresponding entry."
+                    )
             if len(self.string_data) > 1:
                 _str_len = {
                     name: len(arr) for name, arr in self.string_data.items()
@@ -920,6 +1055,97 @@ class LASFile:
                         f"LASFile: string_data have inconsistent "
                         f"array lengths: {_str_len}"
                     )
+
+        # F-I2-MD4-03: Detect key overlap between logs and string_data.
+        # A curve name appearing in both would silently have data
+        # corrupted — one array overwrites the other's meaning.
+        # Per-section DataSection has this guard; top-level lacked it.
+        if self.logs and self.string_data:
+            _overlap = set(self.logs.keys()) & set(self.string_data.keys())
+            if _overlap:
+                raise LASDataError(
+                    f"LASFile: curves {sorted(_overlap)} appear in "
+                    f"both logs and string_data.  Each curve may "
+                    f"only be stored in one location."
+                )
+
+        # --- data_sections validation (F-MD4-01) ---
+        # from_dict has ~200 lines of data_sections validation; __post_init__
+        # previously had zero.  This validates the most critical invariants
+        # for direct-construction scenarios while allowing incremental
+        # construction (empty data_sections skips validation).
+        if self.data_sections:
+            _all_section_curve_names: set[str] = set()
+            for _ds in self.data_sections:
+                # Detect duplicate curve names within each section's
+                # curves_order (matching DataSection.__post_init__).
+                _ds_curves = _ds.curves_order
+                if _ds_curves:
+                    _ds_seen: set[str] = set()
+                    for _cn in _ds_curves:
+                        if _cn in _ds_seen:
+                            raise LASDataError(
+                                f"LASFile: duplicate curve name {_cn!r} "
+                                f"in data section '{_ds.name}' "
+                                f"curves_order."
+                            )
+                        _ds_seen.add(_cn)
+                # Validate per-section data/string_data keys against
+                # curves_order (orphaned key detection, matching from_dict
+                # lines 1472-1491).
+                _ds_order_set = set(_ds_curves) if _ds_curves else set()
+                if _ds.string_data:
+                    _ds_str_keys = set(_ds.string_data.keys())
+                    _orphaned_str = _ds_str_keys - _ds_order_set
+                    if _orphaned_str:
+                        raise LASDataError(
+                            f"LASFile: string_data in section "
+                            f"'{_ds.name}' contains keys not in "
+                            f"curves_order: {sorted(_orphaned_str)}."
+                        )
+                if _ds.data:
+                    _ds_data_keys = set(_ds.data.keys())
+                    _orphaned_data = _ds_data_keys - _ds_order_set
+                    if _orphaned_data:
+                        raise LASDataError(
+                            f"LASFile: data in section '{_ds.name}' "
+                            f"contains keys not in curves_order: "
+                            f"{sorted(_orphaned_data)}."
+                        )
+                # Validate array length consistency within each section.
+                if len(_ds.data) > 1:
+                    _ds_len = {
+                        name: len(arr) for name, arr in _ds.data.items()
+                    }
+                    if len(set(_ds_len.values())) > 1:
+                        raise LASDataError(
+                            f"LASFile: data in section '{_ds.name}' "
+                            f"has inconsistent array lengths: {_ds_len}"
+                        )
+                if len(_ds.string_data) > 1:
+                    _sds_len = {
+                        name: len(arr)
+                        for name, arr in _ds.string_data.items()
+                    }
+                    if len(set(_sds_len.values())) > 1:
+                        raise LASDataError(
+                            f"LASFile: string_data in section "
+                            f"'{_ds.name}' has inconsistent array "
+                            f"lengths: {_sds_len}"
+                        )
+                # Cross-group row-count consistency.
+                if _ds.data and _ds.string_data:
+                    _data_rows = max(len(arr) for arr in _ds.data.values())
+                    _str_rows = max(
+                        len(arr) for arr in _ds.string_data.values()
+                    )
+                    if _data_rows != _str_rows:
+                        raise LASDataError(
+                            f"LASFile: section '{_ds.name}': "
+                            f"data row count ({_data_rows}) does not "
+                            f"match string_data row count "
+                            f"({_str_rows})"
+                        )
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to legacy dict format for backward compatibility.
@@ -960,7 +1186,10 @@ class LASFile:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> LASFile:
+    def from_dict(
+        cls, data: dict[str, Any],
+        mnem_base: dict[str, str] | None = None,
+    ) -> LASFile:
         """Create LASFile from dict format.
 
         Handles multiple format variants inherently:
@@ -968,6 +1197,17 @@ class LASFile:
         - Detailed dict with CurveDefinition metadata (unit, api_code, description)
         - LAS 3.0 dict with array_info, data_format, data_sections, string_data
         - Mixed formats from roundtrip serialization
+
+        Args:
+            data: Dict representation of a LAS file (as produced by
+                ``LASFile.to_dict()``).
+            mnem_base: Optional mnemonic-to-canonical-name mapping for
+                curve name normalization (same as parser's *mnem_base*).
+                When provided, mnemonic names extracted from *data* are
+                resolved through this mapping using case-insensitive
+                lookup (matching the parser's ``_mnem_base_upper``
+                pattern).  Default ``None`` means no normalization —
+                mnemonics are used as-is (backward-compatible).
 
         The method is naturally long due to covering all these variants in a
         single backwards-compatible code path.
@@ -997,6 +1237,38 @@ class LASFile:
             # F-017/F-018/IF-015/IF-026/F-019: Pre-construction validation layer.
             # Closes Pattern #7 (from_dict validation gaps) structurally.
             _validate_from_dict_input(data)
+
+            # F-MD4-03: Build mnemonic normalization lookup when mnem_base
+            # is provided.  Matches the parser's _mnem_base_upper pattern
+            # (parser.py:440-450) for case-insensitive lookup + chain
+            # resolution.  When mnem_base is None, _norm_mnem is an
+            # identity function — backward-compatible.
+            from .mnem_base import resolve_mnemonic as _resolve_mnemonic
+
+            _mnem_base_upper: dict[str, str] | None = None
+
+            def _norm_mnem(raw: str, /) -> str:
+                """Normalize a mnemonic through mnem_base lookup.
+
+                Returns the resolved canonical name when *mnem_base* was
+                provided and the uppercased *raw* string matches an entry;
+                returns *raw* unchanged otherwise (identity).
+                """
+                if _mnem_base_upper is None:
+                    return raw
+                return _mnem_base_upper.get(raw.upper(), raw)
+
+            if mnem_base:
+                _raw_up: dict[str, str] = {}
+                for _k, _v in mnem_base.items():
+                    _key = _k.upper()
+                    if _key not in _raw_up:
+                        _raw_up[_key] = _v
+                _mnem_base_upper = {}
+                for _k in _raw_up:
+                    _mnem_base_upper[_k] = _resolve_mnemonic(_raw_up, _k)
+            else:
+                _mnem_base_upper = None
 
             las_file = cls()
 
@@ -1079,7 +1351,9 @@ class LASFile:
                     f"curves_order must be an iterable, "
                     f"got {type(curves_order).__name__}"
                 )
-            las_file.curves_order = list(curves_order)
+            las_file.curves_order = [
+                _norm_mnem(name) for name in curves_order
+            ]
 
             # Restore curve metadata if available (new format), otherwise create minimal CurveDefinition
             # F-16: Use _resolve_dict_entry — data.get("curves", []) returns
@@ -1112,7 +1386,7 @@ class LASFile:
                                 )
                         las_file.curves.append(
                             CurveDefinition(
-                                mnemonic=_safe_str(curve_dict.get("mnemonic", "")),
+                                mnemonic=_norm_mnem(_safe_str(curve_dict.get("mnemonic", ""))),
                                 unit=_safe_str(curve_dict.get("unit", "")),
                                 api_code=_safe_str(curve_dict.get("api_code", "")),
                                 description=_safe_str(curve_dict.get("description", "")),
@@ -1140,7 +1414,7 @@ class LASFile:
                         f"allowed ({MAX_CURVES})"
                     )
                 for curve_name in curves_order:
-                    las_file.curves.append(CurveDefinition(mnemonic=curve_name))
+                    las_file.curves.append(CurveDefinition(mnemonic=_norm_mnem(curve_name)))
 
             # F-02: Cross-validate curves_order and curves for consistency.
             # Both are built from separate dict keys independently; a mismatched
@@ -1185,12 +1459,20 @@ class LASFile:
                     # and data_sections).  Raises TypeError for non-dict elements.
                     param_details = _validate_iterable_of_dicts(param_details, "parameter_details")
                     for param_dict in param_details:
+                        # F-MD4-03: Normalize mnemonic through mnem_base
+                        # before construction (matching parser.py:2023).
+                        param_dict["mnemonic"] = _norm_mnem(
+                            _safe_str(param_dict.get("mnemonic"))
+                        )
                         las_file.parameters.append(_create_parameter_entry(param_dict))
                 else:
                     # Pure legacy: only params dict, no details available
                     for mnemonic, value in params.items():
                         las_file.parameters.append(
-                            ParameterEntry(mnemonic=mnemonic, value=_safe_str(value))
+                            ParameterEntry(
+                                mnemonic=_norm_mnem(mnemonic),
+                                value=_safe_str(value),
+                            )
                         )
             elif isinstance(params, list):
                 # New format: [{"mnemonic": ..., "value": ..., ...}, ...]
@@ -1198,6 +1480,11 @@ class LASFile:
                 # (previously checked inline, same as param_details and data_sections).
                 _validate_iterable_of_dicts(params, "parameters")
                 for param_dict in params:
+                    # F-MD4-03: Normalize mnemonic through mnem_base
+                    # before construction (matching parser.py:2023).
+                    param_dict["mnemonic"] = _norm_mnem(
+                        _safe_str(param_dict.get("mnemonic"))
+                    )
                     las_file.parameters.append(_create_parameter_entry(param_dict))
             else:
                 # F-I2-M02: This branch is provably unreachable with the current
@@ -1268,7 +1555,30 @@ class LASFile:
                             f"String data for curve '{name}' in section "
                             f"'{ds_name}' is None"
                         )
-                    ds_string_data[name] = np.atleast_1d(np.array(arr, dtype=np.str_))
+                    # F-MD4-02: Pre-allocation size check (same pattern as
+                    # ds_data numeric path above).  np.array() allocates
+                    # before the downstream len() guard — a huge list
+                    # triggers MemoryError before the guard catches it.
+                    if hasattr(arr, '__len__') and len(arr) > MAX_DATA_LINES:
+                        ds_name = ds_dict.get("name", "<unknown>")
+                        raise ValueError(
+                            f"String data array length ({len(arr)}) for "
+                            f"'{name}' in section '{ds_name}' exceeds "
+                            f"maximum allowed ({MAX_DATA_LINES})"
+                        )
+                    # F-I2-MD4-01: Wrap in try/except MemoryError — the
+                    # numeric ds_data path (line ~1616) has this; the
+                    # string_data path was missing it.  A huge list can
+                    # trigger MemoryError from np.array() before the
+                    # downstream len() guard fires.
+                    try:
+                        ds_string_data[name] = np.atleast_1d(np.array(arr, dtype=np.str_))
+                    except (ValueError, TypeError, MemoryError) as e:
+                        ds_name = ds_dict.get("name", "<unknown>")
+                        raise ValueError(
+                            f"Cannot convert string data for section "
+                            f"'{ds_name}', curve '{name}': {e}"
+                        ) from e
                     # F-03: Per-array size guard for data section string_data arrays.
                     if len(ds_string_data[name]) > MAX_DATA_LINES:
                         ds_name = ds_dict.get("name", "<unknown>")
@@ -1325,7 +1635,7 @@ class LASFile:
                             )
                     ds_section_curves.append(
                         CurveDefinition(
-                            mnemonic=_safe_str(sc_dict.get("mnemonic", "")),
+                            mnemonic=_norm_mnem(_safe_str(sc_dict.get("mnemonic", ""))),
                             unit=_safe_str(sc_dict.get("unit", "")),
                             api_code=_safe_str(sc_dict.get("api_code", "")),
                             description=_safe_str(sc_dict.get("description", "")),
@@ -1447,6 +1757,11 @@ class LASFile:
                             f"must be str, got {type(_item).__name__}: "
                             f"{_item!r}"
                         )
+                # F-MD4-03: Normalize curves_order entries through
+                # mnem_base (matching parser's per-section normalization).
+                _ds_curves_order = [
+                    _norm_mnem(_item) for _item in _ds_curves_order
+                ]
                 # F-I2-M19: Detect duplicate curve names in section.  The parser
                 # calls _deduplicate_curves() at data-read time to rename
                 # collisions (append _2, _3 suffixes).  from_dict had zero dedup
@@ -1642,7 +1957,27 @@ class LASFile:
                     raise ValueError(
                         f"String data for curve '{name}' is None"
                     )
-                las_file.string_data[name] = np.atleast_1d(np.array(arr, dtype=np.str_))
+                # F-MD4-02: Pre-allocation size check (same pattern as
+                # numeric logs path).  np.array() allocates before the
+                # downstream len() guard — a huge list triggers MemoryError
+                # before the guard catches it.
+                if hasattr(arr, '__len__') and len(arr) > MAX_DATA_LINES:
+                    raise ValueError(
+                        f"String data array length ({len(arr)}) for "
+                        f"'{name}' exceeds maximum allowed "
+                        f"({MAX_DATA_LINES})"
+                    )
+                # F-I2-MD4-01: Wrap in try/except MemoryError — the
+                # numeric logs path (line ~1952) has this; string_data
+                # was missing it.  A huge list can trigger MemoryError
+                # from np.array() before the downstream len() guard fires.
+                try:
+                    las_file.string_data[name] = np.atleast_1d(np.array(arr, dtype=np.str_))
+                except (ValueError, TypeError, MemoryError) as e:
+                    raise ValueError(
+                        f"Cannot convert string data for curve "
+                        f"'{name}' to string array: {e}"
+                    ) from e
                 # F-M02: Per-array size guard for string_data arrays.
                 if len(las_file.string_data[name]) > MAX_DATA_LINES:
                     raise ValueError(
@@ -1907,6 +2242,7 @@ class DevFile:
                 # reverse that prefix so the roundtrip contract is preserved.
                 if key.startswith("_meta_"):
                     real_key = key[6:]  # strip ``_meta_`` prefix
+                    _recognised = True
                     if real_key == "encoding":
                         dev.encoding = _safe_str(value, "utf-8")
                     elif real_key == "source_file":
@@ -1931,10 +2267,25 @@ class DevFile:
                                     f"maximum allowed is {MAX_CURVES - 1}."
                                 )
                             dev.column_order = _col_order
-                    # unrecognised _meta_ key → skip silently (preserves
-                    # forward-compatibility; a future metadata key added to
-                    # to_dict but not recognised here won't crash)
-                    continue
+                    else:
+                        _recognised = False
+                    if _recognised:
+                        # Known metadata key — handled above, skip
+                        # column processing.
+                        continue
+                    # F-MD4-05: Unrecognised _meta_ key is user data
+                    # (not metadata).  Warn and fall through to store
+                    # as a column under the stripped name so data is
+                    # not silently lost.
+                    warnings.warn(
+                        f"Unrecognized _meta_ prefix key '{key}' — "
+                        f"treating as column '{real_key}' rather "
+                        f"than dropping it.",
+                        stacklevel=2,
+                    )
+                    key = real_key
+                    # Fall through to column processing below — do not
+                    # skip this entry.
                 # R7F-01-gap: When to_dict detects a column-name collision
                 # with a metadata key (e.g. column named "source_file"),
                 # it stores both the bare key (column data) and a

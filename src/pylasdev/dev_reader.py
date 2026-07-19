@@ -15,22 +15,17 @@ from typing import Any
 
 import numpy as np
 
-from .data_reader import (
-    MAX_CURVES,
-    MAX_DATA_LINES,
-    MAX_TOKENS_PER_LINE,
-    MAX_TOTAL_ELEMENTS,
-    _to_finite_float,
-)
+from .data_reader import _to_finite_float
 from .encoding import read_with_encoding
 from .exceptions import DEVReadError, LASEncodingError  # noqa: F401
 from .models import DevFile
 
 # Characters that Python's splitlines() treats as line breaks beyond \n and \r.
 # When present in file content, they cause splitlines() to produce fake section
-# headers and corrupt parsed data.  This is the same regex used by reader.py
-# and parser.py for symmetry across all read paths.
-_SPLITLINES_CHARS_RE = re.compile(r"[\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+# headers and corrupt parsed data.  Matches the full character class used by
+# reader.py:29 and parser.py:102 — covers all 33 C0 control chars (including
+# \x00 (NUL), \x7F (DEL)) plus NEL (\x85) and Unicode line/paragraph separators.
+_SPLITLINES_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85\u2028\u2029]")
 
 logger = logging.getLogger(__name__)
 
@@ -218,7 +213,7 @@ def _parse_columns_tokens(tokens: list[str]) -> list[str]:
 def _split_delimited_line(
     line: str,
     delimiter: str,
-    max_tokens: int = MAX_TOKENS_PER_LINE,
+    max_tokens: int | None = None,
 ) -> list[str]:
     """Split a delimited line with CSV quoting / escaping support.
 
@@ -230,11 +225,31 @@ def _split_delimited_line(
         line:       The stripped content line to split.
         delimiter:  Single-character delimiter (e.g. ``","``).
         max_tokens: Safety cap on the number of tokens returned.
+            When None, fetched from data_reader.MAX_TOKENS_PER_LINE
+            at call time so that runtime overrides take effect.
 
     Returns:
         List of individual field values with leading / trailing
         whitespace stripped from each.
     """
+    if max_tokens is None:
+        from .data_reader import _resolve_max_tokens_per_line
+
+        max_tokens = _resolve_max_tokens_per_line()
+
+    # Pre-validate line length to avoid unbounded CSV token allocation.
+    # Naive delimiter count gives an upper bound on actual token count
+    # (csv quoting can only reduce, never increase, the count).  A line
+    # with 2x the safety cap in delimiters is pathologically malformed
+    # and would cause csv.reader to allocate unbounded memory before the
+    # truncation slice can take effect.
+    if line.count(delimiter) + 1 > max_tokens * 2:
+        raise DEVReadError(
+            f"Line has approximately {line.count(delimiter) + 1} tokens "
+            f"(delimiter {delimiter!r}), exceeding safety cap "
+            f"({max_tokens}). The file may be malformed or corrupt."
+        )
+
     try:
         reader = csv.reader([line], delimiter=delimiter, skipinitialspace=True)
         tokens: list[str] = next(reader, [])
@@ -262,6 +277,10 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
         *skip_content_lines* is the number of content-bearing lines to
         skip before data starts (used by Pass 1 counting).
     """
+    from .data_reader import _resolve_max_tokens_per_line
+
+    _max_tokens = _resolve_max_tokens_per_line()
+
     if not content_entries:
         return ("simple", 1)
 
@@ -272,7 +291,7 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
     if content_entries[0][1].upper().startswith("*COLUMNS"):
         return ("simple", 1)
 
-    first_tokens = content_entries[0][1].split()
+    first_tokens = content_entries[0][1].split(maxsplit=_max_tokens)
 
     # F-019: Check for comma-delimited headerless data BEFORE any format
     # detection.  When any of the first few content lines contains commas
@@ -389,7 +408,7 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
             pass
         else:
             if len(content_entries) >= 2:
-                second_tokens = content_entries[1][1].split()
+                second_tokens = content_entries[1][1].split(maxsplit=_max_tokens)
                 # F-ITER2-D3-M05: Primary check — any non-float token in the
                 # second line means it's a header (text column names).
                 if any(not _is_float_token(t) for t in second_tokens):
@@ -427,14 +446,14 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
     #   "MDKB TVDSS X Y"                ← header with non-numeric tokens
     #   3 content lines before data: title + count + header.
     if len(content_entries) >= 3:
-        second_tokens = content_entries[1][1].split()
+        second_tokens = content_entries[1][1].split(maxsplit=_max_tokens)
         if len(second_tokens) == 1:
             try:
                 col_count = int(second_tokens[0])
             except ValueError:
                 pass
             else:
-                third_tokens = content_entries[2][1].split()
+                third_tokens = content_entries[2][1].split(maxsplit=_max_tokens)
                 # Primary check — any non-float token in the third line
                 # means it's a header (text column names).
                 if third_tokens and any(not _is_float_token(t) for t in third_tokens):
@@ -478,7 +497,7 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
             ]
             if len(first_ints) == len(first_tokens):
                 if len(content_entries) >= 2:
-                    second_tokens = content_entries[1][1].split()
+                    second_tokens = content_entries[1][1].split(maxsplit=_max_tokens)
                     if len(second_tokens) == len(first_tokens):
                         return ("simple", 1)
         return ("headerless", 0)
@@ -601,7 +620,31 @@ def _validate_dev_data(
             )
         break  # Found one recognised azimuth column — done checking.
 
-    # --- 5. Check MD NaN density (already checked above; note that
+    # --- 5. Check inclination range [0, 180] ---
+    _inc_names = ("INC", "INCL", "DEVI", "DIP")
+    for inc_name in _inc_names:
+        if inc_name not in dev.columns:
+            continue
+        inc = dev.columns[inc_name]
+        inc_finite = inc[~np.isnan(inc)]
+        if len(inc_finite) == 0:
+            continue
+        out_of_range = (inc_finite < 0) | (inc_finite > 180)
+        if np.any(out_of_range):
+            n_bad = int(np.sum(out_of_range))
+            bad_vals = inc_finite[out_of_range][:3]
+            warnings.warn(
+                f"Inclination column '{inc_name}' has {n_bad} value(s) "
+                f"outside [0, 180]: "
+                f"{', '.join(str(v) for v in bad_vals)}"
+                f"{'...' if n_bad > 3 else ''}. "
+                f"Inclination values outside [0, 180] can cause inaccurate "
+                f"trajectory calculations.",
+                stacklevel=_stacklevel,
+            )
+        break  # Found one recognised inclination column — done checking.
+
+    # --- 6. Check MD NaN density (already checked above; note that
     #       the NaN-density check on the full md array covers all
     #       data including non-MD columns that may be NaN due to
     #       delimiter mismatch, but the MD column is the most
@@ -654,10 +697,14 @@ def read_dev_file(
     # R7F-01: Also strip _meta_-prefixed keys — to_dict stores metadata
     # under _meta_ prefix when a column name collides with a metadata
     # key (I2F-28), and the returned dict must not leak those.
+    # F-I2-DV-04: Only strip metadata keys (encoding, source_file,
+    # column_order) when they are NOT column names — if a column
+    # shares a metadata key name, the column data must be preserved.
     _metadata_keys = {"encoding", "source_file", "column_order"}
     result = dev.to_dict()
     return {k: v for k, v in result.items()
-            if k not in _metadata_keys and not k.startswith("_meta_")}
+            if not k.startswith("_meta_")
+            and not (k in _metadata_keys and k not in dev.columns)}
 
 
 def read_dev_file_as_object(
@@ -702,6 +749,15 @@ def read_dev_file_as_object(
         >>> dev.to_dict()["MD"][:3]
         array([0., 100., 200.])
     """
+    from .data_reader import (
+        MAX_CURVES,
+        MAX_DATA_LINES,
+        MAX_TOTAL_ELEMENTS,
+        _resolve_max_tokens_per_line,
+    )
+
+    _max_tokens = _resolve_max_tokens_per_line()
+
     file_path = Path(file_path)
 
     if not file_path.exists():
@@ -906,8 +962,13 @@ def read_dev_file_as_object(
     names: list[str] = []
     content_seen = 0
     current_line = 0
-    warned_extra = False  # Track extra-column warning per file
-    warned_short = False  # Track short-row warning per file
+    # F-I2-XPD-03: Replace boolean-once flags with counters so automated
+    # validation tools can enumerate the total number of affected rows.
+    # The first occurrence logs full context; subsequent occurrences are
+    # counted silently; a summary is logged at the end of the file.
+    extra_col_count: int | None = None  # Track extra-column count for summary
+    short_row_count: int | None = None  # Track short-row count for summary
+    discarded_lines = 0  # Track silently-discarded lines from pre-scan undercount
 
     for line in lines:
         stripped = line.strip()
@@ -917,7 +978,7 @@ def read_dev_file_as_object(
         content_seen += 1
 
         if delimiter == " ":
-            values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
+            values = stripped.split(maxsplit=_max_tokens)
         else:
             values = _split_delimited_line(stripped, delimiter)
 
@@ -925,7 +986,7 @@ def read_dev_file_as_object(
             if content_seen == 1:
                 # Auto-generate column names from the first data row.
                 names = [f"col_{i}" for i in range(len(values))]
-                if len(names) > MAX_CURVES:
+                if len(names) >= MAX_CURVES:
                     raise DEVReadError(
                         f"Column count ({len(names)}) exceeds maximum allowed "
                         f"({MAX_CURVES}). The file may be malformed or corrupt."
@@ -947,37 +1008,51 @@ def read_dev_file_as_object(
                             f"'{name}' ({len(names)} columns total): out of memory"
                         ) from e
                 dev.column_order = list(names)
-                # Store first data row.
-                for k in range(len(names)):
-                    try:
-                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
-                    except IndexError:
-                        dev.columns[names[k]][current_line] = np.nan
-                current_line += 1
+                # Store first data row (G-04 bounds guard).
+                if current_line < data_lines:
+                    for k in range(len(names)):
+                        try:
+                            dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
+                        except IndexError:
+                            pass
+                    current_line += 1
+                else:
+                    discarded_lines += 1
             else:
-                # Remaining data rows.
-                if len(values) > len(names) and not warned_extra:
-                    warned_extra = True
-                    logger.warning(
-                        "Data line has %d values but only %d columns declared "
-                        "in the header. Extra columns are discarded.",
-                        len(values),
-                        len(names),
-                    )
-                if len(values) < len(names) and not warned_short:
-                    warned_short = True
-                    logger.warning(
-                        "Data line has %d values but %d columns declared "
-                        "in the header. Missing values are filled with NaN.",
-                        len(values),
-                        len(names),
-                    )
-                for k in range(min(len(values), len(names))):
-                    try:
-                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
-                    except IndexError:
-                        dev.columns[names[k]][current_line] = np.nan
-                current_line += 1
+                # Remaining data rows (G-04 bounds guard).
+                if current_line < data_lines:
+                    if len(values) > len(names):
+                        if extra_col_count is None:
+                            logger.warning(
+                                "Data line has %d values but only %d columns declared "
+                                "in the header. Extra columns are discarded. "
+                                "(Subsequent occurrences will be counted; see summary.)",
+                                len(values),
+                                len(names),
+                            )
+                            extra_col_count = 1
+                        else:
+                            extra_col_count += 1
+                    if len(values) < len(names):
+                        if short_row_count is None:
+                            logger.warning(
+                                "Data line has %d values but %d columns declared "
+                                "in the header. Missing values are filled with NaN. "
+                                "(Subsequent occurrences will be counted; see summary.)",
+                                len(values),
+                                len(names),
+                            )
+                            short_row_count = 1
+                        else:
+                            short_row_count += 1
+                    for k in range(min(len(values), len(names))):
+                        try:
+                            dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
+                        except IndexError:
+                            pass
+                    current_line += 1
+                else:
+                    discarded_lines += 1
 
         elif format_type == "dug":
             if content_seen < skip_content_lines:
@@ -1008,7 +1083,7 @@ def read_dev_file_as_object(
                     names = [_normalize_dev_column(n) for n in names]
                 # Deduplicate column names.
                 names = _deduplicate_dev_columns(names)
-                if len(names) > MAX_CURVES:
+                if len(names) >= MAX_CURVES:
                     raise DEVReadError(
                         f"Column count ({len(names)}) exceeds maximum allowed "
                         f"({MAX_CURVES}). The file may be malformed or corrupt."
@@ -1031,29 +1106,40 @@ def read_dev_file_as_object(
                         ) from e
                 dev.column_order = list(names)
             else:
-                # Data lines.
-                if len(values) > len(names) and not warned_extra:
-                    warned_extra = True
-                    logger.warning(
-                        "Data line has %d values but only %d columns declared "
-                        "in the header. Extra columns are discarded.",
-                        len(values),
-                        len(names),
-                    )
-                if len(values) < len(names) and not warned_short:
-                    warned_short = True
-                    logger.warning(
-                        "Data line has %d values but %d columns declared "
-                        "in the header. Missing values are filled with NaN.",
-                        len(values),
-                        len(names),
-                    )
-                for k in range(min(len(values), len(names))):
-                    try:
-                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
-                    except IndexError:
-                        dev.columns[names[k]][current_line] = np.nan
-                current_line += 1
+                # Data lines (G-04 bounds guard).
+                if current_line < data_lines:
+                    if len(values) > len(names):
+                        if extra_col_count is None:
+                            logger.warning(
+                                "Data line has %d values but only %d columns declared "
+                                "in the header. Extra columns are discarded. "
+                                "(Subsequent occurrences will be counted; see summary.)",
+                                len(values),
+                                len(names),
+                            )
+                            extra_col_count = 1
+                        else:
+                            extra_col_count += 1
+                    if len(values) < len(names):
+                        if short_row_count is None:
+                            logger.warning(
+                                "Data line has %d values but %d columns declared "
+                                "in the header. Missing values are filled with NaN. "
+                                "(Subsequent occurrences will be counted; see summary.)",
+                                len(values),
+                                len(names),
+                            )
+                            short_row_count = 1
+                        else:
+                            short_row_count += 1
+                    for k in range(min(len(values), len(names))):
+                        try:
+                            dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
+                        except IndexError:
+                            pass
+                    current_line += 1
+                else:
+                    discarded_lines += 1
 
         else:  # simple header format
             if content_seen == 1:
@@ -1081,7 +1167,7 @@ def read_dev_file_as_object(
                     names = [_normalize_dev_column(n) for n in names]
                 # Deduplicate column names.
                 names = _deduplicate_dev_columns(names)
-                if len(names) > MAX_CURVES:
+                if len(names) >= MAX_CURVES:
                     raise DEVReadError(
                         f"Column count ({len(names)}) exceeds maximum allowed "
                         f"({MAX_CURVES}). The file may be malformed or corrupt."
@@ -1104,29 +1190,74 @@ def read_dev_file_as_object(
                         ) from e
                 dev.column_order = list(names)
             else:
-                # Data lines.
-                if len(values) > len(names) and not warned_extra:
-                    warned_extra = True
-                    logger.warning(
-                        "Data line has %d values but only %d columns declared "
-                        "in the header. Extra columns are discarded.",
-                        len(values),
-                        len(names),
-                    )
-                if len(values) < len(names) and not warned_short:
-                    warned_short = True
-                    logger.warning(
-                        "Data line has %d values but %d columns declared "
-                        "in the header. Missing values are filled with NaN.",
-                        len(values),
-                        len(names),
-                    )
-                for k in range(min(len(values), len(names))):
-                    try:
-                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
-                    except IndexError:
-                        dev.columns[names[k]][current_line] = np.nan
-                current_line += 1
+                # Data lines (G-04 bounds guard).
+                if current_line < data_lines:
+                    if len(values) > len(names):
+                        if extra_col_count is None:
+                            logger.warning(
+                                "Data line has %d values but only %d columns declared "
+                                "in the header. Extra columns are discarded. "
+                                "(Subsequent occurrences will be counted; see summary.)",
+                                len(values),
+                                len(names),
+                            )
+                            extra_col_count = 1
+                        else:
+                            extra_col_count += 1
+                    if len(values) < len(names):
+                        if short_row_count is None:
+                            logger.warning(
+                                "Data line has %d values but %d columns declared "
+                                "in the header. Missing values are filled with NaN. "
+                                "(Subsequent occurrences will be counted; see summary.)",
+                                len(values),
+                                len(names),
+                            )
+                            short_row_count = 1
+                        else:
+                            short_row_count += 1
+                    for k in range(min(len(values), len(names))):
+                        try:
+                            dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
+                        except IndexError:
+                            pass
+                    current_line += 1
+                else:
+                    discarded_lines += 1
+
+    # --- Post-scan diagnostics (F-I2-DV-07) ---
+    if discarded_lines > 0:
+        logger.warning(
+            "Pre-scan undercount: %d data line(s) discarded because the "
+            "actual data exceeds the %d lines declared by Pass 1. "
+            "Dev file data may be truncated.",
+            discarded_lines,
+            data_lines,
+        )
+    if current_line < data_lines:
+        logger.warning(
+            "Pre-scan overcount: declared %d data lines but only %d actual "
+            "data lines found. Pre-allocated array tail contains NaN.",
+            data_lines,
+            current_line,
+        )
+
+    # F-I2-XPD-03: Summary of extra-column and short-row occurrences,
+    # replacing the previous boolean-once pattern that suppressed all
+    # diagnostics after the first row.  This allows automated data
+    # quality tools to enumerate affected rows.
+    if extra_col_count is not None and extra_col_count > 1:
+        logger.warning(
+            "%d data line(s) had more values than expected. "
+            "Extra columns were discarded.",
+            extra_col_count,
+        )
+    if short_row_count is not None and short_row_count > 1:
+        logger.warning(
+            "%d data line(s) had fewer values than expected. "
+            "Missing values were filled with NaN.",
+            short_row_count,
+        )
 
     _validate_dev_data(dev, _stacklevel=3)
     return dev

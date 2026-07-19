@@ -125,6 +125,60 @@ class TestReadLASFile:
             sizes = [len(data["logs"][c]) for c in data["curves_order"]]
             assert len(set(sizes)) == 1, f"Arrays have different sizes: {sizes}"
 
+    def test_wrapped_string_curve_preserved(self, tmp_path: Path) -> None:
+        """F-R-03: String curve values in wrapped LAS files are preserved.
+
+        Before this fix, _read_wrapped converted all values through
+        _to_finite_float(), silently converting string values to the
+        null value (-999.25).  String curves ({S} format in ~C section)
+        must be stored in string_data, not converted to float.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth {F}\n"
+            " GR .API  :  Gamma Ray {F}\n"
+            " LITH .   :  Lithology {S}\n"
+            "~A\n"
+            "1000.0\n"
+            "50.0  Sandstone\n"
+            "1001.0\n"
+            "51.0  Shale\n"
+        )
+        test_file = tmp_path / "wrapped_string.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+
+        # Float curves should be parsed normally
+        assert "DEPT" in data["logs"]
+        assert "GR" in data["logs"]
+        np.testing.assert_allclose(data["logs"]["DEPT"], [1000.0, 1001.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [50.0, 51.0])
+
+        # String curve must be in string_data, NOT silently converted
+        assert "LITH" in data["string_data"], (
+            "String curve 'LITH' missing from string_data — values "
+            "were likely converted to null_value by _to_finite_float"
+        )
+        lith_values = data["string_data"]["LITH"]
+        assert len(lith_values) == 2, (
+            f"Expected 2 LITH values, got {len(lith_values)}"
+        )
+        np.testing.assert_array_equal(
+            lith_values,
+            np.array(["Sandstone", "Shale"], dtype=np.str_),
+        )
+
+        # String curve should NOT be in float logs
+        assert "LITH" not in data["logs"], (
+            "String curve 'LITH' found in logs (float) — should only "
+            "be in string_data"
+        )
+
     def test_encoding_parameter(self, test_data_dir: Path) -> None:
         """Test that explicit encoding parameter works."""
         sample = test_data_dir / "sample.las"
@@ -2057,8 +2111,9 @@ class TestMaxTokensPerLineGuard:
         test_file = tmp_path / "token_cap_dev.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        # Patch dev_reader's import — read_dev_file uses the module's constant
-        with mock.patch("pylasdev.dev_reader.MAX_TOKENS_PER_LINE", 2):
+        # Patch data_reader.MAX_TOKENS_PER_LINE: dev_reader fetches at
+        # runtime via _resolve_max_tokens_per_line (F-DVR-01 fix).
+        with mock.patch("pylasdev.data_reader.MAX_TOKENS_PER_LINE", 2):
             data = read_dev_file(test_file)
             # split(maxsplit=2) produces at most 3 tokens from 5-space line
             assert "MD" in data
@@ -2099,8 +2154,14 @@ class TestMaxLimitsAtLimit:
             with pytest.raises(LASParseError, match="exceeds maximum"):
                 read_las_file(test_file)
 
-    def test_max_data_lines_at_limit_rejected(self, tmp_path: Path) -> None:
-        """MAX_DATA_LINES set exactly to the file's data line count — must reject."""
+    def test_max_data_lines_at_limit_accepted(self, tmp_path: Path) -> None:
+        """MAX_DATA_LINES set exactly to the file's data line count — must accept.
+
+        F-MDR-01: Changed _read_normal from ``>=`` to ``>`` for consistency
+        with models.py which uses ``>`` at all 8 MAX_DATA_LINES guard sites
+        (accepts at exactly the limit).  The F-M01 fix comment that claimed
+        models.py uses ``>=`` was incorrect.
+        """
         from unittest import mock
 
         # File has exactly 1 data line
@@ -2118,10 +2179,11 @@ class TestMaxLimitsAtLimit:
         test_file = tmp_path / "at_limit_lines.las"
         test_file.write_text(content, encoding="utf-8")
 
-        # MAX_DATA_LINES=1 matches actual data line count — F-M01 now rejects at-limit
+        # MAX_DATA_LINES=1 matches actual data line count — F-MDR-01 accepts at-limit
         with mock.patch("pylasdev.data_reader.MAX_DATA_LINES", 1):
-            with pytest.raises(LASParseError, match="exceeds maximum"):
-                read_las_file(test_file)
+            data = read_las_file(test_file)
+            assert len(data["logs"]["DEPT"]) == 1
+            assert data["logs"]["DEPT"][0] == 100.0
 
     def test_max_total_elements_at_limit_passes(self, tmp_path: Path) -> None:
         """MAX_TOTAL_ELEMENTS set exactly to curves*lines — must pass."""

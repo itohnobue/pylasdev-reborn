@@ -367,8 +367,10 @@ class TestDevSafetyGuards:
         test_file = tmp_path / "max_lines.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        # Monkey-patch MAX_DATA_LINES to 0: any data line triggers guard
-        with mock.patch("pylasdev.dev_reader.MAX_DATA_LINES", 0):
+        # Monkey-patch MAX_DATA_LINES to 0: any data line triggers guard.
+        # Patched at data_reader source since F-DVR-01 moved imports to
+        # function-local (dev_reader reads the constant at runtime).
+        with mock.patch("pylasdev.data_reader.MAX_DATA_LINES", 0):
             with pytest.raises(DEVReadError, match="Data line count"):
                 read_dev_file(test_file)
 
@@ -383,8 +385,10 @@ class TestDevSafetyGuards:
         test_file = tmp_path / "max_curves.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        # Monkey-patch MAX_CURVES to 1: 3 columns > 1
-        with mock.patch("pylasdev.dev_reader.MAX_CURVES", 1):
+        # Monkey-patch MAX_CURVES to 1: 3 columns > 1.
+        # Patched at data_reader source since F-DVR-01 moved imports to
+        # function-local (dev_reader reads the constant at runtime).
+        with mock.patch("pylasdev.data_reader.MAX_CURVES", 1):
             with pytest.raises(DEVReadError, match="Column count"):
                 read_dev_file(test_file)
 
@@ -399,8 +403,10 @@ class TestDevSafetyGuards:
         test_file = tmp_path / "max_total.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        # Monkey-patch MAX_TOTAL_ELEMENTS to 1: 3 cols * 1 line = 3 > 1
-        with mock.patch("pylasdev.dev_reader.MAX_TOTAL_ELEMENTS", 1):
+        # Monkey-patch MAX_TOTAL_ELEMENTS to 1: 3 cols * 1 line = 3 > 1.
+        # Patched at data_reader source since F-DVR-01 moved imports to
+        # function-local (dev_reader reads the constant at runtime).
+        with mock.patch("pylasdev.data_reader.MAX_TOTAL_ELEMENTS", 1):
             with pytest.raises(DEVReadError, match="Total allocation"):
                 read_dev_file(test_file)
 
@@ -447,6 +453,116 @@ class TestDevSafetyGuards:
             dev = read_dev_file_as_object(test_file)
             assert np.isnan(dev.columns["X"][0])
             assert np.isnan(dev.columns["Y"][0])
+
+    # ── F-R-08: MAX_DATA_LINES at-limit acceptance ───────────────────
+
+    def test_max_data_lines_at_limit_accepted(self, tmp_path: Path) -> None:
+        """MAX_DATA_LINES set exactly to file's data line count — must accept.
+
+        F-R-08: Changed dev_reader Pass 1 from ``>=`` to ``>`` to match
+        data_reader.py and models.py convention (accept at-limit, reject above).
+        """
+        from unittest import mock
+
+        # File has exactly 1 data line
+        content = "MD TVD\n0.0 0.0\n"
+        test_file = tmp_path / "at_limit_lines.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        # MAX_DATA_LINES=1 matches actual data line count — F-R-08 accepts at-limit
+        with mock.patch("pylasdev.data_reader.MAX_DATA_LINES", 1):
+            data = read_dev_file(test_file)
+            assert "MD" in data
+            assert len(data["MD"]) == 1
+            assert data["MD"][0] == 0.0
+
+    # ── F-R-04: SPLITLINES_CHARS_RE full character class ─────────────
+
+    def test_splitlines_chars_nul_byte_sanitized(self, tmp_path: Path) -> None:
+        """NUL byte (\\x00) in DEV content is sanitized — no spurious splits.
+
+        F-R-04: dev_reader._SPLITLINES_CHARS_RE previously covered only 8
+        control chars, missing NUL and 24 others.  A NUL byte in a data
+        value would cause splitlines() to produce a fake line break,
+        corrupting parsed data.  The fix expands coverage to 33 chars
+        matching parser.py:102 and reader.py:29.
+        """
+        # NUL byte embedded in data — without sanitization this would
+        # produce spurious line breaks via splitlines()
+        content = "MD TVD INC\n0.0\x000.0 0.0\n"
+        test_file = tmp_path / "nul_byte.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Must not raise; must produce valid 1-row output
+        data = read_dev_file(test_file)
+        assert "MD" in data, "Expected MD column in output"
+        assert len(data["MD"]) == 1
+
+    def test_splitlines_chars_del_byte_sanitized(self, tmp_path: Path) -> None:
+        """DEL byte (\\x7F) in DEV content is sanitized — no spurious splits.
+
+        Part of F-R-04 character class expansion.
+        """
+        content = "MD TVD\n0.0\x7F0.0\n"
+        test_file = tmp_path / "del_byte.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert "MD" in data, "Expected MD column in output"
+        assert len(data["MD"]) == 1
+
+    # ── F-R-07: Diagnostic counter pattern ───────────────────────────
+
+    def test_extra_short_row_counter_summary(self, tmp_path: Path, caplog) -> None:
+        """Multiple mismatched rows produce end-of-section counter summary.
+
+        F-R-07: Replaces boolean-once warnings with counters — first
+        occurrence logs full context, subsequent are counted silently,
+        and a summary is logged at the end.
+
+        Creates a DEV file with 2 extra-column rows and 2 short rows,
+        verifies that all 4 rows produce warnings (not just the first
+        of each type) and that the end-of-section summary fires.
+        """
+        import logging
+
+        content = (
+            "MD TVD INC\n"              # 3 columns expected
+            "0.0 0.0 0.0\n"             # matching row (row 1)
+            "1.0 1.0 1.0 9.0\n"         # extra column (row 2)
+            "2.0 2.0 2.0 9.0\n"         # extra column (row 3)
+            "3.0 3.0\n"                 # short row (row 4)
+            "4.0 4.0\n"                 # short row (row 5)
+        )
+        test_file = tmp_path / "counter.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING, logger="pylasdev.dev_reader"):
+            data = read_dev_file(test_file)
+
+        # Verify data was parsed correctly (discard works, NaN fill works)
+        assert len(data["MD"]) == 5
+        # Row 2 and 3 have extra column values discarded
+        assert data["MD"][1] == 1.0
+        assert data["MD"][2] == 2.0
+        # Row 4 and 5 have short rows — INC filled with NaN
+        assert np.isnan(data["INC"][3])
+        assert np.isnan(data["INC"][4])
+
+        # Find warning messages
+        warning_texts = [r.message for r in caplog.records]
+
+        summary_extra = [m for m in warning_texts if "data line(s) had more values" in m]
+        summary_short = [m for m in warning_texts if "data line(s) had fewer values" in m]
+
+        assert len(summary_extra) == 1, f"Expected 1 extra-col summary, got {warning_texts}"
+        assert len(summary_short) == 1, f"Expected 1 short-row summary, got {warning_texts}"
+
+        # The summary should show count 2 (rows 2 and 3 for extra, rows 4 and 5 for short)
+        assert any("2 data line(s)" in m for m in summary_extra), \
+            f"Extra-col summary should mention '2 data line(s)', got: {summary_extra}"
+        assert any("2 data line(s)" in m for m in summary_short), \
+            f"Short-row summary should mention '2 data line(s)', got: {summary_short}"
 
 
 class TestDevDedupWhileLoop:

@@ -166,6 +166,17 @@ def compare_las_dicts(
                 return False
 
         elif isinstance(val2, list):
+            # F-I2-XCM-01: When val2 is a list but val1 is not, the
+            # downstream functions (_compare_data_sections,
+            # _compare_lists) assume a list type.  Catch this
+            # type mismatch early before dispatching.
+            if not isinstance(val1, list):
+                logger.warning(
+                    "Type mismatch at '%s': %s vs list",
+                    key,
+                    type(val1).__name__,
+                )
+                return False
             # F-10: data_sections contains numpy arrays that can't
             # be compared with generic list equality (ambiguity error).
             if key == "data_sections":
@@ -362,6 +373,15 @@ def _compare_data_sections(
     equality (val1 != val2) would raise "truth value of an array
     is ambiguous" (F-10).
     """
+    # F-I2-XCM-01: Guard against non-list input — the caller
+    # (compare_las_dicts) now guards before dispatch, but this
+    # defense-in-depth check follows the _compare_lists pattern.
+    if not isinstance(sections1, list):
+        logger.warning(
+            "Type mismatch in data_sections: %s vs list",
+            type(sections1).__name__,
+        )
+        return False
     if len(sections1) != len(sections2):
         logger.warning(
             "data_sections length mismatch: %d vs %d",

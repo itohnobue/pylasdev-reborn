@@ -2292,3 +2292,43 @@ class TestSingleDataSectionFallback:
             f"Expected DEPT before GR in output, "
             f"but DEPT at {dept_pos}, GR at {gr_pos}"
         )
+
+    def test_copy_back_inconsistent_curves_count_raises(
+        self, tmp_path: Path
+    ) -> None:
+        """F-R-05: Pre-populated curves_order + empty curves but
+        data_sections[0] has section_curves → independent guards
+        produce mismatch → LASDataError raised."""
+        las = LASFile()
+        las.version = VersionSection(vers="2.0", wrap="NO", dlm="SPACE")
+        las.well["STRT"] = "100.0"
+        las.well["STOP"] = "300.0"
+        las.well["STEP"] = "100.0"
+        las.well["NULL"] = "-999.25"
+
+        # Pre-populate curves_order but leave curves empty
+        las.curves_order = ["DEPT", "GR", "LLS"]
+        # No las.curves.append(...) — deliberately empty
+
+        # DataSection with section_curves of a different count
+        section_curves = [
+            CurveDefinition(mnemonic="DEPT", unit="M"),
+            CurveDefinition(mnemonic="GR", unit="API"),
+        ]
+        ds = DataSection(
+            name="LOG_DATA",
+            curves_order=["DEPT", "GR"],
+            section_curves=section_curves,
+            data={
+                "DEPT": np.array([100.0, 200.0, 300.0]),
+                "GR": np.array([50.0, 60.0, 70.0]),
+            },
+        )
+        las.data_sections.append(ds)
+
+        output_file = tmp_path / "inconsistent.las"
+        with pytest.warns(
+            UserWarning,
+            match="data_sections are only supported for LAS 3.0",
+        ), pytest.raises(LASWriteError, match=r"curves count.*does not match"):
+            write_las_file(str(output_file), las)

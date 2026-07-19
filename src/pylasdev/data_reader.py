@@ -7,7 +7,6 @@ and O(n) performance (vs O(n^2) numpy.append bug in original).
 
 from __future__ import annotations
 
-import csv
 import logging
 import math
 import re
@@ -34,7 +33,22 @@ MAX_TOTAL_ELEMENTS = 1_000_000_000
 # are product-based and do not protect against a single line with millions
 # of space-separated tokens.  Legitimate LAS files never exceed MAX_CURVES
 # tokens per line — this cap matches the curve limit.  Overridable.
-MAX_TOKENS_PER_LINE = MAX_CURVES
+# F-MDR-03: Sentinel — resolves to MAX_CURVES at call time.  Setting this
+# to an explicit int overrides the default curve-count-based limit.
+# Previously was ``= MAX_CURVES`` (import-time snapshot), which caused the
+# documented "Overridable" behavior to break when MAX_CURVES is overridden.
+MAX_TOKENS_PER_LINE: int | None = None
+
+
+def _resolve_max_tokens_per_line() -> int:
+    """Return the per-line token limit, resolving from MAX_CURVES if not
+    explicitly overridden via MAX_TOKENS_PER_LINE.
+
+    The indirection allows MAX_CURVES to be overridden at runtime
+    (documented behavior) and have MAX_TOKENS_PER_LINE follow automatically.
+    Users who need a different per-line cap set MAX_TOKENS_PER_LINE directly.
+    """
+    return MAX_TOKENS_PER_LINE if MAX_TOKENS_PER_LINE is not None else MAX_CURVES
 
 
 # F-ITER2-D2-M04: Regex to extract the full section word from a header line
@@ -75,6 +89,67 @@ def _is_section_header(stripped: str) -> bool:
         and len(stripped) > 1
         and stripped[1] in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
     )
+
+
+# F-I2-XPD-01: Known LAS section words for section-header injection defense.
+# SPLITLINES_CHARS_RE in reader.py replaces null bytes and control characters
+# with spaces before splitlines(), which can create spurious section headers
+# (null byte followed by ~SectionWord becomes a standalone ~SectionWord line
+# after splitting).  Validating section words against this known set before
+# breaking data reading prevents premature termination caused by injected
+# artifacts.  Aligned with parser.py's known section-type dispatch tables.
+_KNOWN_SECTION_WORDS: frozenset[str] = frozenset({
+    # Data section words (from parser._DATA_SECTION_WORDS)
+    "A", "ASCII",
+    "CORE", "CORE_DATA",
+    "DRILLING", "DRILLING_DATA",
+    "FORMATION", "FORMATION_DATA",
+    "INCLINOMETRY", "INCLINOMETRY_DATA",
+    "LOG", "LOG_DATA",
+    "MUD", "MUD_DATA",
+    "PERFORATIONS", "PERFORATIONS_DATA",
+    "RISK", "RISK_DATA",
+    "STRUCTURE", "STRUCTURE_DATA",
+    "TEST", "TEST_DATA",
+    "TOPS", "TOPS_DATA",
+    # Non-data section words (from parser dispatch table)
+    "C", "CURVE",
+    "D", "DEFINITION",
+    "O", "OTHER",
+    "P", "PARAMETER", "PARAMETERS",
+    "V", "VERSION",
+    "W", "WELL",
+})
+
+
+def _is_recognized_section_word(word: str) -> bool:
+    """Check if a section word is a recognized LAS section header type.
+
+    Validates that a potential section header is a genuine LAS section
+    keyword, not an artifact created by control-character replacement
+    (SPLITLINES_CHARS_RE in reader.py).  Used by _read_normal and
+    _read_wrapped as defense-in-depth against section-header injection.
+
+    Args:
+        word: Uppercased section word extracted by _get_section_word
+            (e.g. "A", "CORE_DATA", "VERSION").
+
+    Returns:
+        True if the word is a recognized LAS section type.
+    """
+    if not word:
+        return False
+    # Strip index brackets (e.g., CORE[1] → CORE) before checking.
+    base = word.split("[", 1)[0] if "[" in word else word
+    if base in _KNOWN_SECTION_WORDS:
+        return True
+    # Recognized suffix patterns: _DEFINITION, _PARAMETER, _PARAMETERS, _DATA.
+    # These expand the known set to cover all parser-dispatched section types
+    # (e.g., CORE_DEFINITION, LOG_DEFINITION, CORE_PARAMETERS etc.).
+    for suffix in ("_DEFINITION", "_PARAMETER", "_PARAMETERS", "_DATA"):
+        if base.endswith(suffix):
+            return True
+    return False
 
 
 def _parse_float_with_d_notation(value_str: str) -> float:
@@ -131,14 +206,26 @@ def _get_null_value(
             )
         return null_value
     except (ValueError, TypeError):
+        # F-I2-XPD-05: Log a warning when falling back to the default
+        # null value.  Silent fallback to -999.25 with zero diagnostics
+        # makes it impossible to distinguish a genuine -999.25 null
+        # sentinel from a failed parse.
+        logger.warning(
+            "Could not parse NULL value from well section; "
+            "falling back to default value %.2f.", default_float
+        )
         return default_float
 
 
-def _to_finite_float(value_str: str, null_value: float) -> float:
+def _to_finite_float(
+    value_str: str,
+    null_value: float,
+    _failure_counter: list[int] | None = None,
+) -> float:
     """Convert string to float, replacing non-finite values with null_value.
 
-    Python's ``float()`` accepts ``"nan"``, ``"inf"``, ``"-inf"`` and
-    overflow exponents (e.g. ``"1e309"``) without error.  These non-finite
+    Python's ``float()`` accepts ``\"nan\"``, ``\"inf\"``, ``\"-inf\"`` and
+    overflow exponents (e.g. ``\"1e309\"``) without error.  These non-finite
     values corrupt downstream numpy computations (NaN propagation, Inf
     making statistics invalid).  This helper catches them and returns
     *null_value* instead.
@@ -149,6 +236,10 @@ def _to_finite_float(value_str: str, null_value: float) -> float:
         value_str: String to convert.  May be empty.
         null_value: Value to return when conversion fails or result is
             non-finite.
+        _failure_counter: Optional mutable list; ``_failure_counter[0]`` is
+            incremented on each non-trivial conversion failure (non-empty
+            input that could not be parsed as a finite float).  Used by
+            callers to surface diagnostic counts.
 
     Returns:
         A finite float, or *null_value*.
@@ -158,8 +249,12 @@ def _to_finite_float(value_str: str, null_value: float) -> float:
     try:
         val = _parse_float_with_d_notation(value_str)
     except ValueError:
+        if _failure_counter is not None:
+            _failure_counter[0] += 1
         return null_value
     if not np.isfinite(val):
+        if _failure_counter is not None:
+            _failure_counter[0] += 1
         return null_value
     return val
 
@@ -259,6 +354,12 @@ def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " "
         stripped = line.strip()
 
         if _is_section_header(stripped):
+            # F-I2-XPD-01: Validate section word before toggling
+            # in_ascii — unrecognized patterns may be artifacts from
+            # control-character replacement (SPLITLINES_CHARS_RE).
+            section_word = _get_section_word(stripped)
+            if not _is_recognized_section_word(section_word):
+                continue
             if _is_ascii_section(stripped):
                 in_ascii = True
             else:
@@ -273,27 +374,22 @@ def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " "
             continue
 
         # Data line found — split using DLM-aware approach.
-        # F2-015: Use csv.reader for COMMA/TAB delimiters so values containing
-        # the delimiter inside quotes are NOT incorrectly split.
+        # F-WXP-06: All delimiter types use str.split with maxsplit for
+        # bounded token count.  The writer does NOT emit CSV quoting
+        # (uses raw delimiter.join()), so csv.reader with QUOTE_MINIMAL
+        # would interpret literal double-quotes in string values as CSV
+        # field quoting, creating a roundtrip asymmetry.
+        # The writer already sanitises embedded delimiter characters in
+        # string values (comma→semicolon, tab→space), so str.split on
+        # the raw delimiter is correct for roundtripping.
         if delimiter == " ":
-            values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
+            values = stripped.split(maxsplit=_resolve_max_tokens_per_line())
         else:
-            # F-I2-M12: Wrap csv.reader in try/except — csv.Error
-            # (e.g. unclosed quotes or field-size overflow) is NOT a
-            # LASParseError subclass and would escape the public API
-            # (reader.py only catches LASParseError).
-            try:
-                reader = csv.reader(
-                    [stripped], delimiter=delimiter, quoting=csv.QUOTE_MINIMAL
-                )
-                row = next(reader)
-            except csv.Error as e:
-                raise LASParseError(
-                    f"Failed to parse delimited data line: {e}"
-                ) from e
-            # Safety cap: prevent unbounded token count from malformed input,
-            # matching the maxsplit behavior of str.split.
-            values = row[: MAX_TOKENS_PER_LINE + 1]
+            _max_tokens = _resolve_max_tokens_per_line()
+            # F-DR-01: str.split with maxsplit provides bounded allocation.
+            # The maxsplit parameter limits the number of splits (=tokens),
+            # preventing unbounded memory allocation from malformed input.
+            values = stripped.split(delimiter, maxsplit=_max_tokens)
 
             # I2F-24: Strip trailing empty strings from csv.reader output.
             # Trailing delimiters (e.g. "100.0,") produce empty fields that
@@ -322,10 +418,13 @@ def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " "
             # heuristic: a wrapped depth line always has exactly 1 value;
             # if the first data line has >1 values, it's non-wrapped
             # regardless of curve_count.
-            if delimiter != " ":
-                _first_wrap = len(values) <= 1
-            else:
-                _first_wrap = len(values) < curve_count
+            # F-I2-DR-03: Align COMMA/TAB heuristic with SPACE heuristic.
+            # Using ``len(values) < curve_count`` for all delimiter types
+            # correctly handles wrapped continuation lines that carry
+            # multiple curve values (common in >2-curve wrapped files).
+            # The corroboration step on the second data line catches
+            # sparse-first-line false positives regardless of delimiter.
+            _first_wrap = len(values) < curve_count
             if not _first_wrap:
                 return False  # Not wrapped — no need for second peek
             # Wrapped — continue to second data line for corroboration
@@ -334,13 +433,11 @@ def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " "
             continue
 
         # Second data line — corroborate wrap detection (F-M16).
-        # If the first data line had fewer values than curve_count
-        # (suggesting wrapped), but the second data line has full
-        # values, the first line was sparse rather than wrapped.
-        if delimiter != " ":
-            _corroborates = len(values) <= 1
-        else:
-            _corroborates = len(values) < curve_count
+        # F-I2-DR-03: Use the same unified heuristic (< curve_count)
+        # as the first-line check above.  The old COMMA/TAB-specific
+        # ``<= 1`` path is removed — all delimiters now use the same
+        # curve-count-aware heuristic.
+        _corroborates = len(values) < curve_count
 
         if not _corroborates:
             # Second line has full values — first line was sparse,
@@ -490,10 +587,11 @@ def _read_normal(
     _deduplicate_curves(las_file)
     curve_count = len(las_file.curves_order)
 
-    # F-M01: Use ``>=`` (not ``>``) for consistency with parser.py and models.py
-    # which already use ``>=`` for MAX_DATA_LINES guards.  See comment at
-    # top-level MAX_CURVES check for full rationale.
-    if data_line_count >= MAX_DATA_LINES:
+    # F-MDR-01: Use ``>`` for consistency with models.py which uses ``>`` at
+    # all 8 MAX_DATA_LINES guard sites (accepts at exactly MAX_DATA_LINES).
+    # The F-M01 fix comment previously claimed models.py uses ``>=``, which
+    # was incorrect — the divergence was introduced by the F-M01 change.
+    if data_line_count > MAX_DATA_LINES:
         raise LASParseError(
             f"Data line count ({data_line_count}) exceeds maximum allowed "
             f"({MAX_DATA_LINES}). The file may be malformed or corrupt."
@@ -507,19 +605,64 @@ def _read_normal(
             f"({MAX_TOTAL_ELEMENTS}). The file may be malformed or corrupt."
         )
 
-    # Pre-allocate arrays
-    for curve_name in las_file.curves_order:
-        las_file.logs[curve_name] = np.zeros(data_line_count, dtype=np.float64)
+    # F-WXP-01: Detect string curves from CurveDefinition data_format.
+    # The writer can emit string curve values in the same data section
+    # (via _format_data_rows), but _read_normal previously converted all
+    # values through _to_finite_float (float-only).  String-formatted
+    # curves ({S}, {A} without array_info) must be read as strings and
+    # stored in las_file.string_data, matching the parser's behaviour.
+    _string_curve_indices: set[int] = set()
+    for i, _name in enumerate(las_file.curves_order):
+        if i < len(las_file.curves):
+            cd = las_file.curves[i]
+            # F-MDR-04: Normalize data_format to uppercase for consistent
+            # string-curve detection.  _create_parameter_entry stores
+            # data_format without uppercasing; uppercase normalization
+            # here guards against lowercase-passed format codes.
+            if cd.data_format.upper() in ("S",) or (
+                cd.data_format.upper() in ("A",) and cd.array_info is None
+            ):
+                _string_curve_indices.add(i)
 
-    # Pre-extract arrays to avoid O(rows x curves) dict lookups in inner loop
-    curve_arrays = [las_file.logs[name] for name in las_file.curves_order]
+    # Pre-allocate arrays — string curves go to string_data, numeric to logs.
+    # C-505: Ensure curvenames that appear in both string_curve_indices and
+    # are allocated mixed-ly do not cause double-entry issues in logs.
+    _numeric_curve_indices: list[int] = []
+    _string_curve_map: dict[int, str] = {}  # index → curve_name for fast lookup
+    for i, curve_name in enumerate(las_file.curves_order):
+        if i in _string_curve_indices:
+            las_file.string_data[curve_name] = np.empty(
+                data_line_count, dtype=np.str_
+            )
+            _string_curve_map[i] = curve_name
+        else:
+            las_file.logs[curve_name] = np.zeros(
+                data_line_count, dtype=np.float64
+            )
+            _numeric_curve_indices.append(i)
+
+    # Pre-extract numeric arrays for fast inner-loop access.
+    # String array access is direct via las_file.string_data since we
+    # cannot mix dtypes in a homogeneous list.
+    curve_arrays = [las_file.logs[name] for name in las_file.curves_order
+                    if name in las_file.logs]
+    # Build a mapping from logical curve index → numeric array index
+    # for the inner loop (string curves are excluded from curve_arrays).
+    _logical_to_numeric: dict[int, int] = {}
+    for ni, li in enumerate(_numeric_curve_indices):
+        _logical_to_numeric[li] = ni
 
     null_value = _get_null_value(las_file.well)
+    _fc: list[int] = [0]  # F-PXR-03: count non-trivial conversion failures
 
     in_ascii = False
     current_line = 0
-    warned_extra = False  # Track extra-column warning per file
-    warned_short = False  # F-11: Track short-row warning per file
+    # F-I2-XPD-03: Replace boolean-once flags with counters so automated
+    # validation tools can enumerate the total number of affected rows.
+    # The first occurrence logs full context; subsequent occurrences are
+    # counted silently; a summary is logged at the end of the section.
+    extra_col_count: int | None = None  # Track extra-column count for summary
+    short_row_count: int | None = None  # F-11: Track short-row count for summary
     discarded_lines = 0  # Track silently-discarded lines from pre-scan undercount
 
     for line in lines:
@@ -535,40 +678,37 @@ def _read_normal(
                 in_ascii = True
             else:
                 if in_ascii:
-                    # Stop reading at the first non-~A section header.
-                    # _pre_scan counts data lines for the FIRST contiguous
-                    # ~A block only (per_block_counts[0]), matching this
-                    # break-at-first-non-~A behavior.  Both sides agree:
-                    # only the first ~A block is ingested.
-                    break
+                    # F-I2-XPD-01: Defense-in-depth against section-header
+                    # injection via SPLITLINES_CHARS_RE.  Only break reading
+                    # for recognized LAS section headers — unrecognized
+                    # patterns (potential artifacts from control-character
+                    # replacement) are warned and skipped.
+                    section_word = _get_section_word(stripped)
+                    if _is_recognized_section_word(section_word):
+                        break
+                    logger.warning(
+                        "Unrecognized section header '~%s' found in ASCII "
+                        "data section.  This may be an artifact of "
+                        "control-character replacement (SPLITLINES_CHARS_RE). "
+                        "Skipping line.",
+                        section_word,
+                    )
             continue
 
         if not in_ascii or not stripped or stripped.startswith("#"):
             continue
 
-        # F2-015: Use csv.reader for COMMA/TAB delimiters so values
-        # containing the delimiter inside double-quotes are NOT incorrectly
-        # split (e.g., "Run 1, Tool A" stays as one token with COMMA
-        # delimiter).  csv.QUOTE_MINIMAL handles CSV-style quoting.
+        # F-WXP-06: All delimiter types use str.split with maxsplit.
+        # See _detect_actual_wrap for full rationale — writer doesn't
+        # emit CSV quoting, so csv.reader with QUOTE_MINIMAL creates
+        # a quoting asymmetry on string curve roundtrips.
         if delimiter == " ":
-            values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
+            values = stripped.split(maxsplit=_resolve_max_tokens_per_line())
         else:
-            # F-I2-M12: Wrap csv.reader in try/except — csv.Error
-            # (e.g. unclosed quotes or field-size overflow) is NOT a
-            # LASParseError subclass and would escape the public API
-            # (reader.py only catches LASParseError).
-            try:
-                reader = csv.reader(
-                    [stripped], delimiter=delimiter, quoting=csv.QUOTE_MINIMAL
-                )
-                row = next(reader)
-            except csv.Error as e:
-                raise LASParseError(
-                    f"Failed to parse delimited data line: {e}"
-                ) from e
-            # Safety cap: prevent unbounded token count from malformed input,
-            # matching the maxsplit behavior of str.split.
-            values = row[: MAX_TOKENS_PER_LINE + 1]
+            _max_tokens = _resolve_max_tokens_per_line()
+            # F-DR-01: str.split with maxsplit provides bounded allocation,
+            # preventing unbounded memory use from malformed input.
+            values = stripped.split(delimiter, maxsplit=_max_tokens)
 
             # F-M03: Strip trailing empty strings from csv.reader output.
             # Trailing delimiters (e.g. "100.0,") produce empty fields that
@@ -579,29 +719,41 @@ def _read_normal(
             while values and values[-1] == "":
                 values.pop()
 
-        # Warn about extra columns being silently discarded
-        if len(values) > curve_count and not warned_extra:
-            warned_extra = True
-            logger.warning(
-                "Data line has %d values but only %d curves declared "
-                "in ~C section. Extra columns are discarded.",
-                len(values),
-                curve_count,
-            )
+        # Warn about extra columns being silently discarded.
+        # F-I2-XPD-03: First occurrence logs full context; subsequent
+        # occurrences are counted silently; summary logged at end.
+        if len(values) > curve_count:
+            if extra_col_count is None:
+                logger.warning(
+                    "Data line has %d values but only %d curves declared "
+                    "in ~C section. Extra columns are discarded. "
+                    "(Further occurrences will be counted.)",
+                    len(values),
+                    curve_count,
+                )
+                extra_col_count = 1
+            else:
+                extra_col_count += 1
 
         # F-11: Warn when non-wrapped data lines have fewer values than
         # declared curves. Short rows in WRAP=YES mode are expected;
         # this warning only fires in non-wrapped (WRAP=NO) mode,
         # which we know because _read_normal is only called for non-wrapped.
-        if len(values) < curve_count and not warned_short:
-            warned_short = True
-            logger.warning(
-                "Data line has %d values but %d curves declared in ~C section. "
-                "Missing values are filled with the null value (%.2f).",
-                len(values),
-                curve_count,
-                null_value,
-            )
+        # F-I2-XPD-03: First occurrence logs full context; subsequent
+        # occurrences are counted silently; summary logged at end.
+        if len(values) < curve_count:
+            if short_row_count is None:
+                logger.warning(
+                    "Data line has %d values but %d curves declared in ~C section. "
+                    "Missing values are filled with the null value (%.2f). "
+                    "(Further occurrences will be counted.)",
+                    len(values),
+                    curve_count,
+                    null_value,
+                )
+                short_row_count = 1
+            else:
+                short_row_count += 1
 
         # G-04: Bounds guard — skip writes when current_line exceeds
         # pre-allocated array size.  This can happen when _pre_scan
@@ -612,12 +764,27 @@ def _read_normal(
             continue
 
         for i in range(min(len(values), curve_count)):
-            curve_arrays[i][current_line] = _to_finite_float(values[i], null_value)
+            if i in _string_curve_indices:
+                # F-WXP-01: String curve — store raw value verbatim.
+                curve_name = _string_curve_map[i]
+                las_file.string_data[curve_name][current_line] = values[i]
+            else:
+                ni = _logical_to_numeric[i]
+                curve_arrays[ni][current_line] = _to_finite_float(
+                    values[i], null_value, _fc
+                )
 
         # Fill remaining curves with null_value when line has fewer values
         for i in range(len(values), curve_count):
-            if current_line < len(curve_arrays[i]):
-                curve_arrays[i][current_line] = null_value
+            if i in _string_curve_indices:
+                # Fill missing string curve values with empty string.
+                curve_name = _string_curve_map[i]
+                if current_line < len(las_file.string_data[curve_name]):
+                    las_file.string_data[curve_name][current_line] = ""
+            else:
+                ni = _logical_to_numeric[i]
+                if current_line < len(curve_arrays[ni]):
+                    curve_arrays[ni][current_line] = null_value
 
         current_line += 1
 
@@ -645,18 +812,61 @@ def _read_normal(
             current_line,
         )
 
+    # F-PXR-03: Warn when non-trivial conversion failures occurred
+    # (non-empty input values that could not be parsed as finite floats
+    # and were silently replaced with the null value).
+    if _fc[0] > 0:
+        logger.warning(
+            "%d value(s) could not be converted to finite float "
+            "and were replaced with the null value (%.2f). "
+            "This may indicate string data, corrupt values, or "
+            "non-standard formatting.",
+            _fc[0],
+            null_value,
+        )
+
+    # F-I2-XPD-03: Summary of extra-column and short-row occurrences,
+    # replacing the previous boolean-once pattern that suppressed all
+    # diagnostics after the first row.  This allows automated data
+    # quality tools to enumerate affected rows.
+    if extra_col_count is not None and extra_col_count > 1:
+        logger.warning(
+            "%d data line(s) had more values than the %d declared curves. "
+            "Extra columns were discarded.",
+            extra_col_count,
+            curve_count,
+        )
+    if short_row_count is not None and short_row_count > 1:
+        logger.warning(
+            "%d data line(s) had fewer values than the %d declared curves. "
+            "Missing values were filled with the null value (%.2f).",
+            short_row_count,
+            curve_count,
+            null_value,
+        )
+
     # F36: Trim arrays when ~A section ended early (fewer data lines than
     # declared). Pre-allocated np.zeros tail would otherwise expose 0.0
     # values that differ from null_value, corrupting downstream analysis.
     # Fill the tail with null_value before slicing to ensure consistency
     # even when pre-scan over-counts relative to _read_normal's actual
     # line consumption.
+    # F-WXP-01: Also trim string_data arrays for string-curve columns.
     if current_line < data_line_count:
+        # Trim numeric arrays (float64)
         for curve_name in las_file.curves_order:
-            arr = las_file.logs[curve_name]
-            if current_line < len(arr):
-                arr[current_line:] = null_value
-            las_file.logs[curve_name] = arr[:current_line]
+            if curve_name in las_file.logs:
+                arr = las_file.logs[curve_name]
+                if current_line < len(arr):
+                    arr[current_line:] = null_value
+                las_file.logs[curve_name] = arr[:current_line]
+        # Trim string arrays (str_)
+        for curve_name in las_file.curves_order:
+            if curve_name in las_file.string_data:
+                arr_str = las_file.string_data[curve_name]
+                if current_line < len(arr_str):
+                    arr_str[current_line:] = ""
+                las_file.string_data[curve_name] = arr_str[:current_line]
 
 
 def _read_wrapped(
@@ -690,7 +900,12 @@ def _read_wrapped(
             if _is_ascii_section(stripped):
                 _count_in_ascii = True
             elif _count_in_ascii:
-                break  # End of ~A section
+                # F-I2-XPD-01: Only break counting for recognized LAS
+                # section headers — unrecognized patterns may be artifacts
+                # from control-character replacement (SPLITLINES_CHARS_RE).
+                section_word = _get_section_word(stripped)
+                if _is_recognized_section_word(section_word):
+                    break  # End of ~A section
             continue
         if _count_in_ascii and stripped and not stripped.startswith("#"):
             _count += 1
@@ -720,10 +935,33 @@ def _read_wrapped(
                 f"({MAX_TOTAL_ELEMENTS}). The file may be malformed or corrupt."
             )
 
+    # F-R-03: Detect string curves from CurveDefinition data_format.
+    # Port from _read_normal:614-625 — {S}/{A} format curves must be
+    # read as strings, not converted through _to_finite_float (float-only).
+    # String values in wrapped LAS files were previously silently converted
+    # to null_value at line 1101.
+    _string_curve_indices: set[int] = set()
+    for _idx in range(len(las_file.curves_order)):
+        if _idx < len(las_file.curves):
+            cd = las_file.curves[_idx]
+            if cd.data_format.upper() in ("S",) or (
+                cd.data_format.upper() in ("A",) and cd.array_info is None
+            ):
+                _string_curve_indices.add(_idx)
+    _string_curve_map: dict[int, str] = {
+        _idx: las_file.curves_order[_idx] for _idx in _string_curve_indices
+    }
+    # F-R-03: Accumulate string values into lists (same pattern as
+    # data_lists).  Pad/trim and convert to np.array at the end.
+    _string_lists: dict[str, list[str]] = {
+        _name: [] for _name in _string_curve_map.values()
+    }
+
     # Accumulate into lists, convert to numpy at end
     data_lists: list[list[float]] = [[] for _ in range(curve_count)]
 
     null_value = _get_null_value(las_file.well)
+    _fc: list[int] = [0]  # F-PXR-03: count non-trivial conversion failures
 
     in_ascii = False
     depth_line = True  # First data line is always a depth line
@@ -743,40 +981,37 @@ def _read_wrapped(
                 in_ascii = True
             else:
                 if in_ascii:
-                    # Stop reading at the first non-~A section header.
-                    # _pre_scan counts data lines for the FIRST contiguous
-                    # ~A block only (per_block_counts[0]), matching this
-                    # break-at-first-non-~A behavior.  Both sides agree:
-                    # only the first ~A block is ingested.
-                    break
+                    # F-I2-XPD-01: Defense-in-depth against section-header
+                    # injection via SPLITLINES_CHARS_RE.  Only break reading
+                    # for recognized LAS section headers — unrecognized
+                    # patterns (potential artifacts from control-character
+                    # replacement) are warned and skipped.
+                    section_word = _get_section_word(stripped)
+                    if _is_recognized_section_word(section_word):
+                        break
+                    logger.warning(
+                        "Unrecognized section header '~%s' found in ASCII "
+                        "data section (wrapped mode).  This may be an "
+                        "artifact of control-character replacement "
+                        "(SPLITLINES_CHARS_RE).  Skipping line.",
+                        section_word,
+                    )
             continue
 
         if not in_ascii or not stripped or stripped.startswith("#"):
             continue
 
-        # F2-015: Use csv.reader for COMMA/TAB delimiters so values
-        # containing the delimiter inside double-quotes are NOT incorrectly
-        # split (e.g., "Run 1, Tool A" stays as one token with COMMA
-        # delimiter).  csv.QUOTE_MINIMAL handles CSV-style quoting.
+        # F-WXP-06: All delimiter types use str.split with maxsplit.
+        # See _detect_actual_wrap for full rationale — writer doesn't
+        # emit CSV quoting, so csv.reader with QUOTE_MINIMAL creates
+        # a quoting asymmetry on string curve roundtrips.
         if delimiter == " ":
-            values = stripped.split(maxsplit=MAX_TOKENS_PER_LINE)
+            values = stripped.split(maxsplit=_resolve_max_tokens_per_line())
         else:
-            # F-I2-M12: Wrap csv.reader in try/except — csv.Error
-            # (e.g. unclosed quotes or field-size overflow) is NOT a
-            # LASParseError subclass and would escape the public API
-            # (reader.py only catches LASParseError).
-            try:
-                reader = csv.reader(
-                    [stripped], delimiter=delimiter, quoting=csv.QUOTE_MINIMAL
-                )
-                row = next(reader)
-            except csv.Error as e:
-                raise LASParseError(
-                    f"Failed to parse delimited data line: {e}"
-                ) from e
-            # Safety cap: prevent unbounded token count from malformed input,
-            # matching the maxsplit behavior of str.split.
-            values = row[: MAX_TOKENS_PER_LINE + 1]
+            _max_tokens = _resolve_max_tokens_per_line()
+            # F-DR-01: str.split with maxsplit provides bounded allocation,
+            # preventing unbounded memory use from malformed input.
+            values = stripped.split(delimiter, maxsplit=_max_tokens)
 
             # I2F-25: Strip trailing empty strings from csv.reader output.
             # Trailing delimiters produce empty fields that flow into
@@ -804,10 +1039,14 @@ def _read_wrapped(
                 # data line cannot fill all non-depth curves, the file is
                 # pathologically misaligned and will be rejected.
                 depth_had_extra = True
-            try:
-                data_lists[0].append(_to_finite_float(values[0], null_value))
-            except IndexError:
+            # F-R-03: If the depth curve is a string curve, accumulate
+            # into _string_lists and use null_value as a data_lists[0]
+            # placeholder for row-count alignment.
+            if 0 in _string_curve_indices:
+                _string_lists[_string_curve_map[0]].append(values[0])
                 data_lists[0].append(null_value)
+            else:
+                data_lists[0].append(_to_finite_float(values[0], null_value, _fc))
             total_elements += 1
             if total_elements > MAX_TOTAL_ELEMENTS:
                 raise LASParseError(
@@ -885,7 +1124,12 @@ def _read_wrapped(
                         )
                     break
 
-                data_lists[counter].append(_to_finite_float(val_str, null_value))
+                # F-R-03: Dispatch string curves to _string_lists,
+                # float curves to data_lists via _to_finite_float.
+                if counter in _string_curve_indices:
+                    _string_lists[_string_curve_map[counter]].append(val_str)
+                else:
+                    data_lists[counter].append(_to_finite_float(val_str, null_value, _fc))
                 total_elements += 1
                 if total_elements > MAX_TOTAL_ELEMENTS:
                     raise LASParseError(
@@ -945,17 +1189,48 @@ def _read_wrapped(
                 counter = 0
                 depth_had_extra = False
 
-    # Validate array lengths — pad incomplete last depth step
-    max_len = max((len(dl) for dl in data_lists), default=0)
-    for i, dl in enumerate(data_lists):
-        if len(dl) < max_len:
+    # Compute actual number of depth steps from float curves only.
+    # String curve indices have empty data_lists entries — skip them.
+    _float_indices = [i for i in range(curve_count) if i not in _string_curve_indices]
+    _max_len = max((len(data_lists[i]) for i in _float_indices), default=0)
+
+    # Pad incomplete last depth step for float curves
+    for i in _float_indices:
+        dl = data_lists[i]
+        if len(dl) < _max_len:
             warnings.warn(
                 f"Wrapped mode: curve '{las_file.curves_order[i]}' has {len(dl)} values "
-                f"but expected {max_len}. Padding with null value ({null_value}).",
+                f"but expected {_max_len}. Padding with null value ({null_value}).",
                 stacklevel=2,
             )
-            dl.extend([null_value] * (max_len - len(dl)))
+            dl.extend([null_value] * (_max_len - len(dl)))
 
-    # Convert lists to numpy arrays
-    for i, curve_name in enumerate(las_file.curves_order):
-        las_file.logs[curve_name] = np.array(data_lists[i], dtype=np.float64)
+    # F-PXR-03: Warn when non-trivial conversion failures occurred.
+    if _fc[0] > 0:
+        logger.warning(
+            "%d value(s) could not be converted to finite float "
+            "and were replaced with the null value (%.2f). "
+            "This may indicate string data, corrupt values, or "
+            "non-standard formatting.",
+            _fc[0],
+            null_value,
+        )
+
+    # Convert float lists to numpy arrays
+    for i in _float_indices:
+        las_file.logs[las_file.curves_order[i]] = np.array(data_lists[i], dtype=np.float64)
+
+    # F-R-03: Pad/trim and convert string lists to numpy arrays.
+    # String curve values are accumulated into _string_lists using the
+    # same row-counting protocol as data_lists (one value per depth step).
+    for _name, _sl in _string_lists.items():
+        if len(_sl) < _max_len:
+            warnings.warn(
+                f"Wrapped mode: string curve '{_name}' has {len(_sl)} values "
+                f"but expected {_max_len}. Padding with empty strings.",
+                stacklevel=2,
+            )
+            _sl = _sl + [""] * (_max_len - len(_sl))
+        elif len(_sl) > _max_len:
+            _sl = _sl[:_max_len]
+        las_file.string_data[_name] = np.array(_sl, dtype=np.str_)
