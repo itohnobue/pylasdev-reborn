@@ -686,3 +686,31 @@ class TestIntegrationCompareLasDicts:
         las2.logs["DEPT"] = np.array([1.0, 3.0])
 
         assert compare_las_dicts(las1.to_dict(), las2.to_dict()) is False
+
+
+class TestProductionCheckCompareFix:
+    """Regression test for F-005 fix in compare.py."""
+
+    def test_nan_guard_covers_all_float_dtypes(self) -> None:
+        """F-005: NaN guard catches np.float32, np.float16, np.longdouble.
+
+        Before the fix, isinstance(x, float) missed numpy float subtypes.
+        Now isinstance(x, (float, np.floating)) catches all.
+        """
+        d1 = {"logs": {"VAL": np.array([1.0, np.float32(np.nan), 3.0])}}
+        d2 = {"logs": {"VAL": np.array([1.0, np.float32(np.nan), 3.0])}}
+        assert compare_las_dicts(d1, d2) is True, "NaN np.float32 comparison must match"
+
+    def test_nan_float16_guard(self) -> None:
+        """F-005: NaN in np.float16 is handled correctly."""
+        d1 = {"logs": {"VAL": np.array([1.0, np.float16(np.nan)])}}
+        d2 = {"logs": {"VAL": np.array([1.0, np.float16(np.nan)])}}
+        assert compare_las_dicts(d1, d2) is True, "NaN np.float16 comparison must match"
+
+    def test_nan_different_float_dtypes_both_nan(self) -> None:
+        """F-005: NaN values of different float dtypes still match as equal."""
+        # np.float32(nan) and np.float64(nan) should both be treated as NaN=NaN
+        d1 = {"logs": {"VAL": np.array([np.float32(np.nan)])}}
+        d2 = {"logs": {"VAL": np.array([np.float64(np.nan)])}}
+        # Both are NaN → comparison should return True (NaN==NaN via per-element path)
+        assert compare_las_dicts(d1, d2) is True

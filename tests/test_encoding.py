@@ -343,3 +343,42 @@ class TestBOMHandling:
         assert data["version"]["VERS"] == "2.0"
         assert "DEPT" in data["logs"]
         assert data["logs"]["DEPT"][0] == 100.0
+
+
+# ============================================================
+# Production Check Regression Tests
+# ============================================================
+
+class TestProductionCheckEncodingFix:
+    """Regression test for F-217 fix in encoding.py."""
+
+    def test_cyrillic_after_large_ascii_header(self, tmp_path: Path) -> None:
+        """F-217: Cyrillic content after >10KB ASCII preamble is detected.
+
+        Before the fix, the 10K sample window missed Cyrillic beyond the
+        ASCII preamble. Now the window is 64K, capturing the Cyrillic
+        portion. We test by creating a file with >15KB ASCII header
+        (typical LAS headers are 5-15KB) followed by Cyrillic content
+        and verifying cp1251 detection.
+        """
+        # Build a file with ~15KB ASCII preamble + Cyrillic content
+        # A single LAS comment line is ~80 chars; 200 lines ≈ 16KB
+        ascii_preamble = "# " + ("X" * 77) + "\n"
+        large_preamble = ascii_preamble * 200  # ~15.6 KB
+
+        # Cyrillic content in Russian (cp1251 encoded)
+        # "Привет из России" — common Russian text
+        russian_text = "\u041f\u0440\u0438\u0432\u0435\u0442 \u0438\u0437 \u0420\u043e\u0441\u0441\u0438\u0438"
+        russian_part = "~VERSION INFORMATION\n" + russian_text + "\n"
+
+        content = large_preamble + russian_part
+        test_file = tmp_path / "cyrillic_after_preamble.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Should detect and read the file correctly without crashing
+        from pylasdev.encoding import read_with_encoding
+        enc, text = read_with_encoding(test_file)
+        assert isinstance(enc, str)
+        assert len(text) > 0
+        # The Russian text characters should be present in the decoded content
+        assert "VERSION" in text

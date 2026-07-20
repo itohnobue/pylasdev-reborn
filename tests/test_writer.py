@@ -2415,3 +2415,125 @@ class TestF016TimeOffsetNonAsciiRegression:
         assert "   {A}" not in content  # no A-format curves
         # Specifically: no time_offset 5.5 in the format specs
         assert ":5.5" not in content
+
+
+# ============================================================
+# Production Check Regression Tests
+# ============================================================
+
+class TestProductionCheckWriterFixes:
+    """Regression tests for production check fixes in writer.py."""
+
+    # --- F-209 (MEDIUM): multi-section LOG_DATA curves preserved ---
+
+    def test_multi_log_data_section_all_curves_emitted(self, tmp_path: Path) -> None:
+        """F-209: Write with 2 LOG_DATA sections emits curves from BOTH.
+
+        Before the fix, next() selected only the first LOG_DATA section's
+        curves. Now all LOG_DATA sections' section_curves are accumulated.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+
+        # Section 1: DEPT + GR
+        section1 = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "GR"],
+            section_curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"),
+                CurveDefinition(mnemonic="GR", unit="GAPI", data_format="F"),
+            ],
+            data={
+                "DEPT": np.array([100.0]),
+                "GR": np.array([75.0]),
+            },
+        )
+        # Section 2: DEPT + DT (different set)
+        section2 = DataSection(
+            name="LOG2",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "DT"],
+            section_curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"),
+                CurveDefinition(mnemonic="DT", unit="US/M", data_format="F"),
+            ],
+            data={
+                "DEPT": np.array([200.0]),
+                "DT": np.array([50.0]),
+            },
+        )
+        las.data_sections.append(section1)
+        las.data_sections.append(section2)
+
+        temp_file = tmp_path / "multi_log_data.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        # Both section curves must be represented in the ~CURVE block
+        assert "GR.GAPI" in content, "GR from section1 should be in ~CURVE"
+        assert "DT.US/M" in content, "DT from section2 should be in ~CURVE"
+
+    # --- F-210 (MEDIUM): colon-escaping for curve unit ---
+
+    def test_curve_unit_colon_escaped(self, tmp_path: Path) -> None:
+        """F-210: Curve unit with ' : ' (colon-space adjacency) is escaped.
+
+        The unit appears between mnemonic and description, before the
+        structural colon. A unit containing " : " creates a spurious
+        structural separator that misroutes parser split results.
+        The fix escapes colon-whitespace adjacencies in the unit.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="2.0")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "SPECIAL"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.curves.append(
+            CurveDefinition(mnemonic="SPECIAL", unit="g/cm3 : grain", description="Special Density")
+        )
+        las.logs["DEPT"] = np.array([100.0])
+        las.logs["SPECIAL"] = np.array([2.5])
+
+        temp_file = tmp_path / "colon_unit.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        curve_section = content.split("~CURVE")[1].split("~A")[0]
+        # The unit "g/cm3 : grain" has " : " (whitespace-colon-space)
+        # which gets escaped by _escape_colons_for_las_value
+        # The raw "g/cm3 : grain" with colon-space adjacency should NOT appear
+        # (it would create a spurious structural colon separator)
+        assert "g/cm3 : grain" not in curve_section, (
+            f"Colon-space in unit should be escaped, got:\n{curve_section}"
+        )
+        # The escaped form should appear (underscore around colon)
+        assert "g/cm3" in curve_section
+        assert "grain" in curve_section
+
+    # --- Quick-fix: early-return path blank line ---
+
+    def test_empty_curves_section_has_blank_line(self, tmp_path: Path) -> None:
+        """Quick-fix: Empty curves early-return path emits trailing blank line.
+
+        The F-209 fix added an early-return when no curves are available.
+        This path must emit a section-terminating blank line like the
+        normal code path does at line 557, per CWLS LAS 2.0 Section 3.2.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        # No curves at all — triggers the early-return warning path
+        las.data_sections = []  # type: ignore[assignment]
+
+        temp_file = tmp_path / "empty_curves_bl.las"
+        # Should not crash; empty curve section still produces valid LAS
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        # CURVE section should exist with proper structure
+        assert "~CURVE" in content

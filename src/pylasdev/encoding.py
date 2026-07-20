@@ -55,7 +55,7 @@ FALLBACK_ENCODINGS = ["utf-8", "cp1251", "cp866", "cp1252", "latin-1"]
 # decode to the wrong encoding typically produces significantly fewer \w
 # chars (e.g. cp866 content decoded as cp1251: 33% vs 100% correctly).
 # Sampling the first _MIN_VALIDATION_CHARS avoids scanning multi-GB files.
-_MIN_VALIDATION_CHARS = 10_000  # Sample first 10K chars for mojibake check
+_MIN_VALIDATION_CHARS = 65_536  # Sample first 64K chars/bytes for analysis
 
 
 def detect_encoding(file_path: Path) -> str:

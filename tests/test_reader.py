@@ -2296,3 +2296,141 @@ class TestMaxLimitsAtLimit:
         with mock.patch("pylasdev.data_reader.MAX_CURVES", 2):
             with pytest.raises(LASParseError, match="exceeds maximum"):
                 read_las_file(test_file)
+
+
+# ============================================================
+# Production Check Regression Tests
+# ============================================================
+
+class TestProductionCheckReaderFixes:
+    """Regression tests for production check fixes in data_reader.py and reader.py."""
+
+    # --- F-027 (MEDIUM): _get_null_value silences LASParseError ---
+
+    def test_non_finite_null_value_raises_las_parse_error(self) -> None:
+        """F-027: Non-finite NULL value ('nan') raises LASParseError.
+
+        Before the fix, LASParseError was caught by the except clause
+        (lines 240), falling back to -999.25 silently. Now the error
+        propagates so callers know the NULL is corrupt.
+        """
+        from pylasdev.data_reader import _get_null_value
+
+        well = {"NULL": "nan"}
+        with pytest.raises(LASParseError, match="NULL value must be a finite number"):
+            _get_null_value(well)
+
+    def test_inf_null_value_raises_las_parse_error(self) -> None:
+        """F-027: NULL value 'inf' raises LASParseError."""
+        from pylasdev.data_reader import _get_null_value
+
+        well = {"NULL": "inf"}
+        with pytest.raises(LASParseError, match="NULL value must be a finite number"):
+            _get_null_value(well)
+
+    def test_non_numeric_null_still_falls_back_to_default(self) -> None:
+        """F-027: Non-numeric NULL ('NOT_A_NUMBER') still falls back to default.
+
+        Regression check: the except clause still catches ValueError from
+        float conversion. Only LASParseError was removed.
+        """
+        from pylasdev.data_reader import _get_null_value
+
+        well = {"NULL": "NONSENSE"}
+        result = _get_null_value(well)
+        assert result == -999.25
+
+    # --- F-211 (MEDIUM): _read_wrapped depth-step underestimation ---
+
+    def test_wrapped_compact_all_zero(self, tmp_path: Path) -> None:
+        """F-211: Compact wrapped file (2 lines/step, all zero data).
+
+        The depth-step formula must use max(ceil(N/curves), ceil(N/2))
+        to avoid undercounting steps in compact wrapped format.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            " GR.GAPI  :  Gamma Ray\n"
+            "~A\n"
+            # Depth step 1: 2 lines
+            "100.0\n"
+            "50.0  75.0\n"
+            # Depth step 2: 2 lines
+            "101.0\n"
+            "51.0  76.0\n"
+            # Depth step 3: 2 lines
+            "102.0\n"
+            "52.0  77.0\n"
+        )
+        test_file = tmp_path / "compact_wrapped.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        # All 3 depth steps must be parsed correctly
+        assert len(data["logs"]["DEPT"]) == 3
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 101.0, 102.0])
+        np.testing.assert_allclose(data["logs"]["DT"], [50.0, 51.0, 52.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [75.0, 76.0, 77.0])
+
+    # --- F-212 (MEDIUM): _desanitize_las_value unconditional _# strip ---
+
+    def test_desanitize_disabled_preserves_hash_prefix(self) -> None:
+        """F-212: With _DESANITIZE_ENABLED=False, _# values are preserved.
+
+        When reading non-pylasdev files that genuinely contain _# in
+        their data, the desanitize function must not strip the underscore.
+        """
+        import pylasdev.data_reader as dr_mod
+
+        try:
+            dr_mod._DESANITIZE_ENABLED = False
+            # Value starts with _# — should be preserved as-is
+            result = dr_mod._desanitize_las_value("_#original_value")
+            assert result == "_#original_value", (
+                f"Expected '_#original_value' preserved, got {result!r}"
+            )
+            # Non-_# value unchanged
+            assert dr_mod._desanitize_las_value("normal_value") == "normal_value"
+        finally:
+            dr_mod._DESANITIZE_ENABLED = True
+
+    def test_desanitize_enabled_strips_hash_prefix(self) -> None:
+        """F-212: Default behavior (enabled) strips _# prefix for roundtrip.
+
+        When _DESANITIZE_ENABLED=True (default), _# prefix is stripped
+        to restore the original #-prefixed value from the writer escape.
+        """
+        import pylasdev.data_reader as dr_mod
+
+        assert dr_mod._DESANITIZE_ENABLED is True
+        result = dr_mod._desanitize_las_value("_#test_value")
+        assert result == "#test_value", (
+            f"Expected '#test_value' after desanitize, got {result!r}"
+        )
+
+    # --- F-219 (MEDIUM): LASEncodingError propagation ---
+
+    def test_encoding_error_wrapped_as_las_read_error(self, tmp_path: Path) -> None:
+        """F-219: LASEncodingError is wrapped as LASReadError in reader.
+
+        The docstring was corrected: LASEncodingError is NOT propagated
+        directly. Instead it's caught and re-raised as LASReadError at
+        reader.py:142. Callers receive LASReadError, not LASEncodingError.
+        """
+        content = b"\xff\xfe\x00\x01"  # Invalid encoding bytes
+        test_file = tmp_path / "bad_encoding.las"
+        test_file.write_bytes(content)
+
+        # Without chardet and empty fallback chain, encoding fails
+        from unittest import mock
+
+        with mock.patch("pylasdev.encoding.FALLBACK_ENCODINGS", []):
+            with mock.patch("pylasdev.encoding.HAS_CHARDET", False):
+                with pytest.raises(LASReadError, match="Cannot read file"):
+                    read_las_file(test_file)

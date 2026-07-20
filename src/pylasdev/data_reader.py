@@ -182,6 +182,14 @@ def _parse_float_with_d_notation(value_str: str) -> float:
     return float(value_str.replace("D", "E").replace("d", "e"))
 
 
+# F-212: Module-level flag to control _desanitize_las_value behaviour.
+# Set to False when reading files NOT produced by pylasdev's writer, to
+# avoid corrupting ``_#`` sequences that are legitimate data, not escaped
+# ``#``-prefixed values.  Default True preserves roundtrip correctness
+# for pylasdev-produced files.  Overridable at module level.
+_DESANITIZE_ENABLED: bool = True
+
+
 def _desanitize_las_value(value: str) -> str:
     """Reverse the writer's ``_``-prefix-on-``#`` escape (local copy).
 
@@ -191,6 +199,8 @@ def _desanitize_las_value(value: str) -> str:
 
     Defined locally in data_reader to avoid circular import from parser.
     """
+    if not _DESANITIZE_ENABLED:
+        return value
     if value.startswith("_#"):
         return value[1:]
     idx = value.find("_#")
@@ -227,7 +237,7 @@ def _get_null_value(
                 f"NULL value must be a finite number, got {null_value!r}"
             )
         return null_value
-    except (ValueError, TypeError, LASParseError, AttributeError):
+    except (ValueError, TypeError, AttributeError):
         # F-I2-XPD-05: Log a warning when falling back to the default
         # null value.  Silent fallback to -999.25 with zero diagnostics
         # makes it impossible to distinguish a genuine -999.25 null
@@ -949,7 +959,7 @@ def _read_wrapped(
         # undercounting depth steps in wrapped mode.  Integer division
         # _count // curve_count can undercount by up to curve_count-1
         # steps, allowing malicious files to bypass the resource guard.
-        depth_steps = max(1, math.ceil(_count / curve_count))
+        depth_steps = max(1, math.ceil(_count / curve_count), math.ceil(_count / 2))
         if curve_count * depth_steps > MAX_TOTAL_ELEMENTS:
             raise LASParseError(
                 f"Total allocation ({curve_count} curves x ~{depth_steps} depth steps ≈ "

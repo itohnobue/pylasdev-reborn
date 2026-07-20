@@ -55,6 +55,13 @@ MAX_PARAMETERS = 100_000
 # from malformed files.  Overridable at module level.
 MAX_OTHER_LINES = 1_000_000
 
+# F-212: When reading files NOT produced by pylasdev's writer, the
+# _desanitize_las_value transformation should not be applied — _# in
+# external data is genuine content, not a writer escape.  Defaults to
+# True (preserves existing roundtrip behavior).  Set to False before
+# reading external files to prevent data corruption.
+_DESANITIZE_ENABLED: bool = True
+
 # F-35: Maximum deferred well entries.  Every other accumulator in parser.py
 # has a MAX_* guard (_ascii_data_lines, las_file.curves, las_file.parameters,
 # _other_lines, _current_data_section_idx).  _deferred_well_entries had no
@@ -366,6 +373,8 @@ def _desanitize_las_value(value: str) -> str:
        leading whitespace → ``" _#..."`` → reverse: remove the ``_``
        between whitespace and ``#``.
     """
+    if not _DESANITIZE_ENABLED:
+        return value
     if value.startswith("_#"):
         return value[1:]
     # Case 2: whitespace-prefixed value with sanitized _# (e.g., " _#comment")

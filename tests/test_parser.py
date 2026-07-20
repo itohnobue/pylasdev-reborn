@@ -2571,3 +2571,37 @@ class TestNonLetterTildeHeaders:
         parser = LASParser()
         las = parser.parse(content)
         assert "~" in las.other
+
+
+# ============================================================
+# Production Check Regression Tests
+# ============================================================
+
+class TestProductionCheckParserFix:
+    """Regression test for F-212 fix in parser.py."""
+
+    def test_parser_desanitize_disabled_preserves_hash_prefix(self) -> None:
+        """F-212 (parser.py side): With _DESANITIZE_ENABLED=False, _# preserved.
+
+        The parser.py copy of _desanitize_las_value received the same
+        _DESANITIZE_ENABLED guard as data_reader.py.
+        """
+        import pylasdev.parser as p_mod
+
+        try:
+            p_mod._DESANITIZE_ENABLED = False
+            result = p_mod._desanitize_las_value("_#external_data")
+            assert result == "_#external_data", (
+                f"Expected '_#external_data' preserved, got {result!r}"
+            )
+            assert p_mod._desanitize_las_value("clean") == "clean"
+        finally:
+            p_mod._DESANITIZE_ENABLED = True
+
+    def test_parser_desanitize_enabled_default_behavior(self) -> None:
+        """F-212 (parser.py side): Default retains roundtrip-correct behavior."""
+        import pylasdev.parser as p_mod
+
+        assert p_mod._DESANITIZE_ENABLED is True
+        result = p_mod._desanitize_las_value("_#hash_val")
+        assert result == "#hash_val"

@@ -1860,3 +1860,284 @@ class TestFR01PerSectionDataFormatWriteBack:
         las = LASFile.from_dict(data)
         assert len(las.data_sections) == 1
         assert las.data_sections[0].section_curves[0].data_format == "F"
+
+
+# ============================================================
+# Production Check Regression Tests (20 confirmed fixes)
+# ============================================================
+
+class TestProductionCheckModelsFixes:
+    """Regression tests for production check fixes in models.py."""
+
+    # --- F-002 (HIGH): deepcopy fix — caller can't mutate internal data ---
+
+    def test_to_dict_data_is_deepcopy(self) -> None:
+        """F-002: Modifying to_dict() returned data does not affect LASFile.
+
+        The fix replaced data.copy() with copy.deepcopy(data) so nested
+        dict/numpy array mutations by the caller don't leak into the
+        LASFile's internal state.
+        """
+        las = LASFile()
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT"))
+        las.logs["DEPT"] = np.array([100.0, 200.0])
+        las.well["STRT"] = "100.0"
+
+        d = las.to_dict()
+        # Mutate nested structures in the returned dict
+        d["logs"]["DEPT"][0] = 9999.0
+        d["well"]["STRT"] = "MODIFIED"
+        d["curves_order"].append("EXTRA")
+
+        # Original LASFile must NOT be affected
+        assert las.logs["DEPT"][0] == 100.0
+        assert las.well["STRT"] == "100.0"
+        assert las.curves_order == ["DEPT"]
+
+    def test_from_dict_data_is_deepcopy(self) -> None:
+        """F-002: Modifying input dict after from_dict() does not affect LASFile.
+
+        from_dict also uses copy.deepcopy so the caller's dict remains
+        independent of the LASFile's internal state.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100.0", "STOP": "200.0", "STEP": "1.0", "NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0, 200.0])},
+        }
+        las = LASFile.from_dict(data)
+        # Mutate the original dict after construction
+        data["logs"]["DEPT"][0] = 9999.0
+        data["well"]["STRT"] = "MODIFIED"
+
+        # LASFile must NOT be affected
+        assert las.logs["DEPT"][0] == 100.0
+        assert las.well["STRT"] == "100.0"
+
+    # --- F-003 (MEDIUM): DataSection.__post_init__ data_format cross-validation ---
+
+    def test_datasection_post_init_s_format_in_numeric_data_raises(self) -> None:
+        """F-003: DataSection with S-format curve in numeric data raises LASDataError.
+
+        Direct DataSection construction bypasses from_dict validation.
+        __post_init__ now cross-validates data_format against placement
+        (data vs string_data).
+        """
+        from pylasdev.models import DataSection
+
+        with pytest.raises(LASDataError, match="data_format='S' but is in data"):
+            DataSection(
+                name="BadSection",
+                section_type="",
+                curves_order=["CDES"],
+                data={"CDES": np.array([1.0, 2.0])},
+                section_curves=[
+                    CurveDefinition(mnemonic="CDES", data_format="S"),
+                ],
+            )
+
+    def test_datasection_post_init_f_format_in_string_data_raises(self) -> None:
+        """F-003: DataSection with F-format curve in string_data raises LASDataError."""
+        from pylasdev.models import DataSection
+
+        with pytest.raises(LASDataError, match="data_format='F' but is in string_data"):
+            DataSection(
+                name="BadSection",
+                section_type="",
+                curves_order=["DEPT"],
+                string_data={"DEPT": np.array(["bad"])},
+                section_curves=[
+                    CurveDefinition(mnemonic="DEPT", data_format="F"),
+                ],
+            )
+
+    # --- F-004 (MEDIUM): ArrayElementInfo __post_init__ validation ---
+
+    def test_array_element_info_empty_base_name_raises(self) -> None:
+        """F-004: ArrayElementInfo with empty base_name raises ValueError."""
+        with pytest.raises(ValueError, match="base_name must not be empty"):
+            ArrayElementInfo(base_name="", index=1)
+
+    def test_array_element_info_whitespace_base_name_raises(self) -> None:
+        """F-004: ArrayElementInfo with whitespace-only base_name raises ValueError."""
+        with pytest.raises(ValueError, match="base_name must not be empty"):
+            ArrayElementInfo(base_name="   ", index=1)
+
+    def test_array_element_info_negative_index_raises(self) -> None:
+        """F-004: ArrayElementInfo with negative index raises ValueError."""
+        with pytest.raises(ValueError, match="index must be >= 0"):
+            ArrayElementInfo(base_name="NMR", index=-1)
+
+    def test_array_element_info_non_finite_time_offset_raises(self) -> None:
+        """F-004: ArrayElementInfo with nan time_offset raises ValueError."""
+        with pytest.raises(ValueError, match="time_offset must be a finite number"):
+            ArrayElementInfo(base_name="NMR", index=1, time_offset=float("nan"))
+
+    def test_array_element_info_valid(self) -> None:
+        """F-004: Valid ArrayElementInfo construction succeeds."""
+        ai = ArrayElementInfo(base_name="NMR", index=1, time_offset=5.0)
+        assert ai.base_name == "NMR"
+        assert ai.index == 1
+        assert ai.time_offset == 5.0
+
+    # --- F-201 (MEDIUM): curves_order None guard ---
+
+    def test_from_dict_data_section_none_curves_order(self) -> None:
+        """F-201: data_section with curves_order=None does not crash with TypeError.
+
+        Before the fix, _ds.get("curves_order", []) returned None when
+        the key existed with value None, causing TypeError in the
+        generator expression.  After the isinstance guard fix, None
+        values are safely skipped (the guard checks isinstance(_, list)).
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT", "unit": "M", "data_format": "F"}],
+            "logs": {"DEPT": np.array([100.0])},
+            "data_sections": [
+                {
+                    "name": "Section1",
+                    "section_type": "LOG_DATA",
+                    "curves_order": None,  # key exists but value is None
+                    "data": {"DEPT": np.array([100.0])},
+                }
+            ],
+        }
+        # Should not crash with TypeError — the isinstance guard catches None.
+        # May raise ValueError from orphaned-key detection (which is better
+        # than an unhandled TypeError), so any non-TypeError is acceptable.
+        try:
+            las = LASFile.from_dict(data)
+            assert len(las.data_sections) == 1
+        except (ValueError, LASDataError):
+            pass  # non-TypeError failure is expected and acceptable
+
+    # --- F-202 (MEDIUM): Mnemonic accepts leading/trailing whitespace ---
+
+    def test_curve_definition_leading_whitespace_mnemonic_raises(self) -> None:
+        """F-202: CurveDefinition with leading whitespace mnemonic raises ValueError."""
+        with pytest.raises(ValueError, match="mnemonic must not be empty"):
+            CurveDefinition(mnemonic="  GR")
+
+    def test_curve_definition_trailing_whitespace_mnemonic_raises(self) -> None:
+        """F-202: CurveDefinition with trailing whitespace mnemonic raises ValueError."""
+        with pytest.raises(ValueError, match="mnemonic must not be empty"):
+            CurveDefinition(mnemonic="GR  ")
+
+    def test_parameter_entry_leading_whitespace_mnemonic_raises(self) -> None:
+        """F-202: ParameterEntry with leading whitespace mnemonic raises ValueError."""
+        with pytest.raises(ValueError, match="mnemonic must not be empty"):
+            ParameterEntry(mnemonic="  BHT", value="35")
+
+    def test_parameter_entry_trailing_whitespace_mnemonic_raises(self) -> None:
+        """F-202: ParameterEntry with trailing whitespace mnemonic raises ValueError."""
+        with pytest.raises(ValueError, match="mnemonic must not be empty"):
+            ParameterEntry(mnemonic="BHT  ", value="35")
+
+    # --- F-203 (MEDIUM): from_dict drops legacy params when parameter_details present ---
+
+    def test_from_dict_empty_parameter_details_honors_explicit_empty(self) -> None:
+        """F-203: Empty parameter_details list is honored as explicit (not ignored).
+
+        The fix changed `if param_details:` (truthiness, [] → False)
+        to `if param_details is not None:` so an explicitly-provided
+        empty list is treated as "details present but empty" rather than
+        silently falling back to the legacy params dict. An empty list
+        means the caller explicitly wants no params.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100", "STOP": "200", "STEP": "1", "NULL": "-999"},
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+            "parameters": {"BHT": "35.5", "BS": "200"},  # legacy dict
+            "parameter_details": [],  # explicitly empty list (not None)
+        }
+        las = LASFile.from_dict(data)
+        # Empty details → 0 params (legacy dict NOT processed — caller's
+        # explicit empty parameter_details is honored)
+        assert len(las.parameters) == 0
+
+    def test_from_dict_no_parameter_details_uses_legacy_params(self) -> None:
+        """F-203: No parameter_details key → legacy params dict is used.
+
+        When parameter_details is not provided (None/default), the
+        legacy params dict is processed normally. This was the correct
+        behavior before the fix and remains correct after.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100", "STOP": "200", "STEP": "1", "NULL": "-999"},
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+            "parameters": {"BHT": "35.5", "BS": "200"},  # legacy dict
+        }
+        las = LASFile.from_dict(data)
+        assert len(las.parameters) == 2
+        assert las.parameters[0].mnemonic == "BHT"
+        assert las.parameters[1].mnemonic == "BS"
+
+    def test_from_dict_parameter_details_is_nonempty_list(self) -> None:
+        """F-203: Non-empty parameter_details still takes priority (no regression)."""
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100", "STOP": "200", "STEP": "1", "NULL": "-999"},
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+            "parameters": {"BHT": "35.5"},  # legacy dict (will be overridden)
+            "parameter_details": [
+                {"mnemonic": "BS", "unit": "MM", "value": "200", "description": "Bit Size"},
+            ],
+        }
+        las = LASFile.from_dict(data)
+        # parameter_details takes priority over legacy dict
+        assert len(las.parameters) == 1
+        assert las.parameters[0].mnemonic == "BS"
+
+    # --- F-204 (MEDIUM): str() vs _safe_str() inconsistency for `other` field ---
+
+    def test_from_dict_other_field_none_handled(self) -> None:
+        """F-204: 'other' field with None value does not count "None" as a line.
+
+        Before the fix, str(data.get("other", "")) on None value produced
+        "None" (4 chars), counting it as a line for MAX_OTHER_LINES guard.
+        Now _safe_str() converts None to "".
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100", "STOP": "200", "STEP": "1", "NULL": "-999"},
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+            "other": None,
+        }
+        las = LASFile.from_dict(data)
+        assert las.other == ""
+
+    # --- F-034 (MEDIUM): DevFile.from_dict wraps ImportError as LASDataError ---
+
+    def test_dev_file_from_dict_importerror_not_wrapped(self) -> None:
+        """F-034: ImportError from DevFile.from_dict propagates as ImportError.
+
+        The fix removed ImportError from the except tuple, so import
+        failures inside the try block propagate as ImportError, not
+        misleading LASDataError. The function imports
+        _normalize_dev_column from dev_reader inside the try block
+        when normalize_aliases=True (default). Removing that function
+        from the dev_reader module triggers ImportError.
+        """
+        import pylasdev.dev_reader as dr_mod
+
+        data: dict[str, Any] = {"MD": np.array([0.0, 100.0])}
+        original = getattr(dr_mod, "_normalize_dev_column", None)
+        try:
+            if original is not None:
+                del dr_mod._normalize_dev_column
+            with pytest.raises(ImportError):
+                DevFile.from_dict(data)
+        finally:
+            if original is not None:
+                dr_mod._normalize_dev_column = original

@@ -1789,3 +1789,123 @@ class TestF035FailureCounterRegression:
         # MD should parse correctly
         assert data["MD"][0] == 100.0
         assert data["MD"][1] == 200.0
+
+
+# ============================================================
+# Production Check Regression Tests
+# ============================================================
+
+class TestProductionCheckDevReaderFixes:
+    """Regression tests for production check fixes in dev_reader.py."""
+
+    # --- F-023 (MEDIUM): _SENTINELS incomplete ---
+
+    def test_inf_sentinel_recognized_as_headerless(self, tmp_path: Path) -> None:
+        """F-023: Comma-delimited row with 'inf' is headerless, not a header.
+
+        Before the fix, a row like "1.0, inf, 2.0" was treated as a header
+        because 'inf' is not a float token (rejected by _is_float_token)
+        and was not in _SENTINELS. Now it's recognized as a sentinel.
+        """
+        content = "1.0, inf, 2.0\n100.0, 50.0, 75.0\n"
+        test_file = tmp_path / "inf_sentinel.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Should be headerless (3 columns)
+        assert len(data) == 3
+        assert "col_0" in data
+        assert data["col_0"][0] == 1.0
+        assert np.isnan(data["col_1"][0])  # 'inf' → NaN
+        assert data["col_2"][0] == 2.0
+
+    def test_minus_inf_sentinel_recognized(self, tmp_path: Path) -> None:
+        """F-023: '-inf' is recognized as a sentinel."""
+        content = "-inf, 2.0, 3.0\n50.0, 75.0, 100.0\n"
+        test_file = tmp_path / "minus_inf_sentinel.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert "col_0" in data
+
+    # --- F-021 (MEDIUM): Whitespace path sentinel detection ---
+
+    def test_whitespace_na_sentinel_headerless(self, tmp_path: Path) -> None:
+        """F-021: Whitespace line with 'na' sentinel is headerless.
+
+        Before the fix, whitespace-delimited "100.0 na 200.0" on the
+        first line fell through to "simple" format (treated as header).
+        Now it's detected as headerless data with a sentinel value.
+        """
+        content = "100.0 na 200.0\n50.0 75.0 100.0\n"
+        test_file = tmp_path / "ws_na_sentinel.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Should produce 3 columns (headerless), not try to parse line as header
+        assert len(data) == 3
+
+    def test_whitespace_null_sentinel_headerless(self, tmp_path: Path) -> None:
+        """F-021: Whitespace line with 'null' sentinel is headerless."""
+        content = "100.0 null 200.0\n50.0 75.0 100.0\n"
+        test_file = tmp_path / "ws_null_sentinel.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert len(data) == 3
+
+    # --- F-213 (MEDIUM): All-zero first row heuristic ---
+
+    def test_all_zero_first_row_headerless(self, tmp_path: Path) -> None:
+        """F-213: All-zero first row is headerless data, not integer headers.
+
+        Column names like "0 0 0 0" are nonsensical; an all-zero row
+        is a common first data row in deviation surveys (MD=0 at surface).
+        """
+        content = "0.0 0.0 0.0 0.0\n100.0 99.0 100.0 200.0\n200.0 198.0 101.0 201.0\n"
+        test_file = tmp_path / "all_zero_headerless.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Should be headerless (not simple with column names "0", "0", "0", "0")
+        assert "col_0" in data
+        assert "col_1" in data
+        assert len(data["col_0"]) == 3
+        assert data["col_0"][0] == 0.0
+        assert data["col_0"][1] == 100.0
+        assert data["col_0"][2] == 200.0
+
+    # --- F-025 (MEDIUM): Deduplicated azi/inc columns validation ---
+
+    def test_deduplicated_azimuth_out_of_range_raises_warning(self) -> None:
+        """F-025: _N-suffixed azimuth survivor still gets range validation.
+
+        When normalize_aliases=True deduplicates columns (AZIM + AZ →
+        AZI, AZI_2), the _2-suffixed survivor must still be validated
+        for [0, 360] range.
+        """
+        from pylasdev.dev_reader import _validate_dev_data
+        from pylasdev.models import DevFile
+
+        dev = DevFile()
+        dev.columns["MD"] = np.array([100.0, 200.0, 300.0])
+        # AZI_2 is a deduplicated survivor that should be validated
+        dev.columns["AZI_2"] = np.array([10.0, 400.0, -50.0])
+        dev.column_order = ["MD", "AZI_2"]
+
+        with pytest.warns(UserWarning, match="Azimuth.*outside.*0, 360"):
+            _validate_dev_data(dev)
+
+    def test_deduplicated_azimuth_valid_no_warning(self) -> None:
+        """F-025: Valid _N-suffixed azimuth produces no warning."""
+        from pylasdev.dev_reader import _validate_dev_data
+        from pylasdev.models import DevFile
+
+        dev = DevFile()
+        dev.columns["MD"] = np.array([100.0, 200.0, 300.0])
+        dev.columns["AZI_2"] = np.array([10.0, 90.0, 350.0])
+        dev.column_order = ["MD", "AZI_2"]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _validate_dev_data(dev)  # Should not warn — all in [0, 360]

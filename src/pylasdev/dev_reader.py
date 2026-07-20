@@ -406,6 +406,14 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 _SENTINELS = {
                     "na", "null", "err", "n/a", "nan", "none", "-",
                     "null.", "n.a.", "nil", "nd", "missing",
+                    # F-023: _is_float_token rejects these special float
+                    # strings, so they become non-float tokens.  Without
+                    # these entries a row like "1.0, inf, 2.0" is treated
+                    # as a header and falls through to whitespace detection
+                    # instead of being correctly recognised as headerless
+                    # sentinel-bearing data.
+                    "inf", "-inf", "+inf",
+                    "infinity", "-infinity", "+infinity",
                 }
                 _is_sentinel = all(
                     t.lower().strip() in _SENTINELS
@@ -522,11 +530,47 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 and "e" not in t.lower().replace("d", "e")
             ]
             if len(first_ints) == len(first_tokens):
+                # F-213: All-zero first row is headerless data, not integer
+                # column headers.  Column names like "0 0 0 0" are
+                # nonsensical; a row of all zeros is a common first data
+                # row in deviation surveys (e.g., MD=0 at surface).
+                if all(
+                    float(t.replace("D", "E").replace("d", "e")) == 0.0
+                    for t in first_tokens
+                ):
+                    return ("headerless", 0)
                 if len(content_entries) >= 2:
                     second_tokens = content_entries[1][1].split(maxsplit=_max_tokens)
                     if len(second_tokens) == len(first_tokens):
                         return ("simple", 1)
         return ("headerless", 0)
+
+    # F-021: Mostly-float whitespace-delimited line with sentinel tokens.
+    # Mirror the comma-path sentinel detection (lines ~397-422) for
+    # whitespace split.  When the first content line has mostly numeric
+    # tokens and the non-numeric tokens are known sentinels (e.g., "na",
+    # "err", "NULL"), the line is headerless data — not a column header.
+    # Without this check, a line like "100.0 na 200.0 300.0" falls
+    # through to simple-format, consuming the first data row as a header.
+    if first_tokens:
+        float_tokens = [t for t in first_tokens if _is_float_token(t)]
+        mostly_float = (
+            len(float_tokens) >= 2
+            and len(float_tokens) >= len(first_tokens) - 1
+        )
+        if mostly_float:
+            _non_float_tokens = [t for t in first_tokens if not _is_float_token(t)]
+            _SENTINELS = {
+                "na", "null", "err", "n/a", "nan", "none", "-",
+                "null.", "n.a.", "nil", "nd", "missing",
+                "inf", "-inf", "+inf",
+                "infinity", "-infinity", "+infinity",
+            }
+            _is_sentinel = all(
+                t.lower().strip() in _SENTINELS for t in _non_float_tokens
+            )
+            if _is_sentinel:
+                return ("headerless", 0)
 
     return ("simple", 1)
 
@@ -657,6 +701,36 @@ def _validate_dev_data(
             )
         break  # Found one recognised azimuth column — done checking.
 
+    # F-025: When normalize_aliases=True deduplicates columns (e.g.,
+    # AZIM + AZ1 both normalise to AZI, producing AZI and AZI_2),
+    # the _N-suffixed survivor bypasses the exact-name check above.
+    # Validate those deduplication survivors.
+    for azi_name in _azi_names:
+        for col_name in dev.column_order:
+            _suffix = col_name[len(azi_name):]
+            if (
+                col_name.startswith(azi_name)
+                and _suffix.startswith("_")
+                and _suffix[1:].isdigit()
+            ):
+                azi = dev.columns[col_name]
+                azi_finite = azi[~np.isnan(azi)]
+                if len(azi_finite) == 0:
+                    continue
+                out_of_range = (azi_finite < 0) | (azi_finite > 360)
+                if np.any(out_of_range):
+                    n_bad = int(np.sum(out_of_range))
+                    bad_vals = azi_finite[out_of_range][:3]
+                    warnings.warn(
+                        f"Azimuth column '{col_name}' has {n_bad} value(s) "
+                        f"outside [0, 360]: "
+                        f"{', '.join(str(v) for v in bad_vals)}"
+                        f"{'...' if n_bad > 3 else ''}. "
+                        f"Azimuth values outside [0, 360] can cause "
+                        f"inaccurate trajectory calculations.",
+                        stacklevel=_stacklevel,
+                    )
+
     # --- 5. Check inclination range [0, 180] ---
     _inc_names = ("INC", "INCL", "DEVI", "DIP")
     for inc_name in _inc_names:
@@ -680,6 +754,34 @@ def _validate_dev_data(
                 stacklevel=_stacklevel,
             )
         break  # Found one recognised inclination column — done checking.
+
+    # F-025: Deduplication survivors for inclination columns
+    # (e.g., INCL + DIP both normalise to INC, producing INC and INC_2).
+    for inc_name in _inc_names:
+        for col_name in dev.column_order:
+            _suffix = col_name[len(inc_name):]
+            if (
+                col_name.startswith(inc_name)
+                and _suffix.startswith("_")
+                and _suffix[1:].isdigit()
+            ):
+                inc = dev.columns[col_name]
+                inc_finite = inc[~np.isnan(inc)]
+                if len(inc_finite) == 0:
+                    continue
+                out_of_range = (inc_finite < 0) | (inc_finite > 180)
+                if np.any(out_of_range):
+                    n_bad = int(np.sum(out_of_range))
+                    bad_vals = inc_finite[out_of_range][:3]
+                    warnings.warn(
+                        f"Inclination column '{col_name}' has {n_bad} value(s) "
+                        f"outside [0, 180]: "
+                        f"{', '.join(str(v) for v in bad_vals)}"
+                        f"{'...' if n_bad > 3 else ''}. "
+                        f"Inclination values outside [0, 180] can cause "
+                        f"inaccurate trajectory calculations.",
+                        stacklevel=_stacklevel,
+                    )
 
     # --- 6. Check MD NaN density (already checked above; note that
     #       the NaN-density check on the full md array covers all

@@ -67,7 +67,6 @@ def read_las_file(
     Raises:
         LASReadError: If file cannot be found, is not a regular file, or
             exceeds max_file_size.
-        LASEncodingError: If file encoding cannot be determined.
         LASParseError: If file content cannot be parsed (e.g. missing
             required ~V section).
         MemoryError: If the system runs out of memory during
@@ -120,7 +119,6 @@ def read_las_file_as_object(
     Raises:
         LASReadError: If file cannot be found, is not a regular file, or
             exceeds max_file_size.
-        LASEncodingError: If file encoding cannot be determined.
         LASParseError: If file content cannot be parsed (e.g. missing
             required ~V section).
 

@@ -5,6 +5,7 @@ Supports LAS 1.2, 2.0, and 3.0 formats.
 
 from __future__ import annotations
 
+import copy
 import math
 import re
 import warnings
@@ -397,9 +398,11 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
             _ds_curve_names: set[str] = set()
             for _ds in data_sections:
                 if isinstance(_ds, dict):
-                    _ds_curve_names.update(
-                        str(s).upper() for s in _ds.get("curves_order", [])
-                    )
+                    _ds_co = _ds.get("curves_order")
+                    if isinstance(_ds_co, list):
+                        _ds_curve_names.update(
+                            str(s).upper() for s in _ds_co
+                        )
                     _ds_data = _ds.get("data")
                     if isinstance(_ds_data, dict):
                         _ds_curve_names.update(
@@ -657,6 +660,36 @@ class ArrayElementInfo:
     index: int = 0  # Array index (e.g., 1, 2, 3)
     time_offset: float | None = None  # Time offset from first element (e.g., 0, 5, 10 ms)
 
+    def __post_init__(self) -> None:
+        """Validate base_name, index, and time_offset.
+
+        Direct construction bypasses parser and from_dict validation.
+        Non-finite time_offset values (NaN/Inf) silently propagate to
+        LAS output.
+        """
+        if not self.base_name or not self.base_name.strip():
+            raise ValueError(
+                f"ArrayElementInfo: base_name must not be empty or "
+                f"whitespace-only, got {self.base_name!r}"
+            )
+        if not isinstance(self.index, int):
+            raise TypeError(
+                f"ArrayElementInfo: index must be int, got "
+                f"{type(self.index).__name__} ({self.index!r})"
+            )
+        if self.index < 0:
+            raise ValueError(
+                f"ArrayElementInfo: index must be >= 0, got {self.index!r}"
+            )
+        if self.time_offset is not None and (
+            not isinstance(self.time_offset, (int, float))
+            or (isinstance(self.time_offset, float) and not math.isfinite(self.time_offset))
+        ):
+            raise ValueError(
+                f"ArrayElementInfo: time_offset must be a finite number "
+                f"or None, got {self.time_offset!r}"
+            )
+
 
 @dataclass
 class CurveDefinition:
@@ -686,7 +719,7 @@ class CurveDefinition:
         # strip() catches leading/trailing whitespace but "GR 1"
         # passes — embedded spaces survive to produce corrupted
         # LAS output (space is the field delimiter).
-        if not self.mnemonic or not self.mnemonic.strip() or ' ' in self.mnemonic.strip() or '\t' in self.mnemonic.strip():
+        if not self.mnemonic or not self.mnemonic.strip() or self.mnemonic != self.mnemonic.strip() or ' ' in self.mnemonic.strip() or '\t' in self.mnemonic.strip():
             raise ValueError(
                 f"CurveDefinition: mnemonic must not be empty, "
                 f"whitespace-only, or contain spaces/tabs, "
@@ -788,7 +821,7 @@ class ParameterEntry:
         # strip() catches leading/trailing whitespace but "GR 1"
         # passes — embedded spaces survive to produce corrupted
         # LAS output (space is the field delimiter).
-        if not self.mnemonic or not self.mnemonic.strip() or ' ' in self.mnemonic.strip() or '\t' in self.mnemonic.strip():
+        if not self.mnemonic or not self.mnemonic.strip() or self.mnemonic != self.mnemonic.strip() or ' ' in self.mnemonic.strip() or '\t' in self.mnemonic.strip():
             raise ValueError(
                 f"ParameterEntry: mnemonic must not be empty, "
                 f"whitespace-only, or contain spaces/tabs, "
@@ -1039,6 +1072,34 @@ class DataSection:
                     f"({_data_rows}) does not match string_data "
                     f"row count ({_string_rows})"
                 )
+
+        # Cross-validate data_format against numeric/string data placement
+        # (mirrors _check_df_vs_placement in from_dict path, IF-026).
+        # Direct construction with S-format curve in data or F-format in
+        # string_data passes silently without this check.
+        # Skip for LAS 3.0 typed sections (e.g., Core) where format
+        # conventions differ — CDES with S-format in numeric data is valid.
+        if not self.section_type:
+            for _sc in self.section_curves:
+                _df = _sc.data_format
+                _mnem = _sc.mnemonic
+                if not _df:
+                    continue
+                # I2F-37: {A} without array_info is string-format, not numeric.
+                if _mnem in data_keys and (
+                    _df == "S" or (_df == "A" and not _sc.is_array_element)
+                ):
+                    raise LASDataError(
+                        f"DataSection '{self.name}': curve '{_mnem}' has "
+                        f"data_format='{_df}' but is in data (numeric). "
+                        f"String-format curves must be in string_data."
+                    )
+                if _df not in ("S", "A") and _mnem in string_keys:
+                    raise LASDataError(
+                        f"DataSection '{self.name}': curve '{_mnem}' has "
+                        f"data_format='{_df}' but is in string_data. "
+                        f"Numeric-format curves must be in data."
+                    )
 
         # F-M-036: Detect uncovered curves — curves in curves_order that
         # have no data in either 'data' or 'string_data'.  The writer pads
@@ -1461,7 +1522,7 @@ class LASFile:
             if not isinstance(data, dict):
                 raise TypeError(f"Expected dict, got {type(data).__name__}")
             # F-40: Protect caller's dict from mutation.
-            data = data.copy()
+            data = copy.deepcopy(data)
 
             # F-017/F-018/IF-015/IF-026/F-019: Pre-construction validation layer.
             # Closes Pattern #7 (from_dict validation gaps) structurally.
@@ -1706,7 +1767,7 @@ class LASFile:
                 # Check for parameter_details first to preserve full metadata
                 # on roundtrip (e.g. array_index, zone, unit, description).
                 param_details = data.get("parameter_details")
-                if param_details:
+                if param_details is not None:
                     if len(param_details) >= MAX_PARAMETERS:
                         raise ValueError(
                             f"Number of parameter details ({len(param_details)}) exceeds maximum "
@@ -1759,7 +1820,7 @@ class LASFile:
             # _other_lines.  from_dict previously counted len(str) — characters
             # in the joined other-section string.  Using splitlines() aligns
             # the guard: a file accepted by parse() is accepted by from_dict().
-            _other_str = str(data.get("other", ""))
+            _other_str = _safe_str(data.get("other"), "")
             _other_line_count = len(_other_str.splitlines())
             if _other_line_count >= MAX_OTHER_LINES:
                 raise ValueError(
@@ -2556,7 +2617,7 @@ class DevFile:
             if not isinstance(data, dict):
                 raise TypeError(f"Expected dict, got {type(data).__name__}")
             # F2-12: Protect caller's dict from mutation.
-            data = data.copy()
+            data = copy.deepcopy(data)
 
             dev = cls()
             # Separate column arrays from metadata keys
@@ -2843,5 +2904,5 @@ class DevFile:
                                 stacklevel=2,
                             )
             return dev
-        except (ValueError, TypeError, OverflowError, ImportError) as e:
+        except (ValueError, TypeError, OverflowError) as e:
             raise LASDataError(str(e)) from e

@@ -524,18 +524,19 @@ def _write_curve_section(las_file: LASFile) -> list[str]:
     lines.append("~CURVE INFORMATION")
 
     if is_las30 and las_file.data_sections:
-        # Use the LOG_DATA section's curve definitions for the main ~C block.
+        # Accumulate curve definitions from ALL LOG_DATA sections.
+        # F-209: next() selected only the first LOG_DATA section, silently
+        # dropping curves from subsequent LOG_DATA sections.  Iterate all
+        # sections so multi-section files preserve their ~CURVE metadata.
         # F2-006: Normalize section_type to uppercase — from_dict does not
         # normalize, so programmatically constructed files may have lowercase.
-        log_section = next(
-            (ds for ds in las_file.data_sections if (ds.section_type or "LOG_DATA").upper() == "LOG_DATA"),
-            None,
-        )
-        curves_to_emit = (
-            log_section.section_curves
-            if log_section and log_section.section_curves
-            else las_file.curves
-        )
+        curves_to_emit: list[CurveDefinition] = []
+        for ds in las_file.data_sections:
+            if (ds.section_type or "LOG_DATA").upper() == "LOG_DATA":
+                if ds.section_curves:
+                    curves_to_emit.extend(ds.section_curves)
+        if not curves_to_emit:
+            curves_to_emit = list(las_file.curves)
         if not curves_to_emit:
             import warnings
 
@@ -544,6 +545,7 @@ def _write_curve_section(las_file: LASFile) -> list[str]:
                 UserWarning,
                 stacklevel=3,
             )
+            lines.append("")
             return lines
         for curve in curves_to_emit:
             lines.append(_format_curve_line(curve, is_las30))
@@ -752,6 +754,12 @@ def _section_type_to_prefix(section_type: str) -> str:
 def _format_curve_line(curve: CurveDefinition, is_las30: bool) -> str:
     """Format a single CurveDefinition as a LAS curve line."""
     unit = _sanitize_las_value(curve.unit) if curve.unit else ""
+    # F-210: Escape colons in the unit field.  The unit appears between
+    # the mnemonic and the description (MNEM.UNIT  : DESC), BEFORE the
+    # structural colon.  A unit containing " : " creates a spurious
+    # structural separator that misroutes parser split results.
+    # Same pattern used in _write_parameter_section and _write_well_section.
+    unit = _escape_colons_for_las_value(unit) if unit else ""
     desc = curve.description if curve.description else ""
 
     if is_las30 and curve.data_format:
