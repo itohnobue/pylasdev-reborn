@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import numpy as np
@@ -2141,3 +2142,265 @@ class TestProductionCheckModelsFixes:
         finally:
             if original is not None:
                 dr_mod._normalize_dev_column = original
+
+
+# ============================================================
+# Stage 9 Re-Fix Regression Tests (5 confirmed fixes)
+# ============================================================
+
+
+class TestReFixModels1:
+    """Regression tests for Stage 9 re-fix of models-1 findings."""
+
+    # --- F-046 (MEDIUM): DataSection section_type gate ---
+
+    def test_datasection_default_log_data_s_format_in_data_raises(self) -> None:
+        """F-046: DataSection with section_type='LOG_DATA' validates format.
+
+        Before the fix, ``if not self.section_type:`` always skipped
+        validation for the default 'LOG_DATA' (truthy), so S-format
+        curves in numeric data passed silently.  After the fix,
+        'LOG_DATA' sections are validated too.
+        """
+        sc = CurveDefinition(mnemonic="STR", data_format="S")
+        # F-046 fix: LOG_DATA section_type now triggers format validation.
+        # __post_init__ is called automatically during dataclass construction.
+        with pytest.raises(LASDataError, match=r"curve 'STR'.*data_format='S'.*in data"):
+            DataSection(
+                name="Test",
+                section_type="LOG_DATA",
+                curves_order=["STR"],
+                data={"STR": np.array([1.0, 2.0])},
+                section_curves=[sc],
+            )
+
+    def test_datasection_log_data_f_format_in_string_data_raises(self) -> None:
+        """F-046: LOG_DATA section validates string_data placement.
+
+        Numeric-format curves in string_data should raise LASDataError
+        when section_type is 'LOG_DATA'.
+        """
+        sc = CurveDefinition(mnemonic="GR", data_format="F")
+        with pytest.raises(
+            LASDataError, match=r"curve 'GR'.*data_format='F'.*in string_data"
+        ):
+            DataSection(
+                name="Test",
+                section_type="LOG_DATA",
+                curves_order=["GR"],
+                string_data={"GR": np.array(["a", "b"])},
+                section_curves=[sc],
+            )
+
+    # --- F-048 (MEDIUM): DataSection dtype validation ---
+
+    def test_datasection_string_dtype_in_data_warns(self) -> None:
+        """F-048: Non-numeric dtype in 'data' triggers warning.
+
+        String arrays (dtype='<U...') in the numeric 'data' field
+        should trigger a warnings.warn about non-numeric dtype.
+        """
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            DataSection(
+                name="Test",
+                curves_order=["DEPT"],
+                data={"DEPT": np.array(["abc", "def"], dtype=str)},
+            )
+            dtype_warnings = [
+                x for x in w
+                if "non-numeric dtype" in str(x.message)
+                and "DEPT" in str(x.message)
+            ]
+        assert len(dtype_warnings) == 1, (
+            f"Expected 1 dtype warning for DEPT, got {len(dtype_warnings)}"
+        )
+
+    def test_datasection_numeric_dtype_in_string_data_warns(self) -> None:
+        """F-048: Numeric dtype in 'string_data' triggers warning.
+
+        Float arrays (dtype='float64') in the 'string_data' field
+        should trigger a warnings.warn about numeric dtype.
+        """
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            DataSection(
+                name="Test",
+                curves_order=["STR"],
+                string_data={"STR": np.array([1.0, 2.0], dtype=np.float64)},
+            )
+            dtype_warnings = [
+                x for x in w
+                if "numeric dtype" in str(x.message)
+                and "STR" in str(x.message)
+            ]
+        assert len(dtype_warnings) == 1, (
+            f"Expected 1 dtype warning for STR, got {len(dtype_warnings)}"
+        )
+
+    def test_datasection_numeric_dtype_in_data_no_warn(self) -> None:
+        """F-048: Numeric dtype in 'data' does NOT trigger warning.
+
+        Float64 arrays in the numeric 'data' field are correct
+        and should not trigger any dtype warnings.
+        """
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            DataSection(
+                name="Test",
+                curves_order=["DEPT"],
+                data={"DEPT": np.array([1.0, 2.0], dtype=np.float64)},
+            )
+            dtype_warnings = [
+                x for x in w
+                if "non-numeric dtype" in str(x.message)
+            ]
+        assert len(dtype_warnings) == 0, (
+            f"Expected 0 dtype warnings for numeric data, got {len(dtype_warnings)}"
+        )
+
+    # --- F-059 (MEDIUM): LASFile data_format cross-validation ---
+
+    def test_lasfile_s_format_in_logs_warns(self) -> None:
+        """F-059: S-format curve in logs (numeric) triggers warning.
+
+        LASFile.__post_init__ should warn when a curve with data_format='S'
+        is placed in the logs dict (numeric storage).
+        """
+        sc = CurveDefinition(mnemonic="STR", data_format="S")
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            LASFile(
+                version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+                well=WellSection(entries={"STRT": "0", "STOP": "100", "STEP": "10", "NULL": "-999"}),
+                curves=[sc],
+                curves_order=["STR"],
+                logs={"STR": np.array([1.0, 2.0])},
+            )
+            s_format_warnings = [
+                x for x in w
+                if "string-format" in str(x.message)
+                and "STR" in str(x.message)
+            ]
+        assert len(s_format_warnings) == 1, (
+            f"Expected 1 S-format warning for STR, got {len(s_format_warnings)}"
+        )
+
+    def test_lasfile_numeric_format_in_string_data_warns(self) -> None:
+        """F-059: Numeric-format curve in string_data triggers warning.
+
+        LASFile.__post_init__ should warn when a numeric-format curve
+        is placed in the string_data dict.
+        """
+        sc = CurveDefinition(mnemonic="GR", data_format="F")
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            LASFile(
+                version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+                well=WellSection(entries={"STRT": "0", "STOP": "100", "STEP": "10", "NULL": "-999"}),
+                curves=[sc],
+                curves_order=["GR"],
+                string_data={"GR": np.array(["a", "b"], dtype=str)},
+            )
+            num_format_warnings = [
+                x for x in w
+                if "numeric-format" in str(x.message)
+                and "GR" in str(x.message)
+            ]
+        assert len(num_format_warnings) == 1, (
+            f"Expected 1 numeric-format warning for GR, got {len(num_format_warnings)}"
+        )
+
+    # --- E-F-022 (MEDIUM): string_data and data_sections overlap detection ---
+
+    def test_from_dict_string_data_data_sections_overlap_warns(self) -> None:
+        """E-F-022: Overlap between top-level string_data and data_sections warns.
+
+        When the same curve name appears in both top-level 'string_data'
+        and inside 'data_sections', the writer ignores the top-level
+        value — this should produce a warning.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "0", "STOP": "100", "STEP": "10", "NULL": "-999"},
+            "curves": [
+                {
+                    "mnemonic": "STR",
+                    "unit": None,
+                    "data_format": "S",
+                    "description": "",
+                },
+            ],
+            "curves_order": ["STR"],
+            "string_data": {"STR": np.array(["a", "b"])},
+            "data_sections": [
+                {
+                    "name": "Section1",
+                    "section_type": "LOG_DATA",
+                    "curves_order": ["STR"],
+                    "string_data": {"STR": np.array(["c", "d"])},
+                }
+            ],
+        }
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            LASFile.from_dict(data)
+            overlap_warnings = [
+                x for x in w
+                if "top-level 'string_data'" in str(x.message)
+                and "data_sections" in str(x.message)
+            ]
+        assert len(overlap_warnings) == 1, (
+            f"Expected 1 overlap warning, got {len(overlap_warnings)}"
+        )
+
+    # --- E-F-026 (MEDIUM): DevFile __post_init__ ---
+
+    def test_dev_file_post_init_column_order_keys_mismatch_raises(self) -> None:
+        """E-F-026: DevFile raises when column_order and columns keys don't match.
+
+        Direct construction with mismatched column_order should raise
+        LASDataError via the new __post_init__.
+        """
+        with pytest.raises(LASDataError, match="column_order and columns keys do not match"):
+            DevFile(
+                columns={"MD": np.array([0.0]), "TVD": np.array([0.0])},
+                column_order=["MD"],  # TVD missing
+            )
+
+    def test_dev_file_post_init_inconsistent_lengths_raises(self) -> None:
+        """E-F-026: DevFile raises on inconsistent array lengths.
+
+        Direct construction with columns of different lengths should
+        raise LASDataError via __post_init__.
+        """
+        with pytest.raises(LASDataError, match="inconsistent array lengths"):
+            DevFile(
+                columns={
+                    "MD": np.array([0.0, 100.0, 200.0]),
+                    "TVD": np.array([0.0, 99.0]),  # Only 2 values
+                },
+                column_order=["MD", "TVD"],
+            )
+
+    def test_dev_file_post_init_empty_construction_passes(self) -> None:
+        """E-F-026: Empty DevFile construction does not raise.
+
+        DevFile() with defaults should pass __post_init__ without error
+        (incremental construction is allowed).
+        """
+        dev = DevFile()  # No exception
+        assert dev.columns == {}
+        assert dev.column_order == []
+
+    def test_dev_file_post_init_valid_matching_passes(self) -> None:
+        """E-F-026: DevFile with valid matching data passes __post_init__."""
+        dev = DevFile(
+            columns={
+                "MD": np.array([0.0, 100.0]),
+                "TVD": np.array([0.0, 99.0]),
+            },
+            column_order=["MD", "TVD"],
+        )
+        assert "MD" in dev.columns
+        assert "TVD" in dev.columns

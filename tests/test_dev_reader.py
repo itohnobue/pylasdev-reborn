@@ -503,18 +503,18 @@ class TestDevSafetyGuards:
 
     # ── F-R-07: Diagnostic counter pattern ───────────────────────────
 
-    def test_extra_short_row_counter_summary(self, tmp_path: Path, caplog) -> None:
+    def test_extra_short_row_counter_summary(self, tmp_path: Path) -> None:
         """Multiple mismatched rows produce end-of-section counter summary.
 
         F-R-07: Replaces boolean-once warnings with counters — first
         occurrence logs full context, subsequent are counted silently,
-        and a summary is logged at the end.
+        and a summary is warned at the end.
 
         Creates a DEV file with 2 extra-column rows and 2 short rows,
         verifies that all 4 rows produce warnings (not just the first
         of each type) and that the end-of-section summary fires.
         """
-        import logging
+        import warnings
 
         content = (
             "MD TVD INC\n"              # 3 columns expected
@@ -527,7 +527,8 @@ class TestDevSafetyGuards:
         test_file = tmp_path / "counter.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        with caplog.at_level(logging.WARNING, logger="pylasdev.dev_reader"):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             data = read_dev_file(test_file)
 
         # Verify data was parsed correctly (discard works, NaN fill works)
@@ -540,7 +541,7 @@ class TestDevSafetyGuards:
         assert np.isnan(data["INC"][4])
 
         # Find warning messages
-        warning_texts = [r.message for r in caplog.records]
+        warning_texts: list[str] = [str(warn.message) for warn in w]
 
         summary_extra = [m for m in warning_texts if "data line(s) had more values" in m]
         summary_short = [m for m in warning_texts if "data line(s) had fewer values" in m]
@@ -1085,6 +1086,87 @@ class TestFormatAutoDetection:
 
         dev = read_dev_file_as_object(test_file)
         assert dev.column_order == ["MD", "TVD", "X", "Y"]
+
+    # F-093: Petrel well-header regression tests
+    def test_petrel_well_header_detected_and_skipped(self, tmp_path: Path) -> None:
+        """F-093 HIGH: Petrel well-header line detected and data parsed correctly.
+
+        Petrel exports DEV files with a well-header line preceding column
+        names, e.g. "WELL-1 1000.0 2000.0 50.0".  Without F-093 fix, this
+        line is consumed as column names (WELL-1, 1000.0, 2000.0, 50.0) and
+        the real header "MD INC AZI TVD" becomes NaN data.
+        """
+        import warnings
+
+        content = (
+            "WELL-1 1000.0 2000.0 50.0\n"   # Petrel well-header
+            "MD INC AZI TVD\n"                # real column names
+            "0.0 0.0 90.0 0.0\n"             # data row 1
+            "100.0 0.0 90.0 -100.0\n"         # data row 2
+            "200.0 0.0 90.0 -200.0\n"         # data row 3
+        )
+        test_file = tmp_path / "petrel.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        # Verify Petrel well-header warning was emitted
+        petrel_warnings = [
+            str(x.message) for x in w
+            if "Petrel well-header" in str(x.message)
+        ]
+        assert len(petrel_warnings) == 1, (
+            f"Expected Petrel well-header warning, got: "
+            f"{[str(x.message) for x in w]}"
+        )
+
+        # Verify correct column names (NOT "WELL-1", "1000.0", etc.)
+        assert list(data.keys()) == ["MD", "INC", "AZI", "TVD"], (
+            f"Expected ['MD','INC','AZI','TVD'], got {list(data.keys())}"
+        )
+
+        # Verify actual data (NOT NaN from consuming well-header as data)
+        assert data["MD"][0] == 0.0
+        assert data["MD"][1] == 100.0
+        assert data["MD"][2] == 200.0
+        assert data["TVD"][0] == 0.0
+        assert data["TVD"][1] == -100.0
+        assert data["TVD"][2] == -200.0
+        assert data["INC"][0] == 0.0
+        assert data["AZI"][0] == 90.0
+
+    def test_petrel_well_header_all_numeric_line_alone_not_misdetected(
+        self, tmp_path: Path
+    ) -> None:
+        """F-093: A single numeric-token header line alone is not misdetected.
+
+        When a line like "100 200 300" (all float) appears as the first
+        content line, it should remain headerless (or simple with numeric
+        column names) — NOT trigger Petrel detection.
+        """
+        content = (
+            "100 200 300\n"
+            "1.0 2.0 3.0\n"
+            "4.0 5.0 6.0\n"
+        )
+        test_file = tmp_path / "numeric_header.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _ = read_dev_file(test_file)
+
+        # Should NOT have a Petrel warning
+        petrel_warnings = [
+            str(x.message) for x in w
+            if "Petrel well-header" in str(x.message)
+        ]
+        assert len(petrel_warnings) == 0, (
+            "Should NOT detect Petrel well-header for all-numeric line"
+        )
 
 
 class TestExplicitDelimiterParameter:

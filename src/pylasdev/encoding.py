@@ -58,6 +58,34 @@ FALLBACK_ENCODINGS = ["utf-8", "cp1251", "cp866", "cp1252", "latin-1"]
 _MIN_VALIDATION_CHARS = 65_536  # Sample first 64K chars/bytes for analysis
 
 
+def _has_cyrillic_text(text: str) -> bool:
+    """Check if *text* contains any Cyrillic code points (U+0400-U+04FF)."""
+    for ch in text:
+        cp = ord(ch)
+        if 0x0400 <= cp <= 0x04FF:
+            return True
+    return False
+
+
+def _max_cyrillic_run(text: str) -> int:
+    """Return the length of the longest consecutive run of Cyrillic characters.
+
+    A run length >= 3 is a strong signal that the encoding is genuinely
+    Cyrillic rather than accidental byte-frequency matches.
+    """
+    max_run = 0
+    current_run = 0
+    for ch in text:
+        cp = ord(ch)
+        if 0x0400 <= cp <= 0x04FF:
+            current_run += 1
+            if current_run > max_run:
+                max_run = current_run
+        else:
+            current_run = 0
+    return max_run
+
+
 def detect_encoding(file_path: Path) -> str:
     """Detect file encoding using chardet (if available) or fallback chain.
 
@@ -200,6 +228,17 @@ def _decode_best_quality(
     _russian_byte_count = sum(1 for b in _raw_sample if b in _RUSSIAN_COMMON_BYTES)
     _russian_byte_freq = _russian_byte_count / max(len(_raw_sample), 1)
     _is_cyrillic = _russian_byte_freq >= 0.10
+    # F-129+F-132: Run-length analysis catches cp1251 files with large
+    # ASCII headers that dilute byte-frequency below the 10% threshold.
+    # Decode with cp1251 (always succeeds) and check for concentrated
+    # Cyrillic runs — 3+ consecutive Cyrillic chars strongly indicates
+    # genuine Russian content regardless of byte-frequency.
+    if not _is_cyrillic:
+        _cp1251_sample = raw_bytes[:_MIN_VALIDATION_CHARS].decode(
+            "cp1251", errors="replace"
+        )
+        if _has_cyrillic_text(_cp1251_sample) and _max_cyrillic_run(_cp1251_sample) >= 3:
+            _is_cyrillic = True
     _preferred = _CYRILLIC_ENCS if _is_cyrillic else _WESTERN
     candidates.sort(key=lambda x: (-x[2], 0 if x[0] in _preferred else 1))
     best_enc, _best_sample, best_ratio = candidates[0]

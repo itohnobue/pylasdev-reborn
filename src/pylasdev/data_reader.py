@@ -11,6 +11,7 @@ import logging
 import math
 import re
 import warnings
+from types import ModuleType
 
 import numpy as np
 
@@ -182,6 +183,18 @@ def _parse_float_with_d_notation(value_str: str) -> float:
     return float(value_str.replace("D", "E").replace("d", "e"))
 
 
+def _get_parser_module() -> ModuleType:
+    """Lazy-import the parser module to break circular import.
+
+    data_reader is imported by parser, but data_reader needs access
+    to parser's module-level attributes (e.g., _DESANITIZE_ENABLED)
+    for unified desanitize state.  Lazy import defers the import to
+    call time, avoiding the cycle.
+    """
+    from . import parser as _p
+    return _p
+
+
 # F-212: Module-level flag to control _desanitize_las_value behaviour.
 # Set to False when reading files NOT produced by pylasdev's writer, to
 # avoid corrupting ``_#`` sequences that are legitimate data, not escaped
@@ -199,7 +212,7 @@ def _desanitize_las_value(value: str) -> str:
 
     Defined locally in data_reader to avoid circular import from parser.
     """
-    if not _DESANITIZE_ENABLED:
+    if not _get_parser_module()._DESANITIZE_ENABLED:
         return value
     if value.startswith("_#"):
         return value[1:]
@@ -242,9 +255,11 @@ def _get_null_value(
         # null value.  Silent fallback to -999.25 with zero diagnostics
         # makes it impossible to distinguish a genuine -999.25 null
         # sentinel from a failed parse.
-        logger.warning(
-            "Could not parse NULL value from well section; "
-            "falling back to default value %.2f.", default_float
+        warnings.warn(
+            f"Could not parse NULL value from well section; "
+            f"falling back to default value {default_float:.2f}.",
+            UserWarning,
+            stacklevel=2,
         )
         return default_float
 
@@ -291,7 +306,8 @@ def _to_finite_float(
     return val
 
 
-def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int) -> None:
+def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int,
+                    desanitize: bool = True) -> None:
     """Read the ~A (ASCII data) section and populate las_file.logs.
 
     Args:
@@ -299,6 +315,10 @@ def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int) -
             for efficiency — eliminates redundant content.splitlines()).
         las_file: LASFile object with curves_order already populated.
         data_line_count: Number of data lines (from pre-scan).
+        desanitize: If True (default), strip writer escape prefixes
+            (_# → #) for roundtrip correctness.  Set to False when
+            reading files NOT produced by pylasdev's writer to avoid
+            corrupting genuine _#-prefixed data.
     """
     if len(las_file.curves_order) == 0:
         # F32: Warn when data is present but no curves are defined,
@@ -339,6 +359,11 @@ def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int) -
     # have their own wrapped-aware bounds checks.  For WRAP=NO, this
     # simply eliminates a redundant check (the same bounds guard runs
     # inside _read_normal).
+
+    # F-212: Route the desanitize parameter to the unified parser flag
+    # so _desanitize_las_value and parser._desanitize_las_value share the
+    # same module-level state.
+    _get_parser_module()._DESANITIZE_ENABLED = desanitize  # type: ignore[attr-defined]
 
     delimiter = las_file.version.delimiter_char
 
@@ -718,12 +743,13 @@ def _read_normal(
                     section_word = _get_section_word(stripped)
                     if _is_recognized_section_word(section_word):
                         break
-                    logger.warning(
-                        "Unrecognized section header '~%s' found in ASCII "
-                        "data section.  This may be an artifact of "
-                        "control-character replacement (SPLITLINES_CHARS_RE). "
-                        "Skipping line.",
-                        section_word,
+                    warnings.warn(
+                        f"Unrecognized section header '~{section_word}' found in ASCII "
+                        f"data section.  This may be an artifact of "
+                        f"control-character replacement (SPLITLINES_CHARS_RE). "
+                        f"Skipping line.",
+                        UserWarning,
+                        stacklevel=2,
                     )
             continue
 
@@ -756,12 +782,12 @@ def _read_normal(
         # occurrences are counted silently; summary logged at end.
         if len(values) > curve_count:
             if extra_col_count is None:
-                logger.warning(
-                    "Data line has %d values but only %d curves declared "
-                    "in ~C section. Extra columns are discarded. "
-                    "(Further occurrences will be counted.)",
-                    len(values),
-                    curve_count,
+                warnings.warn(
+                    f"Data line has {len(values)} values but only {curve_count} curves declared "
+                    f"in ~C section. Extra columns are discarded. "
+                    f"(Further occurrences will be counted.)",
+                    UserWarning,
+                    stacklevel=2,
                 )
                 extra_col_count = 1
             else:
@@ -775,13 +801,12 @@ def _read_normal(
         # occurrences are counted silently; summary logged at end.
         if len(values) < curve_count:
             if short_row_count is None:
-                logger.warning(
-                    "Data line has %d values but %d curves declared in ~C section. "
-                    "Missing values are filled with the null value (%.2f). "
-                    "(Further occurrences will be counted.)",
-                    len(values),
-                    curve_count,
-                    null_value,
+                warnings.warn(
+                    f"Data line has {len(values)} values but {curve_count} curves declared in ~C section. "
+                    f"Missing values are filled with the null value ({null_value:.2f}). "
+                    f"(Further occurrences will be counted.)",
+                    UserWarning,
+                    stacklevel=2,
                 )
                 short_row_count = 1
             else:
@@ -822,12 +847,12 @@ def _read_normal(
 
     # Warn when pre-scan undercounted data lines, causing data discard.
     if discarded_lines > 0:
-        logger.warning(
-            "Pre-scan undercount: %d data line(s) discarded because the "
-            "actual data exceeds the %d lines declared by the pre-scan. "
-            "Las file data may be truncated.",
-            discarded_lines,
-            data_line_count,
+        warnings.warn(
+            f"Pre-scan undercount: {discarded_lines} data line(s) discarded because the "
+            f"actual data exceeds the {data_line_count} lines declared by the pre-scan. "
+            f"Las file data may be truncated.",
+            UserWarning,
+            stacklevel=2,
         )
 
     # F-024: Warn when pre-scan overcounted data lines (fewer actual data
@@ -836,25 +861,25 @@ def _read_normal(
     # — e.g. a multi-section file where _pre_scan counts lines across all
     # sections but _read_normal only consumes those in the first ~A section.
     if current_line < data_line_count:
-        logger.warning(
-            "Pre-scan overcount: declared %d data lines but only %d actual "
-            "data lines found in ~A section. Arrays will be trimmed to "
-            "actual line count.",
-            data_line_count,
-            current_line,
+        warnings.warn(
+            f"Pre-scan overcount: declared {data_line_count} data lines but only {current_line} actual "
+            f"data lines found in ~A section. Arrays will be trimmed to "
+            f"actual line count.",
+            UserWarning,
+            stacklevel=2,
         )
 
     # F-PXR-03: Warn when non-trivial conversion failures occurred
     # (non-empty input values that could not be parsed as finite floats
     # and were silently replaced with the null value).
     if _fc[0] > 0:
-        logger.warning(
-            "%d value(s) could not be converted to finite float "
-            "and were replaced with the null value (%.2f). "
-            "This may indicate string data, corrupt values, or "
-            "non-standard formatting.",
-            _fc[0],
-            null_value,
+        warnings.warn(
+            f"{_fc[0]} value(s) could not be converted to finite float "
+            f"and were replaced with the null value ({null_value:.2f}). "
+            f"This may indicate string data, corrupt values, or "
+            f"non-standard formatting.",
+            UserWarning,
+            stacklevel=2,
         )
 
     # F-I2-XPD-03: Summary of extra-column and short-row occurrences,
@@ -862,19 +887,18 @@ def _read_normal(
     # diagnostics after the first row.  This allows automated data
     # quality tools to enumerate affected rows.
     if extra_col_count is not None and extra_col_count > 1:
-        logger.warning(
-            "%d data line(s) had more values than the %d declared curves. "
-            "Extra columns were discarded.",
-            extra_col_count,
-            curve_count,
+        warnings.warn(
+            f"{extra_col_count} data line(s) had more values than the {curve_count} declared curves. "
+            f"Extra columns were discarded.",
+            UserWarning,
+            stacklevel=2,
         )
     if short_row_count is not None and short_row_count > 1:
-        logger.warning(
-            "%d data line(s) had fewer values than the %d declared curves. "
-            "Missing values were filled with the null value (%.2f).",
-            short_row_count,
-            curve_count,
-            null_value,
+        warnings.warn(
+            f"{short_row_count} data line(s) had fewer values than the {curve_count} declared curves. "
+            f"Missing values were filled with the null value ({null_value:.2f}).",
+            UserWarning,
+            stacklevel=2,
         )
 
     # F36: Trim arrays when ~A section ended early (fewer data lines than
@@ -1021,12 +1045,13 @@ def _read_wrapped(
                     section_word = _get_section_word(stripped)
                     if _is_recognized_section_word(section_word):
                         break
-                    logger.warning(
-                        "Unrecognized section header '~%s' found in ASCII "
-                        "data section (wrapped mode).  This may be an "
-                        "artifact of control-character replacement "
-                        "(SPLITLINES_CHARS_RE).  Skipping line.",
-                        section_word,
+                    warnings.warn(
+                        f"Unrecognized section header '~{section_word}' found in ASCII "
+                        f"data section (wrapped mode).  This may be an "
+                        f"artifact of control-character replacement "
+                        f"(SPLITLINES_CHARS_RE).  Skipping line.",
+                        UserWarning,
+                        stacklevel=2,
                     )
             continue
 
@@ -1124,6 +1149,8 @@ def _read_wrapped(
                         stacklevel=2,
                     )
                     depth_had_extra = False  # This line handled the extra-values case
+                    depth_line = True
+                    counter = 0
 
             for i, val_str in enumerate(values):
                 counter += 1
@@ -1246,13 +1273,13 @@ def _read_wrapped(
 
     # F-PXR-03: Warn when non-trivial conversion failures occurred.
     if _fc[0] > 0:
-        logger.warning(
-            "%d value(s) could not be converted to finite float "
-            "and were replaced with the null value (%.2f). "
-            "This may indicate string data, corrupt values, or "
-            "non-standard formatting.",
-            _fc[0],
-            null_value,
+        warnings.warn(
+            f"{_fc[0]} value(s) could not be converted to finite float "
+            f"and were replaced with the null value ({null_value:.2f}). "
+            f"This may indicate string data, corrupt values, or "
+            f"non-standard formatting.",
+            UserWarning,
+            stacklevel=2,
         )
 
     # Convert float lists to numpy arrays

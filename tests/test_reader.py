@@ -1720,9 +1720,7 @@ class TestExtraColumnWarning:
     MORE columns than curve_count. Exercises the `warned_extra` flag path.
     """
 
-    def test_extra_columns_warning_normal(
-        self, caplog: pytest.LogCaptureFixture, tmp_path: Path
-    ) -> None:
+    def test_extra_columns_warning_normal(self, tmp_path: Path) -> None:
         """Test extra-column warning triggered in non-wrapped mode."""
         content = (
             "~VERSION INFORMATION\n"
@@ -1740,9 +1738,11 @@ class TestExtraColumnWarning:
         test_file = tmp_path / "extra_cols.las"
         test_file.write_text(content, encoding="utf-8")
 
-        with caplog.at_level(logging.WARNING, logger="pylasdev.data_reader"):
+        # F-089: warnings now issued via warnings.warn, not logger.warning
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             data = read_las_file(test_file)
-            assert "Extra columns are discarded" in caplog.text
+            assert any("Extra columns are discarded" in str(x.message) for x in w)
 
         # Data should be read correctly: extra values are silently skipped
         assert data["logs"]["DEPT"][0] == 100.0
@@ -1750,9 +1750,7 @@ class TestExtraColumnWarning:
         assert data["logs"]["DEPT"][1] == 101.0
         assert data["logs"]["DT"][1] == 51.0
 
-    def test_extra_columns_only_first_row_warns(
-        self, caplog: pytest.LogCaptureFixture, tmp_path: Path
-    ) -> None:
+    def test_extra_columns_only_first_row_warns(self, tmp_path: Path) -> None:
         """Test extra-column warning fires only once (warned_extra flag)."""
         content = (
             "~VERSION INFORMATION\n"
@@ -1769,10 +1767,13 @@ class TestExtraColumnWarning:
         test_file = tmp_path / "extra_once.las"
         test_file.write_text(content, encoding="utf-8")
 
-        with caplog.at_level(logging.WARNING, logger="pylasdev.data_reader"):
+        # F-089: warnings now issued via warnings.warn, not logger.warning
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             read_las_file(test_file)
             # The warning text should appear exactly once
-            assert caplog.text.count("Extra columns are discarded") == 1
+            warning_texts = [str(x.message) for x in w]
+            assert sum("Extra columns are discarded" in t for t in warning_texts) == 1
 
 
 class TestLAS30StructuredDataValues:
@@ -2378,6 +2379,100 @@ class TestProductionCheckReaderFixes:
         np.testing.assert_allclose(data["logs"]["DT"], [50.0, 51.0, 52.0])
         np.testing.assert_allclose(data["logs"]["GR"], [75.0, 76.0, 77.0])
 
+    # --- E-F-018 (HIGH): depth_line state machine corruption regression test ---
+
+    def test_wrapped_depth_line_state_machine_non_pathological_ef018(
+        self, tmp_path: Path
+    ) -> None:
+        """E-F-018: Regression test for depth_line state machine fix in _read_wrapped.
+
+        When a depth line has extra values (depth_had_extra=True) and the next
+        data line has fewer values than needed (non-pathological), the fix at
+        data_reader.py:1182-1188 resets depth_line=True and counter=0. Without
+        this fix, the next depth line enters the data branch, causing depth
+        values to silently shift into wrong curve slots (permanent corruption).
+
+        Test scenario (curve_count=4, DEPT + DT, GR, SP):
+          Step 1: depth=1000.0, data=200.0,300.0,400.0  (normal baseline)
+          Step 2: depth=1010.0 + extra 1050.5, data=210.0,310.0 (triggers fix)
+          Step 3: depth=1020.0, data=220.0,320.0,420.0  (proves fix works)
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            " GR.GAPI  :  Gamma Ray\n"
+            " SP.MV    :  Spontaneous Potential\n"
+            "~A\n"
+            # Step 1 (normal baseline): one value per line
+            "1000.0\n"
+            "200.0  300.0  400.0\n"
+            # Step 2 (triggers E-F-018 fix path):
+            #   Depth line: 2 values (>1) → depth_had_extra = True
+            #   Data line: 2 values (<3 remaining curves) → non-pathological
+            #   Fix at data_reader.py:1187-1188: depth_line=True, counter=0
+            "1010.0  1050.5\n"
+            "210.0  310.0\n"
+            # Step 3 (proves fix works):
+            #   With fix: "1020.0" is parsed as DEPT (depth_line=True).
+            #   Without fix: depth_line stays False → "1020.0" goes to DT,
+            #   permanently shifting DEPT values into wrong curve slots.
+            "1020.0\n"
+            "220.0  320.0  420.0\n"
+        )
+        test_file = tmp_path / "ef018_wrapped_state_machine.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_las_file(test_file)
+
+            # Warning 1: depth line has extra values
+            assert any(
+                "depth line has 2 values" in str(x.message) for x in w
+            ), (
+                f"Expected depth-line-extra-values warning, got: "
+                f"{[str(x.message) for x in w]}"
+            )
+            # Warning 2: non-pathological misalignment (data line too short)
+            assert any(
+                "previous depth line had extra values"
+                in str(x.message)
+                for x in w
+            ), (
+                f"Expected non-pathological-misalignment warning, got: "
+                f"{[str(x.message) for x in w]}"
+            )
+
+        # All arrays must have same length (3 depth steps)
+        for curve_name in data["curves_order"]:
+            assert len(data["logs"][curve_name]) == 3, (
+                f"Curve '{curve_name}' has {len(data['logs'][curve_name])} "
+                f"values, expected 3"
+            )
+
+        # DEPT values NOT shifted into data curves (core assertion)
+        np.testing.assert_allclose(
+            data["logs"]["DEPT"], [1000.0, 1010.0, 1020.0]
+        )
+        # Data curves have correct values at correct positions
+        np.testing.assert_allclose(
+            data["logs"]["DT"], [200.0, 210.0, 220.0]
+        )
+        np.testing.assert_allclose(
+            data["logs"]["GR"], [300.0, 310.0, 320.0]
+        )
+        # SP: Step 2 had no SP value, so step 3's value fills slot [1].
+        # The padding logic fills slot [2] with null_value.
+        np.testing.assert_allclose(
+            data["logs"]["SP"], [400.0, 420.0, -999.25]
+        )
+
     # --- F-212 (MEDIUM): _desanitize_las_value unconditional _# strip ---
 
     def test_desanitize_disabled_preserves_hash_prefix(self) -> None:
@@ -2387,9 +2482,12 @@ class TestProductionCheckReaderFixes:
         their data, the desanitize function must not strip the underscore.
         """
         import pylasdev.data_reader as dr_mod
+        import pylasdev.parser as _parser_mod
 
         try:
-            dr_mod._DESANITIZE_ENABLED = False
+            # F-088: _DESANITIZE_ENABLED is now unified in parser.py;
+            # setting parser's flag affects data_reader._desanitize_las_value.
+            _parser_mod._DESANITIZE_ENABLED = False
             # Value starts with _# — should be preserved as-is
             result = dr_mod._desanitize_las_value("_#original_value")
             assert result == "_#original_value", (
@@ -2398,7 +2496,7 @@ class TestProductionCheckReaderFixes:
             # Non-_# value unchanged
             assert dr_mod._desanitize_las_value("normal_value") == "normal_value"
         finally:
-            dr_mod._DESANITIZE_ENABLED = True
+            _parser_mod._DESANITIZE_ENABLED = True
 
     def test_desanitize_enabled_strips_hash_prefix(self) -> None:
         """F-212: Default behavior (enabled) strips _# prefix for roundtrip.
@@ -2407,8 +2505,10 @@ class TestProductionCheckReaderFixes:
         to restore the original #-prefixed value from the writer escape.
         """
         import pylasdev.data_reader as dr_mod
+        import pylasdev.parser as _parser_mod
 
-        assert dr_mod._DESANITIZE_ENABLED is True
+        # F-088: _DESANITIZE_ENABLED is now unified in parser.py.
+        assert _parser_mod._DESANITIZE_ENABLED is True
         result = dr_mod._desanitize_las_value("_#test_value")
         assert result == "#test_value", (
             f"Expected '#test_value' after desanitize, got {result!r}"

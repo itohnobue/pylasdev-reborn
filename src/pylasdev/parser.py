@@ -1480,6 +1480,20 @@ class LASParser:
                     stacklevel=2,
                 )
                 self.las_file.version.vers = "2.0"
+            # F-020 pt2: Deferred DLM re-check.  If DLM was parsed BEFORE
+            # VERS in non-standard ~V ordering, the DLM version guard at
+            # L1501 uses the default "2.0" and incorrectly allows
+            # non-SPACE DLM.  Now that the true version is known, re-validate.
+            if self.las_file.version.vers.startswith("1.") and self.las_file.version.dlm != "SPACE":
+                _prev_dlm = self.las_file.version.dlm
+                self.las_file.version.dlm = "SPACE"
+                warnings.warn(
+                    f"DLM value '{_prev_dlm}' was set before VERS was parsed "
+                    f"and is not supported in LAS 1.2. "
+                    f"Resetting DLM to SPACE.",
+                    UserWarning,
+                    stacklevel=2,
+                )
         elif mnemonic == "WRAP":
             wrap_upper = value.upper()
             if wrap_upper in {"YES", "NO"}:
@@ -1497,6 +1511,14 @@ class LASParser:
             if dlm_upper in {"SPACE", "TAB", "COMMA"}:
                 if not self.las_file.version.vers.startswith("1.") or dlm_upper == "SPACE":
                     self.las_file.version.dlm = dlm_upper
+                else:
+                    warnings.warn(
+                        f"DLM value '{value}' is not supported in LAS 1.2 "
+                        f"(only SPACE is allowed). DLM will be ignored "
+                        f"for this file.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
             else:
                 warnings.warn(
                     f"Unknown DLM value '{value}'. Expected SPACE, TAB, or COMMA. "
@@ -1985,6 +2007,12 @@ class LASParser:
                 # __post_init__ does not reject the multi-char string.
                 # The non-format text is preserved in the description
                 # via _keep_non_format below.
+                warnings.warn(
+                    f"Invalid data format '{data_format}' in curve "
+                    f"'{raw_mnemonic}' — clearing to empty string",
+                    UserWarning,
+                    stacklevel=2,
+                )
                 data_format = ""
             if len(data_format) > 1:
                 data_format = data_format[0]
@@ -2448,6 +2476,16 @@ class LASParser:
         Uses per-section curves (F1) to support LAS 3.0 files where
         different ~C blocks define different curve sets before each ~A.
         """
+        # F-26 / F-033: Global aggregate section count guard — placed
+        # before the empty-data-lines early return so that a file with
+        # MAX_DATA_SECTIONS+1 empty sections cannot bypass the limit.
+        if self._current_data_section_idx >= MAX_DATA_SECTIONS:
+            raise LASParseError(
+                f"Data section count ({self._current_data_section_idx + 1}) exceeds "
+                f"maximum allowed ({MAX_DATA_SECTIONS}). "
+                f"The file may be malformed or corrupt."
+            )
+
         if not self._ascii_data_lines:
             return
 
@@ -2530,22 +2568,34 @@ class LASParser:
         # F-10: Validate cross-curve array continuity per LAS 3.0 spec
         # (section 4.3.1: curve array elements must use sequential [1]→[n]
         # indices with no gaps and consistent data formats across elements).
-        _array_groups: dict[str, list[tuple[int, str, str]]] = {}
-        for curve in section_curves:
+        # F-034: Extended to track position (index within section_curves),
+        # enforce 1-based index start, and detect interleaving of array
+        # and non-array curves.
+        _array_groups: dict[str, list[tuple[int, str, str, int]]] = {}
+        for _pos, curve in enumerate(section_curves):
             if curve.array_info is not None:
                 _base = curve.array_info.base_name
                 if _base not in _array_groups:
                     _array_groups[_base] = []
                 _array_groups[_base].append(
-                    (curve.array_info.index, curve.mnemonic, curve.data_format or "")
+                    (curve.array_info.index, curve.mnemonic,
+                     curve.data_format or "", _pos)
                 )
         for _base_name, _elements in _array_groups.items():
             if len(_elements) < 2:
                 continue
             _elements.sort(key=lambda e: e[0])
-            _expected = _elements[0][0]
+            # F-034 (a): Arrays in LAS 3.0 must use 1-based indices.
+            _first_idx = _elements[0][0]
+            if _first_idx != 1:
+                raise LASParseError(
+                    f"Array '{_base_name}' starts at index {_first_idx}; "
+                    f"LAS 3.0 requires 1-based array indices ([1]→[n])"
+                )
+            _expected = _first_idx
             _ref_fmt = _elements[0][2]
-            for _idx, _mnem, _fmt in _elements:
+            _prev_pos: int | None = None
+            for _idx, _mnem, _fmt, _pos in _elements:
                 if _idx != _expected:
                     raise LASParseError(
                         f"Non-contiguous array indices for '{_base_name}': "
@@ -2557,6 +2607,18 @@ class LASParser:
                         f"Inconsistent data_format for array '{_base_name}': "
                         f"mnemonic '{_mnem}' has '{_fmt}', expected '{_ref_fmt}'"
                     )
+                # F-034 (b): Positional contiguity — array elements must
+                # be consecutive in section_curves.  No non-array curves
+                # may interleave between array elements of the same group.
+                if _prev_pos is not None and _pos != _prev_pos + 1:
+                    raise LASParseError(
+                        f"Array '{_base_name}' elements are not contiguous "
+                        f"in curve order: mnemonic '{_mnem}' at position "
+                        f"{_pos} follows position {_prev_pos} (expected "
+                        f"{_prev_pos + 1}). Non-array curves may be "
+                        f"interleaved."
+                    )
+                _prev_pos = _pos
                 _expected += 1
 
         # Determine which curves are string type.
@@ -2622,6 +2684,21 @@ class LASParser:
             if not COMMENT_PATTERN.match(line) and not EMPTY_PATTERN.match(line)
         )
 
+        # F-26: Global aggregate limit across ALL data sections.
+        # Each section passes per-section bounds (_data_reader.MAX_DATA_LINES,
+        # _data_reader.MAX_CURVES, _data_reader.MAX_TOTAL_ELEMENTS) individually,
+        # but an attacker can craft N sections (each just under the limits) to
+        # cumulatively exhaust memory.  This caps the total number of data
+        # sections processed.
+        # F-033: MOVED above actual_count == 0 early return so empty sections
+        # cannot bypass the global section count limit.
+        if self._current_data_section_idx >= MAX_DATA_SECTIONS:
+            raise LASParseError(
+                f"Data section count ({self._current_data_section_idx + 1}) exceeds "
+                f"maximum allowed ({MAX_DATA_SECTIONS}). "
+                f"The file may be malformed or corrupt."
+            )
+
         # F-I2-M09: Guard against zero data rows.  When actual_count is 0
         # (all lines are comments/blanks), num_curves * 0 = 0 always passes
         # _data_reader.MAX_TOTAL_ELEMENTS check, but np.zeros(0) still allocates an empty
@@ -2650,18 +2727,6 @@ class LASParser:
                     self.las_file.curves[global_idx].original_mnemonic = curve.original_mnemonic
                 self.las_file.curves[global_idx].mnemonic = curve.mnemonic
                 self.las_file.curves_order[global_idx] = deduped_order[i]
-
-        # F-26: Global aggregate limit across ALL data sections.
-        # Each section passes per-section bounds (_data_reader.MAX_DATA_LINES, _data_reader.MAX_CURVES,
-        # _data_reader.MAX_TOTAL_ELEMENTS) individually, but an attacker can craft N
-        # sections (each just under the limits) to cumulatively exhaust
-        # memory.  This caps the total number of data sections processed.
-        if self._current_data_section_idx >= MAX_DATA_SECTIONS:
-            raise LASParseError(
-                f"Data section count ({self._current_data_section_idx + 1}) exceeds "
-                f"maximum allowed ({MAX_DATA_SECTIONS}). "
-                f"The file may be malformed or corrupt."
-            )
 
         # Use ``>`` for consistency with data_reader.py and models.py which use ``>``
         # throughout all MAX_DATA_LINES guards (accepts files at exactly MAX_DATA_LINES).

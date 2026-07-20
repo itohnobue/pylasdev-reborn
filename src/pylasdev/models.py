@@ -388,31 +388,36 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
     # (top-level curves) and data_sections (section-level curves)
     # contain different curve names — that is not ambiguous.
     if isinstance(data_sections, list) and data_sections:
+        # Collect all curve names referenced in data_sections.
+        # F-M-015: Apply case normalization (upper()) before overlap
+        # check.  mnem_base maps semantically-equal keys with different
+        # cases to the same canonical name — raw-key intersection
+        # produces false negatives when mnem_base normalization is active.
+        # Collected once at the top so both F-115 (logs overlap) and
+        # E-F-022 (string_data overlap) can use the same set.
+        _ds_curve_names: set[str] = set()
+        for _ds in data_sections:
+            if isinstance(_ds, dict):
+                _ds_co = _ds.get("curves_order")
+                if isinstance(_ds_co, list):
+                    _ds_curve_names.update(
+                        str(s).upper() for s in _ds_co
+                    )
+                _ds_data = _ds.get("data")
+                if isinstance(_ds_data, dict):
+                    _ds_curve_names.update(
+                        str(k).upper() for k in _ds_data.keys()
+                    )
+                _ds_str = _ds.get("string_data")
+                if isinstance(_ds_str, dict):
+                    _ds_curve_names.update(
+                        str(k).upper() for k in _ds_str.keys()
+                    )
+
+        # F-115: Detect ambiguous curve placement — logs vs
+        # data_sections.
         _logs_raw = data.get("logs")
         if isinstance(_logs_raw, dict) and _logs_raw:
-            # Collect all curve names referenced in data_sections.
-            # F-M-015: Apply case normalization (upper()) before overlap
-            # check.  mnem_base maps semantically-equal keys with different
-            # cases to the same canonical name — raw-key intersection
-            # produces false negatives when mnem_base normalization is active.
-            _ds_curve_names: set[str] = set()
-            for _ds in data_sections:
-                if isinstance(_ds, dict):
-                    _ds_co = _ds.get("curves_order")
-                    if isinstance(_ds_co, list):
-                        _ds_curve_names.update(
-                            str(s).upper() for s in _ds_co
-                        )
-                    _ds_data = _ds.get("data")
-                    if isinstance(_ds_data, dict):
-                        _ds_curve_names.update(
-                            str(k).upper() for k in _ds_data.keys()
-                        )
-                    _ds_str = _ds.get("string_data")
-                    if isinstance(_ds_str, dict):
-                        _ds_curve_names.update(
-                            str(k).upper() for k in _ds_str.keys()
-                        )
             _log_curve_names = {str(k).upper() for k in _logs_raw.keys()}
             _overlap = _log_curve_names & _ds_curve_names
             if _overlap:
@@ -429,6 +434,28 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
                     f"the logs values for these curves.  Place each "
                     f"curve in exactly one location to avoid data "
                     f"loss.",
+                    stacklevel=2,
+                )
+
+        # E-F-022: Detect overlap between top-level string_data and
+        # data_sections[*].string_data.  The writer checks data_sections
+        # first (writer.py:743) — when the same curve name appears in
+        # both top-level string_data and data_sections, the top-level
+        # value is silently ignored.  Warn so callers know about the
+        # data discard.
+        _top_str = data.get("string_data")
+        if isinstance(_top_str, dict) and _top_str:
+            _top_str_names = {str(k).upper() for k in _top_str.keys()}
+            _ds_str_overlap = _top_str_names & _ds_curve_names
+            if _ds_str_overlap:
+                warnings.warn(
+                    f"Curve(s) {sorted(_ds_str_overlap)} appear in "
+                    f"both top-level 'string_data' and "
+                    f"'data_sections'.  The writer uses "
+                    f"data_sections when both are present, ignoring "
+                    f"the top-level string_data values for these "
+                    f"curves.  Place each curve in exactly one "
+                    f"location to avoid data loss.",
                     stacklevel=2,
                 )
 
@@ -1079,7 +1106,11 @@ class DataSection:
         # string_data passes silently without this check.
         # Skip for LAS 3.0 typed sections (e.g., Core) where format
         # conventions differ — CDES with S-format in numeric data is valid.
-        if not self.section_type:
+        # F-046: Expand section_type gate to include "LOG_DATA".
+        # Previously ``if not self.section_type:`` skipped validation
+        # for the default "LOG_DATA" (truthy), so S-format curves in
+        # numeric data and F-format curves in string_data passed silently.
+        if not self.section_type or self.section_type == "LOG_DATA":
             for _sc in self.section_curves:
                 _df = _sc.data_format
                 _mnem = _sc.mnemonic
@@ -1121,6 +1152,28 @@ class DataSection:
                     f"{sorted(uncovered)} appear in curves_order but "
                     f"have no data in 'data' or 'string_data'.  The "
                     f"writer will pad these curves with null_value.",
+                    stacklevel=2,
+                )
+
+        # F-048: Validate dtypes — data arrays must be numeric,
+        # string_data arrays must be non-numeric (object/string).
+        # The from_dict path has structural validation but never checks
+        # actual numpy dtypes.  String arrays in 'data' silently produce
+        # corrupted numeric output downstream.
+        for _k, _arr in self.data.items():
+            if not np.issubdtype(_arr.dtype, np.number):
+                warnings.warn(
+                    f"DataSection '{self.name}': curve '{_k}' in 'data' "
+                    f"has non-numeric dtype ({_arr.dtype}).  'data' "
+                    f"arrays must be numeric.",
+                    stacklevel=2,
+                )
+        for _sk, _sarr in self.string_data.items():
+            if np.issubdtype(_sarr.dtype, np.number):
+                warnings.warn(
+                    f"DataSection '{self.name}': curve '{_sk}' in "
+                    f"'string_data' has numeric dtype ({_sarr.dtype}).  "
+                    f"'string_data' arrays must be non-numeric.",
                     stacklevel=2,
                 )
 
@@ -1433,6 +1486,41 @@ class LASFile:
                             f"LASFile: array '{_base}' has non-sequential "
                             f"indices {_indices} in section '{_ds.name}'. "
                             f"Expected [1]→[{len(_indices)}]."
+                        )
+
+        # F-059: Cross-validate curve data_format against actual data
+        # placement.  Previously __post_init__ validated structural
+        # consistency (keys, lengths, rows) but never checked that
+        # S-format curves are in string_data and numeric-format curves
+        # are in logs.  A misplaced curve silently produces corrupted
+        # output downstream.
+        if self.curves and (self.logs or self.string_data):
+            for _sc in self.curves:
+                _df = _sc.data_format
+                _mnem = _sc.mnemonic
+                if not _df:
+                    continue
+                # S-format (or A-format without array element info)
+                # should be in string_data, not in logs.
+                if _df == "S" or (_df == "A" and not _sc.is_array_element):
+                    if _mnem in self.logs:
+                        warnings.warn(
+                            f"LASFile: curve '{_mnem}' has "
+                            f"data_format='{_df}' (string-format) but "
+                            f"is in logs (numeric).  String-format "
+                            f"curves should be in string_data.",
+                            stacklevel=2,
+                        )
+                else:
+                    # Numeric-format curves should be in logs, not in
+                    # string_data.
+                    if _mnem in self.string_data:
+                        warnings.warn(
+                            f"LASFile: curve '{_mnem}' has "
+                            f"data_format='{_df}' (numeric-format) "
+                            f"but is in string_data.  Numeric-format "
+                            f"curves should be in logs.",
+                            stacklevel=2,
                         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -2559,6 +2647,40 @@ class DevFile:
     column_order: list[str] = field(default_factory=list)
     source_file: str = ""
     encoding: str = "utf-8"
+
+    def __post_init__(self) -> None:
+        """Validate critical invariants after construction (E-F-026).
+
+        Direct DevFile construction previously bypassed all validation.
+        This catches invalid state that would cause silent data loss
+        downstream.  Empty construction is allowed for incremental
+        population.
+        """
+        if not self.columns:
+            return
+
+        from .exceptions import LASDataError
+
+        # column_order must match columns keys exactly
+        _col_keys = set(self.columns.keys())
+        _ord_keys = set(self.column_order)
+        if _col_keys != _ord_keys:
+            raise LASDataError(
+                f"DevFile: column_order and columns keys do not "
+                f"match.  column_order has {sorted(_ord_keys)}, "
+                f"columns has {sorted(_col_keys)}."
+            )
+
+        # All columns must have the same array length
+        if len(self.columns) > 1:
+            _col_lens = {
+                name: len(arr) for name, arr in self.columns.items()
+            }
+            if len(set(_col_lens.values())) > 1:
+                raise LASDataError(
+                    f"DevFile: columns have inconsistent array "
+                    f"lengths: {_col_lens}"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to legacy dict format, including file metadata.

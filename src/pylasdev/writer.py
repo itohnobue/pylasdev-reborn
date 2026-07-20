@@ -452,6 +452,49 @@ def _write_well_section(las_file: LASFile) -> list[str]:
                 stacklevel=4,
             )
 
+    # F-110: Value-emptiness checks for mandatory well fields.
+    # Complement the key-presence checks above — a field may be
+    # present but contain a semantically invalid value.
+    _strt_val = None
+    _stop_val = None
+    for key, value in las_file.well.entries.items():
+        upper = key.upper()
+        if upper == "STEP":
+            try:
+                if float(value) == 0.0:
+                    import warnings
+
+                    warnings.warn(
+                        "STEP is zero — depth increment is invalid.",
+                        stacklevel=4,
+                    )
+            except (TypeError, ValueError):
+                pass
+        elif upper == "STRT":
+            _strt_val = value
+        elif upper == "STOP":
+            _stop_val = value
+        elif upper == "NULL":
+            if isinstance(value, str) and not value:
+                import warnings
+
+                warnings.warn(
+                    "NULL is an empty string — null value is ambiguous.",
+                    stacklevel=4,
+                )
+    if _strt_val is not None and _stop_val is not None:
+        try:
+            if float(_strt_val) == float(_stop_val):
+                import warnings
+
+                warnings.warn(
+                    f"STRT equals STOP ({_strt_val}) — well has "
+                    f"zero depth range.",
+                    stacklevel=4,
+                )
+        except (TypeError, ValueError):
+            pass
+
     # F-26: Reorder mandatory well fields (STRT, STOP, STEP, NULL)
     # to appear first per CWLS spec, followed by remaining fields in
     # original dict insertion order.  Do not drop any fields.
@@ -535,6 +578,22 @@ def _write_curve_section(las_file: LASFile) -> list[str]:
             if (ds.section_type or "LOG_DATA").upper() == "LOG_DATA":
                 if ds.section_curves:
                     curves_to_emit.extend(ds.section_curves)
+        # E-F-007: Secondary scan for LOG_DATA sections that have
+        # curves_order but no section_curves (programmatic construction).
+        # Collect their CurveDefinitions from las_file.curves so ~CURVE
+        # declares the correct complete curve set.
+        emitted_mnems = {c.mnemonic for c in curves_to_emit}
+        curves_by_mnem = {c.mnemonic: c for c in las_file.curves}
+        for ds in las_file.data_sections:
+            if (ds.section_type or "LOG_DATA").upper() == "LOG_DATA":
+                if not ds.section_curves and ds.curves_order:
+                    for mnem in ds.curves_order:
+                        if mnem not in emitted_mnems:
+                            curve_def = curves_by_mnem.get(mnem)
+                            if curve_def is not None:
+                                curves_to_emit.append(curve_def)
+                                emitted_mnems.add(mnem)
+
         if not curves_to_emit:
             curves_to_emit = list(las_file.curves)
         if not curves_to_emit:
@@ -1173,6 +1232,7 @@ def _format_data_rows(
 
     warned_long = False  # Deduplicate long-line warnings per section
     warned_delim_str = False  # Deduplicate delimiter-in-string warnings per section
+    warned_empty_str = False  # Deduplicate empty→"-" substitution warnings
     for i in range(num_rows):
         row_values: list[str] = []
         for arr, is_string in curve_arrays:
@@ -1254,6 +1314,17 @@ def _format_data_rows(
                 # "-" value from an originally-empty one.  Full roundtrip
                 # fidelity requires parser-side _desanitize reversal.
                 if not val and delimiter == " ":
+                    if not warned_empty_str:
+                        import warnings
+
+                        warnings.warn(
+                            "Empty string curve value replaced by "
+                            "'-' sentinel — roundtrip fidelity is "
+                            "lost: parser cannot distinguish original "
+                            "'-' from originally-empty value.",
+                            stacklevel=4,
+                        )
+                        warned_empty_str = True
                     val = "-"
                 row_values.append(val)
             else:

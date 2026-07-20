@@ -93,7 +93,7 @@ def _normalize_dev_column(name: str) -> str:
     Returns:
         Canonical column name if an alias exists, otherwise the original.
     """
-    return _DEV_ALIASES.get(name.upper(), name)
+    return _DEV_ALIASES.get(name.strip().upper(), name)
 
 
 def _deduplicate_string_list(
@@ -374,8 +374,36 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                         pass
                     elif all_integer_like:
                         # All integer-like, no alphabetic: could be numeric
-                        # column names (e.g. "100,200,300") or headerless
-                        # data.  Check second line for matching column count.
+                        # column names (e.g. "100,200,300"), headerless
+                        # data, or DUG Pattern A where the first line is an
+                        # integer column count.  Check DUG Pattern A first,
+                        # then fall back to comma-count matching on the
+                        # second line.
+                        #
+                        # R-F-M01: The DUG check MUST run BEFORE the
+                        # second-line comma-matching early return at L386.
+                        # When the first content line has no commas (count)
+                        # and the second line has comma-delimited all-integer
+                        # data, the comma check is self-referential (same
+                        # line is both comma_tokens source and second-line
+                        # comparison), always matching and returning
+                        # ("simple", 1) before the DUG check can fire.
+                        # E-F-001: DUG Pattern A check first — first line
+                        # may be an integer column count.
+                        first_line_tokens = content_entries[0][1].split(maxsplit=_max_tokens)
+                        if (
+                            len(first_line_tokens) == 1
+                            and len(content_entries) >= 3
+                        ):
+                            try:
+                                dug_count = int(first_line_tokens[0])
+                            except ValueError:
+                                pass
+                            else:
+                                if dug_count == len(comma_tokens):
+                                    return ("dug", 2)
+                        # Not DUG Pattern A — check second line for matching
+                        # column count (numeric column names like "100,200,300").
                         if len(content_entries) >= 2:
                             second_comma_tokens = [
                                 t.strip()
@@ -390,6 +418,20 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                     else:
                         # Non-integer float tokens (e.g. "1.5,2.3,3.7")
                         # are definitely data, not column names.
+                        # E-F-001: DUG Pattern A check before headerless
+                        # return.  First line may be an integer column count.
+                        first_line_tokens = content_entries[0][1].split(maxsplit=_max_tokens)
+                        if (
+                            len(first_line_tokens) == 1
+                            and len(content_entries) >= 3
+                        ):
+                            try:
+                                dug_count = int(first_line_tokens[0])
+                            except ValueError:
+                                pass
+                            else:
+                                if dug_count == len(comma_tokens):
+                                    return ("dug", 2)
                         return ("headerless", 0)
                 else:
                     # Single-column all-float comma token — headerless data.
@@ -571,6 +613,32 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
             )
             if _is_sentinel:
                 return ("headerless", 0)
+
+    # F-093/F-095: Petrel well-header detection.
+    # Petrel exports DEV files with a well-header line preceding the column
+    # names.  The well-header line has a non-numeric first token (well name)
+    # followed by numeric parameters (e.g., depths, coordinates).  Without
+    # detection, the well-header is consumed as column names and the real
+    # header line becomes NaN data, shifting all columns.
+    if (
+        len(content_entries) >= 2
+        and len(first_tokens) >= 2
+        and not _is_float_token(first_tokens[0])
+        and any(_is_float_token(t) for t in first_tokens[1:])
+    ):
+        second_line_tokens = content_entries[1][1].split(maxsplit=_max_tokens)
+        # Real column header line has ALL non-numeric tokens (MD, TVD, etc.).
+        if second_line_tokens and not any(
+            _is_float_token(t) for t in second_line_tokens
+        ):
+            warnings.warn(
+                f"Detected Petrel well-header line with "
+                f"{len(first_tokens)} mixed tokens before column header "
+                f"(first token: {first_tokens[0]!r}).  Skipping well-header; "
+                f"using second content line as column names.",
+                stacklevel=3,
+            )
+            return ("simple", 2)
 
     return ("simple", 1)
 
@@ -783,6 +851,62 @@ def _validate_dev_data(
                         stacklevel=_stacklevel,
                     )
 
+    # F-100: TVD validation — minimal sanity checks to detect misparsed
+    # or corrupt TVD data.  TVD is a fundamental survey column; NaN density
+    # and MD-consistency checks catch delimiter mismatches and data corruption.
+    _tvd_names = ("TVD", "TVDKB", "TVDSS", "TVDBML")
+    for tvd_name in _tvd_names:
+        if tvd_name not in dev.columns:
+            continue
+        tvd = dev.columns[tvd_name]
+        tvd_total = len(tvd)
+
+        # NaN density: >50% NaN suggests delimiter mismatch or corrupt data.
+        tvd_nan_count = int(np.isnan(tvd).sum())
+        if tvd_total > 0 and tvd_nan_count / tvd_total > 0.5:
+            warnings.warn(
+                f"TVD column '{tvd_name}' has {tvd_nan_count}/{tvd_total} "
+                f"({tvd_nan_count / tvd_total:.1%}) NaN values. "
+                f"Possible delimiter mismatch: data may have been parsed "
+                f"with the wrong separator.",
+                stacklevel=_stacklevel,
+            )
+
+        # MD-consistency: when both MD and TVD are present, TVD should not
+        # decrease where MD increases (in normal wells TVD increases with
+        # depth).  This is a soft check — TVD can stay constant in horizontal
+        # sections, but backward jumps signal data corruption.
+        if "MD" not in dev.columns:
+            break
+        md = dev.columns["MD"]
+        both_finite = ~np.isnan(tvd) & ~np.isnan(md)
+        if np.sum(both_finite) < 2:
+            break
+        md_finite = md[both_finite]
+        tvd_finite = tvd[both_finite]
+        md_increasing = np.diff(md_finite) > 0
+        tvd_decreasing_where_md_increases = np.diff(tvd_finite) < 0
+        violations = np.logical_and(
+            md_increasing, tvd_decreasing_where_md_increases
+        )
+        if np.any(violations):
+            n_bad = int(np.sum(violations))
+            violations_idx = np.where(violations)[0]
+            example_pairs = []
+            for idx in violations_idx[:3]:
+                example_pairs.append(
+                    f"MD {md_finite[idx]:.1f}->{md_finite[idx + 1]:.1f}, "
+                    f"TVD {tvd_finite[idx]:.1f}->{tvd_finite[idx + 1]:.1f}"
+                )
+            warnings.warn(
+                f"TVD column '{tvd_name}' decreases at {n_bad} station(s) "
+                f"where MD increases. Examples: {'; '.join(example_pairs)}"
+                f"{'...' if n_bad > 3 else ''}. "
+                f"Unexpected TVD reversals may indicate data corruption.",
+                stacklevel=_stacklevel,
+            )
+        break  # Found one recognised TVD column — done checking.
+
     # --- 6. Check MD NaN density (already checked above; note that
     #       the NaN-density check on the full md array covers all
     #       data including non-MD columns that may be NaN due to
@@ -935,14 +1059,14 @@ def read_dev_file_as_object(
     format_type, skip_content_lines = _detect_dev_format(content_entries)
 
     if format_type == "headerless":
-        logger.warning(
-            "Auto-detected headerless format for %s. "
-            "The first data line has all-numeric tokens.  "
-            "A matching column count on the second line would cause "
-            "the file to be treated as simple format (numeric column "
-            "names as headers).  If the file has a header row, "
-            "consider explicit format specification.",
-            file_path,
+        warnings.warn(
+            f"Auto-detected headerless format for {file_path}. "
+            f"The first data line has all-numeric tokens.  "
+            f"A matching column count on the second line would cause "
+            f"the file to be treated as simple format (numeric column "
+            f"names as headers).  If the file has a header row, "
+            f"consider explicit format specification.",
+            stacklevel=2,
         )
 
     # --- Auto-detect delimiter ---
@@ -1042,12 +1166,13 @@ def read_dev_file_as_object(
                              if t.strip()]
                         )
                     if _data_alt_cols >= 2 and _data_alt_cols == _hdr_cols:
-                        logger.warning(
-                            "Auto-corrected delimiter from %r to %r: "
-                            "header has %d columns but first data line "
-                            "produced only %d token(s) with %r delimiter.",
-                            delimiter, _alt_delim, _hdr_cols,
-                            _data_cols, delimiter,
+                        warnings.warn(
+                            f"Auto-corrected delimiter from {delimiter!r} "
+                            f"to {_alt_delim!r}: header has {_hdr_cols} "
+                            f"columns but first data line produced only "
+                            f"{_data_cols} token(s) with {delimiter!r} "
+                            f"delimiter.",
+                            stacklevel=2,
                         )
                         # F-01: Cache header column names parsed with the
                         # ORIGINAL delimiter before switching.  Without this,
@@ -1149,7 +1274,7 @@ def read_dev_file_as_object(
             # Preserve empty fields between consecutive tabs (str.split()
             # collapses them, causing column shift).  str.split("\t") keeps
             # every empty cell as ''.
-            values = stripped.split("\t")
+            values = stripped.split("\t", maxsplit=_max_tokens)
         else:
             values = _split_delimited_line(stripped, delimiter)
 
@@ -1191,24 +1316,24 @@ def read_dev_file_as_object(
                 if current_line < data_lines:
                     if len(values) > len(names):
                         if extra_col_count is None:
-                            logger.warning(
-                                "Data line has %d values but only %d columns declared "
-                                "in the header. Extra columns are discarded. "
-                                "(Subsequent occurrences will be counted; see summary.)",
-                                len(values),
-                                len(names),
+                            warnings.warn(
+                                f"Data line has {len(values)} values but only "
+                                f"{len(names)} columns declared in the header. "
+                                f"Extra columns are discarded. (Subsequent "
+                                f"occurrences will be counted; see summary.)",
+                                stacklevel=2,
                             )
                             extra_col_count = 1
                         else:
                             extra_col_count += 1
                     if len(values) < len(names):
                         if short_row_count is None:
-                            logger.warning(
-                                "Data line has %d values but %d columns declared "
-                                "in the header. Missing values are filled with NaN. "
-                                "(Subsequent occurrences will be counted; see summary.)",
-                                len(values),
-                                len(names),
+                            warnings.warn(
+                                f"Data line has {len(values)} values but "
+                                f"{len(names)} columns declared in the header. "
+                                f"Missing values are filled with NaN. (Subsequent "
+                                f"occurrences will be counted; see summary.)",
+                                stacklevel=2,
                             )
                             short_row_count = 1
                         else:
@@ -1275,24 +1400,24 @@ def read_dev_file_as_object(
                 if current_line < data_lines:
                     if len(values) > len(names):
                         if extra_col_count is None:
-                            logger.warning(
-                                "Data line has %d values but only %d columns declared "
-                                "in the header. Extra columns are discarded. "
-                                "(Subsequent occurrences will be counted; see summary.)",
-                                len(values),
-                                len(names),
+                            warnings.warn(
+                                f"Data line has {len(values)} values but only "
+                                f"{len(names)} columns declared in the header. "
+                                f"Extra columns are discarded. (Subsequent "
+                                f"occurrences will be counted; see summary.)",
+                                stacklevel=2,
                             )
                             extra_col_count = 1
                         else:
                             extra_col_count += 1
                     if len(values) < len(names):
                         if short_row_count is None:
-                            logger.warning(
-                                "Data line has %d values but %d columns declared "
-                                "in the header. Missing values are filled with NaN. "
-                                "(Subsequent occurrences will be counted; see summary.)",
-                                len(values),
-                                len(names),
+                            warnings.warn(
+                                f"Data line has {len(values)} values but "
+                                f"{len(names)} columns declared in the header. "
+                                f"Missing values are filled with NaN. (Subsequent "
+                                f"occurrences will be counted; see summary.)",
+                                stacklevel=2,
                             )
                             short_row_count = 1
                         else:
@@ -1304,7 +1429,12 @@ def read_dev_file_as_object(
                     discarded_lines += 1
 
         else:  # simple header format
-            if content_seen == 1:
+            # F-093: Skip Petrel well-header and any extra pre-header
+            # content lines.  Normal simple format has skip_content_lines=1;
+            # Petrel detection returns skip_content_lines=2.
+            if content_seen < skip_content_lines:
+                continue
+            if content_seen == skip_content_lines:
                 # First non-comment line = column names.
                 # Use cached header names if auto-correction changed
                 # the delimiter (F-01 fix — prevents comma-header misparse).
@@ -1356,24 +1486,24 @@ def read_dev_file_as_object(
                 if current_line < data_lines:
                     if len(values) > len(names):
                         if extra_col_count is None:
-                            logger.warning(
-                                "Data line has %d values but only %d columns declared "
-                                "in the header. Extra columns are discarded. "
-                                "(Subsequent occurrences will be counted; see summary.)",
-                                len(values),
-                                len(names),
+                            warnings.warn(
+                                f"Data line has {len(values)} values but only "
+                                f"{len(names)} columns declared in the header. "
+                                f"Extra columns are discarded. (Subsequent "
+                                f"occurrences will be counted; see summary.)",
+                                stacklevel=2,
                             )
                             extra_col_count = 1
                         else:
                             extra_col_count += 1
                     if len(values) < len(names):
                         if short_row_count is None:
-                            logger.warning(
-                                "Data line has %d values but %d columns declared "
-                                "in the header. Missing values are filled with NaN. "
-                                "(Subsequent occurrences will be counted; see summary.)",
-                                len(values),
-                                len(names),
+                            warnings.warn(
+                                f"Data line has {len(values)} values but "
+                                f"{len(names)} columns declared in the header. "
+                                f"Missing values are filled with NaN. (Subsequent "
+                                f"occurrences will be counted; see summary.)",
+                                stacklevel=2,
                             )
                             short_row_count = 1
                         else:
@@ -1386,19 +1516,18 @@ def read_dev_file_as_object(
 
     # --- Post-scan diagnostics (F-I2-DV-07) ---
     if discarded_lines > 0:
-        logger.warning(
-            "Pre-scan undercount: %d data line(s) discarded because the "
-            "actual data exceeds the %d lines declared by Pass 1. "
-            "Dev file data may be truncated.",
-            discarded_lines,
-            data_lines,
+        warnings.warn(
+            f"Pre-scan undercount: {discarded_lines} data line(s) discarded "
+            f"because the actual data exceeds the {data_lines} lines declared "
+            f"by Pass 1. Dev file data may be truncated.",
+            stacklevel=2,
         )
     if current_line < data_lines:
-        logger.warning(
-            "Pre-scan overcount: declared %d data lines but only %d actual "
-            "data lines found. Pre-allocated array tail contains NaN.",
-            data_lines,
-            current_line,
+        warnings.warn(
+            f"Pre-scan overcount: declared {data_lines} data lines but only "
+            f"{current_line} actual data lines found. Pre-allocated array "
+            f"tail contains NaN.",
+            stacklevel=2,
         )
 
     # F-I2-XPD-03: Summary of extra-column and short-row occurrences,
@@ -1406,16 +1535,16 @@ def read_dev_file_as_object(
     # diagnostics after the first row.  This allows automated data
     # quality tools to enumerate affected rows.
     if extra_col_count is not None and extra_col_count > 1:
-        logger.warning(
-            "%d data line(s) had more values than expected. "
-            "Extra columns were discarded.",
-            extra_col_count,
+        warnings.warn(
+            f"{extra_col_count} data line(s) had more values than expected. "
+            f"Extra columns were discarded.",
+            stacklevel=2,
         )
     if short_row_count is not None and short_row_count > 1:
-        logger.warning(
-            "%d data line(s) had fewer values than expected. "
-            "Missing values were filled with NaN.",
-            short_row_count,
+        warnings.warn(
+            f"{short_row_count} data line(s) had fewer values than expected. "
+            f"Missing values were filled with NaN.",
+            stacklevel=2,
         )
 
     # Warn when non-trivial float conversion failures occurred
@@ -1423,12 +1552,11 @@ def read_dev_file_as_object(
     # and were silently replaced with NaN).  Mirrors the pattern in
     # data_reader.py (F-PXR-03).
     if _fc[0] > 0:
-        logger.warning(
-            "%d value(s) could not be converted to finite float "
-            "and were replaced with NaN. "
-            "This may indicate string data, corrupt values, or "
-            "non-standard formatting.",
-            _fc[0],
+        warnings.warn(
+            f"{_fc[0]} value(s) could not be converted to finite float "
+            f"and were replaced with NaN. This may indicate string data, "
+            f"corrupt values, or non-standard formatting.",
+            stacklevel=2,
         )
 
     _validate_dev_data(dev, _stacklevel=3)
