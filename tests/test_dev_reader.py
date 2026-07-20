@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from pylasdev import read_dev_file, read_dev_file_as_object
-from pylasdev.exceptions import DEVReadError, LASDataError
+from pylasdev.exceptions import DEVReadError
 from pylasdev.models import DevFile
 
 
@@ -190,15 +190,15 @@ class TestReadDEVFile:
     def test_header_only_dev_file(self, tmp_path: Path) -> None:
         """Test reading a DEV file with only a header line, no data.
 
-        G-019: Empty/header-only files now raise LASDataError instead of
+        G-019: Empty/header-only files now raise DEVReadError instead of
         returning empty data.  See dev_reader.py:973.
         """
         content = "MD TVD X Y\n"
         test_file = tmp_path / "header_only.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        # G-019: No data lines — must raise LASDataError
-        with pytest.raises(LASDataError, match="No data lines found"):
+        # G-019: No data lines — must raise DEVReadError (F2-20 fix)
+        with pytest.raises(DEVReadError, match="No data lines found"):
             read_dev_file(test_file)
 
     # --- F-50: Extra columns in data row vs header ---
@@ -691,15 +691,15 @@ class TestDugFormat:
     def test_dug_format_no_data(self, tmp_path: Path) -> None:
         """DUG format with header but no data rows.
 
-        G-019: No data lines — now raises LASDataError instead of
+        G-019: No data lines — now raises DEVReadError instead of
         returning empty columns.
         """
         content = "Survey\n4\nMD TVD X Y\n"
         test_file = tmp_path / "dug_no_data.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        # G-019: No data lines — must raise LASDataError
-        with pytest.raises(LASDataError, match="No data lines found"):
+        # G-019: No data lines — must raise DEVReadError (F2-20 fix)
+        with pytest.raises(DEVReadError, match="No data lines found"):
             read_dev_file(test_file)
 
     def test_dug_format_falls_to_simple_when_header_is_numeric(self, tmp_path: Path) -> None:
@@ -886,35 +886,35 @@ class TestHeaderlessFormat:
         assert data["col_1"][1] == 1020.02
 
     def test_headerless_empty_file_returns_empty_data(self, tmp_path: Path) -> None:
-        """Test that an empty DEV file raises LASDataError.
+        """Test that an empty DEV file raises DEVReadError.
 
-        G-019: Empty files (zero data lines) now raise LASDataError
+        G-019: Empty files (zero data lines) now raise DEVReadError
         instead of returning empty data.  See dev_reader.py:973.
         """
         test_file = tmp_path / "empty.dev"
         test_file.write_text("", encoding="utf-8")
 
-        # G-019: No data lines — must raise LASDataError
-        with pytest.raises(LASDataError, match="No data lines found"):
+        # G-019: No data lines — must raise DEVReadError (F2-20 fix)
+        with pytest.raises(DEVReadError, match="No data lines found"):
             read_dev_file(test_file)
 
-        with pytest.raises(LASDataError, match="No data lines found"):
+        with pytest.raises(DEVReadError, match="No data lines found"):
             read_dev_file_as_object(test_file)
 
     def test_whitespace_only_dev_file(self, tmp_path: Path) -> None:
-        """Test that a whitespace-only DEV file raises LASDataError.
+        """Test that a whitespace-only DEV file raises DEVReadError.
 
         G-019: Whitespace-only files (zero data lines after stripping)
-        now raise LASDataError instead of returning empty data.
+        now raise DEVReadError instead of returning empty data.
         """
         test_file = tmp_path / "whitespace.dev"
         test_file.write_text("   \n\t\n   \n", encoding="utf-8")
 
-        # G-019: No data lines — must raise LASDataError
-        with pytest.raises(LASDataError, match="No data lines found"):
+        # G-019: No data lines — must raise DEVReadError (F2-20 fix)
+        with pytest.raises(DEVReadError, match="No data lines found"):
             read_dev_file(test_file)
 
-        with pytest.raises(LASDataError, match="No data lines found"):
+        with pytest.raises(DEVReadError, match="No data lines found"):
             read_dev_file_as_object(test_file)
 
 
@@ -1248,17 +1248,17 @@ class TestEmptyColumnNames:
     """
 
     def test_trailing_comma_no_data(self, tmp_path: Path) -> None:
-        """Trailing comma in header with no data rows raises LASDataError.
+        """Trailing comma in header with no data rows raises DEVReadError.
 
-        G-019: No data lines — now raises LASDataError instead of
+        G-019: No data lines — now raises DEVReadError instead of
         returning empty columns.
         """
         content = "MD,TVD,\n"
         test_file = tmp_path / "f2_11_trail_no_data.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        # G-019: No data lines — must raise LASDataError
-        with pytest.raises(LASDataError, match="No data lines found"):
+        # G-019: No data lines — must raise DEVReadError (F2-20 fix)
+        with pytest.raises(DEVReadError, match="No data lines found"):
             read_dev_file(test_file)
 
     def test_trailing_comma_with_data(self, tmp_path: Path) -> None:
@@ -1370,17 +1370,17 @@ class TestColumnsKeywordFormat:
         assert data["GR"][0] == 75.0
 
     def test_columns_header_only_no_data(self, tmp_path: Path) -> None:
-        """*COLUMNS header with no data rows raises LASDataError.
+        """*COLUMNS header with no data rows raises DEVReadError.
 
-        G-019: No data lines — now raises LASDataError instead of
+        G-019: No data lines — now raises DEVReadError instead of
         returning empty columns.
         """
         content = "*COLUMNS *MD *TVD *X *Y\n"
         test_file = tmp_path / "columns_no_data.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        # G-019: No data lines — must raise LASDataError
-        with pytest.raises(LASDataError, match="No data lines found"):
+        # G-019: No data lines — must raise DEVReadError (F2-20 fix)
+        with pytest.raises(DEVReadError, match="No data lines found"):
             read_dev_file(test_file)
 
     def test_columns_with_comments(self, tmp_path: Path) -> None:

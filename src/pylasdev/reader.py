@@ -14,7 +14,7 @@ from typing import Any
 
 from .data_reader import read_ascii_data
 from .encoding import read_with_encoding
-from .exceptions import LASParseError, LASReadError
+from .exceptions import LASEncodingError, LASParseError, LASReadError
 from .models import LASFile
 from .parser import LASParser
 
@@ -139,7 +139,7 @@ def read_las_file_as_object(
         detected_encoding, content = read_with_encoding(file_path, encoding, max_file_size)
     except OSError as e:
         raise LASReadError(f"Cannot read file (I/O error): {file_path}") from e
-    except (ValueError, LookupError) as e:
+    except (ValueError, LookupError, LASEncodingError) as e:
         raise LASReadError(
             f"Cannot read file (size exceeded or invalid parameter): {file_path}"
         ) from e

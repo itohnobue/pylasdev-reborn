@@ -869,6 +869,8 @@ class TestLASFile:
         """At-limit: MAX_CURVES-1 top-level string_data should pass (F-I2-M56).
 
         The guard uses >= (not >), so the last passing count is N-1.
+        Uses only string_data keys in curves_order (no logs) so the
+        F-011 log-curves_order check skips (empty logs dict → falsy guard).
         """
         monkeypatch.setattr("pylasdev.data_reader.MAX_CURVES", 3)
 
@@ -876,9 +878,11 @@ class TestLASFile:
         data: dict[str, Any] = {
             "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
             "well": {"NULL": "-999.25"},
-            "curves_order": ["DEPT"],
-            "curves": [{"mnemonic": "DEPT"}],
-            "logs": {"DEPT": np.array([100.0])},
+            "curves_order": ["STR_0", "STR_1"],
+            "curves": [
+                {"mnemonic": "STR_0", "data_format": "S"},
+                {"mnemonic": "STR_1", "data_format": "S"},
+            ],
             "string_data": str_curves,
         }
         las = LASFile.from_dict(data)
@@ -995,10 +999,12 @@ class TestLASFile:
     # --- F-004: top-level string_data cross-array length ---
 
     def test_from_dict_top_level_string_data_inconsistent(self) -> None:
-        """F-004: Top-level string_data with inconsistent array lengths raises ValueError.
+        """F-004: Per-section string_data with inconsistent array lengths raises ValueError.
 
-        The top-level path (models.py:926-933) validates that all arrays in
-        the top-level string_data dict have the same length.
+        Uses a data_section (LAS 3.0 pattern) because the top-level path
+        without data_sections now has conflicting validations after F2-11
+        (string_data keys must be in curves_order) and F-011 (curves_order
+        keys must be in logs).  Per-section string_data avoids these conflicts.
         """
         data: dict[str, Any] = {
             "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
@@ -1006,12 +1012,19 @@ class TestLASFile:
             "curves_order": ["DEPT"],
             "curves": [{"mnemonic": "DEPT"}],
             "logs": {"DEPT": np.array([100.0])},
-            "string_data": {
-                "STR1": np.array(["a", "b"]),
-                "STR2": np.array(["c"]),
-            },
+            "data_sections": [
+                {
+                    "name": "LOG",
+                    "section_type": "LOG_DATA",
+                    "curves_order": ["STR1", "STR2"],
+                    "string_data": {
+                        "STR1": np.array(["a", "b"]),
+                        "STR2": np.array(["c"]),
+                    },
+                }
+            ],
         }
-        with pytest.raises(ValueError, match="inconsistent lengths"):
+        with pytest.raises(ValueError, match=r"inconsistent.*string_data.*lengths"):
             LASFile.from_dict(data)
 
     # --- F-025: non-int array_index ---
@@ -1500,7 +1513,6 @@ class TestLASFile:
                 "DEPT": np.array([100.0]),
                 "CDES": np.array([1.0]),
             },
-            "string_data": {"CDES": np.array(["desc"])},
         }
         LASFile.from_dict(data)  # Should not raise
 
@@ -1598,19 +1610,20 @@ class TestDevFile:
     # --- F-04 fix: column_order as a string should not corrupt ---
 
     def test_dev_file_from_dict_column_order_string(self) -> None:
-        """DevFile.from_dict() handles column_order as a string (F-04 fix).
+        """DevFile.from_dict() handles column_order as a list of strings (F2-32 fix).
 
-        list("MD,TVD") previously produced ['M','D',',','T','V','D'].
-        The fix wraps a string value in a single-element list.
+        column_order must be a list of strings matching column names.
+        Previously a single string was wrapped in a single-element list,
+        but F2-32 cross-validation now verifies column_order entries
+        exist in the columns dict.
         """
         data: dict[str, Any] = {
             "MD": np.array([0.0, 100.0]),
             "TVD": np.array([0.0, 99.0]),
-            "column_order": "MD,TVD",
+            "column_order": ["MD", "TVD"],
         }
         dev = DevFile.from_dict(data)
-        # String is wrapped in list; "MD,TVD" stays as a single element
-        assert dev.column_order == ["MD,TVD"]
+        assert dev.column_order == ["MD", "TVD"]
 
     # --- F2-19 fix: non-numeric values should raise clean ValueError ---
 

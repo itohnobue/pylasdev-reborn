@@ -243,28 +243,38 @@ class TestG001MnemBaseDictKeys:
         )
 
     def test_mnem_base_normalizes_string_data_keys(self) -> None:
-        """G-001: from_dict with mnem_base normalises string_data dict keys.
+        """G-001: from_dict with mnem_base normalises string_data dict keys
+        within a data_section (the LAS 3.0 pattern).
 
-        Provides log data for BOTH curves so from_dict's cross-validation
-        of log keys against curves_order passes."""
+        Uses a data_section because the top-level path without data_sections
+        now has conflicting validations after F2-11 (string_data keys must
+        be in curves_order) and F-011 (curves_order keys must be in logs).
+        Per-section string_data avoids these conflicts."""
         data: dict[str, Any] = {
             "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
             "well": {"NULL": "-999.25"},
-            "curves_order": ["DEPT", "AK"],
+            "curves_order": ["DEPT"],
             "curves": [
                 {"mnemonic": "DEPT", "unit": "M"},
-                {"mnemonic": "AK", "unit": "US/M"},
             ],
             "logs": {
                 "DEPT": np.array([100.0]),
-                "AK": np.array([50.0]),
             },
-            "string_data": {"AK": np.array(["SAND"], dtype=np.str_)},
+            "data_sections": [
+                {
+                    "name": "LOG",
+                    "section_type": "LOG_DATA",
+                    "curves_order": ["DEPT", "AK"],
+                    "data": {"DEPT": np.array([100.0])},
+                    "string_data": {"AK": np.array(["SAND"], dtype=np.str_)},
+                }
+            ],
         }
         las = LASFile.from_dict(data, mnem_base={"AK": "DT"})
-        assert "DT" in las.string_data, (
+        assert len(las.data_sections) == 1
+        assert "DT" in las.data_sections[0].string_data, (
             f"Expected 'DT' key in string_data via mnem_base, "
-            f"got: {list(las.string_data.keys())}"
+            f"got: {list(las.data_sections[0].string_data.keys())}"
         )
 
 
@@ -273,15 +283,17 @@ class TestG001MnemBaseDictKeys:
 # ──────────────────────────────────────────────────────────────
 
 class TestG018WrapPreservation:
-    """G-018: Writer restores las_file.version.wrap to its pre-write value
-    after writing completes, matching the G-018 save/restore pattern."""
+    """G-018: Writer reflects actual disk state in version.wrap after write.
+    The writer always produces WRAP=NO output (non-wrapped), and the model
+    now honestly reflects what was written rather than restoring the pre-write
+    value (F2-26 fix removed the ``finally:`` restore block)."""
 
-    def test_wrap_yes_restored_after_write(self, tmp_path: Path) -> None:
-        """G-018: Write with WRAP=YES — wrap restored after write.
+    def test_wrap_yes_reflects_disk_after_write(self, tmp_path: Path) -> None:
+        """G-018: Write with WRAP=YES — wrap reflects actual disk state.
 
         The writer overrides WRAP=YES to WRAP=NO during content generation
         (it cannot produce wrapped output).  After writing, the LASFile
-        model's wrap attribute must be restored to the original value."""
+        model's wrap attribute honestly reflects what was written to disk."""
         las = LASFile()
         las.version = VersionSection(vers="2.0", wrap="YES")
         las.well["NULL"] = "-999.25"
@@ -294,9 +306,9 @@ class TestG018WrapPreservation:
             warnings.simplefilter("ignore")
             write_las_file(temp_file, las)
 
-        # After writing, the model's wrap value should be restored
-        assert las.version.wrap == "YES", (
-            f"Expected wrap='YES' after write, got wrap={las.version.wrap!r}"
+        # After writing, the model's wrap value reflects what was written
+        assert las.version.wrap == "NO", (
+            f"Expected wrap='NO' after write (disk state), got wrap={las.version.wrap!r}"
         )
 
     def test_wrap_no_preserved_after_write(self, tmp_path: Path) -> None:
@@ -312,11 +324,12 @@ class TestG018WrapPreservation:
         write_las_file(temp_file, las)
         assert las.version.wrap == "NO"
 
-    def test_wrap_non_default_restored(self, tmp_path: Path) -> None:
+    def test_wrap_non_default_reflects_disk_after_write(self, tmp_path: Path) -> None:
         """G-018: Write with non-default wrap=YES on LASFile.
 
-        When using an LASFile with wrap=YES (non-default), writing
-        should not permanently change the wrap attribute."""
+        The writer always produces non-wrapped output. The model honestly
+        reflects the disk state after writing rather than restoring the
+        pre-write value (F2-26 fix)."""
         las = LASFile()
         las.version = VersionSection(vers="3.0", wrap="YES", dlm="COMMA")
         las.well["NULL"] = "-999.25"
@@ -325,8 +338,8 @@ class TestG018WrapPreservation:
         las.logs["DEPT"] = np.array([100.0])
         temp_file = tmp_path / "wrap_yes_las30.las"
         write_las_file(temp_file, las)
-        assert las.version.wrap == "YES", (
-            f"Expected wrap='YES' (restored) after write, "
+        assert las.version.wrap == "NO", (
+            f"Expected wrap='NO' after write (disk state), "
             f"got wrap={las.version.wrap!r}"
         )
 

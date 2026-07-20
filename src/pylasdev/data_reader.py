@@ -143,10 +143,13 @@ def _is_recognized_section_word(word: str) -> bool:
     base = word.split("[", 1)[0] if "[" in word else word
     if base in _KNOWN_SECTION_WORDS:
         return True
-    # Recognized suffix patterns: _DEFINITION, _PARAMETER, _PARAMETERS, _DATA.
+    # Recognized suffix patterns: _DEFINITION (including numbered variants like
+    # _DEFINITION_2), _PARAMETER, _PARAMETERS, _DATA.
     # These expand the known set to cover all parser-dispatched section types
     # (e.g., CORE_DEFINITION, LOG_DEFINITION, CORE_PARAMETERS etc.).
-    for suffix in ("_DEFINITION", "_PARAMETER", "_PARAMETERS", "_DATA"):
+    if re.search(r"_DEFINITION(_\d+)?$", base):
+        return True
+    for suffix in ("_PARAMETER", "_PARAMETERS", "_DATA"):
         if base.endswith(suffix):
             return True
     return False
@@ -179,6 +182,23 @@ def _parse_float_with_d_notation(value_str: str) -> float:
     return float(value_str.replace("D", "E").replace("d", "e"))
 
 
+def _desanitize_las_value(value: str) -> str:
+    """Reverse the writer's ``_``-prefix-on-``#`` escape (local copy).
+
+    The writer prefixes ``#``-starting values with ``_`` to prevent the
+    parser from interpreting them as comment lines.  This function strips
+    that prefix, restoring the original ``#``-prefixed value.
+
+    Defined locally in data_reader to avoid circular import from parser.
+    """
+    if value.startswith("_#"):
+        return value[1:]
+    idx = value.find("_#")
+    if idx > 0 and value[idx - 1].isspace():
+        return value[:idx] + value[idx + 1:]
+    return value
+
+
 def _get_null_value(
     well: WellSection | dict[str, str],
     default: str = "-999.25",
@@ -207,7 +227,7 @@ def _get_null_value(
                 f"NULL value must be a finite number, got {null_value!r}"
             )
         return null_value
-    except (ValueError, TypeError, LASParseError):
+    except (ValueError, TypeError, LASParseError, AttributeError):
         # F-I2-XPD-05: Log a warning when falling back to the default
         # null value.  Silent fallback to -999.25 with zero diagnostics
         # makes it impossible to distinguish a genuine -999.25 null
@@ -769,11 +789,11 @@ def _read_normal(
             if i in _string_curve_indices:
                 # F-WXP-01: String curve — store raw value verbatim.
                 curve_name = _string_curve_map[i]
-                las_file.string_data[curve_name][current_line] = values[i]
+                las_file.string_data[curve_name][current_line] = _desanitize_las_value(values[i])
             else:
                 ni = _logical_to_numeric[i]
                 curve_arrays[ni][current_line] = _to_finite_float(
-                    values[i], null_value, _fc
+                    _desanitize_las_value(values[i]), null_value, _fc
                 )
 
         # Fill remaining curves with null_value when line has fewer values
@@ -1047,10 +1067,10 @@ def _read_wrapped(
             # into _string_lists and use null_value as a data_lists[0]
             # placeholder for row-count alignment.
             if 0 in _string_curve_indices:
-                _string_lists[_string_curve_map[0]].append(values[0])
+                _string_lists[_string_curve_map[0]].append(_desanitize_las_value(values[0]))
                 data_lists[0].append(null_value)
             else:
-                data_lists[0].append(_to_finite_float(values[0], null_value, _fc))
+                data_lists[0].append(_to_finite_float(_desanitize_las_value(values[0]), null_value, _fc))
             total_elements += 1
             if total_elements > MAX_TOTAL_ELEMENTS:
                 raise LASParseError(
@@ -1093,7 +1113,7 @@ def _read_wrapped(
                         f"(total curves={curve_count}). Data may be misaligned.",
                         stacklevel=2,
                     )
-                depth_had_extra = False  # This line handled the extra-values case
+                    depth_had_extra = False  # This line handled the extra-values case
 
             for i, val_str in enumerate(values):
                 counter += 1
@@ -1131,9 +1151,9 @@ def _read_wrapped(
                 # F-R-03: Dispatch string curves to _string_lists,
                 # float curves to data_lists via _to_finite_float.
                 if counter in _string_curve_indices:
-                    _string_lists[_string_curve_map[counter]].append(val_str)
+                    _string_lists[_string_curve_map[counter]].append(_desanitize_las_value(val_str))
                 else:
-                    data_lists[counter].append(_to_finite_float(val_str, null_value, _fc))
+                    data_lists[counter].append(_to_finite_float(_desanitize_las_value(val_str), null_value, _fc))
                 total_elements += 1
                 if total_elements > MAX_TOTAL_ELEMENTS:
                     raise LASParseError(

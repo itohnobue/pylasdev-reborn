@@ -354,6 +354,14 @@ def _compare_lists(
     type — handling ndarrays, nested lists, dicts (F-M30), and scalars.
     """
     try:
+        # Check for NaN values before shortcut comparison — NaN != NaN
+        # evaluates True without raising ValueError/TypeError, bypassing
+        # per-element comparison that correctly handles NaN==NaN (via
+        # _scalars_equal at line 46-48 and np.allclose(equal_nan=True)).
+        if any(isinstance(x, float) and x != x for x in l1) or any(
+            isinstance(x, float) and x != x for x in l2
+        ):
+            raise ValueError  # Route to per-element comparison
         if l1 != l2:
             logger.warning("List mismatch at '%s': %r vs %r", label, l1, l2)
             return False

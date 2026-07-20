@@ -20,7 +20,12 @@ from typing import ClassVar
 import numpy as np
 
 from . import data_reader as _data_reader
-from .data_reader import _get_null_value, _resolve_max_tokens_per_line, _to_finite_float
+from .data_reader import (
+    _get_null_value,
+    _parse_float_with_d_notation,
+    _resolve_max_tokens_per_line,
+    _to_finite_float,
+)
 from .exceptions import LASDataError, LASParseError
 from .mnem_base import resolve_mnemonic
 from .models import (
@@ -449,6 +454,13 @@ class LASParser:
         """
         self.mnem_base = mnem_base or {}
         self._well_format = well_format
+        if well_format is not None and well_format not in ("cwls", "lasio", "auto"):
+            warnings.warn(
+                f"Unrecognized well_format={well_format!r} — "
+                f"falling back to auto-mode. Valid values: 'cwls', 'lasio', 'auto', None",
+                UserWarning,
+                stacklevel=2,
+            )
         # Build uppercased lookup with multi-step chain resolution.
         # resolve_mnemonic walks chains like BK-3 → BK → BFV to reach
         # the terminal canonical name. Single .get() only resolves one hop.
@@ -593,6 +605,11 @@ class LASParser:
         # An empty file produces a default LASFile with version "2.0" — this is
         # intentional for robustness, but callers should know about it.
         if not self._version_found and not content.strip():
+            warnings.warn(
+                "Empty or whitespace-only LAS content — returning default empty LASFile",
+                UserWarning,
+                stacklevel=2,
+            )
             logger.warning(
                 "Empty or whitespace-only content parsed without a ~V section; "
                 "returning default LASFile with version '2.0'."
@@ -688,6 +705,22 @@ class LASParser:
             match = SECTION_PATTERN.match(stripped)
             if match:
                 section_word = match.group(1).upper()
+                # Skip unrecognized section-like patterns so that control-
+                # character noise does not break the ASCII-block count
+                # (matching _read_normal's _is_recognized_section_word
+                # behavior).  Recognized types include standard section
+                # words and suffix-based types (_DEFINITION, _PARAMETER,
+                # _PARAMETERS, _DATA).
+                _base = section_word.split("[", 1)[0] if "[" in section_word else section_word
+                if _base not in {"A", "ASCII", "V", "VERSION", "W", "WELL",
+                                  "C", "CURVE", "P", "PARAMETER", "PARAMETERS",
+                                  "O", "OTHER"}:
+                    if re.search(r"_DEFINITION(_\d+)?$", _base):
+                        pass
+                    elif _base.endswith("_PARAMETER") or _base.endswith("_PARAMETERS") or _base.endswith("_DATA"):
+                        pass
+                    else:
+                        continue
                 is_ascii = section_word in {"A", "ASCII"}
                 # F-I2-M10: Always save the count for the contiguous ~A block
                     # that just ended — zero-count blocks must be preserved so
@@ -796,9 +829,9 @@ class LASParser:
             elif section_word in {"W", "WELL"}:
                 new_section = "W"
                 section_name = section_rest or ""
-            elif section_word in {"C", "CURVE"} or section_word.endswith("_DEFINITION"):
+            elif section_word in {"C", "CURVE"} or re.search(r"_DEFINITION(_\d+)?$", section_word):
                 new_section = "C"
-                if section_word.endswith("_DEFINITION"):
+                if re.search(r"_DEFINITION(_\d+)?$", section_word):
                     section_name = f"{section_word} {section_rest}".strip()
                     # F-01: When the first _Definition section is encountered,
                     # freeze the main curve block endpoint so pipe "| CURVE"
@@ -998,9 +1031,11 @@ class LASParser:
                     # stored until _replay_deferred_well() is called.
                     if self._version_found:
                         self._replay_deferred_well()
-                    self._process_ascii_data()
-                    self._ascii_data_lines = []
-                    self._current_data_section_idx += 1
+                    try:
+                        self._process_ascii_data()
+                    finally:
+                        self._ascii_data_lines = []
+                        self._current_data_section_idx += 1
                 # F-02: Reset current section so data lines in unknown sections
                 # aren't misrouted to the previous section's handler.
                 self._current_section = None
@@ -1030,9 +1065,11 @@ class LASParser:
                     # data so the correct NULL value is available.
                     if self._version_found:
                         self._replay_deferred_well()
-                    self._process_ascii_data()
-                    self._ascii_data_lines = []
-                    self._current_data_section_idx += 1
+                    try:
+                        self._process_ascii_data()
+                    finally:
+                        self._ascii_data_lines = []
+                        self._current_data_section_idx += 1
                 elif new_section == "A" and self._current_section == "A":
                     # Consecutive data sections — process previous first.
                     # M-03: _current_data_section_type was already overwritten
@@ -1049,24 +1086,26 @@ class LASParser:
                     _new_curve_end = self._section_curve_end_idx
                     self._section_curve_start_idx = _prev_curve_start
                     self._section_curve_end_idx = _prev_curve_end
-                    if _prev_data_section_type is not None:
-                        _new_type = self._current_data_section_type
-                        self._current_data_section_type = _prev_data_section_type
-                        # F-I2-H01: Replay deferred well entries before processing
-                        # data so the correct NULL value is available.
-                        if self._version_found:
-                            self._replay_deferred_well()
-                        self._process_ascii_data()
-                        self._current_data_section_type = _new_type
-                    else:
-                        # F-I2-H01: Same replay guard for the else branch.
-                        if self._version_found:
-                            self._replay_deferred_well()
-                        self._process_ascii_data()
-                    self._section_curve_start_idx = _new_curve_start
-                    self._section_curve_end_idx = _new_curve_end
-                    self._ascii_data_lines = []
-                    self._current_data_section_idx += 1
+                    try:
+                        if _prev_data_section_type is not None:
+                            _new_type = self._current_data_section_type
+                            self._current_data_section_type = _prev_data_section_type
+                            # F-I2-H01: Replay deferred well entries before processing
+                            # data so the correct NULL value is available.
+                            if self._version_found:
+                                self._replay_deferred_well()
+                            self._process_ascii_data()
+                            self._current_data_section_type = _new_type
+                        else:
+                            # F-I2-H01: Same replay guard for the else branch.
+                            if self._version_found:
+                                self._replay_deferred_well()
+                            self._process_ascii_data()
+                    finally:
+                        self._section_curve_start_idx = _new_curve_start
+                        self._section_curve_end_idx = _new_curve_end
+                        self._ascii_data_lines = []
+                        self._current_data_section_idx += 1
 
                 # F1: Track per-section curve boundaries for LAS 3.0.
                 # When entering ~C (including _Definition sections), mark the
@@ -1379,6 +1418,13 @@ class LASParser:
             # For completely non-standard values (commas, no dot, etc.),
             # warn and default to "2.0".
             vers_normalized = value.strip()
+            # F-03: Normalize three-segment versions (e.g., "1.2.0" → "1.2",
+            # "2.0.1" → "2.0") by stripping the third segment before the
+            # regex check.  Only three-dot-segment strings are affected;
+            # two-segment versions like "1.2" or "1.20" are unchanged.
+            vers_normalized = re.sub(
+                r"^(\d+\.\d+)\.\d+$", r"\1", vers_normalized
+            )
             if vers_normalized in {"1.2", "2.0", "3.0"}:
                 self.las_file.version.vers = vers_normalized
             elif vers_normalized.startswith("3."):
@@ -1569,7 +1615,7 @@ class LASParser:
                     # If pre-colon text parses as float → CWLS (value in
                     # correct position); otherwise → lasio (swap).
                     try:
-                        float(value.replace("D", "E").replace("d", "e"))
+                        _parse_float_with_d_notation(value)
                     except ValueError:
                         actual_value = description
                         self.las_file.well.descriptions[mnemonic] = value
@@ -1679,7 +1725,7 @@ class LASParser:
             # creating a transient memory pool of up to ~200K dict entries.
             combined = len(self.las_file.well.entries) + len(self._deferred_well_entries)
             if combined > 2 * MAX_DEFERRED_WELL_ENTRIES:
-                raise LASDataError(
+                raise LASParseError(
                     f"Combined well entry count ({combined}) exceeds maximum "
                     f"allowed ({2 * MAX_DEFERRED_WELL_ENTRIES}). "
                     f"The file may be malformed or corrupt."
@@ -2217,6 +2263,7 @@ class LASParser:
                 unit=unit,
                 value=value,
                 description=description,
+                data_format=param_data_format,
                 array_index=array_index,
                 zone=zone,
                 section_type=_section_type,
@@ -2465,12 +2512,43 @@ class LASParser:
             )
             return
 
-        # F1: Local dedup on per-section curves.  For the first data section,
-        # renamed mnemonics are also written back to global curves/curves_order
-        # so that to_dict() and the writer see consistent, unique mnemonics
-        # (M1: LAS 3.0 global curve dedup regression fix).
+        # F1: Local dedup on per-section curves.  Global curve writeback
+        # (lines 2363-2368, 2389-2394) is deferred until after the
+        # actual_count > 0 check — see F2-07 writeback block below.
         is_first_section = not self.las_file.data_sections
-        deduped_order = self._deduplicate_curves(section_curves, is_first_section)
+        deduped_order = self._deduplicate_curves(section_curves, is_first_section=False)
+
+        # F-10: Validate cross-curve array continuity per LAS 3.0 spec
+        # (section 4.3.1: curve array elements must use sequential [1]→[n]
+        # indices with no gaps and consistent data formats across elements).
+        _array_groups: dict[str, list[tuple[int, str, str]]] = {}
+        for curve in section_curves:
+            if curve.array_info is not None:
+                _base = curve.array_info.base_name
+                if _base not in _array_groups:
+                    _array_groups[_base] = []
+                _array_groups[_base].append(
+                    (curve.array_info.index, curve.mnemonic, curve.data_format or "")
+                )
+        for _base_name, _elements in _array_groups.items():
+            if len(_elements) < 2:
+                continue
+            _elements.sort(key=lambda e: e[0])
+            _expected = _elements[0][0]
+            _ref_fmt = _elements[0][2]
+            for _idx, _mnem, _fmt in _elements:
+                if _idx != _expected:
+                    raise LASParseError(
+                        f"Non-contiguous array indices for '{_base_name}': "
+                        f"index {_idx} at mnemonic '{_mnem}' follows index "
+                        f"{_expected - 1} (expected {_expected})"
+                    )
+                if _fmt and _ref_fmt and _fmt != _ref_fmt:
+                    raise LASParseError(
+                        f"Inconsistent data_format for array '{_base_name}': "
+                        f"mnemonic '{_mnem}' has '{_fmt}', expected '{_ref_fmt}'"
+                    )
+                _expected += 1
 
         # Determine which curves are string type.
         # F-001: Previous one-liner (c.data_format in ("S", "A")) routed ALL
@@ -2501,7 +2579,7 @@ class LASParser:
         # NULL key was not set in the well section.  This typically occurs
         # when the data section (~A/ASCII) precedes the ~Well section in
         # LAS 3.0 files, causing section-ordering-dependent null value.
-        if self.las_file.well.get("NULL") is None:
+        if not self.las_file.well.get("NULL"):
             logger.warning(
                 "NULL value not found in well section for data section '%s'; "
                 "using default null value (%.4g). This may indicate that the "
@@ -2551,6 +2629,18 @@ class LASParser:
                 stacklevel=2,
             )
             return
+
+        # F2-07: Deferred global curve writeback — only apply after
+        # confirming actual_count > 0, preventing stale deduped names
+        # in global curves/curves_order when a data section has no
+        # actual data rows and is discarded.
+        if is_first_section:
+            for i, curve in enumerate(section_curves):
+                global_idx = self._section_curve_start_idx + i
+                if curve.original_mnemonic and not self.las_file.curves[global_idx].original_mnemonic:
+                    self.las_file.curves[global_idx].original_mnemonic = curve.original_mnemonic
+                self.las_file.curves[global_idx].mnemonic = curve.mnemonic
+                self.las_file.curves_order[global_idx] = deduped_order[i]
 
         # F-26: Global aggregate limit across ALL data sections.
         # Each section passes per-section bounds (_data_reader.MAX_DATA_LINES, _data_reader.MAX_CURVES,
@@ -2637,6 +2727,11 @@ class LASParser:
                 # CSV quotes — causing roundtrip data corruption for
                 # string values containing double-quote characters.
                 values = line.strip().split(delimiter, maxsplit=_max_tokens)
+                # Strip trailing empty strings from non-space delimiters
+                # (e.g., trailing COMMA produces phantom empty column).
+                # Space-delimited split handles this automatically.
+                while values and values[-1] == "":
+                    values.pop()
 
             # Warn about extra columns being silently discarded
             if len(values) > num_curves:
@@ -2665,7 +2760,7 @@ class LASParser:
                     val = _to_finite_float(val_str, null_value)
                     arr = numeric_arrays[i]  # type: ignore[assignment]
                     if arr is None:
-                        raise RuntimeError(
+                        raise LASParseError(
                             f"Internal error: numeric array '{i}' was not pre-allocated"
                         )
                     arr[idx] = val
@@ -2805,8 +2900,6 @@ class LASParser:
                             _def_type = _canonical.replace("_DATA", "_DEFINITION")
                         else:
                             _def_type = "__MAIN__"
-                    elif _type_word in {"A", "ASCII", "LOG", "LOG_DATA"}:
-                        _def_type = "__MAIN__"
                     else:
                         _def_type = "__MAIN__"
 

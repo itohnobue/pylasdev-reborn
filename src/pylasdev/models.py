@@ -6,6 +6,7 @@ Supports LAS 1.2, 2.0, and 3.0 formats.
 from __future__ import annotations
 
 import math
+import re
 import warnings
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -504,12 +505,18 @@ class VersionSection:
         Empty string values are tolerated (treated as "not specified"
         — the dataclass defaults apply).
         """
+        # VERS: reject None before any string operations.
+        if self.vers is None:
+            raise ValueError("VersionSection: VERS cannot be None")
         # VERS: reject whitespace-only version strings when non-empty.
         if self.vers and not self.vers.strip():
             raise ValueError(
                 f"VersionSection: VERS must not be whitespace-only, "
                 f"got {self.vers!r}"
             )
+        # WRAP: reject None before any string operations.
+        if self.wrap is None:
+            raise ValueError("VersionSection: WRAP cannot be None")
         # WRAP: validate non-empty values against YES/NO
         # (matching parser.py:1097-1108).  Empty string = not specified.
         if self.wrap:
@@ -554,7 +561,12 @@ class VersionSection:
         """Convert to legacy dict format for backward compatibility."""
         return {
             "VERS": self.vers,
-            "WRAP": self.wrap,
+            # F2-26: Emit "NO" when wrap is None — the writer's
+            # write-time override sets wrap to "NO" on disk but prior
+            # to first write the field may be None (e.g. from direct
+            # construction).  Returning None violates the dict[str, str]
+            # type contract.
+            "WRAP": self.wrap if self.wrap is not None else "NO",
             "DLM": self.dlm,
         }
 
@@ -1240,6 +1252,11 @@ class LASFile:
         # for direct-construction scenarios while allowing incremental
         # construction (empty data_sections skips validation).
         if self.data_sections:
+            # F-41: data_sections requires LAS 3.0 version.
+            if not self.version.is_las30:
+                raise LASDataError(
+                    "data_sections requires LAS 3.0 version"
+                )
             _all_section_curve_names: set[str] = set()
             for _ds in self.data_sections:
                 # Detect duplicate curve names within each section's
@@ -1310,6 +1327,51 @@ class LASFile:
                             f"data row count ({_data_rows}) does not "
                             f"match string_data row count "
                             f"({_str_rows})"
+                        )
+
+            # F-10: Cross-curve array continuity validation per LAS 3.0 spec.
+            # "Channels that are members of a 3D array must occur
+            # sequentially from [1] to [n], with no other channels
+            # intermixed." (LAS 3.0 Spec, Page 27)
+            _ARRAY_MNEMONIC_RE = re.compile(
+                r"^(?P<base>[\w\-]+)\[(?P<index>\d+)\]$"
+            )
+            for _ds in self.data_sections:
+                if not _ds.curves_order:
+                    continue
+                # Group array curves by base name, tracking position
+                # and index to validate contiguity and sequential order.
+                _base_groups: dict[str, list[tuple[int, int]]] = {}
+                for _pos, _name in enumerate(_ds.curves_order):
+                    _m = _ARRAY_MNEMONIC_RE.match(_name)
+                    if _m is None:
+                        continue
+                    _base = _m.group("base")
+                    _idx = int(_m.group("index"))
+                    _base_groups.setdefault(_base, []).append((_pos, _idx))
+                for _base, _entries in _base_groups.items():
+                    # Must have at least 2 entries to be an "array."
+                    if len(_entries) < 2:
+                        continue
+                    # Check contiguity: positions must be consecutive
+                    # (no intermixing).
+                    _positions = [p for p, _ in _entries]
+                    if _positions != list(
+                        range(_positions[0], _positions[0] + len(_positions))
+                    ):
+                        raise LASDataError(
+                            f"LASFile: array '{_base}' curves are not "
+                            f"contiguous in section '{_ds.name}'. "
+                            f"Array channels must appear sequentially "
+                            f"with no other channels intermixed."
+                        )
+                    # Check sequential indices [1]→[n], no gaps.
+                    _indices = [i for _, i in _entries]
+                    if _indices != list(range(1, len(_indices) + 1)):
+                        raise LASDataError(
+                            f"LASFile: array '{_base}' has non-sequential "
+                            f"indices {_indices} in section '{_ds.name}'. "
+                            f"Expected [1]→[{len(_indices)}]."
                         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1398,6 +1460,8 @@ class LASFile:
             # TypeError/ValueError get wrapped in LASDataError.
             if not isinstance(data, dict):
                 raise TypeError(f"Expected dict, got {type(data).__name__}")
+            # F-40: Protect caller's dict from mutation.
+            data = data.copy()
 
             # F-017/F-018/IF-015/IF-026/F-019: Pre-construction validation layer.
             # Closes Pattern #7 (from_dict validation gaps) structurally.
@@ -2219,6 +2283,20 @@ class LASFile:
                         f"({MAX_TOTAL_ELEMENTS})"
                     )
 
+            # F2-11: Validate string_data keys against curves_order
+            # (matching per-section guard at lines 1995-2005).
+            # Keys in string_data not in curves_order are orphaned.
+            if las_file.string_data and las_file.curves_order:
+                _order_s = set(las_file.curves_order)
+                _str_orphaned = set(las_file.string_data.keys()) - _order_s
+                if _str_orphaned:
+                    raise ValueError(
+                        f"string_data contains keys not in "
+                        f"curves_order: {sorted(_str_orphaned)}. "
+                        f"Each string_data key must correspond to a "
+                        f"curve mnemonic."
+                    )
+
             logs = _resolve_dict_entry(data, "logs", dict, dict)
             # F-06: Resource-exhaustion guard for logs.
             if len(logs) >= MAX_CURVES:
@@ -2254,6 +2332,19 @@ class LASFile:
                     raise ValueError(
                         f"Array length ({len(las_file.logs[name])}) for log "
                         f"'{name}' exceeds maximum allowed ({MAX_DATA_LINES})"
+                    )
+
+            # F-11: Detect key overlap between logs and string_data.
+            # A curve name appearing in both would silently have data
+            # corrupted — one array overwrites the other's meaning.
+            # (matches __post_init__ guard at lines 1209-1216)
+            if las_file.logs and las_file.string_data:
+                _overlap = set(las_file.logs.keys()) & set(las_file.string_data.keys())
+                if _overlap:
+                    raise ValueError(
+                        f"Curves {sorted(_overlap)} appear in "
+                        f"both logs and string_data.  Each curve may "
+                        f"only be stored in one location."
                     )
 
             # F-011: Validate that log curve keys match curves_order exactly.
@@ -2441,11 +2532,16 @@ class DevFile:
         return result
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> DevFile:
+    def from_dict(
+        cls, data: dict[str, Any], normalize_aliases: bool = True,
+    ) -> DevFile:
         """Create DevFile from dict (reverse of to_dict).
 
         Args:
             data: Flat dict mapping column names to array-like values.
+            normalize_aliases: If True (default), normalize column names
+                through ``_DEV_ALIASES``.  Set to False to preserve
+                column names exactly as provided.
 
         Returns:
             DevFile with columns populated from the dict.
@@ -2459,6 +2555,8 @@ class DevFile:
         try:
             if not isinstance(data, dict):
                 raise TypeError(f"Expected dict, got {type(data).__name__}")
+            # F2-12: Protect caller's dict from mutation.
+            data = data.copy()
 
             dev = cls()
             # Separate column arrays from metadata keys
@@ -2474,22 +2572,20 @@ class DevFile:
                         f"DevFile.from_dict: column keys must be "
                         f"strings, got {type(_k).__name__}"
                     )
-            # F-006: Normalize column names through _DEV_ALIASES before
-            # storage.  dev_reader.py normalizes during file parsing
-            # (line 1097, 1181); from_dict must do the same for
-            # programmatic construction.  Lazy import to avoid circular
-            # dependency (dev_reader imports DevFile from models).
-            from .dev_reader import _normalize_dev_column
-            for _raw_key in list(data.keys()):
-                _norm_key = _normalize_dev_column(_raw_key)
-                if _norm_key != _raw_key:
-                    if _norm_key in data:
-                        raise ValueError(
-                            f"DevFile.from_dict: column name collision: "
-                            f"'{_raw_key}' and '{_norm_key}' normalize "
-                            f"to the same canonical column name"
-                        )
-                    data[_norm_key] = data.pop(_raw_key)
+            # F-20: Normalize column names through _DEV_ALIASES before
+            # storage.  Controlled by normalize_aliases parameter.
+            if normalize_aliases:
+                from .dev_reader import _normalize_dev_column
+                for _raw_key in list(data.keys()):
+                    _norm_key = _normalize_dev_column(_raw_key)
+                    if _norm_key != _raw_key:
+                        if _norm_key in data:
+                            raise ValueError(
+                                f"DevFile.from_dict: column name collision: "
+                                f"'{_raw_key}' and '{_norm_key}' normalize "
+                                f"to the same canonical column name"
+                            )
+                        data[_norm_key] = data.pop(_raw_key)
 
             # F-M01: Resource-exhaustion guard — bound column count.
             # Exclude _meta_-prefixed keys (metadata stored under prefix
@@ -2535,8 +2631,21 @@ class DevFile:
                                     "value.decode('utf-8')"
                                 )
                             dev.column_order = [value]
+                            # F2-31: Normalize column_order entries to match
+                            # normalized column names in dev.columns.
+                            if normalize_aliases:
+                                dev.column_order = [
+                                    _normalize_dev_column(c)
+                                    for c in dev.column_order
+                                ]
                         else:
                             _col_order = list(value)
+                            # F2-31: Normalize column_order entries.
+                            if normalize_aliases:
+                                _col_order = [
+                                    _normalize_dev_column(c)
+                                    for c in _col_order
+                                ]
                             if len(_col_order) >= MAX_CURVES:
                                 raise ValueError(
                                     f"column_order has {len(_col_order)} entries, "
@@ -2586,8 +2695,21 @@ class DevFile:
                                     "value.decode('utf-8')"
                                 )
                             dev.column_order = [value]
+                            # F2-31: Normalize column_order entries to match
+                            # normalized column names in dev.columns.
+                            if normalize_aliases:
+                                dev.column_order = [
+                                    _normalize_dev_column(c)
+                                    for c in dev.column_order
+                                ]
                         else:
                             _col_order = list(value)
+                            # F2-31: Normalize column_order entries.
+                            if normalize_aliases:
+                                _col_order = [
+                                    _normalize_dev_column(c)
+                                    for c in _col_order
+                                ]
                             if len(_col_order) >= MAX_CURVES:
                                 raise ValueError(
                                     f"column_order has {len(_col_order)} entries, "
@@ -2649,6 +2771,77 @@ class DevFile:
             # If column_order wasn't in the dict, infer from Python 3.7+ dict order
             if not dev.column_order:
                 dev.column_order = list(dev.columns.keys())
+            # F2-30: Reject empty DevFile — no columns found.
+            if not dev.columns:
+                raise LASDataError("No columns found in input dict")
+            # F2-32: Cross-validate column_order entries against
+            # columns.keys().  Orphaned entries (e.g. ["INC", "AZI"]
+            # when only "MD" exists) produce silently broken output.
+            _orphaned = [c for c in dev.column_order if c not in dev.columns]
+            if _orphaned:
+                raise LASDataError(
+                    f"column_order contains entries not in columns: "
+                    f"{_orphaned}"
+                )
+            # F-43: Minimum data-quality validation matching reader's
+            # _validate_dev_data checks.  Uses warnings so that
+            # construction with out-of-range values is still possible
+            # for testing — the reader path does the same.
+            for _col_name, _col_data in dev.columns.items():
+                if _col_data is None or len(_col_data) == 0:
+                    continue
+                _col_upper = _col_name.upper()
+                # MD: monotonicity (strictly non-decreasing)
+                if _col_upper == "MD":
+                    _finite = _col_data[np.isfinite(_col_data)]
+                    if len(_finite) >= 2:
+                        _diffs = np.diff(_finite)
+                        if np.any(_diffs < 0):
+                            _n_bad = int(np.sum(_diffs < 0))
+                            warnings.warn(
+                                f"MD values are not monotonically "
+                                f"increasing: {_n_bad} decrease(s) "
+                                f"found.  Unsorted MD values can "
+                                f"cause inaccurate trajectory "
+                                f"calculations.",
+                                stacklevel=2,
+                            )
+                # AZI: range [0, 360]
+                if _col_upper in ("AZI", "AZIM", "AZ", "AZM", "AZIMUTH"):
+                    _finite = _col_data[np.isfinite(_col_data)]
+                    if len(_finite) > 0:
+                        _oor = (_finite < 0) | (_finite > 360)
+                        if np.any(_oor):
+                            _n_bad = int(np.sum(_oor))
+                            _bad_vals = _finite[_oor][:3]
+                            warnings.warn(
+                                f"Azimuth column '{_col_name}' has "
+                                f"{_n_bad} value(s) outside [0, 360]: "
+                                f"{list(_bad_vals)}"
+                                f"{'...' if _n_bad > 3 else ''}. "
+                                f"Azimuth values outside [0, 360] "
+                                f"can cause inaccurate trajectory "
+                                f"calculations.",
+                                stacklevel=2,
+                            )
+                # INC: range [0, 180]
+                if _col_upper in ("INC", "INCL", "DEVI", "DIP"):
+                    _finite = _col_data[np.isfinite(_col_data)]
+                    if len(_finite) > 0:
+                        _oor = (_finite < 0) | (_finite > 180)
+                        if np.any(_oor):
+                            _n_bad = int(np.sum(_oor))
+                            _bad_vals = _finite[_oor][:3]
+                            warnings.warn(
+                                f"Inclination column '{_col_name}' "
+                                f"has {_n_bad} value(s) outside "
+                                f"[0, 180]: {list(_bad_vals)}"
+                                f"{'...' if _n_bad > 3 else ''}. "
+                                f"Inclination values outside [0, 180] "
+                                f"can cause inaccurate trajectory "
+                                f"calculations.",
+                                stacklevel=2,
+                            )
             return dev
         except (ValueError, TypeError, OverflowError, ImportError) as e:
             raise LASDataError(str(e)) from e

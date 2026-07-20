@@ -25,7 +25,14 @@ from .models import DevFile
 # headers and corrupt parsed data.  Matches the full character class used by
 # reader.py:29 and parser.py:102 — covers all 33 C0 control chars (including
 # \x00 (NUL), \x7F (DEL)) plus NEL (\x85) and Unicode line/paragraph separators.
-_SPLITLINES_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85\u2028\u2029]")
+# F-001: Also include the 13 Unicode whitespace characters that the writer's
+# _CONTROL_CHARS_RE strips (\u00A0, \u2000-\u200A, \u202F, \u205F, \u3000)
+# so the write→read roundtrip is symmetric.
+_SPLITLINES_CHARS_RE = re.compile(
+    r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85"
+    r"\u2028\u2029"
+    r"\u00A0\u2000-\u200A\u202F\u205F\u3000]"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1009,7 +1016,7 @@ def read_dev_file_as_object(
         )
 
     if data_lines == 0:
-        raise LASDataError("No data lines found in DEV file")
+        raise DEVReadError("No data lines found in DEV file")
 
     # --- Pass 2: Parse header and data ---
     dev = DevFile()

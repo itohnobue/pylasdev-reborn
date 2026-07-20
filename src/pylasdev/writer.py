@@ -363,66 +363,55 @@ def _write_version_section(las_file: LASFile) -> list[str]:
     # An empty vers produces a malformed version line with an empty value.
     vers = las_file.version.vers or "2.0"
     lines.append(f" VERS.   {_sanitize_las_value(vers)}  : {vers_desc}")
-    # G-018: Save the original wrap value before any override path mutates
-    # it.  Restored at the end of this function so the las_file model
-    # matches the original state after writing.
-    original_wrap = las_file.version.wrap
-    try:
-        # F-05 / F-01: The writer cannot produce wrapped output (we always write
-        # one line per depth step).  If the source has WRAP=YES, override it to
-        # NO so the header declaration matches the actual data layout.  Emit a
-        # warning to inform the user of the override.
-        actual_wrap = las_file.version.wrap.upper() if las_file.version.wrap else "NO"
-        if actual_wrap == "YES":
-            import warnings
+    # F-05 / F-01: The writer cannot produce wrapped output (we always write
+    # one line per depth step).  If the source has WRAP=YES, override it to
+    # NO so the header declaration matches the actual data layout.  Emit a
+    # warning to inform the user of the override.
+    actual_wrap = las_file.version.wrap.upper() if las_file.version.wrap else "NO"
+    if actual_wrap == "YES":
+        import warnings
 
-            warnings.warn(
-                "WRAP=YES overridden to WRAP=NO because the writer "
-                "always produces ONE LINE PER DEPTH STEP (non-wrapped) output. "
-                "The data WILL be non-wrapped regardless of the original declaration.",
-                stacklevel=3,
-            )
-            actual_wrap = "NO"
-            # F-ITER2-W-M08: Write back to the model so the in-memory
-            # LASFile agrees with the file on disk.  Without this, a
-            # subsequent write or to_dict() would still report WRAP=YES.
-            las_file.version.wrap = "NO"
-        # F-M-027: LAS 3.0 requires one data row per line (non-wrapped output).
-        # Force WRAP=NO regardless of user-supplied wrap parameter to prevent
-        # data rows from being joined inline, which would produce a single
-        # giant line that downstream parsers reject.
-        if is_las30 and actual_wrap != "NO":
-            import warnings
-
-            warnings.warn(
-                f"LAS 3.0 WRAP={actual_wrap} overridden to WRAP=NO. "
-                "LAS 3.0 requires one data row per line. "
-                "The data will be written in non-wrapped format.",
-                stacklevel=3,
-            )
-            actual_wrap = "NO"
-            las_file.version.wrap = "NO"
-        wrap_desc = (
-            "ONE LINE PER DEPTH STEP" if actual_wrap == "NO" else "MULTIPLE LINES PER DEPTH STEP"
+        warnings.warn(
+            "WRAP=YES overridden to WRAP=NO because the writer "
+            "always produces ONE LINE PER DEPTH STEP (non-wrapped) output. "
+            "The data WILL be non-wrapped regardless of the original declaration.",
+            stacklevel=3,
         )
-        lines.append(f" WRAP.   {_sanitize_las_value(actual_wrap)}  : {wrap_desc}")
-        # DLM is defined in LAS 2.0 and 3.0 specs.  LAS 1.2 does not use
-        # DLM and always defaults to SPACE.  When DLM is not SPACE (e.g.,
-        # COMMA or TAB), emit the DLM line so the file declares the correct
-        # delimiter — otherwise a re-read would default to SPACE, corrupting
-        # comma- or tab-delimited data.
-        if las_file.version.dlm and las_file.version.dlm.upper() != "SPACE" and not is_las12:
-            dlm_desc = "DELIMITING CHARACTER BETWEEN DATA COLUMNS"
-            lines.append(
-                f" DLM .                        {_sanitize_las_value(las_file.version.dlm)} : {dlm_desc}"
-            )
-        lines.append("")
-    finally:
-        # G-018: Restore the original wrap value so the las_file model matches
-        # its pre-write state.  The override paths above (WRAP=YES → NO and
-        # LAS 3.0 non-NO → NO) mutate las_file.version.wrap directly — this
-        # restores it so the caller's model is unchanged after writing.
-        las_file.version.wrap = original_wrap
+        actual_wrap = "NO"
+        # F-ITER2-W-M08: Write back to the model so the in-memory
+        # LASFile agrees with the file on disk.  Without this, a
+        # subsequent write or to_dict() would still report WRAP=YES.
+        las_file.version.wrap = "NO"
+    # F-M-027: LAS 3.0 requires one data row per line (non-wrapped output).
+    # Force WRAP=NO regardless of user-supplied wrap parameter to prevent
+    # data rows from being joined inline, which would produce a single
+    # giant line that downstream parsers reject.
+    if is_las30 and actual_wrap != "NO":
+        import warnings
+
+        warnings.warn(
+            f"LAS 3.0 WRAP={actual_wrap} overridden to WRAP=NO. "
+            "LAS 3.0 requires one data row per line. "
+            "The data will be written in non-wrapped format.",
+            stacklevel=3,
+        )
+        actual_wrap = "NO"
+        las_file.version.wrap = "NO"
+    wrap_desc = (
+        "ONE LINE PER DEPTH STEP" if actual_wrap == "NO" else "MULTIPLE LINES PER DEPTH STEP"
+    )
+    lines.append(f" WRAP.   {_sanitize_las_value(actual_wrap)}  : {wrap_desc}")
+    # DLM is defined in LAS 2.0 and 3.0 specs.  LAS 1.2 does not use
+    # DLM and always defaults to SPACE.  When DLM is not SPACE (e.g.,
+    # COMMA or TAB), emit the DLM line so the file declares the correct
+    # delimiter — otherwise a re-read would default to SPACE, corrupting
+    # comma- or tab-delimited data.
+    if las_file.version.dlm and las_file.version.dlm.upper() != "SPACE" and not is_las12:
+        dlm_desc = "DELIMITING CHARACTER BETWEEN DATA COLUMNS"
+        lines.append(
+            f" DLM .                        {_sanitize_las_value(las_file.version.dlm)} : {dlm_desc}"
+        )
+    lines.append("")
     return lines
 
 
@@ -547,6 +536,15 @@ def _write_curve_section(las_file: LASFile) -> list[str]:
             if log_section and log_section.section_curves
             else las_file.curves
         )
+        if not curves_to_emit:
+            import warnings
+
+            warnings.warn(
+                "No curves to emit for ~C section — skipping",
+                UserWarning,
+                stacklevel=3,
+            )
+            return lines
         for curve in curves_to_emit:
             lines.append(_format_curve_line(curve, is_las30))
     else:
@@ -618,7 +616,7 @@ def _write_parameter_section(las_file: LASFile) -> list[str]:
             # parser interpretation on re-read.  Replace with underscore.
             st_key = (
                 param.section_type.upper().replace("|", "_")
-                if param.section_type else None
+                if param.section_type and param.section_type.strip() else None
             )
             sections.setdefault(st_key, []).append(param)
 
@@ -923,17 +921,32 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
             # las_file.logs contains curve data not covered by any
             # data_section's data or string_data, that data is silently
             # discarded on write.  Emit a warning so the caller knows.
-            if las_file.logs:
+            if las_file.logs or las_file.string_data:
                 # Collect all curve names present in any data_section.
                 _ds_covered: set[str] = set()
                 for _ds in las_file.data_sections:
                     _ds_covered.update(_ds.data.keys())
                     _ds_covered.update(_ds.string_data.keys())
-                _orphaned_logs = set(las_file.logs.keys()) - _ds_covered
+                _orphaned_logs = (
+                    set(las_file.logs.keys()) - _ds_covered
+                    if las_file.logs else set()
+                )
                 if _orphaned_logs:
                     warnings.warn(
                         f"Top-level logs contain curve(s) not present in any "
                         f"data_section: {sorted(_orphaned_logs)}.  The LAS 3.0 "
+                        f"writer path only writes data from data_sections; "
+                        f"these curves' data will NOT appear in the output file.",
+                        stacklevel=3,
+                    )
+                _orphaned_string_data = (
+                    set(las_file.string_data.keys()) - _ds_covered
+                    if las_file.string_data else set()
+                )
+                if _orphaned_string_data:
+                    warnings.warn(
+                        f"Top-level string_data contains curve(s) not present in any "
+                        f"data_section: {sorted(_orphaned_string_data)}.  The LAS 3.0 "
                         f"writer path only writes data from data_sections; "
                         f"these curves' data will NOT appear in the output file.",
                         stacklevel=3,
@@ -943,7 +956,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
             # Two sections of the same type with IDENTICAL curve definitions share
             # one Definition block (dedup).  When curve definitions differ between
             # same-type sections, a new numbered Definition block is emitted.
-            emitted_defs: dict[str, dict[tuple[tuple[str, str, str, str], ...], str]] = {}
+            emitted_defs: dict[str, dict[tuple[tuple[str, str, str, str, str, float | None], ...], str]] = {}
             for section in las_file.data_sections:
                 # F2-006: Normalize section_type to uppercase — from_dict does
                 # not normalize, so programmatically constructed LASFile objects
@@ -1012,7 +1025,9 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
                     # Build a curve identity signature from the visible fields
                     # that distinguish one curve set from another.
                     sig = tuple(
-                        (curve.mnemonic, curve.unit or "", curve.description or "", curve.data_format or "")
+                        (curve.mnemonic, curve.unit or "", curve.description or "", curve.data_format or "",
+                         curve.api_code or "",
+                         curve.array_info.time_offset if curve.array_info else None)
                         for curve in section.section_curves
                     )
                     if def_prefix:
@@ -1065,6 +1080,17 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
         else:
             # Legacy single data section (~A).
             curve_names = las_file.curves_order
+            if curve_names and not any(
+                name in las_file.logs or name in las_file.string_data for name in curve_names
+            ):
+                import warnings
+
+                warnings.warn(
+                    f"curves_order contains {len(curve_names)} curve(s) "
+                    f"but none have data in logs or string_data. "
+                    f"No data will be emitted.",
+                    stacklevel=3,
+                )
             if any(name in las_file.logs or name in las_file.string_data for name in curve_names):
                 lines.append("~A  " + "  ".join(_sanitize_las_value(name) for name in curve_names))
                 lines.extend(
