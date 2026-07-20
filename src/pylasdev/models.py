@@ -699,7 +699,7 @@ class ArrayElementInfo:
                 f"ArrayElementInfo: base_name must not be empty or "
                 f"whitespace-only, got {self.base_name!r}"
             )
-        if not isinstance(self.index, int):
+        if type(self.index) is not int:
             raise TypeError(
                 f"ArrayElementInfo: index must be int, got "
                 f"{type(self.index).__name__} ({self.index!r})"
@@ -893,6 +893,7 @@ class ParameterEntry:
             if not _stripped:
                 self.section_type = None
             else:
+                self.section_type = _stripped
                 _sec_str = str(self.section_type)
                 if '\n' in _sec_str or '\r' in _sec_str or '~' in _sec_str:
                     raise ValueError(
@@ -1007,6 +1008,8 @@ class DataSection:
                     f"{self.section_type!r}.  section_type must be a "
                     f"LAS identifier (alphanumeric + underscore)."
                 )
+            else:
+                self.section_type = _stripped
 
         # data keys ⊆ curves_order
         data_keys = set(self.data.keys())
@@ -1731,6 +1734,12 @@ class LASFile:
                     f"curves_order must be a list, got str: "
                     f"{curves_order!r}"
                 )
+            elif isinstance(curves_order, dict):
+                raise TypeError(
+                    "curves_order must be a list of strings, "
+                    "got dict.  Use list(curves_order) to extract "
+                    "keys, or provide a list directly."
+                )
             elif not isinstance(curves_order, Iterable):
                 # F-M02: Non-iterable non-str types (int, float, bool) crash
                 # at list() with TypeError.  Provide a clear error instead.
@@ -1980,7 +1989,7 @@ class LASFile:
                     # downstream len() guard fires.
                     try:
                         name = _norm_mnem(name)
-                        ds_string_data[name] = np.atleast_1d(np.array(arr, dtype=np.str_))
+                        ds_string_data[name] = np.atleast_1d(np.array(arr, dtype=object))
                     except (ValueError, TypeError, MemoryError, OverflowError) as e:
                         ds_name = ds_dict.get("name", "<unknown>")
                         raise ValueError(
@@ -2404,7 +2413,7 @@ class LASFile:
                 # from np.array() before the downstream len() guard fires.
                 try:
                     name = _norm_mnem(name)
-                    las_file.string_data[name] = np.atleast_1d(np.array(arr, dtype=np.str_))
+                    las_file.string_data[name] = np.atleast_1d(np.array(arr, dtype=object))
                 except (ValueError, TypeError, MemoryError, OverflowError) as e:
                     raise ValueError(
                         f"Cannot convert string data for curve "

@@ -160,18 +160,16 @@ def _escape_colons_for_las_value(value: str) -> str:
     .. important::
 
         The underscore (``_``) characters inserted by this function are
-        **permanent** — they are NOT reversed during parsing.  Values
+        **bidirectional** — they are reversed during parsing by
+        ``_unescape_colons_for_las_value`` (``parser.py``), which
+        restores the original whitespace-colon adjacencies.  Values
         containing colons adjacent to whitespace (e.g., ``"Oil : Gas"``
-        → ``"Oil _:_ Gas"``) will NOT roundtrip to their original form.
+        → ``"Oil _:_ Gas"`` on write, → ``"Oil : Gas"`` on read) WILL
+        roundtrip to their original form.
 
-        This is a deliberate trade-off.  Without escaping, embedded colons
-        adjacent to whitespace would be misinterpreted as structural
-        separators, causing data truncation on re-read.  The underscore
-        artifacts are the lesser evil compared to data loss.
-
-        If roundtrip fidelity for colon-containing values is required,
-        consider adding an unescape step in the parser that reverses
-        this transformation (``_:_`` → `` : `` etc.).
+        The roundtrip is reliable because the unescape step runs after
+        the structural colon separator has already been consumed by the
+        parser, so reversed colons cannot cause data truncation on re-read.
     """
     # Step 1: Insert _ between whitespace and colon.
     # Prevents \\s+:\\s* from matching at embedded colons.
@@ -887,6 +885,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
     _saved_string_data = dict(las_file.string_data)
     _saved_curves_order = list(las_file.curves_order)
     _saved_curves = list(las_file.curves)
+    _saved_wrap = las_file.version.wrap
 
     try:
         # F-I2-M17 / F-019: Guard against data_sections in non-LAS-3.0 files.
@@ -1181,6 +1180,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
         las_file.string_data = _saved_string_data
         las_file.curves_order = _saved_curves_order
         las_file.curves = _saved_curves
+        las_file.version.wrap = _saved_wrap
 
     return lines
 
@@ -1416,7 +1416,7 @@ def _format_fixed_precision(value: float, precision: str) -> str:
     # Extract the significant-digit count from the precision spec.
     # ".8g" → 8, ".10e" → 10, ".6f" → 6
     m = re.match(r"\.(\d+)", precision)
-    sig_digits = int(m.group(1)) if m else 8
+    sig_digits = min(int(m.group(1)), 100) if m else 8
 
     if value == 0:
         return format(value, f".{sig_digits}f")

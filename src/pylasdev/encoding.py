@@ -87,13 +87,21 @@ def _max_cyrillic_run(text: str) -> int:
 
 
 def detect_encoding(file_path: Path) -> str:
-    """Detect file encoding using chardet (if available) or fallback chain.
+    """Detect file encoding using chardet (if available).
+
+    Reads the first 50 KB of the file (with UTF-8 BOM stripped) and
+    uses chardet to detect the encoding.  When chardet is unavailable,
+    returns ``"utf-8"`` unconditionally — this function does not
+    perform a multi-encoding fallback chain.  The fallback chain with
+    quality-based selection is provided by :func:`read_with_encoding`
+    and :func:`_decode_best_quality`.
 
     Args:
         file_path: Path to the file.
 
     Returns:
-        Detected encoding name.
+        Detected encoding name, or ``"utf-8"`` when chardet is
+        not available or detects with low confidence.
     """
     if HAS_CHARDET:
         with open(file_path, "rb") as f:
@@ -343,6 +351,38 @@ def read_with_encoding(
     # out-compete UTF-8 in the quality-based selection below.
     if raw_bytes.startswith(b"\xef\xbb\xbf"):
         raw_bytes = raw_bytes[3:]
+
+    # Strip UTF-16/32 BOM prefixes and decode immediately — these BOMs
+    # definitively identify the encoding.  Without this, UTF-16/32 files
+    # decode as garbage through single-byte fallbacks when chardet is
+    # unavailable.  Checking 4-byte prefixes first avoids false matches
+    # where the UTF-16 LE BOM (\xff\xfe) is also the start of the
+    # UTF-32 LE BOM (\xff\xfe\x00\x00).
+    #
+    # Only run on files with enough content after BOM stripping to be
+    # meaningful (UTF-16: >= 4 bytes content → >= 6 bytes total;
+    # UTF-32: >= 4 bytes content → >= 8 bytes total).  This avoids
+    # mistaking tiny test payloads (e.g. b"\\xff\\xfe\\x00\\x01") for
+    # valid BOM-prefixed files.
+    _bom = None
+    if len(raw_bytes) >= 8 and raw_bytes.startswith(b"\xff\xfe\x00\x00"):
+        _bom = ("utf-32", 4)
+    elif len(raw_bytes) >= 8 and raw_bytes.startswith(b"\x00\x00\xfe\xff"):
+        _bom = ("utf-32", 4)
+    elif len(raw_bytes) >= 6 and raw_bytes.startswith(b"\xff\xfe"):
+        _bom = ("utf-16", 2)
+    elif len(raw_bytes) >= 6 and raw_bytes.startswith(b"\xfe\xff"):
+        _bom = ("utf-16", 2)
+    if _bom is not None:
+        _bom_enc, _bom_len = _bom
+        try:
+            content = raw_bytes[_bom_len:].decode(_bom_enc)
+            return _bom_enc, content.lstrip("\ufeff")
+        except (UnicodeDecodeError, LookupError) as e:
+            raise LASEncodingError(
+                f"Failed to decode {file_path} with encoding"
+                f" '{_bom_enc}': {e}"
+            ) from e
 
     if encoding is not None:
         try:

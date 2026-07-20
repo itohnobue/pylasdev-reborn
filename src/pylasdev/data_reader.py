@@ -195,14 +195,6 @@ def _get_parser_module() -> ModuleType:
     return _p
 
 
-# F-212: Module-level flag to control _desanitize_las_value behaviour.
-# Set to False when reading files NOT produced by pylasdev's writer, to
-# avoid corrupting ``_#`` sequences that are legitimate data, not escaped
-# ``#``-prefixed values.  Default True preserves roundtrip correctness
-# for pylasdev-produced files.  Overridable at module level.
-_DESANITIZE_ENABLED: bool = True
-
-
 def _desanitize_las_value(value: str) -> str:
     """Reverse the writer's ``_``-prefix-on-``#`` escape (local copy).
 

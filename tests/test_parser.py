@@ -13,6 +13,7 @@ import pytest
 from pylasdev import read_las_file
 from pylasdev.exceptions import LASParseError
 from pylasdev.parser import LASParser, _is_indexed_data_section
+from pylasdev.reader import read_las_file_as_object
 
 
 class TestLASParser:
@@ -2605,3 +2606,48 @@ class TestProductionCheckParserFix:
         assert p_mod._DESANITIZE_ENABLED is True
         result = p_mod._desanitize_las_value("_#hash_val")
         assert result == "#hash_val"
+
+    # --- F-014: string-curve null sentinel padding ---
+
+    def test_string_curve_null_sentinel_no_padding(self, tmp_path: Path) -> None:
+        """F-014: String curves get empty-string padding, not null_value.
+
+        Before the fix in ``parser.py:2868-2871``, when a LAS 3.0 data
+        row had fewer values than declared string curves, the missing
+        values were padded with ``str(null_value)`` (e.g. ``-999.25``).
+        The fix pads string curves with ``""`` instead.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO  : ONE LINE PER DEPTH STEP\n"
+            " DLM .                        COMMA : DELIMITING CHARACTER BETWEEN DATA COLUMNS\n"
+            "~WELL INFORMATION\n"
+            " STRT.   100.0  :\n"
+            " STOP.   200.0  :\n"
+            " STEP.   1.0  :\n"
+            " NULL.   -999.25  :\n"
+            "~CURVE INFORMATION\n"
+            " STR1.  :   {S}\n"
+            " DEPT.  :   {F}\n"
+            "~A LOG | CURVE\n"
+            # Row 1: both values present
+            "hello,100\n"
+            # Row 2: only STR1 value, DEPT missing → STR1 padded with ""
+            "world\n"
+            # Row 3: only DEPT value, STR1 missing → STR1 padded with ""
+            ",300\n"
+        )
+        temp_file = tmp_path / "string_null_pad.las"
+        temp_file.write_text(content)
+
+        las = read_las_file_as_object(temp_file)
+
+        assert "STR1" in las.string_data, "STR1 should be in string_data"
+        str_vals = las.string_data["STR1"].tolist()
+        assert str_vals[0] == "hello", f"Row 1: expected 'hello', got {str_vals[0]!r}"
+        assert str_vals[1] == "world", f"Row 2: expected 'world', got {str_vals[1]!r}"
+        # Row 3: empty-string padding (the fix), NOT "-999.25"
+        assert str_vals[2] == "", (
+            f"Row 3: expected empty-string padding, got {str_vals[2]!r}"
+        )

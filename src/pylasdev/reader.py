@@ -42,6 +42,7 @@ def read_las_file(
     encoding: str | None = None,
     max_file_size: int | None = None,
     well_format: str = "auto",
+    desanitize: bool = True,
 ) -> dict[str, Any]:
     """Read a LAS file and return data dictionary.
 
@@ -58,6 +59,10 @@ def read_las_file(
             ``"auto"`` (default) heuristically detects CWLS vs lasio
             convention per field; ``"cwls"`` forces CWLS convention;
             ``"lasio"`` forces lasio convention.
+        desanitize: If True (default), strip writer escape prefixes
+            (``_#`` → ``#``) for roundtrip correctness.  Set to False
+            when reading files NOT produced by pylasdev's writer to
+            avoid corrupting ``_#``-prefixed data.
 
     Returns:
         Dictionary with keys: version, well, parameters, parameter_details,
@@ -86,6 +91,7 @@ def read_las_file(
         encoding=encoding,
         max_file_size=max_file_size,
         well_format=well_format,
+        desanitize=desanitize,
     )
     return las_file.to_dict()
 
@@ -96,6 +102,7 @@ def read_las_file_as_object(
     encoding: str | None = None,
     max_file_size: int | None = None,
     well_format: str = "auto",
+    desanitize: bool = True,
 ) -> LASFile:
     """Read a LAS file and return LASFile dataclass (new API).
 
@@ -112,6 +119,10 @@ def read_las_file_as_object(
             ``"auto"`` (default) heuristically detects CWLS vs lasio
             convention per field; ``"cwls"`` forces CWLS convention;
             ``"lasio"`` forces lasio convention.
+        desanitize: If True (default), strip writer escape prefixes
+            (``_#`` → ``#``) for roundtrip correctness.  Set to False
+            when reading files NOT produced by pylasdev's writer to
+            avoid corrupting ``_#``-prefixed data.
 
     Returns:
         LASFile dataclass with full parsed data.
@@ -179,7 +190,8 @@ def read_las_file_as_object(
     # For LAS 1.2/2.0, use the dedicated data reader
     if not las_file.is_las30:
         try:
-            read_ascii_data(lines, las_file, parser.data_line_count)
+            read_ascii_data(lines, las_file, parser.data_line_count,
+                            desanitize=desanitize)
         except LASParseError as e:
             raise LASParseError(f"Error reading {file_path}: {e}") from e
 

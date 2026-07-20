@@ -509,6 +509,11 @@ class LASParser:
         self._data_line_count = 0
         self._ascii_data_lines: list[str] = []
         self._current_data_section_idx: int = 0
+        # F2-006: Cumulative cross-section element counter — tracks
+        # total elements (curves x lines) across ALL data sections
+        # to prevent multi-section files from exhausting memory when
+        # each individual section passes the per-section bound.
+        self._cumulative_elements: int = 0
         self._version_found = False  # flag for required ~V section validation
         # F-3: Accumulate other-section lines in a list to avoid O(n^2)
         # string concatenation (self.las_file.other += ... per line).
@@ -723,7 +728,16 @@ class LASParser:
                 _base = section_word.split("[", 1)[0] if "[" in section_word else section_word
                 if _base not in {"A", "ASCII", "V", "VERSION", "W", "WELL",
                                   "C", "CURVE", "P", "PARAMETER", "PARAMETERS",
-                                  "O", "OTHER"}:
+                                  "O", "OTHER",
+                                  # F-005: Section words recognized by
+                                  # data_reader._KNOWN_SECTION_WORDS but
+                                  # missing from _pre_scan — divergence
+                                  # causes stale line-count estimates.
+                                  "D", "DEFINITION",
+                                  "CORE", "DRILLING", "FORMATION",
+                                  "INCLINOMETRY", "LOG", "MUD",
+                                  "PERFORATIONS", "RISK", "STRUCTURE",
+                                  "TEST", "TOPS"}:
                     if re.search(r"_DEFINITION(_\d+)?$", _base):
                         pass
                     elif _base.endswith("_PARAMETER") or _base.endswith("_PARAMETERS") or _base.endswith("_DATA"):
@@ -1637,8 +1651,14 @@ class LASParser:
                     self.las_file.well.descriptions[mnemonic] = value
             elif self._well_format == "lasio":
                 # lasio convention: VALUE after colon (same as LAS 2.0+).
-                actual_value = description
-                self.las_file.well.descriptions[mnemonic] = value
+                # STRT/STOP/STEP/NULL are mandatory numeric fields where
+                # lasio reverses to value:descr order (matching CWLS).
+                if mnemonic in {"STRT", "STOP", "STEP", "NULL"}:
+                    actual_value = value
+                    self.las_file.well.descriptions[mnemonic] = description
+                else:
+                    actual_value = description
+                    self.las_file.well.descriptions[mnemonic] = value
             else:
                 # Auto-mode: detect CWLS vs lasio convention heuristically.
                 if mnemonic in {"STRT", "STOP", "STEP", "NULL"}:
@@ -2200,15 +2220,21 @@ class LASParser:
                         param_data_format = ""  # Not a valid data format — clear to prevent accumulation
                     else:
                         param_data_format = param_data_format[0]
-                # Single-char non-FEDAS codes ({X}, {G}) must be rejected
-                # to ensure parse→to_dict→from_dict roundtrip compatibility.
+                # Single-char non-FEDAS codes ({X}, {G}) are warned and
+                # cleared (matching curve path at line 2003-2016) to
+                # avoid crashing the parse — clearing to "" preserves
+                # roundtrip compatibility.
                 if len(param_data_format) == 1 and param_data_format not in _VALID_DATA_FORMATS:
-                    raise LASParseError(
+                    warnings.warn(
                         f"Parameter '{raw_mnemonic}' has unsupported data "
                         f"format specifier '{{{param_data_format}}}'. "
                         f"Valid LAS data format codes: "
-                        f"{', '.join(sorted(_VALID_DATA_FORMATS))}"
+                        f"{', '.join(sorted(_VALID_DATA_FORMATS))}. "
+                        f"Clearing to empty string.",
+                        UserWarning,
+                        stacklevel=2,
                     )
+                    param_data_format = ""
         # F-REV-01: Only strip validated format specifiers from
         # description — matching the curve path.  FORMAT_SPEC_PATTERN.sub("")
         # blindly strips ALL brace-enclosed text including non-format
@@ -2750,6 +2776,20 @@ class LASParser:
                 f"({_data_reader.MAX_TOTAL_ELEMENTS}). The file may be malformed or corrupt."
             )
 
+        # F2-006: Cumulative cross-section allocation check.
+        # Each section passes the per-section bounds above, but multiple
+        # sections can collectively exceed MAX_TOTAL_ELEMENTS (matching
+        # the from_dict pattern at models.py:2286-2310).
+        self._cumulative_elements += num_curves * actual_count
+        if self._cumulative_elements > _data_reader.MAX_TOTAL_ELEMENTS:
+            raise LASParseError(
+                f"Cumulative cross-section allocation "
+                f"({self._cumulative_elements} elements across "
+                f"{self._current_data_section_idx + 1} sections) exceeds "
+                f"maximum allowed ({_data_reader.MAX_TOTAL_ELEMENTS}). "
+                f"The file may be malformed or corrupt."
+            )
+
         # PERF-03: Pre-allocate numpy arrays for numeric curves.
         string_data_lists: dict[int, list[str]] = {}
         for i, curve in enumerate(section_curves):
@@ -2771,6 +2811,7 @@ class LASParser:
         idx = 0
         extra_count = 0  # I2-XPD-03: Row-count accumulator for extra columns
         short_count = 0  # I2-XPD-03: Row-count accumulator for short rows
+        _fc = [0]  # F-002: Mutable counter for float conversion diagnostics
         for line in self._ascii_data_lines:
             # Skip comment lines and blank/whitespace-only lines.
             # F-32: EMPTY_PATTERN was defined at module level but never
@@ -2820,9 +2861,14 @@ class LASParser:
                 if is_not_wrapped:
                     short_count += 1
 
-            # Pad with null values if needed
+            # Pad with null values if needed.
+            # String curves use "" (empty string) to avoid width-ambiguity
+            # from str(null_value) padding (matching data_reader.py:836-840).
             while len(values) < num_curves:
-                values.append(str(null_value))
+                if string_curves.get(len(values), False):
+                    values.append("")
+                else:
+                    values.append(str(null_value))
 
             for i in range(num_curves):
                 val_str = values[i].strip()
@@ -2831,7 +2877,7 @@ class LASParser:
                 if string_curves.get(i, False):
                     string_data_lists[i].append(val_str)
                 else:
-                    val = _to_finite_float(val_str, null_value)
+                    val = _to_finite_float(val_str, null_value, _failure_counter=_fc)
                     arr = numeric_arrays[i]  # type: ignore[assignment]
                     if arr is None:
                         raise LASParseError(
@@ -2864,6 +2910,19 @@ class LASParser:
                 null_value,
             )
 
+        # F-002: Emit diagnostic warning when float conversions fail in
+        # the LAS 3.0 data path — data processing is correct (values fall
+        # back to null_value), but users should know about unparseable data.
+        if _fc[0] > 0:
+            logger.warning(
+                "Data section '%s': %d value(s) could not be converted "
+                "to finite floats and were replaced with the null value "
+                "(%s).",
+                self._current_section_name or "ASCII",
+                _fc[0],
+                null_value,
+            )
+
         # F2-014: Copy filled numeric arrays from data_section.data to
         # las_file.logs for independent views.  The allocation above only
         # assigned to data_section.data; the fill loop wrote values via
@@ -2880,7 +2939,7 @@ class LASParser:
         # Convert string data lists to numpy arrays
         for i, curve in enumerate(section_curves):
             if i in string_data_lists:
-                string_arr = np.array(string_data_lists[i], dtype=np.str_)
+                string_arr = np.array(string_data_lists[i], dtype=object)
                 data_section.string_data[curve.mnemonic] = string_arr
                 if is_first_section:
                     # F2-014: Defensive copy — prevents shared-reference

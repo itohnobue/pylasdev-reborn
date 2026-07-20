@@ -336,7 +336,7 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
     if _comma_texts:
         # Use the first comma-containing line for token analysis.
         _comma_text = _comma_texts[0]
-        comma_tokens = [t.strip() for t in _comma_text.split(",") if t.strip()]
+        comma_tokens = [t.strip() for t in _comma_text.split(",", maxsplit=_max_tokens) if t.strip()]
         if comma_tokens:
             float_tokens = [t for t in comma_tokens if _is_float_token(t)]
             all_float = len(float_tokens) == len(comma_tokens)
@@ -407,7 +407,7 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                         if len(content_entries) >= 2:
                             second_comma_tokens = [
                                 t.strip()
-                                for t in content_entries[1][1].split(",")
+                                for t in content_entries[1][1].split(",", maxsplit=_max_tokens)
                                 if t.strip()
                             ]
                             if len(second_comma_tokens) == len(comma_tokens):
@@ -502,7 +502,7 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                     return ("dug", 2)
                 # F-DV01: Count-mismatch fallback — when the second line is
                 # all-float but the count doesn't match the first line's
-                # integer, it's still DUG format (not headerless) as long as
+                # integer, it's STILL DUG format (not headerless) as long as
                 # there are 3+ content entries (i.e. data lines exist beyond
                 # the header).  Without >=3 guard a 2-line file like
                 # "100\\n50.0\\n" is too ambiguous — it stays headerless.
@@ -511,9 +511,14 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 # misdetected as DUG format.  A DUG file with only 1 column is
                 # extremely unusual and would be caught by the col_count ==
                 # len(second_tokens) check above anyway.
+                # F2-018: Constrain fallback to col_count <= len(second_tokens) + 1
+                # to prevent pathologically mismatched headerless data (e.g.,
+                # first-line "100" with 3 actual columns) from being misdetected
+                # as DUG.  Genuine DUG count mismatches are typically off by 1-2
+                # tokens; a 33x mismatch means the first line is data, not a count.
                 if len(second_tokens) > 1 and len(content_entries) >= 3 and all(
                     _is_float_token(t) for t in second_tokens
-                ):
+                ) and col_count <= len(second_tokens) + 1:
                     return ("dug", 2)
 
     # Pattern B: multi-word title, integer column count, header.
@@ -1087,7 +1092,9 @@ def read_dev_file_as_object(
         if format_type == "dug" and len(content_entries) > skip_content_lines - 1:
             hdr = content_entries[skip_content_lines - 1][1]
         elif content_entries:
-            _first = content_entries[0][1]
+            _first = content_entries[
+                skip_content_lines - 1 if skip_content_lines > 1 else 0
+            ][1]
             if format_type == "headerless" and "," not in _first:
                 # Headerless format where the first line is a column count
                 # (no commas).  Check subsequent lines for comma presence.
@@ -1107,7 +1114,7 @@ def read_dev_file_as_object(
             # treat the file as comma-delimited.  Using >= (not >) so
             # that "MD, TVD, INC, AZI" (commas with trailing spaces)
             # correctly detects comma delimiter.
-            comma_tokens = [t for t in hdr.split(",") if t.strip()]
+            comma_tokens = [t for t in hdr.split(",", maxsplit=_max_tokens) if t.strip()]
             space_tokens = hdr.split()
             if "\t" in hdr:
                 # Tab-delimited file: use str.split("\t") to preserve

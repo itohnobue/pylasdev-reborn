@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from pylasdev import read_las_file, write_las_file
+from pylasdev import read_las_file, read_las_file_as_object, write_las_file
 from pylasdev.exceptions import LASWriteError
 from pylasdev.models import (
     ArrayElementInfo,
@@ -2537,3 +2537,115 @@ class TestProductionCheckWriterFixes:
         content = temp_file.read_text()
         # CURVE section should exist with proper structure
         assert "~CURVE" in content
+
+    # --- F-001 (CRITICAL): np.str_ truncation — string curves roundtrip ---
+
+    def test_string_curve_no_truncation(self, tmp_path: Path) -> None:
+        """F-001: LAS 3.0 string curves roundtrip without truncation.
+
+        Before the fix, ``dtype=np.str_`` created fixed-width string
+        arrays that silently truncated values exceeding the maximum
+        element length.  The fix uses ``dtype=object`` to preserve
+        arbitrary-length Python strings.
+        """
+        long_strings = [
+            "A" * 50,
+            "B" * 100,
+            "C" * 200,
+            "D" * 512,  # Well beyond default np.str_ width of ~32
+        ]
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["STRVAL"]
+        las.curves.append(CurveDefinition(mnemonic="STRVAL", data_format="S"))
+        las.string_data["STRVAL"] = np.array(long_strings, dtype=object)
+
+        temp_file = tmp_path / "long_string_curves.las"
+        write_las_file(temp_file, las)
+
+        # Roundtrip: read it back via the object API
+        las2 = read_las_file_as_object(temp_file)
+        # String data must match exactly, no truncation
+        assert "STRVAL" in las2.string_data, (
+            "STRVAL not found in string_data after roundtrip"
+        )
+        result = las2.string_data["STRVAL"]
+        assert result.tolist() == long_strings, (
+            f"Expected {long_strings}, got {result.tolist()}"
+        )
+
+    # --- F-031: writer wrap/state exception safety ---
+
+    def test_model_state_preserved_after_write(self, tmp_path: Path) -> None:
+        """F-031: LASFile state (logs, string_data, curves) restored after write.
+
+        Before the fix, ``_write_ascii_sections`` mutated
+        ``las_file.logs``, ``las_file.string_data``,
+        ``las_file.curves_order``, and ``las_file.curves`` during
+        the legacy copy-back path without a finally block to restore
+        the caller's state if an exception occurred downstream.
+
+        The fix saves all four attributes before the try block and
+        restores them in a finally block.  This test verifies that
+        writing a file preserves the caller's pre-write state.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="2.0", wrap="NO")
+        las.well["NULL"] = "-999.25"
+        las.well["STRT"] = "100.0"
+        las.well["STOP"] = "200.0"
+        las.well["STEP"] = "1.0"
+        las.curves_order = ["DEPT", "GR"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.curves.append(CurveDefinition(mnemonic="GR", unit="GAPI"))
+        las.logs["DEPT"] = np.array([100.0, 200.0])
+        las.logs["GR"] = np.array([75.0, 85.0])
+
+        saved_logs = dict(las.logs)
+        saved_curves_order = list(las.curves_order)
+        saved_curves = list(las.curves)
+
+        temp_file = tmp_path / "state_preserved.las"
+        write_las_file(temp_file, las)
+
+        # After write, the caller's model MUST not have corrupted logs
+        assert list(las.logs.keys()) == list(saved_logs.keys()), (
+            f"Log keys changed: {list(las.logs.keys())} vs {list(saved_logs.keys())}"
+        )
+        assert np.array_equal(las.logs["DEPT"], saved_logs["DEPT"]), (
+            "DEPT data mutated during write"
+        )
+        assert np.array_equal(las.logs["GR"], saved_logs["GR"]), (
+            "GR data mutated during write"
+        )
+        assert las.curves_order == saved_curves_order, (
+            "curves_order changed during write"
+        )
+        assert len(las.curves) == len(saved_curves), (
+            "curves count changed during write"
+        )
+
+    # --- F2-016: writer precision cap ---
+
+    def test_precision_capped_at_100(self) -> None:
+        """F2-016: High-precision specifiers cap at 100 decimal places.
+
+        Before the fix, ``max(decimal_places, sig_digits)`` undid the
+        ``min(..., 100)`` cap when ``sig_digits`` was large.  The fix
+        caps ``sig_digits`` at the point of extraction so that the
+        subsequent ``min(..., 100)`` actually limits the output width.
+        """
+        # 1e-100 with sig_digits=200 would produce ~293 decimal places
+        # without the cap.  With the fix, it caps at 100.
+        result = _format_fixed_precision(1e-100, ".200g")
+        # The formatted result should not be excessively long
+        # (cap at 100 decimal places ≈ ~104 chars including leading zero)
+        assert len(result) < 200, (
+            f"Precision cap should limit output length, "
+            f"got {len(result)} chars: {result!r}"
+        )
+
+        # Also verify sensible inputs still work
+        normal = _format_fixed_precision(3.14, ".4g")
+        assert "3.14" in normal

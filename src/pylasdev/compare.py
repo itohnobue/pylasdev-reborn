@@ -181,7 +181,13 @@ def compare_las_dicts(
                     return False
 
         elif isinstance(val2, np.ndarray):
-            if not _compare_arrays(val1, val2, key, None, rtol, atol):
+            if val2.ndim == 0:
+                if not _scalars_equal(val1, val2):
+                    logger.warning(
+                        "Mismatch at '%s': %r vs %r", key, val1, val2
+                    )
+                    return False
+            elif not _compare_arrays(val1, val2, key, None, rtol, atol):
                 return False
 
         elif isinstance(val2, list):
@@ -358,9 +364,17 @@ def _compare_lists(
         # evaluates True without raising ValueError/TypeError, bypassing
         # per-element comparison that correctly handles NaN==NaN (via
         # _scalars_equal at line 46-48 and np.allclose(equal_nan=True)).
-        if any(isinstance(x, (float, np.floating)) and x != x for x in l1) or any(
-            isinstance(x, (float, np.floating)) and x != x for x in l2
-        ):
+        def _has_nan(obj: Any) -> bool:
+            """Check if obj or any nested element is NaN."""
+            if isinstance(obj, (float, np.floating)):
+                return obj != obj
+            if isinstance(obj, list):
+                return any(_has_nan(x) for x in obj)
+            if isinstance(obj, dict):
+                return any(_has_nan(v) for v in obj.values())
+            return False
+
+        if _has_nan(l1) or _has_nan(l2):
             raise ValueError  # Route to per-element comparison
         if l1 != l2:
             logger.warning("List mismatch at '%s': %r vs %r", label, l1, l2)

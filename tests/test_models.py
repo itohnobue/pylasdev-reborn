@@ -2404,3 +2404,43 @@ class TestReFixModels1:
         )
         assert "MD" in dev.columns
         assert "TVD" in dev.columns
+
+    # --- F2-008: ArrayElementInfo rejects bool as index ---
+
+    def test_array_element_info_bool_rejected(self) -> None:
+        """F2-008: ArrayElementInfo(index=True) raises TypeError.
+
+        Before the fix, ``isinstance(self.index, int)`` accepted ``bool``
+        because ``bool`` is a subclass of ``int``.
+        """
+        with pytest.raises(TypeError, match="index must be int"):
+            ArrayElementInfo(base_name="T", index=True)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests added outside TestProductionCheckModelsFixes
+# because they test LASFile-level guards, not DataSection internals.
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionModelsFixes:
+    """Regression tests for production check fixes testing LASFile guards."""
+
+    # --- F2-014: dict as curves_order rejected ---
+
+    def test_curves_order_rejects_dict(self) -> None:
+        """F2-014: Passing a dict as curves_order raises LASDataError.
+
+        Dict is iterable so it passed the old guard chain in from_dict.
+        The fix adds an ``isinstance(curves_order, dict)`` check before
+        the iterable guard.  from_dict wraps the inner TypeError in
+        LASDataError, so we match on the wrapper.
+        """
+        with pytest.raises(LASDataError, match="got dict"):
+            LASFile.from_dict(
+                {
+                    "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+                    "well": {"NULL": "-999.25"},
+                    "curves_order": {"DEPT": "M", "GR": "GAPI"},
+                }
+            )
