@@ -324,6 +324,7 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
                 df = str(_raw).upper()
                 if df:
                     df = df[0]  # F-M-012: truncate extended format codes (parser accepts F8.3, etc.)
+                    cd["data_format"] = df  # F-017: truncate in-place so from_dict passes single-char to constructor
                 if df and df not in _VALID_DATA_FORMATS:
                     raise ValueError(
                         f"curves[{i}]: invalid data_format '{cd['data_format']}'. "
@@ -345,6 +346,7 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
                         df = str(_raw).upper()
                         if df:
                             df = df[0]  # F-M-012: truncate extended format codes (parser accepts F8.3, etc.)
+                            sc["data_format"] = df  # F-017: truncate in-place for from_dict construction
                         if df and df not in _VALID_DATA_FORMATS:
                             raise ValueError(
                                 f"data_sections[{si}].section_curves[{ci}]: "
@@ -520,6 +522,8 @@ class VersionSection:
         # DLM: validate non-empty values against SPACE/TAB/COMMA
         # (matching _validate_from_dict_input lines 246-269).
         # Empty string = not specified.
+        if self.dlm is None:
+            raise ValueError("VersionSection: DLM cannot be None")
         if self.dlm:
             _dlm = self.dlm.upper()
             is_las12 = self.vers.strip().startswith("1")
@@ -670,10 +674,10 @@ class CurveDefinition:
         # strip() catches leading/trailing whitespace but "GR 1"
         # passes — embedded spaces survive to produce corrupted
         # LAS output (space is the field delimiter).
-        if not self.mnemonic or not self.mnemonic.strip() or ' ' in self.mnemonic.strip():
+        if not self.mnemonic or not self.mnemonic.strip() or ' ' in self.mnemonic.strip() or '\t' in self.mnemonic.strip():
             raise ValueError(
                 f"CurveDefinition: mnemonic must not be empty, "
-                f"whitespace-only, or contain spaces, "
+                f"whitespace-only, or contain spaces/tabs, "
                 f"got {self.mnemonic!r}"
             )
         if self.data_format and self.data_format not in _VALID_DATA_FORMATS:
@@ -772,10 +776,10 @@ class ParameterEntry:
         # strip() catches leading/trailing whitespace but "GR 1"
         # passes — embedded spaces survive to produce corrupted
         # LAS output (space is the field delimiter).
-        if not self.mnemonic or not self.mnemonic.strip() or ' ' in self.mnemonic.strip():
+        if not self.mnemonic or not self.mnemonic.strip() or ' ' in self.mnemonic.strip() or '\t' in self.mnemonic.strip():
             raise ValueError(
                 f"ParameterEntry: mnemonic must not be empty, "
-                f"whitespace-only, or contain spaces, "
+                f"whitespace-only, or contain spaces/tabs, "
                 f"got {self.mnemonic!r}"
             )
         # F-M-009: Validate data_format when provided, mirroring
@@ -1521,13 +1525,22 @@ class LASFile:
                     f"curves_order must be an iterable, "
                     f"got {type(curves_order).__name__}"
                 )
+            # F-029: Materialize iterable to prevent generator exhaustion
+            # when iterated twice (validation loop + list comprehension).
+            curves_order = list(curves_order)
             # F-M-014 / F-M-016: Validate per-element types in curves_order.
             # Non-string elements (int, None) crash _norm_mnem().upper()
             # when mnem_base is active, and silently produce integer curve
             # names when mnem_base is None (e.g. curves_order=range(5)
             # passes the iterable guard but produces [0,1,2,3,4]).
             for _i, _name in enumerate(curves_order):
-                if not isinstance(_name, (str, bytes)):
+                if isinstance(_name, bytes):
+                    raise TypeError(
+                        f"curves_order[{_i}] must be str, "
+                        f"got bytes.  Decode to str first: "
+                        f"curves_order[{_i}].decode('utf-8')"
+                    )
+                if not isinstance(_name, str):
                     raise TypeError(
                         f"curves_order[{_i}] must be str, "
                         f"got {type(_name).__name__}: {_name!r}"
@@ -1932,6 +1945,9 @@ class LASFile:
                 # because the mnemonic cross-validation gate (L1496) is
                 # inactive.  str(123) → "123" becomes a column header on
                 # write; on re-read it looks like a genuine curve.
+                # F-029: Materialize to prevent generator exhaustion
+                # when iterated twice (validation loop + list comprehension).
+                _ds_curves_order = list(_ds_curves_order)
                 for _i, _item in enumerate(_ds_curves_order):
                     if not isinstance(_item, (str, bytes)):
                         ds_name = ds_dict.get("name", "<unknown>")
@@ -2467,6 +2483,12 @@ class DevFile:
             for _raw_key in list(data.keys()):
                 _norm_key = _normalize_dev_column(_raw_key)
                 if _norm_key != _raw_key:
+                    if _norm_key in data:
+                        raise ValueError(
+                            f"DevFile.from_dict: column name collision: "
+                            f"'{_raw_key}' and '{_norm_key}' normalize "
+                            f"to the same canonical column name"
+                        )
                     data[_norm_key] = data.pop(_raw_key)
 
             # F-M01: Resource-exhaustion guard — bound column count.

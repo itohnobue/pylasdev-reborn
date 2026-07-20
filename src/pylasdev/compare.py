@@ -142,6 +142,25 @@ def compare_las_dicts(
                             type(val2[in_key]).__name__,
                         )
                         return False
+                    elif isinstance(val2[in_key], dict):
+                        # F-028: Handle nested dict with ndarray leaf values
+                        # at depth 3+. Without this branch, both values
+                        # fall through to _scalars_equal which raises
+                        # ValueError on dict equality with ndarray values
+                        # (ambiguous truth value), silently returning False
+                        # even for identical dicts.
+                        if not isinstance(val1[in_key], dict):
+                            logger.warning(
+                                "Type mismatch at '%s.%s': %s vs dict",
+                                key,
+                                in_key,
+                                type(val1[in_key]).__name__,
+                            )
+                            return False
+                        if not compare_las_dicts(
+                            val1[in_key], val2[in_key], rtol, atol
+                        ):
+                            return False
                     elif not _scalars_equal(val1[in_key], val2[in_key]):
                         logger.warning(
                             "Mismatch at '%s.%s': %r vs %r",
@@ -229,7 +248,7 @@ def _compare_arrays(
 
     # F-4: np.allclose() fails on string/object arrays (e.g. string_data).
     # Use np.array_equal for non-numeric dtypes.
-    if arr1.dtype.kind in ("U", "S", "O", "V", "M", "m", "b") or arr2.dtype.kind in ("U", "S", "O", "V", "M", "m", "b"):
+    if arr1.dtype.kind in ("U", "S", "O", "V", "M", "m", "b", "c") or arr2.dtype.kind in ("U", "S", "O", "V", "M", "m", "b", "c"):
         if not np.array_equal(arr1, arr2):
             logger.warning("Array values mismatch at '%s'", label)
             return False
@@ -483,6 +502,26 @@ def _compare_data_sections(
                             type(v2[in_key]).__name__,
                         )
                         return False
+                    elif isinstance(v2[in_key], dict):
+                        # FR02: Handle nested dict with ndarray leaf values
+                        # at depth 3+. Without this branch, both values
+                        # fall through to _scalars_equal which raises
+                        # ValueError on dict equality with ndarray values
+                        # (ambiguous truth value), silently returning False
+                        # even for identical dicts.
+                        if not isinstance(v1[in_key], dict):
+                            logger.warning(
+                                "Type mismatch at 'data_sections[%d].%s.%s': %s vs dict",
+                                i,
+                                k,
+                                in_key,
+                                type(v1[in_key]).__name__,
+                            )
+                            return False
+                        if not compare_las_dicts(
+                            v1[in_key], v2[in_key], rtol, atol
+                        ):
+                            return False
                     elif not _scalars_equal(v1[in_key], v2[in_key]):
                         logger.warning(
                             "Mismatch at 'data_sections[%d].%s.%s': %r vs %r",

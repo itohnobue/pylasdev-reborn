@@ -280,9 +280,12 @@ class TestDevDedup:
         """Cross-base collision: original name matches prior _N suffix.
 
         Input columns: ["A", "A", "A_2"]
-        Expected: ["A", "A_2", "A_2_2"] — second "A" → "A_2" which
-        collides with the third original name "A_2", so the third
-        becomes "A_2_2".
+        Expected: ["A", "A_3", "A_2"] — second "A" tries to become
+        "A_2" but "A_2" is a natural name (appears in input), so the
+        auto-generated suffix is bumped to "A_3".  The natural "A_2"
+        is preserved.
+        F-033: natural names are now tracked to prevent false
+        "duplicate" warnings and incorrect renaming.
         """
         content = "A A A_2\n10.0 20.0 30.0\n"
         test_file = tmp_path / "cross_base.dev"
@@ -292,12 +295,12 @@ class TestDevDedup:
             warnings.simplefilter("always")
             data = read_dev_file(test_file)
             dup_warnings = [x for x in w if "Duplicate DEV column name" in str(x.message)]
-            assert len(dup_warnings) >= 2
+            assert len(dup_warnings) == 1
 
-        assert list(data.keys()) == ["A", "A_2", "A_2_2"]
+        assert list(data.keys()) == ["A", "A_3", "A_2"]
         np.testing.assert_array_equal(data["A"], [10.0])
-        np.testing.assert_array_equal(data["A_2"], [20.0])
-        np.testing.assert_array_equal(data["A_2_2"], [30.0])
+        np.testing.assert_array_equal(data["A_3"], [20.0])
+        np.testing.assert_array_equal(data["A_2"], [30.0])
 
 
 class TestDevSafetyGuards:
@@ -587,10 +590,13 @@ class TestDevDedupWhileLoop:
         """Test cross-base while-loop when generated _2 suffix collides.
 
         Input columns: ["A", "A", "A_2_2", "A_2"]
-        Expected: ["A", "A_2", "A_2_2", "A_2_3"] — "A_2" triggers the
-        cross-base collision at line 176, producing "A_2_2", but "A_2_2"
-        is ALREADY in output_names from the original third column, so the
-        while-loop at line 179-181 increments suffix to 3 producing "A_2_3".
+        Expected: ["A", "A_3", "A_2_2", "A_2"] — second "A" tries to
+        become "A_2" but "A_2" is a natural name (the fourth column),
+        so the while-loop bumps the suffix to "A_3".  The natural
+        "A_2_2" and "A_2" are preserved.
+        F-033: natural names are now tracked — auto-generated suffixes
+        cannot collide with names that appear in the input list,
+        preventing false "duplicate" warnings and misnaming.
         """
         content = "A A A_2_2 A_2\n10.0 20.0 30.0 40.0\n"
         test_file = tmp_path / "cross_while.dev"
@@ -600,13 +606,13 @@ class TestDevDedupWhileLoop:
             warnings.simplefilter("always")
             data = read_dev_file(test_file)
             dup_warnings = [x for x in w if "Duplicate DEV column name" in str(x.message)]
-            assert len(dup_warnings) >= 2
+            assert len(dup_warnings) == 1
 
-        assert list(data.keys()) == ["A", "A_2", "A_2_2", "A_2_3"]
+        assert list(data.keys()) == ["A", "A_3", "A_2_2", "A_2"]
         np.testing.assert_array_equal(data["A"], [10.0])
-        np.testing.assert_array_equal(data["A_2"], [20.0])
+        np.testing.assert_array_equal(data["A_3"], [20.0])
         np.testing.assert_array_equal(data["A_2_2"], [30.0])
-        np.testing.assert_array_equal(data["A_2_3"], [40.0])
+        np.testing.assert_array_equal(data["A_2"], [40.0])
 
 
 class TestDugFormat:
@@ -1337,14 +1343,21 @@ class TestColumnsKeywordFormat:
         assert data["MD"][0] == 100.0
 
     def test_columns_lowercase_keyword(self, tmp_path: Path) -> None:
-        """*columns (lowercase) still triggers the keyword format path."""
+        """*columns (lowercase) still triggers the keyword format path.
+
+        F-034: _normalize_dev_column now uppercases column names before
+        alias lookup, so lowercase *columns header names like *md, *tvd,
+        *x are normalized to canonical uppercase (MD, TVD, X).
+        Previously they were returned in lowercase, which skipped
+        validation and produced inconsistent column naming.
+        """
         content = "*columns *md *tvd *x\n0.0 0.0 100.0\n"
         test_file = tmp_path / "columns_lower.dev"
         test_file.write_text(content, encoding="utf-8")
 
         data = read_dev_file(test_file)
-        assert list(data.keys()) == ["md", "tvd", "x"]
-        assert data["md"][0] == 0.0
+        assert list(data.keys()) == ["MD", "TVD", "X"]
+        assert data["MD"][0] == 0.0
 
     def test_columns_mixed_case_keyword(self, tmp_path: Path) -> None:
         """*Columns (mixed case) triggers keyword format via .upper() check."""
@@ -1744,3 +1757,35 @@ class TestValidateDevData:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             _validate_dev_data(dev)
+
+
+class TestF035FailureCounterRegression:
+    """F-035 regression: _failure_counter passed to _to_finite_float.
+
+    Before F-035, four non-MD column sites in dev_reader.py called
+    ``_to_finite_float(token, ...)`` without passing a
+    ``_failure_counter`` list.  When a non-numeric token hit the
+    ``float(token)`` branch and failed, it was logged at errors=10+
+    but the counter was None → silent NaN absorption with no
+    end-of-section diagnostic summary for the corrupted column.
+    After F-035, all call sites share a single counter list so the
+    end-of-section report covers all columns.
+    """
+
+    def test_non_numeric_all_columns_counted(self, tmp_path: Path) -> None:
+        """Non-numeric tokens in non-MD columns are counted in diagnostics."""
+        # All columns have non-numeric data — this exercises the
+        # _failure_counter path at all sites (TVD, X, Y, etc.)
+        content = "MD TVD X Y\n100.0 BAD BAD BAD\n200.0 BAD BAD BAD\n"
+        test_file = tmp_path / "f035_all_bad.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Should not crash; non-numeric values become NaN
+        data = read_dev_file(test_file)
+        assert np.isnan(data["TVD"][0])
+        assert np.isnan(data["TVD"][1])
+        assert np.isnan(data["X"][0])
+        assert np.isnan(data["Y"][0])
+        # MD should parse correctly
+        assert data["MD"][0] == 100.0
+        assert data["MD"][1] == 200.0

@@ -1773,3 +1773,77 @@ class TestDevFile:
         assert dev2.encoding == "utf-8"
         np.testing.assert_array_equal(dev2.columns["MD"], np.array([0.0, 100.0]))
         np.testing.assert_array_equal(dev2.columns["TVD"], np.array([0.0, 99.0]))
+
+
+class TestF038DlmNoneRaisesValueError:
+    """F-038 regression: DLM=None raises ValueError in VersionSection.
+
+    Before F-038, VersionSection(dlm=None) passed validation (``if
+    self.dlm:`` skipped it) but crashed downstream in
+    ``delimiter_char`` and the writer.  After F-038,
+    ``__post_init__`` rejects DLM=None explicitly.
+    """
+
+    def test_version_section_dlm_none_raises_value_error(self) -> None:
+        """VersionSection(dlm=None) raises ValueError."""
+        with pytest.raises(ValueError, match="DLM cannot be None"):
+            VersionSection(vers="3.0", wrap="NO", dlm=None)
+
+    def test_version_section_dlm_empty_ok(self) -> None:
+        """VersionSection(dlm='') is valid — empty DLM is allowed."""
+        vs = VersionSection(vers="3.0", wrap="NO", dlm="")
+        assert vs.dlm == ""
+
+    def test_from_dict_dlm_none_after_fix(self) -> None:
+        """from_dict with DLM=None (e.g., omitted from version dict)
+        should still work — explicit None key triggers default."""
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["DEPT"],
+            "logs": {"DEPT": np.array([100.0])},
+        }
+        # DLM not present → from_dict uses default (should succeed)
+        las = LASFile.from_dict(data)
+        assert las.version.dlm == "SPACE"  # default
+
+
+class TestFR01PerSectionDataFormatWriteBack:
+    """F-R01 regression: per-section data_format truncation write-back.
+
+    Before F-R01, the per-section ``data_format`` loop truncated
+    extended format codes (e.g., "F8.3" → "F") into a local variable
+    but did NOT write the truncated value back to the section-curve
+    dict.  This caused ``LASDataError`` at ``CurveDefinition``
+    construction because the original extended code was passed to
+    ``__post_init__`` which rejected it.  The top-level loop at
+    line 327 correctly writes back; the per-section path was a
+    mechanical omission.
+    """
+
+    def test_from_dict_multi_section_extended_data_format(self) -> None:
+        """Multi-section from_dict with per-section extended data_format."""
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"NULL": "-999.25"},
+            "data_sections": [
+                {
+                    "name": "Section1",
+                    "section_type": "LOG_DATA",
+                    "data": {"DEPT": np.array([100.0, 200.0])},
+                    "curves_order": ["DEPT"],
+                    "section_curves": [
+                        {
+                            "mnemonic": "DEPT",
+                            "unit": "M",
+                            "description": "DEPTH",
+                            "data_format": "F8.3",  # extended — triggers truncation
+                        },
+                    ],
+                },
+            ],
+        }
+        # F-R01: extended per-section data_format must not raise LASDataError
+        las = LASFile.from_dict(data)
+        assert len(las.data_sections) == 1
+        assert las.data_sections[0].section_curves[0].data_format == "F"

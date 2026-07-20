@@ -207,7 +207,7 @@ def _get_null_value(
                 f"NULL value must be a finite number, got {null_value!r}"
             )
         return null_value
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, LASParseError):
         # F-I2-XPD-05: Log a warning when falling back to the default
         # null value.  Silent fallback to -999.25 with zero diagnostics
         # makes it impossible to distinguish a genuine -999.25 null
@@ -1197,6 +1197,11 @@ def _read_wrapped(
     # String curve indices have empty data_lists entries — skip them.
     _float_indices = [i for i in range(curve_count) if i not in _string_curve_indices]
     _max_len = max((len(data_lists[i]) for i in _float_indices), default=0)
+    # F-007-fix: Also consider string curve lengths so _max_len is not
+    # zero when all curves are string-formatted (which would truncate
+    # all accumulated string data to empty arrays).
+    if _string_lists:
+        _max_len = max(_max_len, *(len(sl) for sl in _string_lists.values()))
 
     # Pad incomplete last depth step for float curves
     for i in _float_indices:

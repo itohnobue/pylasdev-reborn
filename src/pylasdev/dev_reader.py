@@ -60,6 +60,16 @@ _DEV_ALIASES: dict[str, str] = {
     "UTMY": "Y",
     "NS": "Y",            # Petrel north-south
     "DY": "Y",            # Petrel Y offset
+    # Self-mappings — canonical names must map to themselves
+    # so that lowercased canonical names (e.g. "md", "azi") are
+    # normalised to uppercase rather than silently preserving the
+    # original case and bypassing _validate_dev_data checks.
+    "MD": "MD",
+    "TVD": "TVD",
+    "INC": "INC",
+    "AZI": "AZI",
+    "X": "X",
+    "Y": "Y",
 }
 
 
@@ -104,12 +114,21 @@ def _deduplicate_string_list(
     seen: dict[str, int] = {}
     result: list[str] = []
     output_names: set[str] = set()
+    # Track all natural input names so generated _N suffixes don't
+    # collide with a name that appears later in the input list.
+    # Without this, e.g. input ["MD","TVD","MD","TVD","TVD_2"]
+    # produces "TVD_2" for the first duplicate, then misnames the
+    # natural "TVD_2" as "TVD_2_2" with a false "duplicate" warning.
+    natural_names: frozenset[str] = frozenset(items)
     for name in items:
         if name in seen:
             seen[name] += 1
             suffix = seen[name]
             new_name = f"{name}_{suffix}"
-            while new_name in output_names:
+            # Bump suffix past any existing output name OR any natural
+            # input name — prevents cross-base collision with names
+            # that appear later in the list.
+            while new_name in output_names or new_name in natural_names:
                 suffix += 1
                 new_name = f"{name}_{suffix}"
             seen[name] = suffix
@@ -532,6 +551,13 @@ def _validate_dev_data(
     if "MD" in dev.columns:
         md = dev.columns["MD"]
         total = len(md)
+        # Gating flag: controls whether monotonicity & repeat checks
+        # run.  Set to False when conditions (single-row, all-NaN,
+        # fewer than 2 finite values) prevent those checks, but do
+        # NOT return — azimuth and inclination checks at function
+        # scope must still execute.
+        _md_check_ok = True
+
         if total < 2:
             # Need at least 2 stations for monotonicity and repeat checks.
             # NaN-density check still applies for single-row files.
@@ -543,59 +569,62 @@ def _validate_dev_data(
                     "explicitly.",
                     stacklevel=_stacklevel,
                 )
-            return
+            _md_check_ok = False
 
-        # --- 1. Check NaN density (> 50% NaN suggests delimiter mismatch) ---
-        nan_count = int(np.isnan(md).sum())
-        if nan_count / total > 0.5:
-            warnings.warn(
-                f"MD column has {nan_count}/{total} ({nan_count / total:.1%}) "
-                f"NaN values. Possible delimiter mismatch: data may have been "
-                f"parsed with the wrong separator. Specify the correct "
-                f"delimiter explicitly.",
-                stacklevel=_stacklevel,
-            )
+        if _md_check_ok:
+            # --- 1. Check NaN density (> 50% NaN suggests delimiter mismatch) ---
+            nan_count = int(np.isnan(md).sum())
+            if nan_count / total > 0.5:
+                warnings.warn(
+                    f"MD column has {nan_count}/{total} ({nan_count / total:.1%}) "
+                    f"NaN values. Possible delimiter mismatch: data may have been "
+                    f"parsed with the wrong separator. Specify the correct "
+                    f"delimiter explicitly.",
+                    stacklevel=_stacklevel,
+                )
 
-        # Filter to finite values for monotonicity and duplicate checks.
-        finite_mask = ~np.isnan(md)
-        if not np.any(finite_mask):
-            return
+            # Filter to finite values for monotonicity and duplicate checks.
+            finite_mask = ~np.isnan(md)
+            if not np.any(finite_mask):
+                _md_check_ok = False
 
-        finite_md = md[finite_mask]
-        if len(finite_md) < 2:
-            return
+        if _md_check_ok:
+            finite_md = md[finite_mask]
+            if len(finite_md) < 2:
+                _md_check_ok = False
 
-        # --- 2. Check MD monotonicity (strictly non-decreasing) ---
-        diffs = np.diff(finite_md)
-        non_monotonic = diffs < 0
-        if np.any(non_monotonic):
-            n_violations = int(np.sum(non_monotonic))
-            violations = np.where(non_monotonic)[0]
-            example_lines = []
-            for idx in violations[:3]:
-                example_lines.append(f"{finite_md[idx]} -> {finite_md[idx + 1]}")
-            warnings.warn(
-                f"MD values are not monotonically increasing: "
-                f"{n_violations} decrease(s) found. "
-                f"First violations: {', '.join(example_lines)}. "
-                f"Unsorted MD values can cause inaccurate trajectory "
-                f"calculations.",
-                stacklevel=_stacklevel,
-            )
+        if _md_check_ok:
+            # --- 2. Check MD monotonicity (strictly non-decreasing) ---
+            diffs = np.diff(finite_md)
+            non_monotonic = diffs < 0
+            if np.any(non_monotonic):
+                n_violations = int(np.sum(non_monotonic))
+                violations = np.where(non_monotonic)[0]
+                example_lines = []
+                for idx in violations[:3]:
+                    example_lines.append(f"{finite_md[idx]} -> {finite_md[idx + 1]}")
+                warnings.warn(
+                    f"MD values are not monotonically increasing: "
+                    f"{n_violations} decrease(s) found. "
+                    f"First violations: {', '.join(example_lines)}. "
+                    f"Unsorted MD values can cause inaccurate trajectory "
+                    f"calculations.",
+                    stacklevel=_stacklevel,
+                )
 
-        # --- 3. Check repeated station MD values ---
-        unique_md, counts = np.unique(finite_md, return_counts=True)
-        duplicates = unique_md[counts > 1]
-        if len(duplicates) > 0:
-            n_dup = len(duplicates)
-            example_vals = sorted(duplicates)[:3]
-            warnings.warn(
-                f"Found {n_dup} repeated MD station value(s): "
-                f"{', '.join(str(v) for v in example_vals)}"
-                f"{'...' if n_dup > 3 else ''}. "
-                f"Repeated stations may indicate merged multi-tool surveys.",
-                stacklevel=_stacklevel,
-            )
+            # --- 3. Check repeated station MD values ---
+            unique_md, counts = np.unique(finite_md, return_counts=True)
+            duplicates = unique_md[counts > 1]
+            if len(duplicates) > 0:
+                n_dup = len(duplicates)
+                example_vals = sorted(duplicates)[:3]
+                warnings.warn(
+                    f"Found {n_dup} repeated MD station value(s): "
+                    f"{', '.join(str(v) for v in example_vals)}"
+                    f"{'...' if n_dup > 3 else ''}. "
+                    f"Repeated stations may indicate merged multi-tool surveys.",
+                    stacklevel=_stacklevel,
+                )
 
     # --- 4. Check azimuth range [0, 360] ---
     _azi_names = ("AZI", "AZIM", "AZ", "AZM", "AZIMUTH")
@@ -847,7 +876,17 @@ def read_dev_file_as_object(
             # correctly detects comma delimiter.
             comma_tokens = [t for t in hdr.split(",") if t.strip()]
             space_tokens = hdr.split()
-            if len(comma_tokens) >= len(space_tokens) and len(comma_tokens) >= 2:
+            if "\t" in hdr:
+                # Tab-delimited file: use str.split("\t") to preserve
+                # empty fields between consecutive tabs.
+                tab_tokens = hdr.split("\t")
+                if len(tab_tokens) >= 2:
+                    delimiter = "\t"
+                elif len(comma_tokens) >= len(space_tokens) and len(comma_tokens) >= 2:
+                    delimiter = ","
+                else:
+                    delimiter = " "
+            elif len(comma_tokens) >= len(space_tokens) and len(comma_tokens) >= 2:
                 delimiter = ","
             else:
                 delimiter = " "
@@ -986,6 +1025,7 @@ def read_dev_file_as_object(
     extra_col_count: int | None = None  # Track extra-column count for summary
     short_row_count: int | None = None  # Track short-row count for summary
     discarded_lines = 0  # Track silently-discarded lines from pre-scan undercount
+    _fc: list[int] = [0]  # Count non-trivial float conversion failures
 
     for line in lines:
         stripped = line.strip()
@@ -996,6 +1036,11 @@ def read_dev_file_as_object(
 
         if delimiter == " ":
             values = stripped.split(maxsplit=_max_tokens)
+        elif delimiter == "\t":
+            # Preserve empty fields between consecutive tabs (str.split()
+            # collapses them, causing column shift).  str.split("\t") keeps
+            # every empty cell as ''.
+            values = stripped.split("\t")
         else:
             values = _split_delimited_line(stripped, delimiter)
 
@@ -1028,7 +1073,7 @@ def read_dev_file_as_object(
                 # Store first data row (G-04 bounds guard).
                 if current_line < data_lines:
                     for k in range(len(names)):
-                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
+                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan, _failure_counter=_fc)
                     current_line += 1
                 else:
                     discarded_lines += 1
@@ -1060,7 +1105,7 @@ def read_dev_file_as_object(
                         else:
                             short_row_count += 1
                     for k in range(min(len(values), len(names))):
-                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
+                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan, _failure_counter=_fc)
                     current_line += 1
                 else:
                     discarded_lines += 1
@@ -1144,7 +1189,7 @@ def read_dev_file_as_object(
                         else:
                             short_row_count += 1
                     for k in range(min(len(values), len(names))):
-                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
+                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan, _failure_counter=_fc)
                     current_line += 1
                 else:
                     discarded_lines += 1
@@ -1225,7 +1270,7 @@ def read_dev_file_as_object(
                         else:
                             short_row_count += 1
                     for k in range(min(len(values), len(names))):
-                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan)
+                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan, _failure_counter=_fc)
                     current_line += 1
                 else:
                     discarded_lines += 1
@@ -1262,6 +1307,19 @@ def read_dev_file_as_object(
             "%d data line(s) had fewer values than expected. "
             "Missing values were filled with NaN.",
             short_row_count,
+        )
+
+    # Warn when non-trivial float conversion failures occurred
+    # (non-empty input values that could not be parsed as finite floats
+    # and were silently replaced with NaN).  Mirrors the pattern in
+    # data_reader.py (F-PXR-03).
+    if _fc[0] > 0:
+        logger.warning(
+            "%d value(s) could not be converted to finite float "
+            "and were replaced with NaN. "
+            "This may indicate string data, corrupt values, or "
+            "non-standard formatting.",
+            _fc[0],
         )
 
     _validate_dev_data(dev, _stacklevel=3)

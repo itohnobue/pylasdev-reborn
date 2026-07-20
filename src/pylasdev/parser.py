@@ -11,7 +11,6 @@ Supports LAS 1.2, 2.0, and 3.0 formats.
 
 from __future__ import annotations
 
-import csv
 import logging
 import re
 import warnings
@@ -193,7 +192,7 @@ ARRAY_MNEMONIC_PATTERN = re.compile(r"^(?P<base>[\w\-]+)\[(?P<index>\d+)\]$")
 # matched as a format specifier.  LAS 3.0 format specifiers do not
 # contain spaces; matching them caused description corruption via
 # sub("") stripping legitimate brace-enclosed text.
-FORMAT_SPEC_PATTERN = re.compile(r"\{(?P<format>[A-Za-z][^}:\s]*?)(?::(?P<offset>[\d.]*))?\s*\}")
+FORMAT_SPEC_PATTERN = re.compile(r"\{(?P<format>[A-Za-z][^}:\s]*?)(?::(?P<offset>[-\d.]*))?\s*\}")
 
 # LAS 3.0: Zone association via pipe (e.g., | Run[1], | Zone[2]).
 # F-M16: Support zone names containing spaces (e.g., "| Main Zone").
@@ -1441,7 +1440,8 @@ class LASParser:
         elif mnemonic == "DLM":
             dlm_upper = value.upper()
             if dlm_upper in {"SPACE", "TAB", "COMMA"}:
-                self.las_file.version.dlm = dlm_upper
+                if not self.las_file.version.vers.startswith("1.") or dlm_upper == "SPACE":
+                    self.las_file.version.dlm = dlm_upper
             else:
                 warnings.warn(
                     f"Unknown DLM value '{value}'. Expected SPACE, TAB, or COMMA. "
@@ -1496,6 +1496,16 @@ class LASParser:
                 and "T" in value
                 and bool(re.search(r"T\d{2}:", value))
             )
+            if not _is_timestamp:
+                # F-003: Check the full value for bare hh:mm[:ss]
+                # timestamp patterns BEFORE the partial post-colon
+                # check.  A value like "12:34" has only one colon —
+                # the post-colon portion "34" won't match
+                # \b\d{1,2}:\d{2}\b, causing the bare-colon split to
+                # corrupt the value (stored as "34" instead of "12:34").
+                _is_timestamp = bool(
+                    re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", value)
+                )
             if not _is_timestamp:
                 # F-002: Scope the timestamp regex to the portion after
                 # the first colon to avoid false positives like "15:01"
@@ -1721,43 +1731,44 @@ class LASParser:
                 saved_section_type = self._current_data_section_type
                 saved_section_name = self._current_section_name
 
-                # Process each deferred group as its own DataSection.
-                for (section_type, _section_name, _section_idx), raw_lines, curve_start, curve_end in groups:
-                    # I2-D2-01: Restore pipe-target curve scoping stored
-                    # at defer time, preserving |CURVE and
-                    # |X_Definition associations.
-                    self._section_curve_start_idx = curve_start
-                    self._section_curve_end_idx = curve_end
-                    # Pre-~V section type may be stale — use stored value.
-                    self._current_data_section_type = section_type or "LOG_DATA"
-                    # Preserve user-provided section names when available.
-                    # Bare section keywords (e.g., "A" from ~A,
-                    # "Core[1]" from ~Core[1]) are blanked so
-                    # auto-generation produces unique Section_N names.
-                    # Real user-provided names (e.g., "Main Log" from
-                    # "~A Main Log") are preserved across replay.
-                    _is_bare_keyword = (
-                        _section_name in _DATA_SECTION_WORDS
-                        or _is_indexed_data_section(_section_name)
-                    )
-                    if _section_name and not _is_bare_keyword:
-                        self._current_section_name = _section_name
+                try:
+                    # Process each deferred group as its own DataSection.
+                    for (section_type, _section_name, _section_idx), raw_lines, curve_start, curve_end in groups:
+                        # I2-D2-01: Restore pipe-target curve scoping stored
+                        # at defer time, preserving |CURVE and
+                        # |X_Definition associations.
+                        self._section_curve_start_idx = curve_start
+                        self._section_curve_end_idx = curve_end
+                        # Pre-~V section type may be stale — use stored value.
+                        self._current_data_section_type = section_type or "LOG_DATA"
+                        # Preserve user-provided section names when available.
+                        # Bare section keywords (e.g., "A" from ~A,
+                        # "Core[1]" from ~Core[1]) are blanked so
+                        # auto-generation produces unique Section_N names.
+                        # Real user-provided names (e.g., "Main Log" from
+                        # "~A Main Log") are preserved across replay.
+                        _is_bare_keyword = (
+                            _section_name in _DATA_SECTION_WORDS
+                            or _is_indexed_data_section(_section_name)
+                        )
+                        if _section_name and not _is_bare_keyword:
+                            self._current_section_name = _section_name
+                        else:
+                            self._current_section_name = ""
+                        self._ascii_data_lines = raw_lines
+                        self._process_ascii_data()
+                        self._current_data_section_idx += 1
+                finally:
+                    # Restore state.
+                    if saved_lines:
+                        self._ascii_data_lines = saved_lines
                     else:
-                        self._current_section_name = ""
-                    self._ascii_data_lines = raw_lines
-                    self._process_ascii_data()
-                    self._current_data_section_idx += 1
-
-                # Restore state.
-                if saved_lines:
-                    self._ascii_data_lines = saved_lines
-                else:
-                    self._ascii_data_lines = []
-                self._section_curve_start_idx = saved_curve_start
-                self._section_curve_end_idx = saved_curve_end
-                self._current_data_section_type = saved_section_type
-                # F-I2-M01: Reset section name (defense-in-depth).
-                self._current_section_name = saved_section_name or ""
+                        self._ascii_data_lines = []
+                    self._section_curve_start_idx = saved_curve_start
+                    self._section_curve_end_idx = saved_curve_end
+                    self._current_data_section_type = saved_section_type
+                    # F-I2-M01: Reset section name (defense-in-depth).
+                    self._current_section_name = saved_section_name or ""
             self._deferred_ascii_data_lines.clear()
 
     def _parse_well(self, line: str) -> None:
@@ -2103,7 +2114,7 @@ class LASParser:
                     try:
                         _validate_curve_data_format(param_data_format, raw_mnemonic)
                     except LASParseError:
-                        pass  # Not a valid data format — pass through as metadata
+                        param_data_format = ""  # Not a valid data format — clear to prevent accumulation
                     else:
                         param_data_format = param_data_format[0]
                 # Single-char non-FEDAS codes ({X}, {G}) must be rejected
@@ -2619,27 +2630,13 @@ class LASParser:
             if delimiter == " ":
                 values = line.split(maxsplit=_max_tokens)
             else:
-                # F-I2-M12: Wrap csv.reader in try/except csv.Error.
-                # csv.Error (e.g. unclosed quotes, field-size overflow)
-                # is NOT a LASParseError subclass — without this guard
-                # it escapes the public API unwrapped.
-                try:
-                    reader = csv.reader(
-                        [line.strip()], delimiter=delimiter, quoting=csv.QUOTE_MINIMAL
-                    )
-                    row = next(reader)
-                except csv.Error as exc:
-                    # I2-D2-04: Include line index and content so
-                    # malformed TAB/COMMA data lines can be diagnosed.
-                    _line_preview = line.strip()[:200]
-                    raise LASParseError(
-                        f"CSV parsing error at data line {idx} in section "
-                        f"'{self._current_section_name or 'ASCII'}': {exc} "
-                        f"(line content: {_line_preview!r})"
-                    ) from exc
-                # Safety cap: prevent unbounded token count from malformed
-                # input, matching the maxsplit behavior of str.split.
-                values = row[: _max_tokens + 1]
+                # str.split(delimiter) avoids the csv.reader quoting
+                # asymmetry with the writer (which uses raw
+                # delimiter.join()).  csv.reader with QUOTE_MINIMAL
+                # interprets " as CSV quoting; the writer does not emit
+                # CSV quotes — causing roundtrip data corruption for
+                # string values containing double-quote characters.
+                values = line.strip().split(delimiter, maxsplit=_max_tokens)
 
             # Warn about extra columns being silently discarded
             if len(values) > num_curves:

@@ -2334,3 +2334,84 @@ class TestSingleDataSectionFallback:
             match="data_sections are only supported for LAS 3.0",
         ), pytest.raises(LASWriteError, match=r"curves count.*does not match"):
             write_las_file(str(output_file), las)
+
+
+class TestF010EmptyDlmWriterRegression:
+    """F-010 regression: empty DLM string should not crash the writer.
+
+    Before F-010, VersionSection(dlm="") passed validation but
+    writer.py's ``if las_file.version.dlm`` was falsy for empty
+    string, causing the DLM header line to be skipped with no
+    substitute.  Downstream code expecting a DLM to be set then
+    crashed.  After F-010, the writer guards with an explicit
+    ``and las_file.version.dlm`` check.
+    """
+
+    def test_write_with_empty_dlm_succeeds(self, tmp_path: Path) -> None:
+        """Writer with DLM='' should not crash — header line is skipped."""
+        las = LASFile()
+        las.version = VersionSection(vers="2.0", wrap="NO", dlm="")
+        las.well["STRT"] = "100.0"
+        las.well["STOP"] = "300.0"
+        las.well["STEP"] = "100.0"
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0, 200.0, 300.0])
+
+        temp_file = tmp_path / "empty_dlm.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        assert "~V" in content
+        assert "~W" in content
+        assert "~C" in content
+        assert "~A" in content
+        # DLM line should NOT appear since DLM is empty
+        assert "DLM ." not in content
+
+
+class TestF016TimeOffsetNonAsciiRegression:
+    """F-016 regression: time_offset only emitted for data_format='A'.
+
+    Before F-016, the writer emitted time_offset for ALL array
+    curves regardless of data_format.  This produced unparseable
+    LAS when the curve used a non-ASCII format (e.g., 'F8.3') —
+    the parser sees `{F8.3:5.5}` in the format string and chokes.
+    After F-016, time_offset is restricted to data_format == "A".
+    """
+
+    def test_non_ascii_array_no_time_offset(self, tmp_path: Path) -> None:
+        """Array curve with data_format='F' gets no time_offset in format."""
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "NMR[1]"]
+        las.curves.append(
+            CurveDefinition(mnemonic="DEPT", unit="M", data_format="F")
+        )
+        las.curves.append(
+            CurveDefinition(
+                mnemonic="NMR[1]",
+                unit="ms",
+                data_format="F",
+                array_info=ArrayElementInfo(
+                    base_name="NMR", index=1, time_offset=5.5
+                ),
+            )
+        )
+        las.logs["DEPT"] = np.array([100.0])
+        las.logs["NMR[1]"] = np.array([10.0])
+
+        temp_file = tmp_path / "non_ascii_array.las"
+        write_las_file(temp_file, las)
+
+        content = temp_file.read_text()
+        # F-016: time_offset must NOT appear in format spec for non-'A'
+        # data_format curves.  With data_format='F', the format is just
+        # {F} with no colon or time_offset (contrast with 'A' curves
+        # where {A:5.5} would appear).
+        assert "{F}" in content  # format without time_offset
+        assert "   {A}" not in content  # no A-format curves
+        # Specifically: no time_offset 5.5 in the format specs
+        assert ":5.5" not in content
