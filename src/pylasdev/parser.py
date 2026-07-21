@@ -715,8 +715,8 @@ class LASParser:
         # F-07: Re-run validations skipped during incremental construction.
         # The parser populates curves_order and curves after __post_init__,
         # so index-curve validation (and other __post_init__ guards) never
-        # saw the fully-populated state.  validate() re-checks now.
-        self.las_file.validate()
+        # saw the fully-populated state.  validate(complete=True) re-checks now.
+        self.las_file.validate(complete=True)
 
         return self.las_file
 

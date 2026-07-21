@@ -355,6 +355,11 @@ def write_las_file(
 
 def _generate_las_content(las_file: LASFile, precision: str = ".8g") -> str:
     """Generate LAS file content string with metadata preservation."""
+    import warnings
+    # Run deferred validation before generating content — warn only
+    # (don't raise) to preserve existing writer behavior.
+    for issue in las_file.validate(complete=True):
+        warnings.warn(issue, stacklevel=2)
     lines: list[str] = []
     lines.extend(_write_version_section(las_file))
     lines.extend(_write_well_section(las_file))
@@ -441,74 +446,19 @@ def _write_well_section(las_file: LASFile) -> list[str]:
     is_las12 = _LASVersionSpec(las_file.version.vers).is_las12
     lines.append("~WELL INFORMATION")
 
-    # Validate mandatory well fields — emit warnings for missing fields
-    # so that programmatically-constructed LAS files don't silently produce
-    # semantically non-compliant output.  No exception raised; consistent
-    # with the parser's read-time validation pattern.
-    # F-M-028: Validate well entry keys are strings before any .upper() call.
-    # Non-string keys (e.g., from WellSection(entries={123: "val"})) crash
-    # on key.upper() with confusing AttributeError.  Raise a clear TypeError.
-    # This is defense-in-depth — F-M-008 adds __post_init__ validation at
-    # the model layer; this protects the writer when that layer is bypassed.
+    # Key-type validation — defense-in-depth (F-M-008 covers model layer).
+    # This protects the writer when the model layer is bypassed.
     for key in las_file.well.entries:
         if not isinstance(key, str):
             raise TypeError(
                 f"WellSection entry key must be str, got {type(key).__name__}: {key!r}"
             )
-    mandatory_fields = {"STRT", "STOP", "STEP", "NULL"}
-    present_fields = {k.upper() for k in las_file.well.entries}
-    for field in mandatory_fields:
-        if field not in present_fields:
-            import warnings
 
-            warnings.warn(
-                f"Missing mandatory well field: {field}. "
-                "The output file may be semantically non-compliant.",
-                stacklevel=4,
-            )
+    # Mandatory well field checks (missing, STEP=0, NULL empty, STRT==STOP)
+    # are now centralized in WellSection.validate(complete=True), called at
+    # the start of _generate_las_content before any section writers run.
 
-    # F-110: Value-emptiness checks for mandatory well fields.
-    # Complement the key-presence checks above — a field may be
-    # present but contain a semantically invalid value.
-    _strt_val = None
-    _stop_val = None
-    for key, value in las_file.well.entries.items():
-        upper = key.upper()
-        if upper == "STEP":
-            try:
-                if float(value) == 0.0:
-                    import warnings
-
-                    warnings.warn(
-                        "STEP is zero — depth increment is invalid.",
-                        stacklevel=4,
-                    )
-            except (TypeError, ValueError):
-                pass
-        elif upper == "STRT":
-            _strt_val = value
-        elif upper == "STOP":
-            _stop_val = value
-        elif upper == "NULL":
-            if isinstance(value, str) and not value:
-                import warnings
-
-                warnings.warn(
-                    "NULL is an empty string — null value is ambiguous.",
-                    stacklevel=4,
-                )
-    if _strt_val is not None and _stop_val is not None:
-        try:
-            if float(_strt_val) == float(_stop_val):
-                import warnings
-
-                warnings.warn(
-                    f"STRT equals STOP ({_strt_val}) — well has "
-                    f"zero depth range.",
-                    stacklevel=4,
-                )
-        except (TypeError, ValueError):
-            pass
+    # Collect STRT/STOP for later comparison.
 
     # F-26: Reorder mandatory well fields (STRT, STOP, STEP, NULL)
     # to appear first per CWLS spec, followed by remaining fields in

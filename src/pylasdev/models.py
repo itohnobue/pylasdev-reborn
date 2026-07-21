@@ -535,6 +535,35 @@ class VersionSection:
     wrap: str = "NO"
     dlm: str = "SPACE"  # LAS 2.0+: SPACE, TAB, or COMMA
 
+    def validate(self, complete: bool = False) -> list[str]:
+        """Validate version section fields.
+
+        Args:
+            complete: If True, also run deferred/semantic checks
+                suitable for pre-write or post-construction validation.
+
+        Returns:
+            List of issue strings (empty = no issues found).
+        """
+        issues: list[str] = []
+        # VERS: warn about unrecognized version values (H-02).
+        if self.vers and self.vers not in {"1.2", "2.0", "3.0"}:
+            issues.append(
+                f"VersionSection: Unrecognized VERS value "
+                f"{self.vers!r}. Expected 1.2, 2.0, or 3.0."
+            )
+        # DLM: warn about non-SPACE DLM on LAS 1.2.
+        if complete and self.dlm:
+            _dlm = self.dlm.upper()
+            _spec = _LASVersionSpec(self.vers)
+            if _spec.is_las12 and _dlm != "SPACE":
+                issues.append(
+                    f"DLM '{self.dlm}' is not valid for LAS 1.2 "
+                    f"(spec requires SPACE).  The file will use "
+                    f"SPACE delimiter on write."
+                )
+        return issues
+
     def __post_init__(self) -> None:
         """Validate VERS, WRAP, and DLM after construction.
 
@@ -551,13 +580,6 @@ class VersionSection:
             raise ValueError(
                 f"VersionSection: VERS must not be whitespace-only, "
                 f"got {self.vers!r}"
-            )
-        # VERS: warn about unrecognized version values (H-02).
-        if self.vers and self.vers not in {"1.2", "2.0", "3.0"}:
-            warnings.warn(
-                f"VersionSection: Unrecognized VERS value "
-                f"{self.vers!r}. Expected 1.2, 2.0, or 3.0.",
-                stacklevel=2,
             )
         # WRAP: reject None before any string operations.
         if self.wrap is None:
@@ -579,7 +601,6 @@ class VersionSection:
             raise ValueError("VersionSection: DLM cannot be None")
         if self.dlm:
             _dlm = self.dlm.upper()
-            _spec = _LASVersionSpec(self.vers)
             # F-I2-MD3-01: Validate DLM value first, then check LAS
             # version compatibility.  The previous if/elif structure
             # warned for LAS 1.2 with non-SPACE DLM but skipped the
@@ -594,14 +615,9 @@ class VersionSection:
                     f"VersionSection: invalid DLM value "
                     f"{self.dlm!r}.  Expected SPACE, TAB, or COMMA."
                 )
-            if _spec.is_las12 and _dlm != "SPACE":
-                import warnings as _w
-                _w.warn(
-                    f"DLM '{self.dlm}' is not valid for LAS 1.2 "
-                    f"(spec requires SPACE).  The file will use "
-                    f"SPACE delimiter on write.",
-                    stacklevel=2,
-                )
+        # Run warning-producing checks via validate().
+        for issue in self.validate(complete=False):
+            warnings.warn(issue, stacklevel=2)
 
     def to_dict(self) -> dict[str, str]:
         """Convert to legacy dict format for backward compatibility."""
@@ -650,6 +666,60 @@ class WellSection:
     descriptions: dict[str, str] = field(
         default_factory=dict
     )  # CWLS description text for well fields
+
+    def validate(self, complete: bool = False) -> list[str]:
+        """Validate well section fields.
+
+        Args:
+            complete: If True, also run deferred/semantic checks
+                (STEP=0, NULL empty, STRT==STOP).
+
+        Returns:
+            List of issue strings (empty = no issues found).
+            Mandatory field presence is checked separately
+            by _validate_from_dict_input (from_dict path) and
+            the parser (parse path) with version-aware messages.
+        """
+        issues: list[str] = []
+        if not complete:
+            return issues
+
+        # STEP=0 check.
+        _step_val = None
+        for key, value in self.entries.items():
+            if key.upper() == "STEP":
+                _step_val = value
+                break
+        if _step_val is not None:
+            try:
+                if float(_step_val) == 0.0:
+                    issues.append(
+                        "STEP is zero — depth increment is invalid."
+                    )
+            except (TypeError, ValueError):
+                pass
+
+        # NULL empty check.
+        _null_val = self.entries.get("NULL", "")
+        if isinstance(_null_val, str) and not _null_val:
+            issues.append(
+                "NULL is an empty string — null value is ambiguous."
+            )
+
+        # STRT==STOP check.
+        _strt_raw = self.entries.get("STRT")
+        _stop_raw = self.entries.get("STOP")
+        if _strt_raw is not None and _stop_raw is not None:
+            try:
+                if float(_strt_raw) == float(_stop_raw):
+                    issues.append(
+                        f"STRT equals STOP ({_strt_raw}) — well has "
+                        f"zero depth range."
+                    )
+            except (TypeError, ValueError):
+                pass
+
+        return issues
 
     def __post_init__(self) -> None:
         """Validate entries dict contains only string keys (F-M-008).
@@ -720,6 +790,16 @@ class ArrayElementInfo:
     index: int = 0  # Array index (e.g., 1, 2, 3)
     time_offset: float | None = None  # Time offset from first element (e.g., 0, 5, 10 ms)
 
+    def validate(self, complete: bool = False) -> list[str]:
+        """Validate array element info fields.
+
+        Returns:
+            List of issue strings (empty = no issues found).
+            All structural checks raise during construction
+            and are not duplicated here.
+        """
+        return []
+
     def __post_init__(self) -> None:
         """Validate base_name, index, and time_offset.
 
@@ -772,6 +852,16 @@ class CurveDefinition:
     # LAS 3.0 specific fields
     data_format: str = ""  # F, E, S, or A (from {F}, {E}, {S}, {A:x})
     array_info: ArrayElementInfo | None = None  # For array curves like NMR[1]
+
+    def validate(self, complete: bool = False) -> list[str]:
+        """Validate curve definition fields.
+
+        Returns:
+            List of issue strings (empty = no issues found).
+            All structural checks raise during construction
+            and are not duplicated here.
+        """
+        return []
 
     def __post_init__(self) -> None:
         """Reject empty-or-whitespace mnemonic and invalid data_format.
@@ -847,6 +937,28 @@ class ParameterZone:
     zone_name: str = ""
     zone_index: int | None = None
 
+    def validate(self, complete: bool = False) -> list[str]:
+        """Validate parameter zone fields.
+
+        Returns:
+            List of issue strings (empty = no issues found).
+            Basic type/value checks raise during construction.
+        """
+        issues: list[str] = []
+        # zone_name: warn if None or empty.
+        if self.zone_name is None:
+            issues.append(
+                "ParameterZone: zone_name is None.  Zone names "
+                "must be non-empty strings for valid LAS output."
+            )
+        elif isinstance(self.zone_name, str) and not self.zone_name.strip():
+            issues.append(
+                f"ParameterZone: zone_name {self.zone_name!r} is "
+                f"empty or whitespace-only.  Zone names must be "
+                f"non-empty strings for valid LAS output."
+            )
+        return issues
+
     def __post_init__(self) -> None:
         """Validate zone_index is int or None (F-M-010).
 
@@ -865,23 +977,9 @@ class ParameterZone:
                 f"ParameterZone: zone_index must be >= 0, "
                 f"got {self.zone_index!r}"
             )
-        # M-16: Validate zone_name is non-None and non-empty.
-        # Callers may construct zones programmatically with placeholder
-        # names, so warn rather than raise.  Empty/whitespace zone names
-        # produce malformed LAS output (empty pipe notation).
-        if self.zone_name is None:
-            warnings.warn(
-                "ParameterZone: zone_name is None.  Zone names "
-                "must be non-empty strings for valid LAS output.",
-                stacklevel=2,
-            )
-        elif isinstance(self.zone_name, str) and not self.zone_name.strip():
-            warnings.warn(
-                f"ParameterZone: zone_name {self.zone_name!r} is "
-                f"empty or whitespace-only.  Zone names must be "
-                f"non-empty strings for valid LAS output.",
-                stacklevel=2,
-            )
+        # Run warning-producing checks via validate().
+        for issue in self.validate(complete=False):
+            warnings.warn(issue, stacklevel=2)
 
 
 @dataclass
@@ -906,6 +1004,18 @@ class ParameterEntry:
     # can reconstruct per-section parameter sections on roundtrip.
     # Parameters from a standard ~P/~Parameter section have section_type=None.
     section_type: str | None = None
+
+    def validate(self, complete: bool = False) -> list[str]:
+        """Validate parameter entry fields.
+
+        Returns:
+            List of issue strings (empty = no issues found).
+            Mnemonic, data_format, array_index, zone, and section_type
+            checks raise during construction and are not duplicated here.
+            Unit/value/description coercion warnings fire during
+            __post_init__ before coercion.
+        """
+        return []
 
     def __post_init__(self) -> None:
         """Reject empty-or-whitespace mnemonic (F-M10).
@@ -1051,6 +1161,67 @@ class DataSection:
             "string_data": {k: v.copy() for k, v in self.string_data.items()},
             "section_curves": [c.to_dict() for c in self.section_curves],
         }
+
+    def validate(self, complete: bool = False) -> list[str]:
+        """Validate data section fields.
+
+        Args:
+            complete: If True, also run deferred/semantic checks
+                (NaN/Inf in numeric data, dtype validation,
+                uncovered curves).
+
+        Returns:
+            List of issue strings (empty = no issues found).
+            Basic structural checks (type, keys, lengths, data_format)
+            raise during construction and are not duplicated here.
+        """
+        issues: list[str] = []
+        # --- dtype validation for data arrays ---
+        for _k, _arr in self.data.items():
+            if not isinstance(_arr, np.ndarray):
+                _arr = self.data[_k] = np.asarray(_arr)
+            if not np.issubdtype(_arr.dtype, np.number):
+                issues.append(
+                    f"DataSection '{self.name}': curve '{_k}' in 'data' "
+                    f"has non-numeric dtype ({_arr.dtype}).  'data' "
+                    f"arrays must be numeric."
+                )
+
+        # --- dtype validation for string_data arrays ---
+        for _sk, _sarr in self.string_data.items():
+            if not isinstance(_sarr, np.ndarray):
+                _sarr = self.string_data[_sk] = np.asarray(_sarr)
+            if np.issubdtype(_sarr.dtype, np.number):
+                issues.append(
+                    f"DataSection '{self.name}': curve '{_sk}' in "
+                    f"'string_data' has numeric dtype ({_sarr.dtype}).  "
+                    f"'string_data' arrays must be non-numeric."
+                )
+
+        # --- NaN/Inf validation for numeric data arrays ---
+        for _k, _arr in self.data.items():
+            if isinstance(_arr, np.ndarray) and _arr.dtype.kind in ('f', 'c'):
+                if not np.all(np.isfinite(_arr)):
+                    issues.append(
+                        f"DataSection '{self.name}': curve '{_k}' in "
+                        f"'data' contains non-finite values (NaN/Inf)."
+                    )
+
+        # --- uncovered curves ---
+        curve_set = set(self.curves_order)
+        data_keys = set(self.data.keys())
+        string_keys = set(self.string_data.keys())
+        if self.data or self.string_data:
+            uncovered = curve_set - data_keys - string_keys
+            if uncovered:
+                issues.append(
+                    f"DataSection '{self.name}': curve(s) "
+                    f"{sorted(uncovered)} appear in curves_order but "
+                    f"have no data in 'data' or 'string_data'.  The "
+                    f"writer will pad these curves with null_value."
+                )
+
+        return issues
 
     def __post_init__(self) -> None:
         """Validate invariants after construction (F-001).
@@ -1258,76 +1429,10 @@ class DataSection:
                         f"Numeric-format curves must be in data."
                     )
 
-        # F-M-036: Detect uncovered curves — curves in curves_order that
-        # have no data in either 'data' or 'string_data'.  The writer pads
-        # uncovered curves with null_value, so this is recoverable (warning
-        # only).  Both the __post_init__ (here) and the from_dict path
-        # (below) were unidirectional before — only orphaned data was
-        # checked (data_keys - curve_set), not uncovered curves
-        # (curve_set - data_keys - string_keys).
-        #
-        # When BOTH data and string_data are empty, this indicates deferred
-        # population (e.g. parser constructs DataSection before populating
-        # data).  Skip the warning in this case — curves_order entries will
-        # be covered once data is populated externally.
-        if self.data or self.string_data:
-            uncovered = curve_set - data_keys - string_keys
-            if uncovered:
-                warnings.warn(
-                    f"DataSection '{self.name}': curve(s) "
-                    f"{sorted(uncovered)} appear in curves_order but "
-                    f"have no data in 'data' or 'string_data'.  The "
-                    f"writer will pad these curves with null_value.",
-                    stacklevel=2,
-                )
-
-        # F-048: Validate dtypes — data arrays must be numeric,
-        # string_data arrays must be non-numeric (object/string).
-        # The from_dict path has structural validation but never checks
-        # actual numpy dtypes.  String arrays in 'data' silently produce
-        # corrupted numeric output downstream.
-        for _k, _arr in self.data.items():
-            # M-17: Guard against non-ndarray input before accessing
-            # .dtype.  Python lists, scalars, and other non-ndarray
-            # types raise AttributeError on .dtype access.
-            if not isinstance(_arr, np.ndarray):
-                # F-25: Write back the converted array — _arr was a
-                # local variable; self.data[_k] was never updated.
-                _arr = self.data[_k] = np.asarray(_arr)
-            if not np.issubdtype(_arr.dtype, np.number):
-                warnings.warn(
-                    f"DataSection '{self.name}': curve '{_k}' in 'data' "
-                    f"has non-numeric dtype ({_arr.dtype}).  'data' "
-                    f"arrays must be numeric.",
-                    stacklevel=2,
-                )
-        for _sk, _sarr in self.string_data.items():
-            # M-17: Same guard for string_data arrays.
-            if not isinstance(_sarr, np.ndarray):
-                # F-25: Write back the converted array — same bug as
-                # the data path above.
-                _sarr = self.string_data[_sk] = np.asarray(_sarr)
-            if np.issubdtype(_sarr.dtype, np.number):
-                warnings.warn(
-                    f"DataSection '{self.name}': curve '{_sk}' in "
-                    f"'string_data' has numeric dtype ({_sarr.dtype}).  "
-                    f"'string_data' arrays must be non-numeric.",
-                    stacklevel=2,
-                )
-
-        # F-20: NaN/Inf validation for numeric data arrays.
-        # NaN/Inf silently pass all existing structural checks.
-        # LAS spec doesn't prohibit NaN (used for missing data),
-        # so warn rather than raise.
-        for _k, _arr in self.data.items():
-            if isinstance(_arr, np.ndarray) and _arr.dtype.kind in ('f', 'c'):
-                if not np.all(np.isfinite(_arr)):
-                    if not self._from_dict:
-                        warnings.warn(
-                            f"DataSection '{self.name}': curve '{_k}' in "
-                            f"'data' contains non-finite values (NaN/Inf).",
-                            stacklevel=2,
-                        )
+        # Run warning-producing checks via validate() (gated by _from_dict).
+        if not self._from_dict:
+            for issue in self.validate(complete=False):
+                warnings.warn(issue, stacklevel=2)
 
 
 @dataclass(eq=False)
@@ -1393,10 +1498,7 @@ class LASFile:
         _order_set = set(self.curves_order) if self.curves_order else set()
 
         # M-19: LAS 2.0 first-curve-must-be-index constraint.
-        # Extracted to _validate_index_curve() so the parser can
-        # re-run this check after incrementally populating curves_order
-        # (F-07).  Also called during from_dict re-validation (I2F-13).
-        self._validate_index_curve()
+        # Now validated by validate() below (called at end of __post_init__).
 
         # --- duplicate curve name detection (F-MD4-06) ---
         # DataSection.__post_init__ has this check for per-section orders.
@@ -1528,34 +1630,7 @@ class LASFile:
         # F-26: Validate dtypes for logs (numeric) and string_data (object).
         # DataSection.__post_init__ has these checks; LASFile omitted them.
         # F-20: Also validate NaN/Inf in numeric data arrays.
-        for _k, _arr in self.logs.items():
-            if not isinstance(_arr, np.ndarray):
-                _arr = self.logs[_k] = np.asarray(_arr)
-            if not np.issubdtype(_arr.dtype, np.number):
-                warnings.warn(
-                    f"LASFile: curve '{_k}' in 'logs' has non-numeric "
-                    f"dtype ({_arr.dtype}).  'logs' arrays must be "
-                    f"numeric.",
-                    stacklevel=2,
-                )
-            # F-20: NaN/Inf check for numeric data arrays.
-            if _arr.dtype.kind in ('f', 'c') and not np.all(np.isfinite(_arr)):
-                if not self._from_dict:
-                    warnings.warn(
-                        f"LASFile: curve '{_k}' in 'logs' contains "
-                        f"non-finite values (NaN/Inf).",
-                        stacklevel=2,
-                    )
-        for _sk, _sarr in self.string_data.items():
-            if not isinstance(_sarr, np.ndarray):
-                _sarr = self.string_data[_sk] = np.asarray(_sarr)
-            if np.issubdtype(_sarr.dtype, np.number):
-                warnings.warn(
-                    f"LASFile: curve '{_sk}' in 'string_data' has "
-                    f"numeric dtype ({_sarr.dtype}).  'string_data' "
-                    f"arrays must be non-numeric.",
-                    stacklevel=2,
-                )
+        # These are now handled by validate() below.
 
         # --- data_sections validation (F-MD4-01) ---
         # from_dict has ~200 lines of data_sections validation; __post_init__
@@ -1686,72 +1761,112 @@ class LASFile:
                         )
 
         # F-059: Cross-validate curve data_format against actual data
-        # placement.  Previously __post_init__ validated structural
-        # consistency (keys, lengths, rows) but never checked that
-        # S-format curves are in string_data and numeric-format curves
-        # are in logs.  A misplaced curve silently produces corrupted
-        # output downstream.
-        if self.curves and (self.logs or self.string_data):
-            for _sc in self.curves:
-                _df = _sc.data_format
-                _mnem = _sc.mnemonic
-                if not _df:
-                    continue
-                # S-format (or A-format without array element info)
-                # should be in string_data, not in logs.
-                if _df == "S" or (_df == "A" and not _sc.is_array_element):
-                    if _mnem in self.logs:
-                        if not self._from_dict:
-                            warnings.warn(
-                                f"LASFile: curve '{_mnem}' has "
-                                f"data_format='{_df}' (string-format) but "
-                                f"is in logs (numeric).  String-format "
-                                f"curves should be in string_data.",
-                                stacklevel=2,
-                            )
-                else:
-                    # Numeric-format curves should be in logs, not in
-                    # string_data.
-                    if _mnem in self.string_data:
-                        if not self._from_dict:
-                            warnings.warn(
-                                f"LASFile: curve '{_mnem}' has "
-                                f"data_format='{_df}' (numeric-format) "
-                                f"but is in string_data.  Numeric-format "
-                                f"curves should be in logs.",
-                                stacklevel=2,
-                            )
+        # placement.  Now validated by validate() below.
 
-    def _validate_index_curve(self) -> None:
-        """Validate LAS 2.0 first-curve-must-be-index constraint (M-19).
+        # Run warning-producing checks via validate() (gated by _from_dict).
+        if not self._from_dict:
+            for issue in self.validate(complete=False):
+                warnings.warn(issue, stacklevel=2)
 
-        Extracted from __post_init__ so the parser can re-run this check
-        after incrementally populating curves_order (F-07).  Also called
-        during from_dict re-validation (I2F-13).
+    def validate(self, complete: bool = False) -> list[str]:
+        """Validate LASFile state.
+
+        Args:
+            complete: If True, also run deferred cross-field checks
+                including children delegation, cross-section consistency,
+                mandatory well fields, and semantic well checks.
+
+        Returns:
+            List of issue strings (empty = no issues found).
+            Basic structural checks (type, keys, lengths) raise during
+            construction and are not duplicated here.
         """
+        issues: list[str] = []
+
+        # --- index curve check (LAS 2.0) ---
         _INDEX_CURVE_ALIASES = frozenset({"DEPT", "DEPTH", "TIME", "INDEX"})
         if (
             self.curves_order
             and _LASVersionSpec(self.version.vers).is_las20
             and self.curves_order[0].upper() not in _INDEX_CURVE_ALIASES
         ):
-            if not self._from_dict:
-                warnings.warn(
-                    f"LAS 2.0 spec requires the first curve to be "
-                    f"DEPT, DEPTH, TIME, or INDEX, but got "
-                    f"{self.curves_order[0]!r}.  Many real-world files "
-                    f"use alternative index curve names.",
-                    stacklevel=2,
+            issues.append(
+                f"LAS 2.0 spec requires the first curve to be "
+                f"DEPT, DEPTH, TIME, or INDEX, but got "
+                f"{self.curves_order[0]!r}.  Many real-world files "
+                f"use alternative index curve names."
+            )
+
+        # --- dtype and NaN/Inf for logs ---
+        for _k, _arr in self.logs.items():
+            if not isinstance(_arr, np.ndarray):
+                _arr = self.logs[_k] = np.asarray(_arr)
+            if not np.issubdtype(_arr.dtype, np.number):
+                issues.append(
+                    f"LASFile: curve '{_k}' in 'logs' has non-numeric "
+                    f"dtype ({_arr.dtype}).  'logs' arrays must be "
+                    f"numeric."
+                )
+            if _arr.dtype.kind in ('f', 'c') and not np.all(np.isfinite(_arr)):
+                issues.append(
+                    f"LASFile: curve '{_k}' in 'logs' contains "
+                    f"non-finite values (NaN/Inf)."
                 )
 
-    def validate(self) -> None:
-        """Re-run validations skipped during incremental construction.
+        # --- dtype for string_data ---
+        for _sk, _sarr in self.string_data.items():
+            if not isinstance(_sarr, np.ndarray):
+                _sarr = self.string_data[_sk] = np.asarray(_sarr)
+            if np.issubdtype(_sarr.dtype, np.number):
+                issues.append(
+                    f"LASFile: curve '{_sk}' in 'string_data' has "
+                    f"numeric dtype ({_sarr.dtype}).  'string_data' "
+                    f"arrays must be non-numeric."
+                )
 
-        The parser constructs LASFile objects incrementally (curves_order,
-        curves, logs are populated after __post_init__).  Call this method
-        after incremental population to validate the fully-populated state.
-        """
-        self._validate_index_curve()
+        # --- data_format vs placement ---
+        if self.curves and (self.logs or self.string_data):
+            for _sc in self.curves:
+                _df = _sc.data_format
+                _mnem = _sc.mnemonic
+                if not _df:
+                    continue
+                if _df == "S" or (_df == "A" and not _sc.is_array_element):
+                    if _mnem in self.logs:
+                        issues.append(
+                            f"LASFile: curve '{_mnem}' has "
+                            f"data_format='{_df}' (string-format) but "
+                            f"is in logs (numeric).  String-format "
+                            f"curves should be in string_data."
+                        )
+                else:
+                    if _mnem in self.string_data:
+                        issues.append(
+                            f"LASFile: curve '{_mnem}' has "
+                            f"data_format='{_df}' (numeric-format) "
+                            f"but is in string_data.  Numeric-format "
+                            f"curves should be in logs."
+                        )
+
+        # --- deferred checks (complete=True) ---
+        if complete:
+            # Delegate to children.
+            issues.extend(self.version.validate(complete=True))
+            issues.extend(self.well.validate(complete=True))
+            for _cd in self.curves:
+                issues.extend(_cd.validate(complete=True))
+            for _pe in self.parameters:
+                issues.extend(_pe.validate(complete=True))
+            for _ds in self.data_sections:
+                issues.extend(_ds.validate(complete=True))
+
+            # data_sections requires LAS 3.0.
+            if self.data_sections and not self.version.is_las30:
+                issues.append(
+                    "data_sections requires LAS 3.0 version"
+                )
+
+        return issues
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to legacy dict format for backward compatibility.
@@ -2840,6 +2955,11 @@ class LASFile:
             las_file._from_dict = True
             try:
                 las_file.__post_init__()
+                # Run deferred validate(complete=True) while _from_dict
+                # suppresses redundant warnings.
+                _complete_issues = las_file.validate(complete=True)
+                for issue in _complete_issues:
+                    warnings.warn(issue, stacklevel=2)
             finally:
                 las_file._from_dict = False
 
@@ -2897,6 +3017,88 @@ class DevFile:
     column_order: list[str] = field(default_factory=list)
     source_file: str = ""
     encoding: str = "utf-8"
+
+    def validate(self, complete: bool = False) -> list[str]:
+        """Validate DEV file data integrity.
+
+        Args:
+            complete: If True, run deferred data-quality checks
+                (NaN/Inf in numeric columns, MD monotonicity,
+                AZI/INC range validation).
+
+        Returns:
+            List of issue strings (empty = no issues found).
+            Basic structural checks (key matching, consistent lengths)
+            raise during construction and are not duplicated here.
+        """
+        issues: list[str] = []
+        if not complete:
+            return issues
+
+        # NaN/Inf check for numeric column arrays.
+        for _col_name, _col_data in self.columns.items():
+            if isinstance(_col_data, np.ndarray) and _col_data.dtype.kind in ('f', 'c'):
+                if not np.all(np.isfinite(_col_data)):
+                    issues.append(
+                        f"DevFile: column '{_col_name}' contains "
+                        f"non-finite values (NaN/Inf)."
+                    )
+
+        # Data-quality validation (MD monotonicity, AZI/INC range).
+        for _col_name, _col_data in self.columns.items():
+            if _col_data is None or len(_col_data) == 0:
+                continue
+            _col_upper = _col_name.upper()
+            # MD: monotonicity
+            if _col_upper == "MD":
+                _finite = _col_data[np.isfinite(_col_data)]
+                if len(_finite) >= 2:
+                    _diffs = np.diff(_finite)
+                    if np.any(_diffs < 0):
+                        _n_bad = int(np.sum(_diffs < 0))
+                        issues.append(
+                            f"MD values are not monotonically "
+                            f"increasing: {_n_bad} decrease(s) "
+                            f"found.  Unsorted MD values can "
+                            f"cause inaccurate trajectory "
+                            f"calculations."
+                        )
+            # AZI: range [0, 360]
+            if _col_upper in ("AZI", "AZIM", "AZ", "AZM", "AZIMUTH"):
+                _finite = _col_data[np.isfinite(_col_data)]
+                if len(_finite) > 0:
+                    _oor = (_finite < 0) | (_finite > 360)
+                    if np.any(_oor):
+                        _n_bad = int(np.sum(_oor))
+                        _bad_vals = _finite[_oor][:3]
+                        _extra = "..." if _n_bad > 3 else ""
+                        issues.append(
+                            f"Azimuth column '{_col_name}' has "
+                            f"{_n_bad} value(s) outside [0, 360]: "
+                            f"{list(_bad_vals)}{_extra}. "
+                            f"Azimuth values outside [0, 360] "
+                            f"can cause inaccurate trajectory "
+                            f"calculations."
+                        )
+            # INC: range [0, 180]
+            if _col_upper in ("INC", "INCL", "DEVI", "DIP"):
+                _finite = _col_data[np.isfinite(_col_data)]
+                if len(_finite) > 0:
+                    _oor = (_finite < 0) | (_finite > 180)
+                    if np.any(_oor):
+                        _n_bad = int(np.sum(_oor))
+                        _bad_vals = _finite[_oor][:3]
+                        _extra = "..." if _n_bad > 3 else ""
+                        issues.append(
+                            f"Inclination column '{_col_name}' "
+                            f"has {_n_bad} value(s) outside "
+                            f"[0, 180]: {list(_bad_vals)}{_extra}. "
+                            f"Inclination values outside [0, 180] "
+                            f"can cause inaccurate trajectory "
+                            f"calculations."
+                        )
+
+        return issues
 
     def __post_init__(self) -> None:
         """Validate critical invariants after construction (E-F-026).
@@ -3229,64 +3431,10 @@ class DevFile:
                     f"{_orphaned}"
                 )
             # F-43: Minimum data-quality validation matching reader's
-            # _validate_dev_data checks.  Uses warnings so that
-            # construction with out-of-range values is still possible
-            # for testing — the reader path does the same.
-            for _col_name, _col_data in dev.columns.items():
-                if _col_data is None or len(_col_data) == 0:
-                    continue
-                _col_upper = _col_name.upper()
-                # MD: monotonicity (strictly non-decreasing)
-                if _col_upper == "MD":
-                    _finite = _col_data[np.isfinite(_col_data)]
-                    if len(_finite) >= 2:
-                        _diffs = np.diff(_finite)
-                        if np.any(_diffs < 0):
-                            _n_bad = int(np.sum(_diffs < 0))
-                            warnings.warn(
-                                f"MD values are not monotonically "
-                                f"increasing: {_n_bad} decrease(s) "
-                                f"found.  Unsorted MD values can "
-                                f"cause inaccurate trajectory "
-                                f"calculations.",
-                                stacklevel=2,
-                            )
-                # AZI: range [0, 360]
-                if _col_upper in ("AZI", "AZIM", "AZ", "AZM", "AZIMUTH"):
-                    _finite = _col_data[np.isfinite(_col_data)]
-                    if len(_finite) > 0:
-                        _oor = (_finite < 0) | (_finite > 360)
-                        if np.any(_oor):
-                            _n_bad = int(np.sum(_oor))
-                            _bad_vals = _finite[_oor][:3]
-                            warnings.warn(
-                                f"Azimuth column '{_col_name}' has "
-                                f"{_n_bad} value(s) outside [0, 360]: "
-                                f"{list(_bad_vals)}"
-                                f"{'...' if _n_bad > 3 else ''}. "
-                                f"Azimuth values outside [0, 360] "
-                                f"can cause inaccurate trajectory "
-                                f"calculations.",
-                                stacklevel=2,
-                            )
-                # INC: range [0, 180]
-                if _col_upper in ("INC", "INCL", "DEVI", "DIP"):
-                    _finite = _col_data[np.isfinite(_col_data)]
-                    if len(_finite) > 0:
-                        _oor = (_finite < 0) | (_finite > 180)
-                        if np.any(_oor):
-                            _n_bad = int(np.sum(_oor))
-                            _bad_vals = _finite[_oor][:3]
-                            warnings.warn(
-                                f"Inclination column '{_col_name}' "
-                                f"has {_n_bad} value(s) outside "
-                                f"[0, 180]: {list(_bad_vals)}"
-                                f"{'...' if _n_bad > 3 else ''}. "
-                                f"Inclination values outside [0, 180] "
-                                f"can cause inaccurate trajectory "
-                                f"calculations.",
-                                stacklevel=2,
-                            )
+            # _validate_dev_data checks.  Now delegated to validate(complete=True).
+            for issue in dev.validate(complete=True):
+                warnings.warn(issue, stacklevel=2)
+
             return dev
         except (ValueError, TypeError, OverflowError) as e:
             raise LASDataError(str(e)) from e
