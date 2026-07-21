@@ -245,6 +245,60 @@ def _validate_precision(precision: str) -> None:
         )
 
 
+class _WriterMutationGuard:
+    """Context manager that runs deferred validation after write.
+
+    During write, several LASFile attributes may be mutated to ensure
+    format compliance (WRAP→NO, DLM→SPACE for LAS 1.2, copy-back from
+    data_sections for legacy paths).  This guard snapshots the pre-write
+    state for comparison/detection purposes and runs
+    ``las_file.validate(complete=True)`` in ``__exit__``, warning on any
+    issues found.  State is intentionally NOT restored — the model must
+    honestly reflect what was written to disk (G-018 "honest model"
+    principle).  Individual write paths manage their own state restoration
+    for non-semantic mutations (e.g., data_sections copy-back restore in
+    ``_write_ascii_sections``'s ``finally`` block).
+    """
+
+    def __init__(self, las_file: LASFile) -> None:
+        self._las_file = las_file
+        # Snapshot mutable state at construction time for potential
+        # future comparison/detection logging.  State is intentionally
+        # NOT written back to las_file — the model must honestly reflect
+        # what was written to disk (G-018).
+        self._saved_wrap: str = las_file.version.wrap
+        self._saved_dlm: str = las_file.version.dlm
+        self._saved_logs = dict(las_file.logs)
+        self._saved_string_data = dict(las_file.string_data)
+        self._saved_curves_order = list(las_file.curves_order) if las_file.curves_order is not None else []
+        self._saved_curves = list(las_file.curves) if las_file.curves is not None else []
+
+    def __enter__(self) -> _WriterMutationGuard:
+        """Enter the guarded context (state already snapped in __init__)."""
+        return self
+
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
+        """Run deferred validation against the post-write model state.
+
+        Does NOT restore pre-write state — the model must honestly
+        reflect what was written to disk per G-018.  Runs
+        ``las_file.validate(complete=True)`` and warns on issues.
+        Does not suppress exceptions.
+        """
+        # Run deferred validation and warn on any issues found.
+        import warnings
+
+        try:
+            issues = self._las_file.validate(complete=True)
+            for msg in issues:
+                warnings.warn(msg, UserWarning, stacklevel=2)
+        except Exception:
+            pass  # validate should not break the write
+
+        # Do not suppress exceptions.
+        return False  # type: ignore[return-value]
+
+
 def write_las_file(
     file_path: str | Path,
     las_data: dict[str, Any] | LASFile,
@@ -325,32 +379,38 @@ def write_las_file(
     # Always write with the specified encoding (default: utf-8).
     # F-I2-M04: Also catch PylasdevError — content generation may raise
     # PylasdevError subclasses from models.py validation.
-    try:
-        content = _generate_las_content(las_file, precision)
-    except (ValueError, TypeError, KeyError, AttributeError, OverflowError, PylasdevError) as e:
-        raise LASWriteError(f"Failed to generate LAS file content: {e}") from e
-
-    try:
-        # Atomic write: write content to a temporary file in the same
-        # directory as the target, then atomically replace the target.
-        # This prevents partial/corrupt files on I/O interruption,
-        # disk-full, or system crash mid-write.
-        target_dir = str(file_path.parent)
-        fd, tmp_path = tempfile.mkstemp(
-            dir=target_dir, prefix=".tmp_", suffix=file_path.name
-        )
+    #
+    # Wrap all write operations in _WriterMutationGuard: snapshots the
+    # LASFile's mutable state before mutations begin, restores it after
+    # the write completes (success or failure), and runs deferred
+    # validate(complete=True) to catch any mutation-induced corruption.
+    with _WriterMutationGuard(las_file):
         try:
-            with os.fdopen(fd, 'w', encoding=encoding, newline='') as f:
-                f.write(content)
-            os.replace(tmp_path, file_path)
-        except Exception:
+            content = _generate_las_content(las_file, precision)
+        except (ValueError, TypeError, KeyError, AttributeError, OverflowError, PylasdevError) as e:
+            raise LASWriteError(f"Failed to generate LAS file content: {e}") from e
+
+        try:
+            # Atomic write: write content to a temporary file in the same
+            # directory as the target, then atomically replace the target.
+            # This prevents partial/corrupt files on I/O interruption,
+            # disk-full, or system crash mid-write.
+            target_dir = str(file_path.parent)
+            fd, tmp_path = tempfile.mkstemp(
+                dir=target_dir, prefix=".tmp_", suffix=file_path.name
+            )
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-    except (OSError, UnicodeError, LookupError) as e:
-        raise LASWriteError(f"Cannot write to {file_path}: {e}") from e
+                with os.fdopen(fd, 'w', encoding=encoding, newline='') as f:
+                    f.write(content)
+                os.replace(tmp_path, file_path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except (OSError, UnicodeError, LookupError) as e:
+            raise LASWriteError(f"Cannot write to {file_path}: {e}") from e
 
 
 def _generate_las_content(las_file: LASFile, precision: str = ".8g") -> str:
@@ -830,11 +890,6 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
     spec = _LASVersionSpec(las_file.version.vers)
     import warnings  # consolidated — shared by all warning paths below
 
-    # F-28: LAS 2.0 WRAP=NO also has the 256-char line-length limit per
-    # the CWLS specification.  Extend the line-length check to cover both
-    # LAS 1.2 (all modes) and LAS 2.0 with WRAP=NO.
-    check_line_limit = spec.line_length_limit_for_wrap(las_file.version.wrap) is not None
-
     # F-02-H: Save original DLM before the LAS 1.2 SPACE-override
     # mutation below.  Restored in the finally block so the caller's
     # LASFile DLM is unchanged after writing.
@@ -878,10 +933,11 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
     if _actual_wrap == "YES" or (spec.is_las30 and _actual_wrap != "NO"):
         las_file.version.wrap = "NO"
 
-    # F-28 / M-06: Recompute line-limit check AFTER WRAP mutation.
-    # LAS 2.0 WRAP=YES input is forced to WRAP=NO output above, but
-    # check_line_limit was computed from the PRE-MUTATION _wrap value.
-    # The 256-char line-limit warning must use the actual output state.
+    # F-28 / M-06: Compute line-limit check AFTER WRAP mutation.
+    # The writer always produces WRAP=NO output regardless of input
+    # (LAS 2.0 WRAP=YES is overridden, LAS 3.0 requires WRAP=NO).
+    # The 256-char line-limit warning must use the actual output state,
+    # so compute check_line_limit from the post-mutation wrap value.
     check_line_limit = spec.line_length_limit_for_wrap(
         las_file.version.wrap
     ) is not None

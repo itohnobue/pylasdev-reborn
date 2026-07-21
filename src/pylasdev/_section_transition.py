@@ -1,0 +1,351 @@
+"""Section-transition lifecycle handler for LASParser.
+
+Extracted from parser.py:LASParser._parse_line.  Handles the three-phase
+section-transition lifecycle:
+
+    1. capture_current_state()  → _CapturedState
+    2. process_previous_section(captured, new_section) → cumulative_elements
+    3. enter_new_section(section_type, section_label, section_word, section_rest)
+
+TYPE-LEVEL ORDERING: ``process_previous_section`` REQUIRES a
+``_CapturedState`` parameter — you cannot call it without first calling
+``capture_current_state``.
+
+The handler owns the transition logic.  The parser owns classification
+and line dispatch.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from ._las30_data import AsciiDataContext, process_ascii_data
+
+if TYPE_CHECKING:
+    from .models import LASFile
+    from .parser import LASParser
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _CapturedState:
+    """Snapshot of parser state at the point a new section header is detected.
+
+    Frozen so it cannot be mutated after capture — the transition handler
+    processes the captured snapshot, not live parser state.
+    """
+
+    # The section we are LEAVING (None if first section)
+    previous_section: str | None
+
+    # ASCII data accumulated in the previous section
+    ascii_data_lines: list[str]
+
+    # Curve range of the previous section (for per-section scoping in LAS 3.0)
+    curve_start_idx: int
+    curve_end_idx: int | None
+
+    # Metadata of the previous section
+    section_name: str
+    data_section_type: str
+    data_section_idx: int
+
+    # Cumulative element counter (modified by process_ascii_data)
+    cumulative_elements: int
+
+    # Whether ~V has been parsed (controls deferred-well replay)
+    version_found: bool
+
+    # The LASFile being built (needed for AsciiDataContext)
+    las_file: LASFile
+
+    # Previous definition name — for saving C section curve ranges
+    previous_definition_name: str | None
+
+
+class _SectionTransitionHandler:
+    """Handles the three-phase section-transition lifecycle.
+
+    TYPE-LEVEL ORDERING (enforced by the API):
+        1. capture_current_state() → _CapturedState
+        2. process_previous_section(captured, new_section) → int
+        3. enter_new_section(section_type, ...) → None
+
+    You CANNOT call ``process_previous_section`` without first calling
+    ``capture_current_state`` — the method signature requires the captured
+    object.
+
+    The handler holds a reference to the parser to read/write parser state.
+    It owns the transition logic; the parser owns classification and line
+    dispatch.
+    """
+
+    def __init__(self, parser: LASParser) -> None:
+        self._parser = parser
+
+    # ------------------------------------------------------------------
+    # Phase 1 — CAPTURE: snapshot parser state BEFORE classification
+    # ------------------------------------------------------------------
+
+    def capture_current_state(self) -> _CapturedState:
+        """Snapshot the current section's state BEFORE classification runs.
+
+        Must be called at the TOP of the new-section-detection block,
+        before classification determines ``new_section`` and overwrites
+        ``_current_definition_name``, ``_current_data_section_type``, etc.
+
+        Also saves the current C section's curve range to
+        ``_definition_curve_ranges`` so pipe-target lookups during
+        classification can find the freshly-saved entry (H-03/H-01).
+
+        Returns:
+            Frozen _CapturedState with all data needed to finalize the
+            previous section.
+        """
+        p = self._parser
+
+        # Save C curve range to _definition_curve_ranges BEFORE classification
+        # runs.  This is needed so pipe-target lookups in the data-section
+        # classification block can find the entry (H-03/H-01).
+        if p._current_section == "C":
+            start = p._section_curve_start_idx
+            end = (
+                p._section_curve_end_idx
+                if p._section_curve_end_idx is not None
+                else len(p.las_file.curves)
+            )
+            if p._current_definition_name is not None:
+                p._definition_curve_ranges[p._current_definition_name] = (start, end)
+            else:
+                # H-01: Non-_Definition ~C section — save under sentinel.
+                p._definition_curve_ranges["__MAIN__"] = (start, end)
+
+        return _CapturedState(
+            previous_section=p._current_section,
+            ascii_data_lines=list(p._ascii_data_lines),  # shallow copy
+            curve_start_idx=p._section_curve_start_idx,
+            curve_end_idx=p._section_curve_end_idx,
+            section_name=p._current_section_name,
+            data_section_type=p._current_data_section_type,
+            data_section_idx=p._current_data_section_idx,
+            cumulative_elements=p._cumulative_elements,
+            version_found=p._version_found,
+            las_file=p.las_file,
+            previous_definition_name=p._current_definition_name,
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 2 — PROCESS: finalize the previous section
+    # ------------------------------------------------------------------
+
+    def process_previous_section(
+        self, captured: _CapturedState, new_section: str | None
+    ) -> int:
+        """Process the previous section's accumulated data and finalize its state.
+
+        REQUIRES: ``captured`` from a prior ``capture_current_state()`` call.
+        The captured state is immutable — the handler works with the snapshot,
+        not live parser state (except for the A→A swap which needs the NEW
+        section's state already set by classification).
+
+        Args:
+            captured: Snapshot from ``capture_current_state()``.
+            new_section: The section type determined by classification
+                (``"V"``, ``"W"``, ``"C"``, ``"P"``, ``"O"``, ``"A"``,
+                or ``None`` for unknown sections).
+
+        Returns:
+            Updated ``cumulative_elements`` count (to write back to the parser).
+        """
+        p = self._parser
+
+        if new_section is not None:
+            prev_sec = captured.previous_section
+
+            if prev_sec == "A" and new_section != "A":
+                # A→non-A: process the previous data section.
+                self._process_ascii_section(captured, swap_type=False)
+
+            elif new_section == "A" and prev_sec == "A":
+                # A→A (consecutive data sections): swap back to the
+                # previous section's state, process, then restore the
+                # new section's state.
+                self._process_consecutive_data(captured)
+
+            # Save the PREVIOUS C section's curve range to
+            # _definition_curve_ranges.  Uses captured values
+            # (snapshot before classification) so pipe overwrites
+            # don't corrupt the range (F-01/G-02/H-03).
+            if prev_sec == "C":
+                self._save_c_curve_range(captured)
+
+        return p._cumulative_elements
+
+    # ------------------------------------------------------------------
+    # Phase 3 — ENTER: set up parser state for the new section
+    # ------------------------------------------------------------------
+
+    def enter_new_section(
+        self,
+        section_type: str,
+        section_label: str,
+        section_word: str,
+        section_name: str,
+    ) -> None:
+        """Enter the new section — reset parser state for the incoming section.
+
+        Args:
+            section_type: Normalized type code (``"V"``, ``"W"``, ``"C"``,
+                ``"P"``, ``"O"``, ``"A"``).
+            section_label: Full label for ``_section_sequence``
+                (e.g. ``"CORE_DEFINITION:Core Definition"``).
+            section_word: Raw section-word from the header
+                (e.g. ``"CORE_DEFINITION"``).
+            section_name: Computed section name from classification
+                (may include section_word + section_rest).
+        """
+        p = self._parser
+
+        # F1: Track per-section curve boundaries for LAS 3.0.
+        # When entering ~C (including _Definition sections), mark the
+        # current curve list position for per-section curve scoping.
+        if section_type == "C":
+            p._section_curve_start_idx = len(p.las_file.curves)
+            p._section_curve_end_idx = None
+
+        p._current_section = section_type
+
+        # F-M27: For parameter sections, _current_section_name must
+        # preserve the section_word (e.g., CORE_PARAMETERS) for type
+        # derivation in _parse_parameter_entry.  section_name may be
+        # annotation text, not the type identifier.
+        if section_type == "P" and (
+            section_word.endswith("_PARAMETER") or section_word.endswith("_PARAMETERS")
+        ):
+            p._current_section_name = section_word
+        else:
+            p._current_section_name = (
+                section_name.strip() if section_name else section_word
+            )
+
+        # F-34: Track section sequence for cross-section validation.
+        # Section label uses section_word (e.g. "CURVE", "VERSION")
+        # instead of just new_section (single letter "C", "V")
+        # so that ~C and ~CURVE produce distinct labels (F-I2-M11).
+        from .parser import MAX_SECTION_SEQUENCE
+
+        if len(p._section_sequence) >= MAX_SECTION_SEQUENCE:
+            from .exceptions import LASParseError
+
+            raise LASParseError(
+                f"Section sequence length ({len(p._section_sequence) + 1}) "
+                f"exceeds maximum allowed ({MAX_SECTION_SEQUENCE}). "
+                f"The file may be malformed or corrupt."
+            )
+        p._section_sequence.append(section_label)
+
+        # F-048/F-103: Track semantic section type for duplicate detection.
+        p._section_type_sequence.append(section_type)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _process_ascii_section(
+        self, captured: _CapturedState, swap_type: bool
+    ) -> None:
+        """Process accumulated ASCII data for a data section transition.
+
+        Args:
+            captured: The snapshot from ``capture_current_state()``.
+            swap_type: If True, swap ``_current_data_section_type``
+                between captured (old) and parser (new) values.
+                Used for consecutive A→A transitions.
+        """
+        p = self._parser
+
+        if not captured.ascii_data_lines:
+            return
+
+        # F-I2-H01: Replay deferred well entries before processing
+        # data so the correct NULL value is available.
+        if captured.version_found:
+            p._replay_deferred_well()
+
+        try:
+            ctx = AsciiDataContext(
+                las_file=captured.las_file,
+                ascii_data_lines=captured.ascii_data_lines,
+                section_curve_start_idx=captured.curve_start_idx,
+                section_curve_end_idx=captured.curve_end_idx,
+                current_section_name=captured.section_name,
+                current_data_section_type=captured.data_section_type,
+                current_data_section_idx=captured.data_section_idx,
+                cumulative_elements=captured.cumulative_elements,
+            )
+            process_ascii_data(ctx)
+            p._cumulative_elements = ctx.cumulative_elements
+        finally:
+            p._ascii_data_lines = []
+            p._current_data_section_idx += 1
+
+    def _process_consecutive_data(self, captured: _CapturedState) -> None:
+        """Handle consecutive data section (A→A) transition.
+
+        The classification block has already overwritten
+        ``_section_curve_start_idx``, ``_section_curve_end_idx``, and
+        ``_current_data_section_type`` with the NEW section's values.
+        This method saves the new values, restores the old values
+        (from ``captured``), processes the previous section's data,
+        and restores the new values.
+        """
+        p = self._parser
+
+        # Save new (incoming) section's curve indices.
+        _new_curve_start = p._section_curve_start_idx
+        _new_curve_end = p._section_curve_end_idx
+
+        # Restore old (previous) section's curve indices.
+        p._section_curve_start_idx = captured.curve_start_idx
+        p._section_curve_end_idx = captured.curve_end_idx
+
+        try:
+            # Swap data section type: save new, restore old.
+            _new_type = p._current_data_section_type
+            p._current_data_section_type = captured.data_section_type
+
+            self._process_ascii_section(captured, swap_type=True)
+
+            # Restore new section's type.
+            p._current_data_section_type = _new_type
+        finally:
+            # Restore new section's curve indices and reset accumulators.
+            p._section_curve_start_idx = _new_curve_start
+            p._section_curve_end_idx = _new_curve_end
+
+    def _save_c_curve_range(self, captured: _CapturedState) -> None:
+        """Save the previous C section's curve range.
+
+        Uses captured values (snapshot before classification) so that
+        pipe-handling overwrites of ``_section_curve_start_idx`` etc.
+        don't corrupt the range (F-01).
+        """
+        p = self._parser
+
+        start = captured.curve_start_idx
+        end = (
+            captured.curve_end_idx
+            if captured.curve_end_idx is not None
+            else len(p.las_file.curves)
+        )
+
+        if captured.previous_definition_name is not None:
+            # G-02/H-03: Save under the definition name captured
+            # before classification overwrites _current_definition_name.
+            p._definition_curve_ranges[captured.previous_definition_name] = (start, end)
+        else:
+            # H-01: Non-_Definition ~C section — save under sentinel.
+            p._definition_curve_ranges["__MAIN__"] = (start, end)

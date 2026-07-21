@@ -21,6 +21,7 @@ import numpy as np
 
 from . import data_reader as _data_reader
 from ._las30_data import AsciiDataContext, process_ascii_data
+from ._section_transition import _SectionTransitionHandler
 from ._version_spec import _LASVersionSpec
 from .data_reader import (
     _parse_float_with_d_notation,
@@ -494,6 +495,7 @@ class LASParser:
         for k in _raw_upper:
             self._mnem_base_upper[k] = resolve_mnemonic(_raw_upper, k)
         self.source_file: str = ""
+        self._transition_handler = _SectionTransitionHandler(self)
         self._reset()
 
     def _reset(self) -> None:
@@ -838,41 +840,11 @@ class LASParser:
                 section_word = section_word[:pipe_idx_w].strip()
                 section_rest = ""
 
-            # M-03: Save the previous data section type before the new-section
-            # detection block overwrites it.  When two consecutive data sections
-            # appear (e.g., ~A then ~Core[1]), this saved value is used to give
-            # the PREVIOUS section's DataSection its correct section_type.
-            _prev_data_section_type: str | None = None
-
-            # Save curve indices of the PREVIOUS section before the new section's
-            # pipe handler (below) may overwrite them for the new section.
-            # _process_ascii_data for the previous section must use ITS indices,
-            # not the new section's.
-            _prev_curve_start = self._section_curve_start_idx
-            _prev_curve_end = self._section_curve_end_idx
-
-            # H-03: Save the previous _Definition's curve range BEFORE the
-            # data section classification block so pipe target lookups
-            # (line 567) can find the freshly-saved entry.  Without this,
-            # the lookup runs before the save at line 665, producing false
-            # "unrecognized pipe target" warnings and silent data corruption
-            # when ~C (or _Definition) → data section transitions occur.
-            # H-01: Also save non-_Definition ~C section ranges under a
-            # sentinel key so consecutive non-_Definition ~C sections don't
-            # silently lose curve scoping.
-            _prev_def_name = self._current_definition_name
-            if self._current_section == "C":
-                start = self._section_curve_start_idx
-                end = (
-                    self._section_curve_end_idx
-                    if self._section_curve_end_idx is not None
-                    else len(self.las_file.curves)
-                )
-                if _prev_def_name is not None:
-                    self._definition_curve_ranges[_prev_def_name] = (start, end)
-                else:
-                    # H-01: Non-_Definition ~C section — save under sentinel.
-                    self._definition_curve_ranges["__MAIN__"] = (start, end)
+            # Capture previous section's state BEFORE classification runs.
+            # The handler snapshots all transition-relevant state and saves
+            # C curve ranges to _definition_curve_ranges so pipe-target
+            # lookups during classification can find them (H-03/H-01).
+            captured = self._transition_handler.capture_current_state()
 
             # Classify section_word for dispatch.
             # Standard sections (V, W, C, P, O, A) — also accept full
@@ -944,11 +916,6 @@ class LASParser:
                     section_name = (
                         f"{section_word} {section_rest}".strip() if section_rest else section_word
                     )
-                # M-03: Save the previous data section type BEFORE overwriting.
-                # When two consecutive data sections appear (e.g., ~A then
-                # ~Core[1]),_process_ascii_data() for the PREVIOUS section
-                # must use ITS type, not the newly-set one.
-                _prev_data_section_type = self._current_data_section_type
                 # Derive section_type from keyword, falling back to LOG_DATA.
                 # F-03: Handle indexed sections (e.g., CORE[1] → CORE_DATA).
                 # F-M-03: Warn when section_word is not a recognized type
@@ -1124,175 +1091,26 @@ class LASParser:
                     source_info,
                 )
 
-            # F1: When leaving a data section for a non-data section,
-            # process pending data from the previous section.
-            if new_section is not None:
-                if self._current_section == "A" and new_section != "A":
-                    # F-I2-H01: Replay deferred well entries before processing
-                    # data so the correct NULL value is available.
-                    if self._version_found:
-                        self._replay_deferred_well()
-                    try:
-                        ctx = AsciiDataContext(
-                            las_file=self.las_file,
-                            ascii_data_lines=self._ascii_data_lines,
-                            section_curve_start_idx=self._section_curve_start_idx,
-                            section_curve_end_idx=self._section_curve_end_idx,
-                            current_section_name=self._current_section_name,
-                            current_data_section_type=self._current_data_section_type,
-                            current_data_section_idx=self._current_data_section_idx,
-                            cumulative_elements=self._cumulative_elements,
-                        )
-                        process_ascii_data(ctx)
-                        self._cumulative_elements = ctx.cumulative_elements
-                    finally:
-                        self._ascii_data_lines = []
-                        self._current_data_section_idx += 1
-                elif new_section == "A" and self._current_section == "A":
-                    # Consecutive data sections — process previous first.
-                    # M-03: _current_data_section_type was already overwritten
-                    # for the newly-detected section (lines 337-345).  Swap
-                    # back to the saved previous-section type while processing
-                    # the previous section's accumulated data lines, then
-                    # restore the new-section type for the rest of parsing.
-                    #
-                    # Also swap in the PREVIOUS section's curve indices so
-                    # _process_ascii_data scopes curves correctly.  The new
-                    # section's pipe handler may have already overwritten
-                    # _section_curve_start_idx/_end_idx for the new section.
-                    _new_curve_start = self._section_curve_start_idx
-                    _new_curve_end = self._section_curve_end_idx
-                    self._section_curve_start_idx = _prev_curve_start
-                    self._section_curve_end_idx = _prev_curve_end
-                    try:
-                        if _prev_data_section_type is not None:
-                            _new_type = self._current_data_section_type
-                            self._current_data_section_type = _prev_data_section_type
-                            # F-I2-H01: Replay deferred well entries before processing
-                            # data so the correct NULL value is available.
-                            if self._version_found:
-                                self._replay_deferred_well()
-                            ctx = AsciiDataContext(
-                                las_file=self.las_file,
-                                ascii_data_lines=self._ascii_data_lines,
-                                section_curve_start_idx=self._section_curve_start_idx,
-                                section_curve_end_idx=self._section_curve_end_idx,
-                                current_section_name=self._current_section_name,
-                                current_data_section_type=self._current_data_section_type,
-                                current_data_section_idx=self._current_data_section_idx,
-                                cumulative_elements=self._cumulative_elements,
-                            )
-                            process_ascii_data(ctx)
-                            self._cumulative_elements = ctx.cumulative_elements
-                            self._current_data_section_type = _new_type
-                        else:
-                            # F-I2-H01: Same replay guard for the else branch.
-                            if self._version_found:
-                                self._replay_deferred_well()
-                            ctx = AsciiDataContext(
-                                las_file=self.las_file,
-                                ascii_data_lines=self._ascii_data_lines,
-                                section_curve_start_idx=self._section_curve_start_idx,
-                                section_curve_end_idx=self._section_curve_end_idx,
-                                current_section_name=self._current_section_name,
-                                current_data_section_type=self._current_data_section_type,
-                                current_data_section_idx=self._current_data_section_idx,
-                                cumulative_elements=self._cumulative_elements,
-                            )
-                            process_ascii_data(ctx)
-                            self._cumulative_elements = ctx.cumulative_elements
-                    finally:
-                        self._section_curve_start_idx = _new_curve_start
-                        self._section_curve_end_idx = _new_curve_end
-                        self._ascii_data_lines = []
-                        self._current_data_section_idx += 1
+            # Process the previous section and enter the new section.
+            # The handler enforces capture→process→enter ordering at the type
+            # level: process_previous_section REQUIRES a _CapturedState.
+            self._cumulative_elements = self._transition_handler.process_previous_section(
+                captured, new_section
+            )
 
-                # F1: Track per-section curve boundaries for LAS 3.0.
-                # When entering ~C (including _Definition sections), mark the
-                # current curve list position for per-section curve scoping.
+            # F-34: Compute section label for tracking.
+            section_label = (
+                f"{section_word}:{section_name}" if section_name.strip()
+                else section_word
+            )
 
-                # G-02/H-03: Before overwriting _section_curve_start_idx for
-                # the new ~C section, save the previous _Definition's curve
-                # range so later data sections can look up the correct range.
-                # Uses _prev_def_name (captured BEFORE classification) to
-                # avoid using a freshly-overwritten _current_definition_name
-                # when consecutive _Definition sections are parsed.
-                if self._current_section == "C" and _prev_def_name is not None:
-                    # Guard: verify the definition name hasn't been changed
-                    # by a consecutive _Definition overwrite during
-                    # classification.
-                    if (
-                        self._current_definition_name is not None
-                        and self._current_definition_name != _prev_def_name
-                    ):
-                        logger.warning(
-                            "Definition name mismatch during curve range save: "
-                            "previous='%s', current='%s'. Using previous for "
-                            "range storage.",
-                            _prev_def_name,
-                            self._current_definition_name,
-                        )
-                    # F-01: Use _prev_curve_start/_prev_curve_end instead of
-                    # self._section_curve_start_idx/_end_idx, which may have
-                    # been overwritten by pipe handling (lines 602-657) for
-                    # the new section.  The prev locals were captured at
-                    # lines 456-457 BEFORE pipe handler ran.
-                    self._definition_curve_ranges[_prev_def_name] = (
-                        _prev_curve_start,
-                        _prev_curve_end
-                        if _prev_curve_end is not None
-                        else len(self.las_file.curves),
-                    )
-                elif self._current_section == "C" and _prev_def_name is None:
-                    # H-01: Non-_Definition ~C section — save under sentinel
-                    # key so consecutive non-_Definition ~C sections don't
-                    # silently lose curve scoping.
-                    # F-01: Same as above — use preserved locals.
-                    self._definition_curve_ranges["__MAIN__"] = (
-                        _prev_curve_start,
-                        _prev_curve_end
-                        if _prev_curve_end is not None
-                        else len(self.las_file.curves),
-                    )
-
-                if new_section == "C":
-                    self._section_curve_start_idx = len(self.las_file.curves)
-                    self._section_curve_end_idx = None
-
-                self._current_section = new_section
-                # F-M27: For parameter sections, _current_section_name must
-                # preserve the section_word (e.g., CORE_PARAMETERS) for type
-                # derivation in _parse_parameter_entry.  section_rest is
-                # annotation text, not the type identifier.
-                if new_section == "P" and (
-                    section_word.endswith("_PARAMETER") or section_word.endswith("_PARAMETERS")
-                ):
-                    self._current_section_name = section_word
-                else:
-                    self._current_section_name = section_name.strip() if section_name else section_word
-                # F-34: Track section sequence for cross-section validation.
-                # F-I2-M11: Use section_word (e.g. "CURVE", "VERSION")
-                # instead of just new_section (single letter "C", "V")
-                # so that ~C and ~CURVE produce distinct labels instead
-                # of both collapsing to "C".
-                section_label = (
-                    f"{section_word}:{section_name}" if section_name.strip()
-                    else section_word
-                )
-                # F-006: Guard against unbounded section sequence growth
-                # from repeated unknown section headers.
-                if len(self._section_sequence) >= MAX_SECTION_SEQUENCE:
-                    raise LASParseError(
-                        f"Section sequence length ({len(self._section_sequence) + 1}) "
-                        f"exceeds maximum allowed ({MAX_SECTION_SEQUENCE}). "
-                        f"The file may be malformed or corrupt."
-                    )
-                self._section_sequence.append(section_label)
-                # F-048/F-103: Track semantic section type for duplicate detection.
-                # Labels differ for same type (e.g., "V:" vs "VERSION:INFORMATION")
-                # but new_section is the normalized type code ("V").
-                self._section_type_sequence.append(new_section)
-                return
+            # Enter the new section — set parser state for incoming section.
+            # Unknown sections (new_section is None) return early above.
+            assert new_section is not None
+            self._transition_handler.enter_new_section(
+                new_section, section_label, section_word, section_name
+            )
+            return
 
         if COMMENT_PATTERN.match(line) or EMPTY_PATTERN.match(line):
             return
