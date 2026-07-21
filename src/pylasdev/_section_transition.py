@@ -21,8 +21,6 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ._las30_data import AsciiDataContext, process_ascii_data
-
 if TYPE_CHECKING:
     from .models import LASFile
     from .parser import LASParser
@@ -51,10 +49,6 @@ class _CapturedState:
     # Metadata of the previous section
     section_name: str
     data_section_type: str
-    data_section_idx: int
-
-    # Cumulative element counter (modified by process_ascii_data)
-    cumulative_elements: int
 
     # Whether ~V has been parsed (controls deferred-well replay)
     version_found: bool
@@ -130,8 +124,6 @@ class _SectionTransitionHandler:
             curve_end_idx=p._state.section_curve_end_idx,
             section_name=p._state.current_section_name,
             data_section_type=p._state.current_data_section_type,
-            data_section_idx=p._state.current_data_section_idx,
-            cumulative_elements=p._state.cumulative_elements,
             version_found=p._state.version_found,
             las_file=p.las_file,
             previous_definition_name=p._state.current_definition_name,
@@ -167,7 +159,7 @@ class _SectionTransitionHandler:
 
             if prev_sec == "A" and new_section != "A":
                 # A→non-A: process the previous data section.
-                self._process_ascii_section(captured, swap_type=False)
+                self._process_ascii_section(captured)
 
             elif new_section == "A" and prev_sec == "A":
                 # A→A (consecutive data sections): swap back to the
@@ -254,43 +246,28 @@ class _SectionTransitionHandler:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _process_ascii_section(
-        self, captured: _CapturedState, swap_type: bool
-    ) -> None:
+    def _process_ascii_section(self, captured: _CapturedState) -> None:
         """Process accumulated ASCII data for a data section transition.
 
         Args:
             captured: The snapshot from ``capture_current_state()``.
-            swap_type: If True, swap ``_current_data_section_type``
-                between captured (old) and parser (new) values.
-                Used for consecutive A→A transitions.
         """
         p = self._parser
 
-        if not captured.ascii_data_lines:
-            return
-
-        # F-I2-H01: Replay deferred well entries before processing
-        # data so the correct NULL value is available.
-        if captured.version_found:
-            p._replay_deferred_well()
-
-        try:
-            ctx = AsciiDataContext(
-                las_file=captured.las_file,
-                ascii_data_lines=captured.ascii_data_lines,
-                section_curve_start_idx=captured.curve_start_idx,
-                section_curve_end_idx=captured.curve_end_idx,
-                current_section_name=captured.section_name,
-                current_data_section_type=captured.data_section_type,
-                current_data_section_idx=captured.data_section_idx,
-                cumulative_elements=captured.cumulative_elements,
-            )
-            process_ascii_data(ctx)
-            p._state.cumulative_elements = ctx.cumulative_elements
-        finally:
-            p._state.ascii_data_lines = []
-            p._state.current_data_section_idx += 1
+        # F-30: Delegate to the shared flush helper on LASParser to
+        # eliminate duplicated AsciiDataContext construction and finally-
+        # cleanup logic between this method and the unknown-section handler.
+        p._flush_ascii_data(
+            data_lines=captured.ascii_data_lines,
+            section_curve_start_idx=captured.curve_start_idx,
+            section_curve_end_idx=captured.curve_end_idx,
+            current_section_name=captured.section_name,
+            current_data_section_type=captured.data_section_type,
+            current_data_section_idx=p._state.current_data_section_idx,
+            cumulative_elements=p._state.cumulative_elements,
+            version_found=captured.version_found,
+            las_file=captured.las_file,
+        )
 
     def _process_consecutive_data(self, captured: _CapturedState) -> None:
         """Handle consecutive data section (A→A) transition.
@@ -317,7 +294,7 @@ class _SectionTransitionHandler:
             _new_type = p._state.current_data_section_type
             p._state.current_data_section_type = captured.data_section_type
 
-            self._process_ascii_section(captured, swap_type=True)
+            self._process_ascii_section(captured)
 
             # Restore new section's type.
             p._state.current_data_section_type = _new_type

@@ -2265,15 +2265,17 @@ class TestReFixModels1:
 
     # --- F-059 (MEDIUM): LASFile data_format cross-validation ---
 
-    def test_lasfile_s_format_in_logs_warns(self) -> None:
-        """F-059: S-format curve in logs (numeric) triggers warning.
+    def test_lasfile_s_format_in_logs_raises(self) -> None:
+        """I2F-08: S-format curve in logs (numeric) raises LASDataError.
 
-        LASFile.__post_init__ should warn when a curve with data_format='S'
-        is placed in the logs dict (numeric storage).
+        LASFile.__post_init__ raises when a curve with data_format='S'
+        is placed in the logs dict (numeric storage), matching the
+        from_dict path and DataSection.__post_init__.
         """
+        from pylasdev.exceptions import LASDataError
+
         sc = CurveDefinition(mnemonic="STR", data_format="S")
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
+        with pytest.raises(LASDataError, match=r"S.*string-format.*logs"):
             LASFile(
                 version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
                 well=WellSection(entries={"STRT": "0", "STOP": "100", "STEP": "10", "NULL": "-999"}),
@@ -2281,24 +2283,18 @@ class TestReFixModels1:
                 curves_order=["STR"],
                 logs={"STR": np.array([1.0, 2.0])},
             )
-            s_format_warnings = [
-                x for x in w
-                if "string-format" in str(x.message)
-                and "STR" in str(x.message)
-            ]
-        assert len(s_format_warnings) == 1, (
-            f"Expected 1 S-format warning for STR, got {len(s_format_warnings)}"
-        )
 
-    def test_lasfile_numeric_format_in_string_data_warns(self) -> None:
-        """F-059: Numeric-format curve in string_data triggers warning.
+    def test_lasfile_numeric_format_in_string_data_raises(self) -> None:
+        """I2F-08: Numeric-format curve in string_data raises LASDataError.
 
-        LASFile.__post_init__ should warn when a numeric-format curve
-        is placed in the string_data dict.
+        LASFile.__post_init__ raises when a numeric-format curve
+        is placed in the string_data dict, matching the from_dict
+        path and DataSection.__post_init__.
         """
+        from pylasdev.exceptions import LASDataError
+
         sc = CurveDefinition(mnemonic="GR", data_format="F")
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
+        with pytest.raises(LASDataError, match=r"F.*numeric-format.*string_data"):
             LASFile(
                 version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
                 well=WellSection(entries={"STRT": "0", "STOP": "100", "STEP": "10", "NULL": "-999"}),
@@ -2306,14 +2302,6 @@ class TestReFixModels1:
                 curves_order=["GR"],
                 string_data={"GR": np.array(["a", "b"], dtype=str)},
             )
-            num_format_warnings = [
-                x for x in w
-                if "numeric-format" in str(x.message)
-                and "GR" in str(x.message)
-            ]
-        assert len(num_format_warnings) == 1, (
-            f"Expected 1 numeric-format warning for GR, got {len(num_format_warnings)}"
-        )
 
     # --- E-F-022 (MEDIUM): string_data and data_sections overlap detection ---
 

@@ -13,9 +13,13 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
+import threading
+import types
 import warnings
+from collections.abc import Sequence
 from itertools import groupby
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 
@@ -28,7 +32,7 @@ from .data_reader import (
     _parse_float_with_d_notation,
 )
 from .exceptions import LASParseError
-from .mnem_base import resolve_mnemonic
+from .mnem_base import build_mnemonic_lookup
 from .models import (
     _VALID_DATA_FORMATS,
     ArrayElementInfo,
@@ -60,7 +64,56 @@ MAX_OTHER_LINES = 1_000_000
 # external data is genuine content, not a writer escape.  Defaults to
 # True (preserves existing roundtrip behavior).  Set to False before
 # reading external files to prevent data corruption.
-_DESANITIZE_ENABLED: bool = True
+# F-21: Thread-local storage to prevent race conditions when concurrent
+# callers use different desanitize values.  Module-level attribute
+# setting (e.g. data_reader's ``_DESANITIZE_ENABLED = desanitize``)
+# is intercepted via ``_DesanitizeModule.__setattr__`` and routed to
+# per-thread storage.  Truthiness checks via ``_DesanitizeProxy.__bool__``
+# also route to per-thread storage.
+_desanitize_storage = threading.local()
+_desanitize_storage.enabled = True  # Default on the importing thread.
+
+
+def _is_desanitize_enabled() -> bool:
+    """Return True if desanitization is enabled (thread-local, default True)."""
+    return getattr(_desanitize_storage, 'enabled', True)
+
+
+def _set_desanitize_enabled(value: bool) -> None:
+    """Set the desanitization flag for the current thread."""
+    _desanitize_storage.enabled = value
+
+
+class _DesanitizeModule(types.ModuleType):
+    """Module subclass that routes ``_DESANITIZE_ENABLED`` reads and writes
+    to thread-local storage.  This intercepts the ``= desanitize`` assignment
+    in data_reader.py and ``if not _DESANITIZE_ENABLED:`` truthiness checks
+    in this module and data_reader, all without modifying those modules.
+    """
+
+    def __getattr__(self, name: str) -> object:
+        if name == '_DESANITIZE_ENABLED':
+            return _is_desanitize_enabled()
+        raise AttributeError(
+            f"module '{__name__}' has no attribute {name!r}"
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == '_DESANITIZE_ENABLED':
+            _set_desanitize_enabled(bool(value))
+        else:
+            super().__setattr__(name, value)
+
+
+# Install the custom module class so that ``_DESANITIZE_ENABLED``
+# access is intercepted regardless of which module performs it.
+_sys_mod = sys.modules[__name__]
+_sys_mod.__class__ = _DesanitizeModule
+# Remove _DESANITIZE_ENABLED from the module's __dict__ so that reads
+# and writes fall through to __getattr__ / __setattr__.  The existing
+# proxy instance would otherwise shadow our custom behaviour.
+_sys_mod.__dict__.pop('_DESANITIZE_ENABLED', None)
+del _sys_mod
 
 # F-35: Maximum deferred well entries.  Every other accumulator in parser.py
 # has a MAX_* guard (_ascii_data_lines, las_file.curves, las_file.parameters,
@@ -381,7 +434,7 @@ def _desanitize_las_value(value: str) -> str:
        leading whitespace → ``" _#..."`` → reverse: remove the ``_``
        between whitespace and ``#``.
     """
-    if not _DESANITIZE_ENABLED:
+    if not _is_desanitize_enabled():
         return value
     if value.startswith("_#"):
         return value[1:]
@@ -390,6 +443,27 @@ def _desanitize_las_value(value: str) -> str:
     if idx > 0 and value[idx - 1].isspace():
         return value[:idx] + value[idx + 1 :]
     return value
+
+
+# F-27: Reusable cross-section curve count validation — extracted from
+# _validate_cross_section_consistency so the from_dict path (models.py)
+# can also call it.  Takes a list of DataSection objects and warns when
+# the number of data columns (data + string_data) does not match the
+# number of declared section_curves.
+def _validate_data_section_column_counts(data_sections: Sequence[Any]) -> None:
+    """Validate curve-count vs data-column-count per data section."""
+    for ds in data_sections:
+        declared = len(ds.section_curves)
+        actual_cols = len(ds.data) + len(ds.string_data)
+        if actual_cols != declared and declared > 0:
+            logger.warning(
+                "Data section '%s': section has %d data columns "
+                "but %d curves declared. Data count mismatch may "
+                "indicate corrupt or misaligned data.",
+                ds.name,
+                actual_cols,
+                declared,
+            )
 
 
 # F-088 / F-102: Shared format specifier validation — extracted from
@@ -469,32 +543,10 @@ class LASParser:
                 stacklevel=2,
             )
         # Build uppercased lookup with multi-step chain resolution.
-        # resolve_mnemonic walks chains like BK-3 → BK → BFV to reach
-        # the terminal canonical name. Single .get() only resolves one hop.
-        #
-        # F-H-01: Use first-wins semantics — canonical uppercase entries
-        # (e.g. "BK": "BFV") appear first in insertion order.  Later
-        # lowercased aliases (e.g. "bk": "BK") that collide on uppercased
-        # key must not overwrite.  Dict comprehension gives last-wins,
-        # which breaks chain resolution.
-        _raw_upper: dict[str, str] = {}
-        # Sort so canonical uppercase entries come first, ensuring
-        # first-wins semantics are invariant regardless of input dict
-        # ordering.  Without this sort, a dict where lowercase aliases
-        # (e.g. "bk") precede canonical entries ("BK") would break
-        # chain resolution because the lowercase alias would "win"
-        # and overwrite when uppercased.
-        sorted_items = sorted(
-            self.mnem_base.items(),
-            key=lambda item: (not item[0].isupper(), item[0]),
-        )
-        for k, v in sorted_items:
-            key = k.upper()
-            if key not in _raw_upper:
-                _raw_upper[key] = v
-        self._mnem_base_upper: dict[str, str] = {}
-        for k in _raw_upper:
-            self._mnem_base_upper[k] = resolve_mnemonic(_raw_upper, k)
+        # build_mnemonic_lookup walks chains like BK-3 → BK → BFV to reach
+        # the terminal canonical name.  Uses first-wins semantics so
+        # canonical uppercase entries take priority over lowercase aliases.
+        self._mnem_base_upper = build_mnemonic_lookup(self.mnem_base)
         self.source_file: str = ""
         self._state = _ParserState()
         self._transition_handler = _SectionTransitionHandler(self)
@@ -607,13 +659,14 @@ class LASParser:
             self.las_file.version.vers
         ).is_las12_or_later
         if is_las12_or_later and self._state.version_found:
-            # M-03: All 8 LAS 1.2 mandatory well fields (was 4).
-            # WELL, LOC, SRVC, and UWI are commonly missing in real-world
-            # files — we warn but do NOT raise an error.
-            _mandatory_fields = [
-                "STRT", "STOP", "STEP", "NULL",
-                "WELL", "LOC", "SRVC", "UWI",
-            ]
+            # F-25: Use version-specific mandatory well fields from
+            # _LASVersionSpec.  LAS 1.2 requires 8 fields (STRT, STOP,
+            # STEP, NULL, WELL, LOC, SRVC, UWI); LAS 2.0/3.0 require
+            # only 4 (STRT, STOP, STEP, NULL).  WELL, LOC, SRVC, and
+            # UWI are commonly missing in real-world files — we warn
+            # but do NOT raise an error.
+            _version_spec = _LASVersionSpec(self.las_file.version.vers)
+            _mandatory_fields = list(_version_spec.mandatory_well_fields)
             for field in _mandatory_fields:
                 if field not in self.las_file.well.entries:
                     warnings.warn(
@@ -995,28 +1048,19 @@ class LASParser:
                 # before resetting, to avoid leaving orphaned data lines and to
                 # prevent LAS 3.0 contamination (F-08).
                 if self._state.current_section == "A" and self._state.ascii_data_lines:
-                    # F-I2-H01: Replay deferred well entries before processing
-                    # data so the correct NULL value is available.  When ~W
-                    # appears before ~V, well entries are buffered and not
-                    # stored until _replay_deferred_well() is called.
-                    if self._state.version_found:
-                        self._replay_deferred_well()
-                    try:
-                        ctx = AsciiDataContext(
-                            las_file=self.las_file,
-                            ascii_data_lines=self._state.ascii_data_lines,
-                            section_curve_start_idx=self._state.section_curve_start_idx,
-                            section_curve_end_idx=self._state.section_curve_end_idx,
-                            current_section_name=self._state.current_section_name,
-                            current_data_section_type=self._state.current_data_section_type,
-                            current_data_section_idx=self._state.current_data_section_idx,
-                            cumulative_elements=self._state.cumulative_elements,
-                        )
-                        process_ascii_data(ctx)
-                        self._state.cumulative_elements = ctx.cumulative_elements
-                    finally:
-                        self._state.ascii_data_lines = []
-                        self._state.current_data_section_idx += 1
+                    # F-30: Use shared _flush_ascii_data helper to avoid
+                    # duplicating the AsciiDataContext construction and
+                    # finally-cleanup logic with _process_ascii_section.
+                    self._flush_ascii_data(
+                        data_lines=self._state.ascii_data_lines,
+                        section_curve_start_idx=self._state.section_curve_start_idx,
+                        section_curve_end_idx=self._state.section_curve_end_idx,
+                        current_section_name=self._state.current_section_name,
+                        current_data_section_type=self._state.current_data_section_type,
+                        current_data_section_idx=self._state.current_data_section_idx,
+                        cumulative_elements=self._state.cumulative_elements,
+                        version_found=self._state.version_found,
+                    )
                 # F-02: Reset current section so data lines in unknown sections
                 # aren't misrouted to the previous section's handler.
                 self._state.current_section = None
@@ -1447,14 +1491,19 @@ class LASParser:
                     re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", value)
                 )
             if not _is_timestamp:
-                # F-002: Scope the timestamp regex to the portion after
-                # the first colon to avoid false positives like "15:01"
-                # inside a date such as "15/01/2001" in CWLS well entries.
-                _time_match = re.search(
-                    r"\b\d{1,2}:\d{2}(:\d{2})?\b",
-                    value[value.index(":") + 1 :],
-                )
-                _is_timestamp = _time_match is not None
+                # F-002 / I2F-12: Scope the timestamp regex to the portion
+                # after the first colon, but ONLY when the pre-colon portion
+                # does not contain alphabetic text.  When the pre-colon part
+                # has text (e.g., "LOG DATE:12:34:56"), the colon is a CWLS
+                # description:value separator, not part of a timestamp.
+                _colon_idx = value.index(":")
+                _pre_colon = value[:_colon_idx]
+                if not re.search(r"[a-zA-Z]", _pre_colon):
+                    _time_match = re.search(
+                        r"\b\d{1,2}:\d{2}(:\d{2})?\b",
+                        value[_colon_idx + 1 :],
+                    )
+                    _is_timestamp = _time_match is not None
 
             if not _is_timestamp:
                 colon_idx = value.index(":")
@@ -1716,6 +1765,10 @@ class LASParser:
                         )
                         process_ascii_data(ctx)
                         self._state.cumulative_elements = ctx.cumulative_elements
+                        # F-M3: Per-group increment restored.  The F-54 fix
+                        # consolidated this into a single finally-block += 1,
+                        # but with 2+ deferred groups the counter must
+                        # increment once per group, not once total.
                         self._state.current_data_section_idx += 1
                 finally:
                     # Restore state.
@@ -1728,7 +1781,9 @@ class LASParser:
                     self._state.current_data_section_type = saved_section_type
                     # F-I2-M01: Reset section name (defense-in-depth).
                     self._state.current_section_name = saved_section_name or ""
-            self._state.deferred_ascii_data_lines.clear()
+                    # F-M3: Per-group current_data_section_idx increment
+                    # moved back inside the for loop (one per deferred group).
+                    self._state.deferred_ascii_data_lines.clear()
 
     def _parse_well(self, line: str) -> None:
         """Parse ~W (well information) section line.
@@ -2294,28 +2349,111 @@ class LASParser:
                 stacklevel=2,
             )
 
+    def _flush_ascii_data(
+        self,
+        data_lines: list[str],
+        section_curve_start_idx: int,
+        section_curve_end_idx: int | None,
+        current_section_name: str,
+        current_data_section_type: str,
+        current_data_section_idx: int,
+        cumulative_elements: int,
+        version_found: bool,
+        las_file: LASFile | None = None,
+    ) -> None:
+        """Flush accumulated ASCII data lines into structured data arrays.
+
+        Shared helper used by both the unknown-section handler and
+        ``_SectionTransitionHandler._process_ascii_section`` to eliminate
+        duplicated ``AsciiDataContext`` construction and ``finally`` cleanup
+        logic (F-30).
+
+        Args:
+            data_lines: Accumulated ASCII data lines for the current section.
+            section_curve_start_idx: Start index into ``las_file.curves``.
+            section_curve_end_idx: End index (exclusive), or ``None``.
+            current_section_name: Human-readable section name.
+            current_data_section_type: LAS 3.0 data section type string.
+            current_data_section_idx: Zero-based data section counter.
+            cumulative_elements: Running total of elements across sections.
+            version_found: Whether ``~V`` has been parsed (controls deferred
+                well replay).
+            las_file: The ``LASFile`` to write into.  Defaults to
+                ``self.las_file``.
+        """
+        if not data_lines:
+            return
+        if version_found:
+            self._replay_deferred_well()
+            # F-M2: _replay_deferred_well() mutates self._state.current_data_section_idx
+            # and self._state.cumulative_elements.  The parameters were evaluated at the
+            # call site BEFORE replay ran, so they are stale.  Read the live post-replay
+            # values from self._state to construct AsciiDataContext correctly.
+            current_data_section_idx = self._state.current_data_section_idx
+            cumulative_elements = self._state.cumulative_elements
+        _las = las_file if las_file is not None else self.las_file
+        try:
+            ctx = AsciiDataContext(
+                las_file=_las,
+                ascii_data_lines=data_lines,
+                section_curve_start_idx=section_curve_start_idx,
+                section_curve_end_idx=section_curve_end_idx,
+                current_section_name=current_section_name,
+                current_data_section_type=current_data_section_type,
+                current_data_section_idx=current_data_section_idx,
+                cumulative_elements=cumulative_elements,
+            )
+            process_ascii_data(ctx)
+            self._state.cumulative_elements = ctx.cumulative_elements
+        finally:
+            self._state.ascii_data_lines = []
+            self._state.current_data_section_idx += 1
+
     def _validate_cross_section_consistency(self) -> None:
         """Validate cross-section consistency (F-34).
 
-        Three dimensions checked:
+        Four dimensions checked:
         (1) Curve count vs data column count for each data section.
         (2) LAS 3.0 section ordering — data sections before curve
             definitions have no curves to reference.
         (3) Duplicate section headers.
+        (4) Per-section data_format x placement validation (F-28).
         """
         # (1) Curve count vs data column count per data section.
+        # F-27: Extracted into a reusable module-level function so the
+        # from_dict path (models.py) can also call it.
+        _validate_data_section_column_counts(self.las_file.data_sections)
+
+        # (4) F-28: Per-section data_format x placement check. Every
+        # S-format (or non-array A-format) curve must be in string_data,
+        # not data; every numeric-format curve must be in data, not
+        # string_data.  This mirrors DataSection.__post_init__ (which runs
+        # during construction) and LASFile.validate() (which only checks
+        # top-level curves).
         for ds in self.las_file.data_sections:
-            declared = len(ds.section_curves)
-            actual_cols = len(ds.data) + len(ds.string_data)
-            if actual_cols != declared and declared > 0:
-                logger.warning(
-                    "Data section '%s': section has %d data columns "
-                    "but %d curves declared. Data count mismatch may "
-                    "indicate corrupt or misaligned data.",
-                    ds.name,
-                    actual_cols,
-                    declared,
-                )
+            _data_keys = set(ds.data.keys())
+            _str_keys = set(ds.string_data.keys())
+            for _sc in ds.section_curves:
+                _df = _sc.data_format
+                _mnem = _sc.mnemonic
+                if not _df:
+                    continue
+                if _mnem in _data_keys and (
+                    _df == "S" or (_df == "A" and not _sc.is_array_element)
+                ):
+                    logger.warning(
+                        "Data section '%s': curve '%s' has data_format='%s' "
+                        "(string-format) but is in data (numeric). "
+                        "String-format curves should be in string_data.",
+                        ds.name, _mnem, _df,
+                    )
+                elif _df not in ("S", "A") and _mnem in _str_keys:
+                    logger.warning(
+                        "Data section '%s': curve '%s' has data_format='%s' "
+                        "(numeric-format) but is in string_data. "
+                        "Numeric-format curves should be in data.",
+                        ds.name, _mnem, _df,
+                    )
 
         # (2) LAS 3.0 section ordering — data sections before curves.
         # F-013: Per-type ordering check.  The previous code used a single

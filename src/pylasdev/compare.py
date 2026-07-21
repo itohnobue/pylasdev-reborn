@@ -141,10 +141,19 @@ def _coerce_and_compare(
     # ── Phase 1: Normalize 0-d ndarrays to scalars ──
     # 0-d ndarrays are genuine arrays but represent scalar values.
     # Coerce them BEFORE type-dispatch so they follow the scalar path.
+    # F-42: .item() ignores the mask on MaskedArray/MaskedConstant,
+    # returning the raw underlying data even when the value is marked
+    # as invalid.  Check the mask first and preserve masked semantics.
     if isinstance(a, np.ndarray) and a.ndim == 0:
-        a = a.item()
+        if np.ma.is_masked(a):
+            a = np.ma.masked
+        else:
+            a = a.item()
     if isinstance(b, np.ndarray) and b.ndim == 0:
-        b = b.item()
+        if np.ma.is_masked(b):
+            b = np.ma.masked
+        else:
+            b = b.item()
 
     # ── Phase 2: Symmetric type-dispatch ──
     # AND-checks (both operands match a type) come before OR-checks

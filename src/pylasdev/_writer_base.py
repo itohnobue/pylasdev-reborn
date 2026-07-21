@@ -34,8 +34,15 @@ from .models import CurveDefinition, LASFile, ParameterEntry
 # parsed structure.
 _CONTROL_CHARS_RE = re.compile(
     r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85"
-    r"\u2028\u2029"
-    r"\u00A0\u2000-\u200A\u202F\u205F\u3000]"
+    r"\u2028\u2029]"
+)
+
+# Unicode whitespace characters that should be replaced with an ASCII
+# space, not silently deleted.  These are layout/presentation characters
+# (non-breaking space, en/em quads, thin spaces, ideographic space) that
+# act as visual word separators.
+_UNICODE_WS_RE = re.compile(
+    r"[\u00A0\u2000-\u200A\u202F\u205F\u3000]"
 )
 
 # Previous pattern ^~([A-Za-z]) only matched a leading tilde.
@@ -90,6 +97,7 @@ def _sanitize_las_value(value: str) -> str:
     )
     value = value.replace("\t", " ")
     value = _CONTROL_CHARS_RE.sub("", value)
+    value = _UNICODE_WS_RE.sub(" ", value)
     value = _LEADING_SECTION_RE.sub(r"\1", value, count=1)
     if value.startswith("#"):
         value = "_" + value
@@ -183,7 +191,13 @@ def _format_parameter_line(param: ParameterEntry, is_las30: bool) -> str:
     desc = param.description if param.description else ""
 
     if is_las30 and param.data_format:
-        desc = f"{desc}  {{{param.data_format}}}"
+        # Only single-character format codes (F, A, I, D, etc.) are
+        # wrapped in {} per the LAS 3.0 spec.  Multi-character values
+        # (e.g. "DD/MM/YYYY") are metadata annotations, not format codes.
+        if len(param.data_format.strip()) == 1:
+            desc = f"{desc}  {{{param.data_format}}}"
+        else:
+            desc = f"{desc}  {param.data_format}"
 
     if is_las30 and param.zone:
         zone_str = f" | {param.zone.zone_name}"
@@ -322,7 +336,14 @@ def _format_number(value: float, precision: str = ".8g", null_value: float | Non
     if null_value is not None and value == null_value:
         return _format_null_sentinel(null_value, precision)
     if value == int(value):
-        result = format(int(value), precision)
+        # IEEE 754 negative zero (-0.0): int(-0.0) == 0 loses the sign,
+        # producing "0" instead of "-0".  Use float formatting for the
+        # negative-zero case so that Python's native format(-0.0, ...)
+        # correctly emits "-0".
+        if value == 0 and math.copysign(1.0, value) < 0:
+            result = format(float(value), precision)
+        else:
+            result = format(int(value), precision)
     else:
         result = format(float(value), precision)
     if "e" in result.lower():
@@ -353,6 +374,32 @@ def _format_fixed_precision(value: float, precision: str) -> str:
 
     result = format(value, f".{decimal_places}f")
     return result
+
+
+def _warn_long_header_lines(lines: list[str], max_length: int) -> None:
+    """Warn if any header section line exceeds the LAS 1.2 length limit.
+
+    The LAS 1.2 CWLS specification limits ALL lines (including header
+    lines) to 256 characters.  This check covers header-section lines
+    (version, well, curve, parameter, other) that were not previously
+    validated — data rows are checked separately in ``_format_data_rows``.
+    """
+    warned = False
+    for line in lines:
+        if len(line) > max_length:
+            if not warned:
+                import warnings
+
+                warnings.warn(
+                    f"LAS 1.2 header line exceeds {max_length}-character "
+                    f"limit: {line[:80]!r}... ({len(line)} chars). "
+                    f"The LAS 1.2 specification limits all lines "
+                    f"(including header lines) to {max_length} "
+                    f"characters.  Subsequent violations in this file "
+                    f"will not be reported.",
+                    stacklevel=4,
+                )
+                warned = True
 
 
 # ── _WriterMutationGuard ────────────────────────────────────────────────
@@ -414,6 +461,8 @@ class _WriterBase:
         lines.extend(self._write_curve_section())
         lines.extend(self._write_parameter_section())
         lines.extend(self._write_other_section())
+        if self._spec.is_las12:
+            _warn_long_header_lines(lines, MAX_LINE_LENGTH_LAS12)
         lines.extend(self._write_ascii_sections())
         return "\n".join(lines) + "\n"
 

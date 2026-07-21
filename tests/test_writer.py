@@ -1045,10 +1045,11 @@ class TestWriteLASFile:
                 data={
                     "CORET": np.array([545.5]),
                     "COREB": np.array([550.6]),
-                    "CDES": np.array([0.0]),
+                },
+                string_data={
+                    "CDES": np.array(["ROCK"]),
                 },
             )
-            section.string_data["CDES"] = np.array(["ROCK"], dtype=np.str_)
             las.data_sections.append(section)
 
         temp_file = tmp_path / "dedup_def.las"

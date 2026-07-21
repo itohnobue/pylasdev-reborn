@@ -366,13 +366,13 @@ def read_with_encoding(
     # valid BOM-prefixed files.
     _bom = None
     if len(raw_bytes) >= 8 and raw_bytes.startswith(b"\xff\xfe\x00\x00"):
-        _bom = ("utf-32", 4)
+        _bom = ("utf-32-le", 4)
     elif len(raw_bytes) >= 8 and raw_bytes.startswith(b"\x00\x00\xfe\xff"):
-        _bom = ("utf-32", 4)
+        _bom = ("utf-32-be", 4)
     elif len(raw_bytes) >= 6 and raw_bytes.startswith(b"\xff\xfe"):
-        _bom = ("utf-16", 2)
+        _bom = ("utf-16-le", 2)
     elif len(raw_bytes) >= 6 and raw_bytes.startswith(b"\xfe\xff"):
-        _bom = ("utf-16", 2)
+        _bom = ("utf-16-be", 2)
     if _bom is not None:
         _bom_enc, _bom_len = _bom
         try:

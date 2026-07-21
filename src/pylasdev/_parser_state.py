@@ -158,6 +158,7 @@ class _ParserState:
         self._check_deferred_state_consistency(issues)
         self._check_section_sequence_consistency(issues)
         self._check_cumulative_counters_consistency(issues)
+        self._check_curve_index_bounds(issues, las_file)
         return issues
 
     # ------------------------------------------------------------------
@@ -230,3 +231,59 @@ class _ParserState:
                 f"the warning threshold requires multiple sections to be "
                 f"reachable; this may indicate a corrupted counter."
             )
+
+    def _check_curve_index_bounds(
+        self, issues: list[str], las_file: LASFile
+    ) -> None:
+        """Invariant 9 (F-29): Curve index bounds consistency.
+
+        Validates that ``main_curve_end``, ``definition_curve_ranges``,
+        and curve index fields stay within legal bounds after parsing.
+        These invariants were previously unenforced — invalid values
+        could propagate silently to downstream consumers.
+        """
+        n_curves = len(las_file.curves)
+
+        # main_curve_end must be >= -1 and <= total number of curves.
+        if self.main_curve_end < -1:
+            issues.append(
+                f"main_curve_end is {self.main_curve_end} "
+                f"(expected >= -1 for unset, or >= 0 for set)."
+            )
+        elif self.main_curve_end > n_curves:
+            issues.append(
+                f"main_curve_end is {self.main_curve_end} but only "
+                f"{n_curves} curve(s) exist — index exceeds curve count."
+            )
+
+        # section_curve_start_idx must be >= 0.
+        if self.section_curve_start_idx < 0:
+            issues.append(
+                f"section_curve_start_idx is "
+                f"{self.section_curve_start_idx} (should be >= 0)."
+            )
+
+        # section_curve_end_idx must be >= 0 or None.
+        if self.section_curve_end_idx is not None and self.section_curve_end_idx < 0:
+            issues.append(
+                f"section_curve_end_idx is {self.section_curve_end_idx} "
+                f"(should be >= 0 or None)."
+            )
+
+        # Each definition_curve_range must have valid start ≤ end.
+        for key, (start, end) in self.definition_curve_ranges.items():
+            if start < 0:
+                issues.append(
+                    f"definition_curve_ranges['{key}']: start={start} "
+                    f"is negative."
+                )
+            if end < start:
+                issues.append(
+                    f"definition_curve_ranges['{key}']: start={start} > "
+                    f"end={end} — range must be non-decreasing."
+                )
+            if end > n_curves:
+                issues.append(
+                    f"definition_curve_ranges['{key}']: end={end} "
+                    f"exceeds {n_curves} curves."
+                )

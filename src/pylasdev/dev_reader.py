@@ -201,7 +201,7 @@ def _is_float_token(token: str) -> bool:
     # Reject special float strings (nan, inf, -inf, infinity) that
     # float() can parse but are not meaningful numeric well-log data.
     lower = token.replace("D", "E").replace("d", "e")
-    if lower.lower() in ("nan", "inf", "-inf", "infinity", "+inf", "-infinity", "+infinity"):
+    if lower.lower() in ("nan", "inf", "-inf", "infinity", "+inf", "-infinity", "+infinity", "-nan", "+nan"):
         return False
     try:
         float(lower)
@@ -668,6 +668,18 @@ def _validate_dev_data(
     exceptions so that users can inspect raw data even when it
     contains quality issues.
     """
+    # --- NaN/Inf check for all numeric columns (F-47: reconcile
+    #     with DevFile.validate(complete=True)) ---
+    for _col_name, _col_data in dev.columns.items():
+        if _col_name == "MD":
+            continue  # MD has its own NaN-density check below
+        if isinstance(_col_data, np.ndarray) and _col_data.dtype.kind in ('f', 'c'):
+            if not np.all(np.isfinite(_col_data)):
+                warnings.warn(
+                    f"DevFile: column '{_col_name}' contains "
+                    f"non-finite values (NaN/Inf).",
+                    stacklevel=_stacklevel,
+                )
     # --- Check MD column exists ---
     # Each validation block independently guards its prerequisite
     # columns; azimuth and inclination range checks still run when
@@ -675,6 +687,22 @@ def _validate_dev_data(
     if "MD" in dev.columns:
         md = dev.columns["MD"]
         total = len(md)
+        # --- Check for negative MD values (F-45: moved outside
+        #     _md_check_ok gate — runs even with single finite value) ---
+        md_finite_all = md[~np.isnan(md)]
+        if len(md_finite_all) > 0:
+            neg_md = md_finite_all < 0
+            if np.any(neg_md):
+                n_neg = int(np.sum(neg_md))
+                neg_vals = md_finite_all[neg_md][:3]
+                warnings.warn(
+                    f"Found {n_neg} negative MD value(s): "
+                    f"{', '.join(str(v) for v in neg_vals)}"
+                    f"{'...' if n_neg > 3 else ''}. "
+                    f"Negative measured depth values are physically "
+                    f"impossible in normal well logging.",
+                    stacklevel=_stacklevel,
+                )
         # Gating flag: controls whether monotonicity & repeat checks
         # run.  Set to False when conditions (single-row, all-NaN,
         # fewer than 2 finite values) prevent those checks, but do
@@ -747,20 +775,6 @@ def _validate_dev_data(
                     f"{', '.join(str(v) for v in example_vals)}"
                     f"{'...' if n_dup > 3 else ''}. "
                     f"Repeated stations may indicate merged multi-tool surveys.",
-                    stacklevel=_stacklevel,
-                )
-
-            # --- 4 (F-34). Check for negative MD values ---
-            neg_md = finite_md < 0
-            if np.any(neg_md):
-                n_neg = int(np.sum(neg_md))
-                neg_vals = finite_md[neg_md][:3]
-                warnings.warn(
-                    f"Found {n_neg} negative MD value(s): "
-                    f"{', '.join(str(v) for v in neg_vals)}"
-                    f"{'...' if n_neg > 3 else ''}. "
-                    f"Negative measured depth values are physically "
-                    f"impossible in normal well logging.",
                     stacklevel=_stacklevel,
                 )
 
@@ -1143,7 +1157,22 @@ def read_dev_file_as_object(
                 # Tab-delimited file: use str.split("\t") to preserve
                 # empty fields between consecutive tabs.
                 tab_tokens = hdr.split("\t")
-                if len(tab_tokens) >= 2:
+                # When both tab and semicolon are present, compare token
+                # counts to pick the real delimiter.  A semicolon-delimited
+                # header with a stray tab (e.g., extra whitespace) should
+                # not be misdetected as tab-delimited.  (I2F-21)
+                _has_semi = ";" in hdr
+                if _has_semi:
+                    _semi_tokens = [t for t in hdr.split(";", maxsplit=_max_tokens) if t.strip()]
+                    if len(_semi_tokens) > len(tab_tokens) and len(_semi_tokens) >= 2:
+                        delimiter = ";"
+                    elif len(tab_tokens) >= 2:
+                        delimiter = "\t"
+                    elif len(comma_tokens) >= len(space_tokens) and len(comma_tokens) >= 2:
+                        delimiter = ","
+                    else:
+                        delimiter = " "
+                elif len(tab_tokens) >= 2:
                     delimiter = "\t"
                 elif len(comma_tokens) >= len(space_tokens) and len(comma_tokens) >= 2:
                     delimiter = ","

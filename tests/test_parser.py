@@ -10,9 +10,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from pylasdev import read_las_file
+from pylasdev import CurveDefinition, DataSection, read_las_file
 from pylasdev.exceptions import LASParseError
-from pylasdev.parser import LASParser, _is_indexed_data_section
+from pylasdev.parser import (
+    LASParser,
+    _is_indexed_data_section,
+    _validate_data_section_column_counts,
+)
 from pylasdev.reader import read_las_file_as_object
 
 
@@ -1482,15 +1486,13 @@ class TestLAS30AsciiDataBranches:
             mandatory_warnings = [
                 x for x in w if "LAS 2.0 file missing mandatory well field" in str(x.message)
             ]
-            # Missing STEP, NULL, WELL, LOC, SRVC, UWI (6 out of 8)
-            assert len(mandatory_warnings) == 6
+            # Missing STEP, NULL (2 out of 4 LAS 2.0 mandatory fields).
+            # F-25: LAS 2.0+ only requires STRT, STOP, STEP, NULL.
+            # WELL, LOC, SRVC, UWI are LAS 1.2-specific.
+            assert len(mandatory_warnings) == 2
             warning_texts = [str(x.message) for x in mandatory_warnings]
             assert any("STEP" in t for t in warning_texts)
             assert any("NULL" in t for t in warning_texts)
-            assert any("WELL" in t for t in warning_texts)
-            assert any("LOC" in t for t in warning_texts)
-            assert any("SRVC" in t for t in warning_texts)
-            assert any("UWI" in t for t in warning_texts)
 
     def test_las20_all_mandatory_fields_no_warning(self) -> None:
         """LAS 2.0 files with all mandatory fields should not warn."""
@@ -1522,7 +1524,11 @@ class TestLAS30AsciiDataBranches:
             assert len(mandatory_warnings) == 0
 
     def test_las12_no_mandatory_field_warning(self) -> None:
-        """LAS 1.2 files should not trigger the LAS 2.0 mandatory field check."""
+        """LAS 1.2 files should trigger mandatory well field check.
+
+        After F-M24 expanded mandatory field validation to LAS 1.2,
+        missing WELL, LOC, SRVC, and UWI fields should emit warnings.
+        """
         content = """~VERSION INFORMATION
  VERS.   1.2  : CWLS LOG ASCII STANDARD
  WRAP.   NO   :
@@ -1542,9 +1548,9 @@ class TestLAS30AsciiDataBranches:
             warnings.simplefilter("always")
             parser.parse(content)
             mandatory_warnings = [
-                x for x in w if "LAS 2.0 file missing mandatory well field" in str(x.message)
+                x for x in w if "LAS 1.2 file missing mandatory well field" in str(x.message)
             ]
-            assert len(mandatory_warnings) == 0
+            assert len(mandatory_warnings) == 4
 
     # --- F-M2: Pre-scan only counts ~A/~ASCII sections ---
     def test_pre_scan_ignores_non_ascii_sections(self, tmp_path: Path) -> None:
@@ -2659,3 +2665,200 @@ class TestProductionCheckParserFix:
         assert str_vals[2] == "", (
             f"Row 3: expected empty-string padding, got {str_vals[2]!r}"
         )
+
+
+class TestValidateCrossSectionConsistency:
+    """I2F-16: Tests for _validate_cross_section_consistency.
+
+    Exercises all invariant checks:
+    (1) curve count vs data column count mismatch
+    (2) data_format x placement mismatch (S-format curve in numeric data)
+    (3) LAS 3.0 section ordering (data before definition)
+    (4) definition-type without corresponding data section (Definition->Data gap)
+    (5) duplicate reserved section headers
+    (6) parameter-after-definition ordering
+    """
+
+    # --- (1) Curve count vs data column count ---
+
+    def test_column_count_mismatch_warns(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Data section with more/less data columns than declared curves warns."""
+        import numpy as np
+
+        # Construct valid 3-curve section, then remove a curve to create
+        # a mismatch (3 data columns, 2 declared curves).
+        ds = DataSection(
+            name="Section_1",
+            curves_order=["DEPT", "GR", "EXTRA"],
+            section_curves=[
+                CurveDefinition(mnemonic="DEPT", data_format="F"),
+                CurveDefinition(mnemonic="GR", data_format="F"),
+                CurveDefinition(mnemonic="EXTRA", data_format="F"),
+            ],
+            data={"DEPT": np.array([100.0]), "GR": np.array([50.0]), "EXTRA": np.array([1.0])},
+        )
+        # Simulate construction-time mismatch: 2 section_curves, 3 data columns.
+        ds.section_curves = ds.section_curves[:2]
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            _validate_data_section_column_counts([ds])
+            assert "Section_1" in caplog.text
+            assert "data columns" in caplog.text
+
+    def test_column_count_match_no_warning(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Data section with matching curves and data columns does not warn."""
+        import numpy as np
+
+        ds = DataSection(
+            name="Section_1",
+            curves_order=["DEPT", "GR"],
+            section_curves=[
+                CurveDefinition(mnemonic="DEPT", data_format="F"),
+                CurveDefinition(mnemonic="GR", data_format="F"),
+            ],
+            data={"DEPT": np.array([100.0]), "GR": np.array([50.0])},
+        )
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            _validate_data_section_column_counts([ds])
+            assert "data columns" not in caplog.text
+
+    # --- (2) Data format x placement mismatch ---
+
+    def test_s_format_curve_in_numeric_data_warns(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """S-format curve placed in data (numeric) triggers warning."""
+        import numpy as np
+
+        # Construct valid section with COMMENT in string_data, then move it
+        # to data to create the format/placement mismatch after construction.
+        ds = DataSection(
+            name="Section_1",
+            curves_order=["DEPT", "COMMENT"],
+            section_curves=[
+                CurveDefinition(mnemonic="DEPT", data_format="F"),
+                CurveDefinition(mnemonic="COMMENT", data_format="S"),
+            ],
+            data={"DEPT": np.array([100.0])},
+            string_data={"COMMENT": np.array(["hello"])},
+        )
+        # Move S-format curve from string_data to data (numeric).
+        ds.data["COMMENT"] = ds.string_data.pop("COMMENT")
+        parser = LASParser()
+        parser.las_file.data_sections = [ds]
+        parser._state.section_sequence = []
+        parser._state.section_type_sequence = []
+
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            parser._validate_cross_section_consistency()
+            assert "string-format" in caplog.text
+            assert "COMMENT" in caplog.text
+
+    # --- (3) LAS 3.0 section ordering (data before definition) ---
+
+    def test_data_before_definition_ordering_warns(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Data section appearing before its definition emits ordering warning."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~Core_Data
+ 2.5,0.15
+~CORE_DEFINITION
+ RHOZ.OHMM       :  RESISTIVITY  {F}
+ PHIZ.V/V        :  POROSITY  {F}
+"""
+        parser = LASParser()
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            parser.parse(content)
+            warning_text = caplog.text
+            assert "before" in warning_text, (
+                f"Expected ordering warning; got: {warning_text}"
+            )
+
+    # --- (4) Definition→Data gap ---
+
+    def test_definition_without_data_section_warns(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Definition type without any corresponding data section warns."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+~WELL INFORMATION
+ STRT.M    : 1670.0000
+ STOP.M    : 1680.0000
+ STEP.M    : 0.1000
+ NULL.    : -999.25
+~CORE_DEFINITION
+ RHOZ.OHMM       :  RESISTIVITY  {F}
+ PHIZ.V/V        :  POROSITY  {F}
+"""
+        parser = LASParser()
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            parser.parse(content)
+            warning_text = caplog.text
+            assert "no corresponding data section" in warning_text, (
+                f"Expected Definition→Data gap warning; got: {warning_text}"
+            )
+
+    # --- (5) Duplicate reserved section headers ---
+
+    def test_duplicate_version_section_warns(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Duplicate ~V (reserved single-occurrence) section emits warning."""
+        content = """~VERSION INFORMATION
+ VERS.   2.0  : CWLS LOG ASCII STANDARD
+ WRAP.   NO   :
+~VERSION INFORMATION
+ VERS.   2.0  : CWLS LOG ASCII STANDARD
+ WRAP.   NO   :
+~WELL INFORMATION
+ STRT.M    : 1670.0000
+ STOP.M    : 1680.0000
+ STEP.M    : 0.1000
+ NULL.    : -999.25
+"""
+        parser = LASParser()
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            parser.parse(content)
+            warning_text = caplog.text
+            assert "Duplicate reserved section" in warning_text, (
+                f"Expected duplicate section warning; got: {warning_text}"
+            )
+
+    # --- (6) Parameter-after-definition ordering ---
+
+    def test_parameter_after_definition_ordering_warns(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Parameter section after its definition emits ordering warning."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.    -999.25 : NULL VALUE
+~CORE_DEFINITION
+ RHOZ.OHMM       :  RESISTIVITY  {F}
+ PHIZ.V/V        :  POROSITY  {F}
+~Core_Parameter
+ PARAM1.MNEM     :  VALUE  : DESCRIPTION
+~Core_Data
+ 2.5,0.15
+"""
+        parser = LASParser()
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            parser.parse(content)
+            warning_text = caplog.text
+            assert "Parameter sections should precede" in warning_text, (
+                f"Expected param-after-def warning; got: {warning_text}"
+            )

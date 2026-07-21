@@ -345,33 +345,34 @@ def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " "
 
         if _first_wrap is None:
             # First data line — determine initial wrap heuristic.
-            # F-023: For non-space delimiters (COMMA, TAB), trailing empty
-            # values can be omitted per CSV convention, making the first
-            # line appear shorter than curve_count.  Use a different
-            # heuristic: a wrapped depth line always has exactly 1 value;
-            # if the first data line has >1 values, it's non-wrapped
-            # regardless of curve_count.
-            # F-I2-DR-03: Align COMMA/TAB heuristic with SPACE heuristic.
-            # Using ``len(values) < curve_count`` for all delimiter types
-            # correctly handles wrapped continuation lines that carry
-            # multiple curve values (common in >2-curve wrapped files).
-            # The corroboration step on the second data line catches
-            # sparse-first-line false positives regardless of delimiter.
-            _first_wrap = len(values) < curve_count
+            if delimiter == " ":
+                # Space delimiter: wrapped lines are shorter than curve_count.
+                # Use second-line corroboration (F-M16) to catch sparse
+                # first-line false positives.
+                _first_wrap = len(values) < curve_count
+            else:
+                # COMMA/TAB delimiter: trailing empty values are stripped by
+                # _split_data_line per CSV convention, making len(values)
+                # legitimately < curve_count even for non-wrapped files.
+                # Use the depth-line heuristic: a wrapped depth line always
+                # has exactly 1 value; if the first data line has >1 values,
+                # it's non-wrapped regardless of curve_count (F-023).
+                _first_wrap = len(values) <= 1
             if not _first_wrap:
                 return False  # Not wrapped — no need for second peek
-            # Wrapped — continue to second data line for corroboration
-            # (F-M16: secondary peek prevents sparse-first-line false
-            # positives).
+            # For COMMA/TAB: depth-line heuristic is definitive — no
+            # second-line corroboration needed.  Non-wrapped files always
+            # have >1 values per line (curve_count > 1 guaranteed above).
+            if delimiter != " ":
+                return True
+            # Space delimiter: continue to second data line for
+            # corroboration (F-M16: secondary peek prevents sparse
+            # first-line false positives).
             continue
 
-        # Second data line — corroborate wrap detection (F-M16).
-        # F-I2-DR-03: Use the same unified heuristic (< curve_count)
-        # as the first-line check above.  The old COMMA/TAB-specific
-        # ``<= 1`` path is removed — all delimiters now use the same
-        # curve-count-aware heuristic.
+        # Second data line — corroborate wrap detection for space
+        # delimiter (F-M16).
         _corroborates = len(values) < curve_count
-
         if not _corroborates:
             # Second line has full values — first line was sparse,
             # not wrapped.

@@ -2047,3 +2047,32 @@ def resolve_mnemonic(
         max_depth, mnemonic,
     )
     return current
+
+
+def build_mnemonic_lookup(mnem_base: dict[str, str]) -> dict[str, str]:
+    """Build a case-insensitive mnemonic resolution lookup.
+
+    Sorts *mnem_base* entries so canonical uppercase keys take priority
+    (first-wins semantics), uppercases keys, then resolves multi-step
+    alias chains via :func:`resolve_mnemonic`.
+
+    Args:
+        mnem_base: Raw mnemonic-to-canonical mapping (mixed case).
+
+    Returns:
+        Uppercased-key lookup dict mapping mnemonics to resolved
+        canonical names.  Returns an empty dict when *mnem_base* is empty
+        or falsy.
+    """
+    if not mnem_base:
+        return {}
+    _raw_upper: dict[str, str] = {}
+    sorted_items = sorted(
+        mnem_base.items(),
+        key=lambda item: (not item[0].isupper(), item[0]),
+    )
+    for k, v in sorted_items:
+        key = k.upper()
+        if key not in _raw_upper:
+            _raw_upper[key] = v
+    return {k: resolve_mnemonic(_raw_upper, k) for k in _raw_upper}

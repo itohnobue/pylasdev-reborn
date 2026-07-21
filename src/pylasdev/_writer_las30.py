@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from ._writer_base import (
     _SECTION_TYPE_TO_DEFINITION_PREFIX,
     _format_curve_line,
@@ -220,7 +222,7 @@ class _Las30Writer(_WriterBase):
         null_value: float,
         delimiter: str,
         check_line_limit: bool,
-        _warnings_module: object,
+        _warnings_module: Any,
     ) -> list[str]:
         """LAS 3.0 multi-section typed data path (Path B of original _write_ascii_sections)."""
         lines: list[str] = []
@@ -336,5 +338,21 @@ class _Las30Writer(_WriterBase):
                     is_las12=check_line_limit,
                 )
             )
+
+            # Warn about curves in curves_order that have no data,
+            # matching the legacy path at _writer_base.py:564-571.
+            _log_keys = set(section.data.keys()) if section.data else set()
+            _str_keys = set(section.string_data.keys()) if section.string_data else set()
+            _order_set = set(section.curves_order)
+            _uncovered = _order_set - _log_keys - _str_keys
+            if _uncovered:
+                _warnings_module.warn(
+                    f"Curve(s) {sorted(_uncovered)} appear in "
+                    f"curves_order for section {section.name!r} but "
+                    f"have no data in 'data' or 'string_data'.  "
+                    f"The writer will pad these curves with "
+                    f"null_value.",
+                    stacklevel=4,
+                )
 
         return lines
