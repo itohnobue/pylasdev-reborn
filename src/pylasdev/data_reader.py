@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import math
-import re
 import warnings
 from types import ModuleType
 
@@ -52,108 +51,16 @@ def _resolve_max_tokens_per_line() -> int:
     return MAX_TOKENS_PER_LINE if MAX_TOKENS_PER_LINE is not None else MAX_CURVES
 
 
-# F-ITER2-D2-M04: Regex to extract the full section word from a header line
-# (matching parser.SECTION_PATTERN semantics).  Used to compare against
-# exact section words {"A", "ASCII"} instead of checking only the first
-# character after ~, which caused divergence when headers like ~A_DEFINITION
-# entered ASCII mode in the reader but were excluded by parser._pre_scan.
-_SECTION_WORD_RE = re.compile(r"^~([A-Za-z]\S*)")
-
-
-def _get_section_word(stripped: str) -> str:
-    """Extract the section word from a section header line.
-
-    Returns the uppercased section word (e.g. "A", "ASCII", "A_DEFINITION")
-    or an empty string if the line is not a valid section header.
-    """
-    match = _SECTION_WORD_RE.match(stripped)
-    return match.group(1).upper() if match else ""
-
-
-def _is_ascii_section(stripped: str) -> bool:
-    """Check if a section header targets the ASCII data (~A / ~ASCII) section.
-
-    Aligned with parser._pre_scan which uses ``section_word in {"A", "ASCII"}``.
-    """
-    return _get_section_word(stripped) in {"A", "ASCII"}
-
-
-def _is_section_header(stripped: str) -> bool:
-    """Check if a stripped line is a section header (~[A-Za-z]).
-
-    Uses ASCII-only character check to match the parser's SECTION_PATTERN,
-    which is limited to [A-Za-z].  The parser upper-cases section letters,
-    so matching must stay within ASCII.
-    """
-    return (
-        stripped.startswith("~")
-        and len(stripped) > 1
-        and stripped[1] in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-    )
-
-
-# F-I2-XPD-01: Known LAS section words for section-header injection defense.
-# SPLITLINES_CHARS_RE in reader.py replaces null bytes and control characters
-# with spaces before splitlines(), which can create spurious section headers
-# (null byte followed by ~SectionWord becomes a standalone ~SectionWord line
-# after splitting).  Validating section words against this known set before
-# breaking data reading prevents premature termination caused by injected
-# artifacts.  Aligned with parser.py's known section-type dispatch tables.
-_KNOWN_SECTION_WORDS: frozenset[str] = frozenset({
-    # Data section words (from parser._DATA_SECTION_WORDS)
-    "A", "ASCII",
-    "CORE", "CORE_DATA",
-    "DRILLING", "DRILLING_DATA",
-    "FORMATION", "FORMATION_DATA",
-    "INCLINOMETRY", "INCLINOMETRY_DATA",
-    "LOG", "LOG_DATA",
-    "MUD", "MUD_DATA",
-    "PERFORATIONS", "PERFORATIONS_DATA",
-    "RISK", "RISK_DATA",
-    "STRUCTURE", "STRUCTURE_DATA",
-    "TEST", "TEST_DATA",
-    "TOPS", "TOPS_DATA",
-    # Non-data section words (from parser dispatch table)
-    "C", "CURVE",
-    "D", "DEFINITION",
-    "O", "OTHER",
-    "P", "PARAMETER", "PARAMETERS",
-    "V", "VERSION",
-    "W", "WELL",
-})
-
-
-def _is_recognized_section_word(word: str) -> bool:
-    """Check if a section word is a recognized LAS section header type.
-
-    Validates that a potential section header is a genuine LAS section
-    keyword, not an artifact created by control-character replacement
-    (SPLITLINES_CHARS_RE in reader.py).  Used by _read_normal and
-    _read_wrapped as defense-in-depth against section-header injection.
-
-    Args:
-        word: Uppercased section word extracted by _get_section_word
-            (e.g. "A", "CORE_DATA", "VERSION").
-
-    Returns:
-        True if the word is a recognized LAS section type.
-    """
-    if not word:
-        return False
-    # Strip index brackets (e.g., CORE[1] → CORE) before checking.
-    base = word.split("[", 1)[0] if "[" in word else word
-    if base in _KNOWN_SECTION_WORDS:
-        return True
-    # Recognized suffix patterns: _DEFINITION (including numbered variants like
-    # _DEFINITION_2), _PARAMETER, _PARAMETERS, _DATA.
-    # These expand the known set to cover all parser-dispatched section types
-    # (e.g., CORE_DEFINITION, LOG_DEFINITION, CORE_PARAMETERS etc.).
-    if re.search(r"_DEFINITION(_\d+)?$", base):
-        return True
-    for suffix in ("_PARAMETER", "_PARAMETERS", "_DATA"):
-        if base.endswith(suffix):
-            return True
-    return False
+from ._data_section_reader import (  # noqa: E402
+    _detect_string_curves,
+    _get_section_word,
+    _is_ascii_section,
+    _is_recognized_section_word,
+    _is_section_header,
+    _iter_ascii_data_lines,
+    _log_conversion_failures,
+    _split_data_line,
+)
 
 
 def _parse_float_with_d_notation(value_str: str) -> float:
@@ -422,32 +329,9 @@ def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " "
         if not in_ascii or not stripped or stripped.startswith("#"):
             continue
 
-        # Data line found — split using DLM-aware approach.
-        # F-WXP-06: All delimiter types use str.split with maxsplit for
-        # bounded token count.  The writer does NOT emit CSV quoting
-        # (uses raw delimiter.join()), so csv.reader with QUOTE_MINIMAL
-        # would interpret literal double-quotes in string values as CSV
-        # field quoting, creating a roundtrip asymmetry.
-        # The writer already sanitises embedded delimiter characters in
-        # string values (comma→semicolon, tab→space), so str.split on
-        # the raw delimiter is correct for roundtripping.
-        if delimiter == " ":
-            values = stripped.split(maxsplit=_resolve_max_tokens_per_line())
-        else:
-            _max_tokens = _resolve_max_tokens_per_line()
-            # F-DR-01: str.split with maxsplit provides bounded allocation.
-            # The maxsplit parameter limits the number of splits (=tokens),
-            # preventing unbounded memory allocation from malformed input.
-            values = stripped.split(delimiter, maxsplit=_max_tokens)
-
-            # I2F-24: Strip trailing empty strings from csv.reader output.
-            # Trailing delimiters (e.g. "100.0,") produce empty fields that
-            # inflate len(values), causing false-negative wrap detection:
-            # len(["100.0", ""])=2 > 1 → incorrectly detected as non-wrapped.
-            # Strip only TRAILING empties — middle empty fields represent
-            # legitimate sparse data values that must be preserved.
-            while values and values[-1] == "":
-                values.pop()
+        # Data line found — split using DLM-aware split (shared utility).
+        # See _data_section_reader._split_data_line for full rationale.
+        values = _split_data_line(stripped, delimiter)
 
         # F-M20: When curve_count is 1, wrapped and non-wrapped modes are
         # equivalent — every line holds exactly one value regardless of
@@ -655,23 +539,8 @@ def _read_normal(
         )
 
     # F-WXP-01: Detect string curves from CurveDefinition data_format.
-    # The writer can emit string curve values in the same data section
-    # (via _format_data_rows), but _read_normal previously converted all
-    # values through _to_finite_float (float-only).  String-formatted
-    # curves ({S}, {A} without array_info) must be read as strings and
-    # stored in las_file.string_data, matching the parser's behaviour.
-    _string_curve_indices: set[int] = set()
-    for i, _name in enumerate(las_file.curves_order):
-        if i < len(las_file.curves):
-            cd = las_file.curves[i]
-            # F-MDR-04: Normalize data_format to uppercase for consistent
-            # string-curve detection.  _create_parameter_entry stores
-            # data_format without uppercasing; uppercase normalization
-            # here guards against lowercase-passed format codes.
-            if cd.data_format.upper() in ("S",) or (
-                cd.data_format.upper() in ("A",) and cd.array_info is None
-            ):
-                _string_curve_indices.add(i)
+    # See _data_section_reader._detect_string_curves for full details.
+    _string_curve_indices: set[int] = _detect_string_curves(las_file)
 
     # Pre-allocate arrays — string curves go to string_data, numeric to logs.
     # C-505: Ensure curvenames that appear in both string_curve_indices and
@@ -704,7 +573,6 @@ def _read_normal(
     null_value = _get_null_value(las_file.well)
     _fc: list[int] = [0]  # F-PXR-03: count non-trivial conversion failures
 
-    in_ascii = False
     current_line = 0
     # F-I2-XPD-03: Replace boolean-once flags with counters so automated
     # validation tools can enumerate the total number of affected rows.
@@ -714,60 +582,9 @@ def _read_normal(
     short_row_count: int | None = None  # F-11: Track short-row count for summary
     discarded_lines = 0  # Track silently-discarded lines from pre-scan undercount
 
-    for line in lines:
-        stripped = line.strip()
-
-        # F-20: Align section detection with parser.py's SECTION_PATTERN
-        # (~[A-Za-z]).  Lines starting with ~ but without an alphabetic
-        # section letter (e.g. bare ~, ~~~, etc.) are ignored.
-        # F-ITER2-D2-M04: Use _is_ascii_section to check for exact ~A/~ASCII
-        # match (aligned with parser._pre_scan), not just the first character.
-        if _is_section_header(stripped):
-            if _is_ascii_section(stripped):
-                in_ascii = True
-            else:
-                if in_ascii:
-                    # F-I2-XPD-01: Defense-in-depth against section-header
-                    # injection via SPLITLINES_CHARS_RE.  Only break reading
-                    # for recognized LAS section headers — unrecognized
-                    # patterns (potential artifacts from control-character
-                    # replacement) are warned and skipped.
-                    section_word = _get_section_word(stripped)
-                    if _is_recognized_section_word(section_word):
-                        break
-                    warnings.warn(
-                        f"Unrecognized section header '~{section_word}' found in ASCII "
-                        f"data section.  This may be an artifact of "
-                        f"control-character replacement (SPLITLINES_CHARS_RE). "
-                        f"Skipping line.",
-                        UserWarning,
-                        stacklevel=2,
-                    )
-            continue
-
-        if not in_ascii or not stripped or stripped.startswith("#"):
-            continue
-
-        # F-WXP-06: All delimiter types use str.split with maxsplit.
-        # See _detect_actual_wrap for full rationale — writer doesn't
-        # emit CSV quoting, so csv.reader with QUOTE_MINIMAL creates
-        # a quoting asymmetry on string curve roundtrips.
-        if delimiter == " ":
-            values = stripped.split(maxsplit=_resolve_max_tokens_per_line())
-        else:
-            _max_tokens = _resolve_max_tokens_per_line()
-            # F-DR-01: str.split with maxsplit provides bounded allocation,
-            # preventing unbounded memory use from malformed input.
-            values = stripped.split(delimiter, maxsplit=_max_tokens)
-
-            # F-M03: Strip trailing empty strings from csv.reader output.
-            # Trailing delimiters (e.g. "100.0,") produce empty fields that
-            # inflate len(values), causing spurious "extra columns" warnings.
-            # Matches the stripping pattern used in _detect_actual_wrap and
-            # _read_wrapped.  Strip only TRAILING empties — middle empty
-            # fields are legitimate sparse data values.
-            while values and values[-1] == "":
-                values.pop()
+    for stripped in _iter_ascii_data_lines(lines):
+        # Split using DLM-aware split (shared utility).
+        values = _split_data_line(stripped, delimiter)
 
         # Warn about extra columns being silently discarded.
         # F-I2-XPD-03: First occurrence logs full context; subsequent
@@ -861,18 +678,8 @@ def _read_normal(
             stacklevel=2,
         )
 
-    # F-PXR-03: Warn when non-trivial conversion failures occurred
-    # (non-empty input values that could not be parsed as finite floats
-    # and were silently replaced with the null value).
-    if _fc[0] > 0:
-        warnings.warn(
-            f"{_fc[0]} value(s) could not be converted to finite float "
-            f"and were replaced with the null value ({null_value:.2f}). "
-            f"This may indicate string data, corrupt values, or "
-            f"non-standard formatting.",
-            UserWarning,
-            stacklevel=2,
-        )
+    # F-PXR-03: Warn when non-trivial conversion failures occurred.
+    _log_conversion_failures(_fc, null_value)
 
     # F-I2-XPD-03: Summary of extra-column and short-row occurrences,
     # replacing the previous boolean-once pattern that suppressed all
@@ -989,18 +796,8 @@ def _read_wrapped(
             )
 
     # F-R-03: Detect string curves from CurveDefinition data_format.
-    # Port from _read_normal:614-625 — {S}/{A} format curves must be
-    # read as strings, not converted through _to_finite_float (float-only).
-    # String values in wrapped LAS files were previously silently converted
-    # to null_value at line 1101.
-    _string_curve_indices: set[int] = set()
-    for _idx in range(len(las_file.curves_order)):
-        if _idx < len(las_file.curves):
-            cd = las_file.curves[_idx]
-            if cd.data_format.upper() in ("S",) or (
-                cd.data_format.upper() in ("A",) and cd.array_info is None
-            ):
-                _string_curve_indices.add(_idx)
+    # See _data_section_reader._detect_string_curves for full details.
+    _string_curve_indices: set[int] = _detect_string_curves(las_file)
     _string_curve_map: dict[int, str] = {
         _idx: las_file.curves_order[_idx] for _idx in _string_curve_indices
     }
@@ -1016,66 +813,14 @@ def _read_wrapped(
     null_value = _get_null_value(las_file.well)
     _fc: list[int] = [0]  # F-PXR-03: count non-trivial conversion failures
 
-    in_ascii = False
     depth_line = True  # First data line is always a depth line
     counter = 0  # Tracks position within non-depth curves
     depth_had_extra = False  # F-06: track pathologically-malformed depth lines
     total_elements = 0  # F-54-upgrade: dynamic element counter for wrapped mode
 
-    for line in lines:
-        stripped = line.strip()
-
-        # F-20: Align section detection with parser.py's SECTION_PATTERN
-        # (~[A-Za-z]).  Only treat lines as section headers when the
-        # character after ~ is alphabetic.
-        # F-ITER2-D2-M04: Use _is_ascii_section for exact match.
-        if _is_section_header(stripped):
-            if _is_ascii_section(stripped):
-                in_ascii = True
-            else:
-                if in_ascii:
-                    # F-I2-XPD-01: Defense-in-depth against section-header
-                    # injection via SPLITLINES_CHARS_RE.  Only break reading
-                    # for recognized LAS section headers — unrecognized
-                    # patterns (potential artifacts from control-character
-                    # replacement) are warned and skipped.
-                    section_word = _get_section_word(stripped)
-                    if _is_recognized_section_word(section_word):
-                        break
-                    warnings.warn(
-                        f"Unrecognized section header '~{section_word}' found in ASCII "
-                        f"data section (wrapped mode).  This may be an "
-                        f"artifact of control-character replacement "
-                        f"(SPLITLINES_CHARS_RE).  Skipping line.",
-                        UserWarning,
-                        stacklevel=2,
-                    )
-            continue
-
-        if not in_ascii or not stripped or stripped.startswith("#"):
-            continue
-
-        # F-WXP-06: All delimiter types use str.split with maxsplit.
-        # See _detect_actual_wrap for full rationale — writer doesn't
-        # emit CSV quoting, so csv.reader with QUOTE_MINIMAL creates
-        # a quoting asymmetry on string curve roundtrips.
-        if delimiter == " ":
-            values = stripped.split(maxsplit=_resolve_max_tokens_per_line())
-        else:
-            _max_tokens = _resolve_max_tokens_per_line()
-            # F-DR-01: str.split with maxsplit provides bounded allocation,
-            # preventing unbounded memory use from malformed input.
-            values = stripped.split(delimiter, maxsplit=_max_tokens)
-
-            # I2F-25: Strip trailing empty strings from csv.reader output.
-            # Trailing delimiters produce empty fields that flow into
-            # _to_finite_float("") → null_value, and consume curve slots
-            # via counter += 1.  This fills the last curve of each depth
-            # step with null_value instead of real data.  Strip only
-            # TRAILING empties — middle empty fields are legitimate
-            # sparse data.
-            while values and values[-1] == "":
-                values.pop()
+    for stripped in _iter_ascii_data_lines(lines, mode_suffix=" (wrapped mode)"):
+        # Split using DLM-aware split (shared utility).
+        values = _split_data_line(stripped, delimiter)
 
         if depth_line:
             # Depth line: single value = depth for this step.
@@ -1273,15 +1018,7 @@ def _read_wrapped(
             dl.extend([null_value] * (_max_len - len(dl)))
 
     # F-PXR-03: Warn when non-trivial conversion failures occurred.
-    if _fc[0] > 0:
-        warnings.warn(
-            f"{_fc[0]} value(s) could not be converted to finite float "
-            f"and were replaced with the null value ({null_value:.2f}). "
-            f"This may indicate string data, corrupt values, or "
-            f"non-standard formatting.",
-            UserWarning,
-            stacklevel=2,
-        )
+    _log_conversion_failures(_fc, null_value)
 
     # Convert float lists to numpy arrays
     for i in _float_indices:
