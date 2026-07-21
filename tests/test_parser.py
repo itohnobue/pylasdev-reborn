@@ -1462,7 +1462,7 @@ class TestLAS30AsciiDataBranches:
 
     # --- F-H2: LAS 2.0 mandatory well field warnings ---
     def test_las20_missing_mandatory_well_field_warning(self) -> None:
-        """LAS 2.0 files missing STRT, STOP, STEP, NULL should warn."""
+        """LAS 2.0 files missing mandatory well fields should warn."""
         content = """~VERSION INFORMATION
  VERS.   2.0  : CWLS LOG ASCII STANDARD
  WRAP.   NO   :
@@ -1482,11 +1482,15 @@ class TestLAS30AsciiDataBranches:
             mandatory_warnings = [
                 x for x in w if "LAS 2.0 file missing mandatory well field" in str(x.message)
             ]
-            # Both STEP and NULL are missing
-            assert len(mandatory_warnings) == 2
+            # Missing STEP, NULL, WELL, LOC, SRVC, UWI (6 out of 8)
+            assert len(mandatory_warnings) == 6
             warning_texts = [str(x.message) for x in mandatory_warnings]
             assert any("STEP" in t for t in warning_texts)
             assert any("NULL" in t for t in warning_texts)
+            assert any("WELL" in t for t in warning_texts)
+            assert any("LOC" in t for t in warning_texts)
+            assert any("SRVC" in t for t in warning_texts)
+            assert any("UWI" in t for t in warning_texts)
 
     def test_las20_all_mandatory_fields_no_warning(self) -> None:
         """LAS 2.0 files with all mandatory fields should not warn."""
@@ -1498,6 +1502,10 @@ class TestLAS30AsciiDataBranches:
  STOP.M  1680.0000  :
  STEP.M     0.1000  :
  NULL.   -999.25  :
+ WELL.   WELL_A  :
+ LOC .   LOC_A  :
+ SRVC.   SRVC_A  :
+ UWI .   UWI_A  :
 ~CURVE INFORMATION
  DEPT.M   : DEPTH
 ~A

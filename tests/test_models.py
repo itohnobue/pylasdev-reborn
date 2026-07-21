@@ -1235,6 +1235,10 @@ class TestLASFile:
                 "STOP": "200.0",
                 "STEP": "1.0",
                 "NULL": "-999.25",
+                "WELL": "WELL_A",
+                "LOC": "LOC_A",
+                "SRVC": "SRVC_A",
+                "UWI": "UWI_A",
             },
             "curves_order": ["DEPT"],
             "logs": {"DEPT": np.array([100.0])},
@@ -2444,3 +2448,114 @@ class TestRegressionModelsFixes:
                     "curves_order": {"DEPT": "M", "GR": "GAPI"},
                 }
             )
+
+    # --- H-01: WRAP asymmetry (canonical uppercase after construction) ---
+
+    def test_version_section_wrap_canonical_uppercase(self) -> None:
+        """H-01: VersionSection(wrap='no').wrap returns canonical uppercase 'NO'.
+
+        The fix ensures WRAP is normalized to uppercase in __post_init__,
+        closing the asymmetry between construction-time and parse-time
+        canonicalization.  Previously VersionSection(wrap='no').wrap
+        returned 'no' but parsing the same LAS file would yield 'NO'.
+        """
+        vs = VersionSection(wrap="no")
+        assert vs.wrap == "NO"
+        # Also verify that uppercase input is preserved as-is
+        vs2 = VersionSection(wrap="YES")
+        assert vs2.wrap == "YES"
+
+    # --- H-04: VERS validation in from_dict ---
+
+    def test_from_dict_unrecognized_vers_warns(self) -> None:
+        """H-04: LASFile.from_dict() with VERS='4.0' emits a warning.
+
+        Unrecognized VERS values should produce a UserWarning at
+        construction time (not silently accepted).
+        """
+        with pytest.warns(UserWarning, match="Unrecognized VERS"):
+            LASFile.from_dict(
+                {
+                    "version": {"VERS": "4.0", "WRAP": "NO", "DLM": "SPACE"},
+                    "well": {
+                        "STRT": "100.0", "STOP": "200.0", "STEP": "1.0",
+                        "NULL": "-999.25",
+                        "WELL": "A", "LOC": "B", "SRVC": "C", "UWI": "D",
+                    },
+                    "curves_order": ["DEPT"],
+                    "logs": {"DEPT": np.array([100.0])},
+                }
+            )
+
+    # --- H-03↓: zone_index >= 0 validation ---
+
+    def test_parameter_zone_negative_zone_index_raises(self) -> None:
+        """H-03: ParameterZone(zone_index=-1) raises ValueError.
+
+        The fix adds ``zone_index >= 0`` validation to __post_init__,
+        previously accepting negative indices silently.
+        """
+        from pylasdev.models import ParameterZone
+
+        with pytest.raises(ValueError, match="zone_index must be >= 0"):
+            ParameterZone(zone_name="TEST", zone_index=-1)
+
+    # --- M-13: time_offset >= 0 validation ---
+
+    def test_array_element_info_negative_time_offset_raises(self) -> None:
+        """M-13: ArrayElementInfo(time_offset=-1.0) raises ValueError.
+
+        The fix adds ``time_offset >= 0`` validation to __post_init__,
+        previously accepting negative time offsets silently.
+        """
+        with pytest.raises(ValueError, match="time_offset must be >= 0"):
+            ArrayElementInfo(base_name="T", time_offset=-1.0)
+
+    # --- M-15: array_info type validation ---
+
+    def test_curve_definition_array_info_not_array_element_info_raises(self) -> None:
+        """M-15: CurveDefinition with array_info='not_an_array_info' raises TypeError.
+
+        The fix adds ``isinstance(self.array_info, ArrayElementInfo)``
+        validation to __post_init__, previously accepting any object.
+        """
+        with pytest.raises(TypeError, match="array_info must be ArrayElementInfo"):
+            CurveDefinition(mnemonic="GR", array_info="not_an_array_info")
+
+    # --- M-17: non-ndarray dtype crash prevention ---
+
+    def test_data_section_non_ndarray_data_no_crash(self) -> None:
+        """M-17: DataSection with list data converts via np.asarray, no crash.
+
+        Before the fix, accessing .dtype on a Python list would raise
+        AttributeError.  The fix adds a guard: ``if not isinstance(_arr,
+        np.ndarray): _arr = np.asarray(_arr)`` before dtype access.
+        The conversion is local to the guard (does not mutate self.data).
+        """
+        # Construction should not raise AttributeError.
+        ds = DataSection(curves_order=["GR"], data={"GR": [1.0, 2.0]})
+        assert "GR" in ds.data
+        assert len(ds.data["GR"]) == 2
+
+    # --- M-18: 0-d array crash prevention ---
+
+    def test_data_section_zero_d_array_no_crash(self) -> None:
+        """M-18: DataSection with 0-d array data does not crash.
+
+        np.array(5.0) is a valid 0-d ndarray.  The fix ensures that
+        dtype access works correctly and numeric dtype validation passes.
+        """
+        ds = DataSection(curves_order=["GR"], data={"GR": np.array(5.0)})
+        assert ds.data["GR"].ndim == 0
+        assert np.issubdtype(ds.data["GR"].dtype, np.number)
+
+    # --- M-25: curses_order bytes rejection ---
+
+    def test_data_section_curves_order_bytes_raises(self) -> None:
+        """M-25: DataSection(curves_order=b'GR') raises TypeError.
+
+        Before the fix, bytes iterated as integers, producing corrupted
+        curve sets.  The fix adds an explicit isinstance check for bytes.
+        """
+        with pytest.raises(TypeError, match="curves_order must be a list"):
+            DataSection(curves_order=b"GR")

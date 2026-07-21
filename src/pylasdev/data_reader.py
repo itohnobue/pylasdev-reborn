@@ -1137,7 +1137,11 @@ def _read_wrapped(
                         f"Wrapped mode: previous depth line had extra values, "
                         f"and this data line has only {len(values)} values but "
                         f"{remaining_curves} non-depth curves still need values "
-                        f"(total curves={curve_count}). Data may be misaligned.",
+                        f"(total curves={curve_count}). Recovery resets "
+                        f"depth-step alignment — curve values after this line "
+                        f"may shift by 1 column from expected positions. "
+                        f"Consider reloading with wrapped=False if the "
+                        f"original unwrapped file is available.",
                         stacklevel=2,
                     )
                     depth_had_extra = False  # This line handled the extra-values case

@@ -1991,3 +1991,41 @@ class TestProductionCheckDevReaderFixes:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             _validate_dev_data(dev)  # Should not warn — all in [0, 360]
+
+    # --- M-33 (MEDIUM): Tab token strip ---
+
+    def test_tab_delimited_tokens_whitespace_stripped(self, tmp_path: Path) -> None:
+        """M-33: Tab-delimited DEV values with whitespace are stripped.
+
+        Before the fix, tab-delimited values with leading/trailing
+        whitespace (e.g., ``" 100.0\t"``) could retain spaces/tabs
+        in parsed values.  The fix ensures ``v.strip()`` is applied
+        to every token after csv.reader splits the line.
+        """
+        from pylasdev.dev_reader import _split_delimited_line
+
+        # Values with leading/trailing whitespace between tabs
+        line = "  MD  \t\t  100.0  \t  200.0  "
+        tokens = _split_delimited_line(line, "\t")
+        assert tokens == ["MD", "", "100.0", "200.0"], (
+            f"Expected stripped tokens, got {tokens!r}"
+        )
+
+    def test_tab_delimited_dev_file_whitespace_stripped(
+        self, tmp_path: Path
+    ) -> None:
+        """M-33: Full DEV file read with tab-delimited whitespace values.
+
+        End-to-end: tab-delimited .dev file with values that have
+        trailing whitespace should parse correctly with stripped values.
+        """
+        content = "MD\tTVD\n 100.0 \t 99.0 \n 200.0 \t 198.0 \n"
+        test_file = tmp_path / "tab_ws.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert "MD" in data, f"Expected 'MD' column, got keys: {list(data.keys())}"
+        assert data["MD"][0] == 100.0, f"Unexpected MD[0]: {data['MD'][0]!r}"
+        assert data["MD"][1] == 200.0, f"Unexpected MD[1]: {data['MD'][1]!r}"
+        assert data["TVD"][0] == 99.0, f"Unexpected TVD[0]: {data['TVD'][0]!r}"
+        assert data["TVD"][1] == 198.0, f"Unexpected TVD[1]: {data['TVD'][1]!r}"

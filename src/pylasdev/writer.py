@@ -876,6 +876,11 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
             stacklevel=3,
         )
         delimiter = " "
+        # M-11: Update the model's DLM to reflect what was actually
+        # written to disk.  Without this, a subsequent to_dict() or
+        # re-write would report the original (non-SPACE) delimiter,
+        # creating a model-disk inconsistency.
+        las_file.version.dlm = "SPACE"
 
     # R8-007: Save original values before data_sections copy-back mutates the model.
     # The legacy fallback path below (lines ~846-857) copies data_sections[0] contents

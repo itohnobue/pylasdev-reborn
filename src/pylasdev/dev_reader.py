@@ -1281,7 +1281,7 @@ def read_dev_file_as_object(
             # Preserve empty fields between consecutive tabs (str.split()
             # collapses them, causing column shift).  str.split("\t") keeps
             # every empty cell as ''.
-            values = stripped.split("\t", maxsplit=_max_tokens)
+            values = [v.strip() for v in stripped.split("\t", maxsplit=_max_tokens)]
         else:
             values = _split_delimited_line(stripped, delimiter)
 

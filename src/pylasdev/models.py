@@ -242,7 +242,11 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
     # (populated but incomplete) triggered it.  Both are equally invalid.
     well = data.get("well")
     if isinstance(well, dict):
-        _mandatory = {"STRT", "STOP", "STEP", "NULL"}
+        # M-24: All 8 LAS 1.2 mandatory well fields (was 4: STRT, STOP,
+        # STEP, NULL).  WELL, LOC, SRVC, and UWI are commonly missing in
+        # real-world files — we warn but do NOT raise an error, matching
+        # parser.py behavior.
+        _mandatory = {"STRT", "STOP", "STEP", "NULL", "WELL", "LOC", "SRVC", "UWI"}
         _well_keys = {k.upper() for k in well if isinstance(k, str)}
         _missing = _mandatory - _well_keys
         if _missing:
@@ -267,6 +271,16 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
                 "Missing required VERS field in version section. "
                 "VERS must be present (e.g. '1.2', '2.0', '3.0')."
             )
+        # H-04: Validate VERS value against known LAS versions.
+        vers_val = version.get("VERS")
+        if vers_val is not None and vers_val != "":
+            vers_str = str(vers_val).strip()
+            if vers_str not in {"1.2", "2.0", "3.0"}:
+                warnings.warn(
+                    f"Unrecognized VERS value '{vers_val}'. "
+                    f"Expected 1.2, 2.0, or 3.0.",
+                    stacklevel=3,
+                )
 
     # --- F-018: DLM validation ---
     if isinstance(version, dict):
@@ -544,6 +558,13 @@ class VersionSection:
                 f"VersionSection: VERS must not be whitespace-only, "
                 f"got {self.vers!r}"
             )
+        # VERS: warn about unrecognized version values (H-02).
+        if self.vers and self.vers not in {"1.2", "2.0", "3.0"}:
+            warnings.warn(
+                f"VersionSection: unrecognized VERS value "
+                f"{self.vers!r}. Expected 1.2, 2.0, or 3.0.",
+                stacklevel=2,
+            )
         # WRAP: reject None before any string operations.
         if self.wrap is None:
             raise ValueError("VersionSection: WRAP cannot be None")
@@ -551,6 +572,7 @@ class VersionSection:
         # (matching parser.py:1097-1108).  Empty string = not specified.
         if self.wrap:
             _wrap = self.wrap.upper()
+            self.wrap = _wrap
             if _wrap not in {"YES", "NO"}:
                 raise ValueError(
                     f"VersionSection: invalid WRAP value "
@@ -653,6 +675,15 @@ class WellSection:
                     f"WellSection: all entry keys must be str, "
                     f"got {type(_key).__name__} ({_key!r})"
                 )
+        # M-14: coerce non-str values to str with a warning.
+        for _key, _val in self.entries.items():
+            if not isinstance(_val, str):
+                warnings.warn(
+                    f"WellSection: coercing non-str value for key "
+                    f"{_key!r} from {type(_val).__name__} to str",
+                    stacklevel=2,
+                )
+                self.entries[_key] = str(_val)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to legacy dict format, including non-empty units and descriptions."""
@@ -716,6 +747,11 @@ class ArrayElementInfo:
                 f"ArrayElementInfo: time_offset must be a finite number "
                 f"or None, got {self.time_offset!r}"
             )
+        if self.time_offset is not None and self.time_offset < 0:
+            raise ValueError(
+                f"ArrayElementInfo: time_offset must be >= 0, "
+                f"got {self.time_offset!r}"
+            )
 
 
 @dataclass
@@ -757,6 +793,14 @@ class CurveDefinition:
                 f"CurveDefinition: invalid data_format "
                 f"'{self.data_format}' for curve '{self.mnemonic}'. "
                 f"Valid values: {', '.join(sorted(_VALID_DATA_FORMATS))}"
+            )
+        # M-15: array_info must be ArrayElementInfo or None.
+        if self.array_info is not None and not isinstance(
+            self.array_info, ArrayElementInfo
+        ):
+            raise TypeError(
+                f"CurveDefinition: array_info must be ArrayElementInfo "
+                f"or None, got {type(self.array_info).__name__}"
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -813,6 +857,28 @@ class ParameterZone:
                 f"ParameterZone: zone_index must be int or None, "
                 f"got {type(self.zone_index).__name__} "
                 f"({self.zone_index!r})"
+            )
+        if self.zone_index is not None and self.zone_index < 0:
+            raise ValueError(
+                f"ParameterZone: zone_index must be >= 0, "
+                f"got {self.zone_index!r}"
+            )
+        # M-16: Validate zone_name is non-None and non-empty.
+        # Callers may construct zones programmatically with placeholder
+        # names, so warn rather than raise.  Empty/whitespace zone names
+        # produce malformed LAS output (empty pipe notation).
+        if self.zone_name is None:
+            warnings.warn(
+                "ParameterZone: zone_name is None.  Zone names "
+                "must be non-empty strings for valid LAS output.",
+                stacklevel=2,
+            )
+        elif isinstance(self.zone_name, str) and not self.zone_name.strip():
+            warnings.warn(
+                f"ParameterZone: zone_name {self.zone_name!r} is "
+                f"empty or whitespace-only.  Zone names must be "
+                f"non-empty strings for valid LAS output.",
+                stacklevel=2,
             )
 
 
@@ -969,6 +1035,18 @@ class DataSection:
         # Deferred import to avoid circular dependencies.
         from .exceptions import LASDataError
 
+        # M-25: Reject bytes for curves_order — matches top-level
+        # guard in from_dict at line 1768.  ``set(b"GR")`` produces
+        # ``{71, 82}`` (integers), corrupting all downstream checks.
+        # ``str(b"GR")`` produces ``"b'GR'"`` which corrupts column
+        # headers.  Reject with the same error type as the top-level.
+        if isinstance(self.curves_order, bytes):
+            raise TypeError(
+                "DataSection curves_order must be a list of strings, "
+                "got bytes.  Decode to str first: "
+                "curves_order.decode('utf-8')"
+            )
+
         curve_set = set(self.curves_order)
 
         # F-105: Reject duplicate curve names in curves_order.
@@ -1071,7 +1149,14 @@ class DataSection:
         # shorter arrays with null_value, producing semantically incorrect
         # output.
         if self.data:
-            _data_lengths = {name: len(arr) for name, arr in self.data.items()}
+            # M-18: Guard against 0-d numpy arrays — len(np.array(5.0))
+            # raises TypeError: len() of unsized object.  0-d arrays
+            # are treated as single-element arrays.
+            _data_lengths = {
+                name: (1 if isinstance(arr, np.ndarray) and arr.ndim == 0
+                       else len(arr))
+                for name, arr in self.data.items()
+            }
             if len(set(_data_lengths.values())) > 1:
                 raise LASDataError(
                     f"DataSection '{self.name}' has inconsistent "
@@ -1079,7 +1164,9 @@ class DataSection:
                 )
         if self.string_data:
             _string_lengths = {
-                name: len(arr) for name, arr in self.string_data.items()
+                name: (1 if isinstance(arr, np.ndarray) and arr.ndim == 0
+                       else len(arr))
+                for name, arr in self.string_data.items()
             }
             if len(set(_string_lengths.values())) > 1:
                 raise LASDataError(
@@ -1094,8 +1181,17 @@ class DataSection:
         # row counts between data and string_data produce semantically
         # incorrect null-padded output.
         if self.data and self.string_data:
-            _data_rows = max(len(arr) for arr in self.data.values())
-            _string_rows = max(len(arr) for arr in self.string_data.values())
+            # M-18: Guard against 0-d numpy arrays.
+            _data_rows = max(
+                (1 if isinstance(arr, np.ndarray) and arr.ndim == 0
+                 else len(arr))
+                for arr in self.data.values()
+            )
+            _string_rows = max(
+                (1 if isinstance(arr, np.ndarray) and arr.ndim == 0
+                 else len(arr))
+                for arr in self.string_data.values()
+            )
             if _data_rows != _string_rows:
                 raise LASDataError(
                     f"DataSection '{self.name}': data row count "
@@ -1164,6 +1260,11 @@ class DataSection:
         # actual numpy dtypes.  String arrays in 'data' silently produce
         # corrupted numeric output downstream.
         for _k, _arr in self.data.items():
+            # M-17: Guard against non-ndarray input before accessing
+            # .dtype.  Python lists, scalars, and other non-ndarray
+            # types raise AttributeError on .dtype access.
+            if not isinstance(_arr, np.ndarray):
+                _arr = np.asarray(_arr)
             if not np.issubdtype(_arr.dtype, np.number):
                 warnings.warn(
                     f"DataSection '{self.name}': curve '{_k}' in 'data' "
@@ -1172,6 +1273,9 @@ class DataSection:
                     stacklevel=2,
                 )
         for _sk, _sarr in self.string_data.items():
+            # M-17: Same guard for string_data arrays.
+            if not isinstance(_sarr, np.ndarray):
+                _sarr = np.asarray(_sarr)
             if np.issubdtype(_sarr.dtype, np.number):
                 warnings.warn(
                     f"DataSection '{self.name}': curve '{_sk}' in "
@@ -1235,6 +1339,25 @@ class LASFile:
                     )
 
         _order_set = set(self.curves_order) if self.curves_order else set()
+
+        # M-19: LAS 2.0 first-curve-must-be-index constraint.
+        # Per LAS 2.0 spec, the first curve must be DEPT, DEPTH, TIME,
+        # or INDEX.  Many real-world files use non-standard index curve
+        # names — warn only, do NOT raise.  LAS 1.2 and 3.0 have no
+        # such constraint.
+        _INDEX_CURVE_ALIASES = frozenset({"DEPT", "DEPTH", "TIME", "INDEX"})
+        if (
+            self.curves_order
+            and self.version.vers.startswith("2")
+            and self.curves_order[0].upper() not in _INDEX_CURVE_ALIASES
+        ):
+            warnings.warn(
+                f"LAS 2.0 spec requires the first curve to be "
+                f"DEPT, DEPTH, TIME, or INDEX, but got "
+                f"{self.curves_order[0]!r}.  Many real-world files "
+                f"use alternative index curve names.",
+                stacklevel=2,
+            )
 
         # --- duplicate curve name detection (F-MD4-06) ---
         # DataSection.__post_init__ has this check for per-section orders.

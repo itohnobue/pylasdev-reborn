@@ -100,6 +100,14 @@ MAX_FIELD_LENGTH = 100_000
 # Overridable at module level.
 _SAFE_REGEX_LINE_LENGTH = 2_000
 
+# M-01: Hoist regex and frozenset to module level — previously re-allocated
+# per call in _validate_curve_data_format (hot path, up to
+# _data_reader.MAX_CURVES=100K calls per file).
+_KNOWN_CURVE_FORMATS: frozenset[str] = frozenset({"F", "E", "D", "S", "A", "I"})
+_FORMAT_SPEC_RE = re.compile(
+    r"^(?:[FEDI](?:\d+(?:\.\d+)?(?:[ED][+-]?\d+)?)?|[SA]\w*(?:;[\w.]+)*)$"
+)
+
 # F-32 + G-17 + F-I2-M04 + F-I2-M05: Control characters that appear in file
 # content and must be stripped before splitlines() to prevent section-header
 # injection and silent data corruption.  The writer's _CONTROL_CHARS_RE strips
@@ -408,16 +416,6 @@ def _validate_curve_data_format(data_format: str, mnemonic: str) -> None:
     """
     if not data_format:
         return
-    _KNOWN_CURVE_FORMATS: frozenset[str] = frozenset({"F", "E", "D", "S", "A", "I"})
-    # Accept single-letter codes OR extended format: [FEDI] + optional
-    # width[.precision][±exponent], or bare [SA] (no numeric suffix).
-    # PD2-02: Also accept array spacing indicators (LAS 3.0) — format
-    # codes may be multi-letter (e.g. ``AF``, ``AS``) optionally followed
-    # by semicolon-separated parameters (e.g. ``AF;50ms;5ft``).  The
-    # caller truncates to the first character after validation.
-    _FORMAT_SPEC_RE = re.compile(
-        r"^(?:[FEDI](?:\d+(?:\.\d+)?(?:[ED][+-]?\d+)?)?|[SA]\w*(?:;[\w.]+)*)$"
-    )
     if data_format in _KNOWN_CURVE_FORMATS or _FORMAT_SPEC_RE.match(data_format):
         return
     raise LASParseError(
@@ -649,7 +647,13 @@ class LASParser:
         # silently skipping mandatory-field validation for LAS 3.0 files.
         is_las12_or_later = self.las_file.version.vers.startswith(("1.", "2.", "3."))
         if is_las12_or_later and self._version_found:
-            _mandatory_fields = ["STRT", "STOP", "STEP", "NULL"]
+            # M-03: All 8 LAS 1.2 mandatory well fields (was 4).
+            # WELL, LOC, SRVC, and UWI are commonly missing in real-world
+            # files — we warn but do NOT raise an error.
+            _mandatory_fields = [
+                "STRT", "STOP", "STEP", "NULL",
+                "WELL", "LOC", "SRVC", "UWI",
+            ]
             for field in _mandatory_fields:
                 if field not in self.las_file.well.entries:
                     warnings.warn(
@@ -715,6 +719,13 @@ class LASParser:
         per_block_counts: list[int] = []
 
         for line in lines:
+            # M-02: Guard against absurdly long lines before any regex
+            # processing in _pre_scan.  _parse_line has MAX_LINE_LENGTH
+            # protection but _pre_scan runs first — a crafted 500MB
+            # single-line file would crash here before _parse_line ever
+            # sees it.  Skip the line; pre-scan is for estimation only.
+            if len(line) > MAX_LINE_LENGTH:
+                continue
             stripped = line.strip()
             match = SECTION_PATTERN.match(stripped)
             if match:
@@ -1415,16 +1426,16 @@ class LASParser:
             )
             return
 
-        # F-10: Set _version_found only after a valid data line match,
-        # not unconditionally before validation.  Setting it before the
-        # match caused spurious "missing mandatory well field" warnings
-        # for non-matching lines in the ~V section.
-        self._version_found = True
-
+        # F-10: Extract mnemonic and value before any flag-setting.
+        # M-05: _version_found is set only for VERS (below), not for
+        # any ~V data line (e.g., VERT, VMIN, VDATA).
         mnemonic = match.group("mnemonic").upper().strip()
         value = match.group("value").strip()
 
         if mnemonic == "VERS":
+            # M-05: Only set _version_found for VERS, not other ~V data.
+            self._version_found = True
+
             # F-005: Validate VERS against known LAS versions.
             # Non-standard values (e.g., "1,2" with comma, "2,0")
             # silently fail all startswith() checks, causing the
@@ -2988,6 +2999,9 @@ class LASParser:
             # Keys: definition type names (e.g., "CORE_DEFINITION",
             # "DRILLING_DEFINITION") or "__MAIN__" for global curves.
             _defs_seen: set[str] = set()
+            # M-08: Track definition types that have corresponding data
+            # sections — used for forward validation (Definition→Data).
+            _data_types_seen: set[str] = set()
             per_type_data_before_def: list[str] = []
 
             # F-004: Track parameter sections per type group, parallel to
@@ -3046,6 +3060,10 @@ class LASParser:
                             f"~{section_word} before {_def_display}"
                         )
 
+                    # M-08: Track which definition types have data sections
+                    # for forward validation (Definition→Data).
+                    _data_types_seen.add(_def_type)
+
                 if is_curve:
                     # Mark this definition type as seen.
                     if section_word.endswith("_DEFINITION"):
@@ -3093,6 +3111,24 @@ class LASParser:
                     "metadata loss.",
                     msg,
                 )
+
+            # M-08: Forward check — definition types without corresponding
+            # data sections.  The reverse check (above) catches Data→Definition
+            # gaps; this catches Definition→Data gaps where curves are
+            # declared but never populated.
+            for _def_type in _defs_seen:
+                if _def_type not in _data_types_seen:
+                    _def_display = (
+                        f"~{_def_type}"
+                        if _def_type != "__MAIN__"
+                        else "the main curve definition (~C or ~CURVE)"
+                    )
+                    logger.warning(
+                        "LAS 3.0 curve definition %s has no corresponding "
+                        "data section. Curves defined without data sections "
+                        "will produce empty output.",
+                        _def_display,
+                    )
 
         # (3) Duplicate section headers — detect by semantic section TYPE,
         # not by label string.  Label-based counting (prior implementation)
