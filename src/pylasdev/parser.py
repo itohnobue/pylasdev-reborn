@@ -21,6 +21,7 @@ import numpy as np
 
 from . import data_reader as _data_reader
 from ._las30_data import AsciiDataContext, process_ascii_data
+from ._parser_state import _ParserState
 from ._section_transition import _SectionTransitionHandler
 from ._version_spec import _LASVersionSpec
 from .data_reader import (
@@ -495,78 +496,19 @@ class LASParser:
         for k in _raw_upper:
             self._mnem_base_upper[k] = resolve_mnemonic(_raw_upper, k)
         self.source_file: str = ""
+        self._state = _ParserState()
         self._transition_handler = _SectionTransitionHandler(self)
         self._reset()
 
     def _reset(self) -> None:
         """Reset parser state for a new file."""
         self.las_file = LASFile()
-        self._current_section: str | None = None
-        self._current_section_name: str = ""
-        self._current_data_section_type: str = "LOG_DATA"
-        self._data_line_count = 0
-        self._ascii_data_lines: list[str] = []
-        self._current_data_section_idx: int = 0
-        # F2-006: Cumulative cross-section element counter — tracks
-        # total elements (curves x lines) across ALL data sections
-        # to prevent multi-section files from exhausting memory when
-        # each individual section passes the per-section bound.
-        self._cumulative_elements: int = 0
-        # F-09: Cumulative cross-section raw data line counter — tracks
-        # total lines across ALL sections to catch multi-section files
-        # where each individual section passes per-section bounds.
-        self._cumulative_data_lines: int = 0
-        self._cumulative_data_lines_warned: bool = False
-        self._version_found = False  # flag for required ~V section validation
-        # F-3: Accumulate other-section lines in a list to avoid O(n^2)
-        # string concatenation (self.las_file.other += ... per line).
-        self._other_lines: list[str] = []
-        # F1: Track per-section curve boundaries for LAS 3.0 files where
-        # different ~C blocks define different curve sets before each ~A section.
-        self._section_curve_start_idx: int = 0
-        self._section_curve_end_idx: int | None = None
-        # F-01/F-08: Track the end of the main (non-_Definition) curve block.
-        # When a data section has a pipe "| CURVE" association, the per-section
-        # curves revert to using the main block (curves[0:_main_curve_end]).
-        self._main_curve_end: int = -1
-        # G-02: Per-_Definition curve range storage.  Consecutive _Definition
-        # sections overwrote _section_curve_start_idx, making later data
-        # sections without pipe associations use the wrong curve range.
-        # Maps definition name (e.g. "CORE_DEFINITION") → (start_idx, end_idx).
-        self._definition_curve_ranges: dict[str, tuple[int, int]] = {}
-        self._current_definition_name: str | None = None
-        # M-PA4: Track whether LAS 3.0 typed data sections (~Core, ~Drilling,
-        # etc.) were encountered during parsing for cross-validation against
-        # the VERS header value.
-        self._las30_sections_seen: bool = False
-        # F-P06: Raw well entries are buffered when ~W appears before ~V so
-        # they can be re-processed with the correct version after ~V is parsed.
-        self._deferred_well_entries: list[dict[str, str]] = []
-        # F-M12: Raw ASCII data lines are buffered when data sections (~A,
-        # ~ASCII, etc.) appear before ~V so they can be re-processed after
-        # the version (and hence is_las30) is known.
-        # F-H01 / I2-D2-01: Each entry is a (section_type, section_name,
-        # section_idx, raw_line, curve_start_idx, curve_end_idx) tuple to
-        # preserve per-section boundaries AND pipe-target curve scoping
-        # across the deferred replay.  section_idx distinguishes
-        # consecutive sections that happen to have the same section_type
-        # and section_name (e.g., two bare ~A sections).
-        self._deferred_ascii_data_lines: list[
-            tuple[str, str, int, str, int, int | None]
-        ] = []
-        # F-34: Track section headers encountered (in order) for cross-section
-        # consistency validation: duplicate detection and LAS 3.0 ordering check.
-        self._section_sequence: list[str] = []
-        # F-048/F-103: Parallel list tracking semantic section type codes
-        # ("V", "W", "C", "P", "O", "A") for duplicate detection normalization.
-        # Label-based counting (above) misses semantically-duplicate sections
-        # that differ only by section_name (e.g., ~V = "V:" vs ~VERSION = "VERSION:").
-        self._section_type_sequence: list[str] = []
+        self._state.reset()
 
     @property
     def data_line_count(self) -> int:
         """Public accessor for pre-scanned data line count."""
-        return self._data_line_count
+        return self._state.data_line_count
 
     def parse(self, content: str, lines: list[str] | None = None) -> LASFile:
         """Parse LAS file content string.
@@ -612,7 +554,7 @@ class LASParser:
         self._replay_deferred_well()
 
         # Validation: a valid LAS file must have a ~V section
-        if not self._version_found and content.strip():
+        if not self._state.version_found and content.strip():
             raise LASParseError(
                 "Content does not appear to be a valid LAS file: "
                 "missing required ~V (Version Information) section."
@@ -621,7 +563,7 @@ class LASParser:
         # Warn when empty/whitespace-only content is parsed without a ~V section.
         # An empty file produces a default LASFile with version "2.0" — this is
         # intentional for robustness, but callers should know about it.
-        if not self._version_found and not content.strip():
+        if not self._state.version_found and not content.strip():
             warnings.warn(
                 "Empty or whitespace-only LAS content — returning default empty LASFile",
                 UserWarning,
@@ -633,24 +575,24 @@ class LASParser:
             )
 
         # Finalize accumulated ~O section text (F-3: O(n) join vs O(n^2) concat)
-        if self._other_lines:
-            self.las_file.other = "\n".join(self._other_lines) + "\n"
+        if self._state.other_lines:
+            self.las_file.other = "\n".join(self._state.other_lines) + "\n"
 
         # Process collected ASCII data only for LAS 3.0
         # For LAS 1.2/2.0, data_reader handles ASCII data with proper wrap mode support
         if self.las_file.version.is_las30:
             ctx = AsciiDataContext(
                 las_file=self.las_file,
-                ascii_data_lines=self._ascii_data_lines,
-                section_curve_start_idx=self._section_curve_start_idx,
-                section_curve_end_idx=self._section_curve_end_idx,
-                current_section_name=self._current_section_name,
-                current_data_section_type=self._current_data_section_type,
-                current_data_section_idx=self._current_data_section_idx,
-                cumulative_elements=self._cumulative_elements,
+                ascii_data_lines=self._state.ascii_data_lines,
+                section_curve_start_idx=self._state.section_curve_start_idx,
+                section_curve_end_idx=self._state.section_curve_end_idx,
+                current_section_name=self._state.current_section_name,
+                current_data_section_type=self._state.current_data_section_type,
+                current_data_section_idx=self._state.current_data_section_idx,
+                cumulative_elements=self._state.cumulative_elements,
             )
             process_ascii_data(ctx)
-            self._cumulative_elements = ctx.cumulative_elements
+            self._state.cumulative_elements = ctx.cumulative_elements
 
         # Validate mandatory well fields (STRT, STOP, STEP, NULL).
         # LAS 1.2 and 2.0 both require these fields; LAS 3.0 inherits the
@@ -664,7 +606,7 @@ class LASParser:
         is_las12_or_later = _LASVersionSpec(
             self.las_file.version.vers
         ).is_las12_or_later
-        if is_las12_or_later and self._version_found:
+        if is_las12_or_later and self._state.version_found:
             # M-03: All 8 LAS 1.2 mandatory well fields (was 4).
             # WELL, LOC, SRVC, and UWI are commonly missing in real-world
             # files — we warn but do NOT raise an error.
@@ -685,7 +627,7 @@ class LASParser:
         # found but is_las30 is False (VERS does not start with "3"), the
         # parser silently discards data in those sections.  Warn the user
         # and advise correcting the VERS header.
-        if self._las30_sections_seen and not self.las_file.version.is_las30:
+        if self._state.las30_sections_seen and not self.las_file.version.is_las30:
             logger.warning(
                 "LAS 3.0 structured data sections (~Core, ~Drilling, "
                 "~Inclinometry, etc.) found but VERS is '%s' (not a 3.x "
@@ -719,6 +661,11 @@ class LASParser:
         # so index-curve validation (and other __post_init__ guards) never
         # saw the fully-populated state.  validate(complete=True) re-checks now.
         self.las_file.validate(complete=True)
+
+        # Cross-validate _ParserState against las_file.
+        _state_issues = self._state.validate(self.las_file)
+        for issue in _state_issues:
+            logger.warning("Parser state inconsistency: %s", issue)
 
         return self.las_file
 
@@ -804,7 +751,7 @@ class LASParser:
 
         # Use the count from the first contiguous ~A block, matching
         # _read_normal's behavior (processes until first non-~A header).
-        self._data_line_count = per_block_counts[0] if per_block_counts else 0
+        self._state.data_line_count = per_block_counts[0] if per_block_counts else 0
 
     def _parse_line(self, line: str) -> None:
         """Route a single line to the appropriate section handler."""
@@ -864,16 +811,16 @@ class LASParser:
                     # F-01: When the first _Definition section is encountered,
                     # freeze the main curve block endpoint so pipe "| CURVE"
                     # associations can reference it later.
-                    if self._main_curve_end == -1:
-                        self._main_curve_end = len(self.las_file.curves)
+                    if self._state.main_curve_end == -1:
+                        self._state.main_curve_end = len(self.las_file.curves)
                     # G-02: Track which _Definition is active so curve ranges
                     # can be saved per-definition type (prevents overwrite
                     # by consecutive _Definition sections).
-                    self._current_definition_name = section_word.upper()
+                    self._state.current_definition_name = section_word.upper()
                 else:
                     section_name = section_rest or ""
                     # G-02: Regular ~C or ~CURVE section — no definition name.
-                    self._current_definition_name = None
+                    self._state.current_definition_name = None
             elif section_word in {"P", "PARAMETER", "PARAMETERS"} or section_word.endswith(
                 "_PARAMETER"
             ) or section_word.endswith("_PARAMETERS"):
@@ -906,7 +853,7 @@ class LASParser:
                 # cross-validation against VERS.  Only non-standard
                 # (non-~A/~ASCII) data sections indicate LAS 3.0 intent.
                 if section_word not in ("A", "ASCII"):
-                    self._las30_sections_seen = True
+                    self._state.las30_sections_seen = True
                 # For standard 'A' or 'ASCII' sections and written-form *_DATA
                 # sections (e.g., ~DRILLING_DATA DRILLING), use only the rest
                 # as the section name (backward-compatible).
@@ -935,7 +882,7 @@ class LASParser:
                             stacklevel=2,
                         )
                         stype = "LOG_DATA"
-                    self._current_data_section_type = stype
+                    self._state.current_data_section_type = stype
                 else:
                     stype = _SECTION_TYPE_MAP.get(section_word)
                     if stype is None:
@@ -960,7 +907,7 @@ class LASParser:
                                 stacklevel=2,
                             )
                             stype = "LOG_DATA"
-                    self._current_data_section_type = stype
+                    self._state.current_data_section_type = stype
                 # F-08: Handle pipe-delimited definition association.
                 # "| CURVE" means use the main curve block (before
                 # _Definition sections). "| X_Definition" means use
@@ -969,16 +916,16 @@ class LASParser:
                     pipe_target_upper = pipe_target.upper()
                     if pipe_target_upper in {"CURVE", "C"}:
                         # Pipe "| CURVE" → use main curve block only.
-                        self._section_curve_start_idx = 0
-                        self._section_curve_end_idx = (
-                            self._main_curve_end if self._main_curve_end >= 0 else None
+                        self._state.section_curve_start_idx = 0
+                        self._state.section_curve_end_idx = (
+                            self._state.main_curve_end if self._state.main_curve_end >= 0 else None
                         )
-                    elif pipe_target_upper in self._definition_curve_ranges:
+                    elif pipe_target_upper in self._state.definition_curve_ranges:
                         # G-02: Explicit pipe to a known _Definition —
                         # look up the saved (start, end) range.
-                        start, end = self._definition_curve_ranges[pipe_target_upper]
-                        self._section_curve_start_idx = start
-                        self._section_curve_end_idx = end
+                        start, end = self._state.definition_curve_ranges[pipe_target_upper]
+                        self._state.section_curve_start_idx = start
+                        self._state.section_curve_end_idx = end
                     else:
                         # Unrecognized pipe target (not "CURVE"/"C" and
                         # not a known _Definition).  Reset curve indices
@@ -992,33 +939,33 @@ class LASParser:
                             section_word,
                             source_info,
                         )
-                        self._section_curve_start_idx = 0
-                        self._section_curve_end_idx = None  # F-051: None → all curves (0 → empty slice)
-                elif self._current_data_section_type != "LOG_DATA":
+                        self._state.section_curve_start_idx = 0
+                        self._state.section_curve_end_idx = None  # F-051: None → all curves (0 → empty slice)
+                elif self._state.current_data_section_type != "LOG_DATA":
                     # G-02: No pipe — try to match data section type
                     # to a _Definition (e.g., CORE_DATA → CORE_DEFINITION).
                     def_prefix = (
-                        self._current_data_section_type.replace("_DATA", "") + "_DEFINITION"
+                        self._state.current_data_section_type.replace("_DATA", "") + "_DEFINITION"
                     )
-                    if def_prefix in self._definition_curve_ranges:
-                        start, end = self._definition_curve_ranges[def_prefix]
-                        self._section_curve_start_idx = start
-                        self._section_curve_end_idx = end
-                    elif "__MAIN__" in self._definition_curve_ranges:
+                    if def_prefix in self._state.definition_curve_ranges:
+                        start, end = self._state.definition_curve_ranges[def_prefix]
+                        self._state.section_curve_start_idx = start
+                        self._state.section_curve_end_idx = end
+                    elif "__MAIN__" in self._state.definition_curve_ranges:
                         # H-01: No matching _Definition found — fall back
                         # to the main non-_Definition curve range.
-                        start, end = self._definition_curve_ranges["__MAIN__"]
-                        self._section_curve_start_idx = start
-                        self._section_curve_end_idx = end
-                elif "__MAIN__" in self._definition_curve_ranges:
+                        start, end = self._state.definition_curve_ranges["__MAIN__"]
+                        self._state.section_curve_start_idx = start
+                        self._state.section_curve_end_idx = end
+                elif "__MAIN__" in self._state.definition_curve_ranges:
                     # H-01: LOG_DATA section with no pipe — fall back to
                     # the main non-_Definition curve range to avoid
                     # silently losing curve scoping when the previous
                     # section was a typed data section with different
                     # curve indices.
-                    start, end = self._definition_curve_ranges["__MAIN__"]
-                    self._section_curve_start_idx = start
-                    self._section_curve_end_idx = end
+                    start, end = self._state.definition_curve_ranges["__MAIN__"]
+                    self._state.section_curve_start_idx = start
+                    self._state.section_curve_end_idx = end
             else:
                 # Unknown section type — accumulate lines as free-form text (like ~O).
                 new_section = None
@@ -1047,32 +994,32 @@ class LASParser:
                 # F-02: Process any pending ASCII data from the current section
                 # before resetting, to avoid leaving orphaned data lines and to
                 # prevent LAS 3.0 contamination (F-08).
-                if self._current_section == "A" and self._ascii_data_lines:
+                if self._state.current_section == "A" and self._state.ascii_data_lines:
                     # F-I2-H01: Replay deferred well entries before processing
                     # data so the correct NULL value is available.  When ~W
                     # appears before ~V, well entries are buffered and not
                     # stored until _replay_deferred_well() is called.
-                    if self._version_found:
+                    if self._state.version_found:
                         self._replay_deferred_well()
                     try:
                         ctx = AsciiDataContext(
                             las_file=self.las_file,
-                            ascii_data_lines=self._ascii_data_lines,
-                            section_curve_start_idx=self._section_curve_start_idx,
-                            section_curve_end_idx=self._section_curve_end_idx,
-                            current_section_name=self._current_section_name,
-                            current_data_section_type=self._current_data_section_type,
-                            current_data_section_idx=self._current_data_section_idx,
-                            cumulative_elements=self._cumulative_elements,
+                            ascii_data_lines=self._state.ascii_data_lines,
+                            section_curve_start_idx=self._state.section_curve_start_idx,
+                            section_curve_end_idx=self._state.section_curve_end_idx,
+                            current_section_name=self._state.current_section_name,
+                            current_data_section_type=self._state.current_data_section_type,
+                            current_data_section_idx=self._state.current_data_section_idx,
+                            cumulative_elements=self._state.cumulative_elements,
                         )
                         process_ascii_data(ctx)
-                        self._cumulative_elements = ctx.cumulative_elements
+                        self._state.cumulative_elements = ctx.cumulative_elements
                     finally:
-                        self._ascii_data_lines = []
-                        self._current_data_section_idx += 1
+                        self._state.ascii_data_lines = []
+                        self._state.current_data_section_idx += 1
                 # F-02: Reset current section so data lines in unknown sections
                 # aren't misrouted to the previous section's handler.
-                self._current_section = None
+                self._state.current_section = None
                 return
 
             # F-M01: Warn when a pipe target is specified on a known
@@ -1094,7 +1041,7 @@ class LASParser:
             # Process the previous section and enter the new section.
             # The handler enforces capture→process→enter ordering at the type
             # level: process_previous_section REQUIRES a _CapturedState.
-            self._cumulative_elements = self._transition_handler.process_previous_section(
+            self._state.cumulative_elements = self._transition_handler.process_previous_section(
                 captured, new_section
             )
 
@@ -1123,8 +1070,8 @@ class LASParser:
             self._append_other_line(line)
             return
 
-        if self._current_section:
-            handler_name = self.SECTION_HANDLERS.get(self._current_section)
+        if self._state.current_section:
+            handler_name = self.SECTION_HANDLERS.get(self._state.current_section)
             if handler_name:
                 getattr(self, handler_name)(line)
             else:
@@ -1138,13 +1085,13 @@ class LASParser:
 
     def _append_other_line(self, line: str) -> None:
         """Append a line to _other_lines with a bounds check (F-M-02)."""
-        if len(self._other_lines) >= MAX_OTHER_LINES:
+        if len(self._state.other_lines) >= MAX_OTHER_LINES:
             raise LASParseError(
-                f"Other section line count ({len(self._other_lines) + 1}) exceeds "
+                f"Other section line count ({len(self._state.other_lines) + 1}) exceeds "
                 f"maximum allowed ({MAX_OTHER_LINES}). "
                 f"The file may be malformed or corrupt."
             )
-        self._other_lines.append(line)
+        self._state.other_lines.append(line)
 
     @staticmethod
     def _manual_colon_scan(line: str) -> dict[str, str] | None:
@@ -1318,7 +1265,7 @@ class LASParser:
 
         if mnemonic == "VERS":
             # M-05: Only set _version_found for VERS, not other ~V data.
-            self._version_found = True
+            self._state.version_found = True
 
             # F-005: Validate VERS against known LAS versions.
             # Non-standard values (e.g., "1,2" with comma, "2,0")
@@ -1671,12 +1618,12 @@ class LASParser:
         F-M12: When data sections appear before ~V, data lines are buffered
         and replayed here after the version is known.
         """
-        if self._deferred_well_entries:
+        if self._state.deferred_well_entries:
             # F-M-006: Combined-count guard before replay.  well.entries
             # may already contain entries + _deferred_well_entries may
             # independently have up to MAX_DEFERRED_WELL_ENTRIES (100K),
             # creating a transient memory pool of up to ~200K dict entries.
-            combined = len(self.las_file.well.entries) + len(self._deferred_well_entries)
+            combined = len(self.las_file.well.entries) + len(self._state.deferred_well_entries)
             if combined > 2 * MAX_DEFERRED_WELL_ENTRIES:
                 raise LASParseError(
                     f"Combined well entry count ({combined}) exceeds maximum "
@@ -1686,7 +1633,7 @@ class LASParser:
             is_las12 = _LASVersionSpec(
                 self.las_file.version.vers
             ).is_las12
-            for entry in self._deferred_well_entries:
+            for entry in self._state.deferred_well_entries:
                 self._store_well_entry(
                     mnemonic=entry["mnemonic"],
                     unit=entry["unit"],
@@ -1694,7 +1641,7 @@ class LASParser:
                     description=entry["description"],
                     is_las12=is_las12,
                 )
-            self._deferred_well_entries.clear()
+            self._state.deferred_well_entries.clear()
 
         # F-M12: Replay deferred data lines if the file is LAS 3.0.
         # F-H01 / I2-D2-01: Each deferred entry is a (section_type,
@@ -1704,7 +1651,7 @@ class LASParser:
         # curve_start/curve_end preserve pipe-target scoping through
         # the deferred replay so that |CURVE and |X_Definition pipe
         # associations are not lost.
-        if self._deferred_ascii_data_lines:
+        if self._state.deferred_ascii_data_lines:
             if self.las_file.version.is_las30:
                 # Build groups from per-line tuple storage.
                 # itertools.groupby groups consecutive lines with the same
@@ -1714,7 +1661,7 @@ class LASParser:
                     tuple[tuple[str, str, int], list[str], int, int | None]
                 ] = []
                 for key, group_iter in groupby(
-                    self._deferred_ascii_data_lines,
+                    self._state.deferred_ascii_data_lines,
                     key=lambda t: (t[0], t[1], t[2]),
                 ):
                     rows = list(group_iter)
@@ -1726,11 +1673,11 @@ class LASParser:
                     ))
 
                 # Save current state before processing deferred groups.
-                saved_lines = self._ascii_data_lines
-                saved_curve_start = self._section_curve_start_idx
-                saved_curve_end = self._section_curve_end_idx
-                saved_section_type = self._current_data_section_type
-                saved_section_name = self._current_section_name
+                saved_lines = self._state.ascii_data_lines
+                saved_curve_start = self._state.section_curve_start_idx
+                saved_curve_end = self._state.section_curve_end_idx
+                saved_section_type = self._state.current_data_section_type
+                saved_section_name = self._state.current_section_name
 
                 try:
                     # Process each deferred group as its own DataSection.
@@ -1738,10 +1685,10 @@ class LASParser:
                         # I2-D2-01: Restore pipe-target curve scoping stored
                         # at defer time, preserving |CURVE and
                         # |X_Definition associations.
-                        self._section_curve_start_idx = curve_start
-                        self._section_curve_end_idx = curve_end
+                        self._state.section_curve_start_idx = curve_start
+                        self._state.section_curve_end_idx = curve_end
                         # Pre-~V section type may be stale — use stored value.
-                        self._current_data_section_type = section_type or "LOG_DATA"
+                        self._state.current_data_section_type = section_type or "LOG_DATA"
                         # Preserve user-provided section names when available.
                         # Bare section keywords (e.g., "A" from ~A,
                         # "Core[1]" from ~Core[1]) are blanked so
@@ -1753,35 +1700,35 @@ class LASParser:
                             or _is_indexed_data_section(_section_name)
                         )
                         if _section_name and not _is_bare_keyword:
-                            self._current_section_name = _section_name
+                            self._state.current_section_name = _section_name
                         else:
-                            self._current_section_name = ""
-                        self._ascii_data_lines = raw_lines
+                            self._state.current_section_name = ""
+                        self._state.ascii_data_lines = raw_lines
                         ctx = AsciiDataContext(
                             las_file=self.las_file,
-                            ascii_data_lines=self._ascii_data_lines,
-                            section_curve_start_idx=self._section_curve_start_idx,
-                            section_curve_end_idx=self._section_curve_end_idx,
-                            current_section_name=self._current_section_name,
-                            current_data_section_type=self._current_data_section_type,
-                            current_data_section_idx=self._current_data_section_idx,
-                            cumulative_elements=self._cumulative_elements,
+                            ascii_data_lines=self._state.ascii_data_lines,
+                            section_curve_start_idx=self._state.section_curve_start_idx,
+                            section_curve_end_idx=self._state.section_curve_end_idx,
+                            current_section_name=self._state.current_section_name,
+                            current_data_section_type=self._state.current_data_section_type,
+                            current_data_section_idx=self._state.current_data_section_idx,
+                            cumulative_elements=self._state.cumulative_elements,
                         )
                         process_ascii_data(ctx)
-                        self._cumulative_elements = ctx.cumulative_elements
-                        self._current_data_section_idx += 1
+                        self._state.cumulative_elements = ctx.cumulative_elements
+                        self._state.current_data_section_idx += 1
                 finally:
                     # Restore state.
                     if saved_lines:
-                        self._ascii_data_lines = saved_lines
+                        self._state.ascii_data_lines = saved_lines
                     else:
-                        self._ascii_data_lines = []
-                    self._section_curve_start_idx = saved_curve_start
-                    self._section_curve_end_idx = saved_curve_end
-                    self._current_data_section_type = saved_section_type
+                        self._state.ascii_data_lines = []
+                    self._state.section_curve_start_idx = saved_curve_start
+                    self._state.section_curve_end_idx = saved_curve_end
+                    self._state.current_data_section_type = saved_section_type
                     # F-I2-M01: Reset section name (defense-in-depth).
-                    self._current_section_name = saved_section_name or ""
-            self._deferred_ascii_data_lines.clear()
+                    self._state.current_section_name = saved_section_name or ""
+            self._state.deferred_ascii_data_lines.clear()
 
     def _parse_well(self, line: str) -> None:
         """Parse ~W (well information) section line.
@@ -1839,24 +1786,24 @@ class LASParser:
         # is_las12 is False, skipping the LAS 1.2 convention swap.  Buffer raw
         # entries so they can be re-processed with the correct version after
         # ~V is parsed.
-        if not self._version_found:
+        if not self._state.version_found:
             # F-35: Guard against unbounded deferred-well-entry accumulation.
             # Every other accumulator in parser.py has a MAX_* guard; this was
             # the sole unguarded buffer.  Malicious ~W-before-~V files without
             # a ~V section could grow this list without bound.
-            if len(self._deferred_well_entries) >= MAX_DEFERRED_WELL_ENTRIES:
+            if len(self._state.deferred_well_entries) >= MAX_DEFERRED_WELL_ENTRIES:
                 raise LASParseError(
-                    f"Deferred well entry count ({len(self._deferred_well_entries) + 1}) "
+                    f"Deferred well entry count ({len(self._state.deferred_well_entries) + 1}) "
                     f"exceeds maximum allowed ({MAX_DEFERRED_WELL_ENTRIES}). "
                     f"The file may be malformed or corrupt."
                 )
-            self._deferred_well_entries.append({
+            self._state.deferred_well_entries.append({
                 "mnemonic": mnemonic,
                 "unit": unit,
                 "value": value,
                 "description": description,  # type: ignore[dict-item]
             })
-            if len(self._deferred_well_entries) == 1:
+            if len(self._state.deferred_well_entries) == 1:
                 warnings.warn(
                     "~W (Well) section encountered before ~V (Version) "
                     "section. Well data interpretation may be incorrect "
@@ -2230,7 +2177,7 @@ class LASParser:
         # sections (e.g., ~Core_Parameter) → "CORE_PARAMETER".
         # Derive section_type by stripping the _PARAMETER/_PARAMETERS suffix.
         _section_type: str | None = None
-        _sect_name = (self._current_section_name or "").upper()
+        _sect_name = (self._state.current_section_name or "").upper()
         if _sect_name.endswith("_PARAMETER"):
             _section_type = _sect_name[: -len("_PARAMETER")]
         elif _sect_name.endswith("_PARAMETERS"):
@@ -2295,8 +2242,8 @@ class LASParser:
             # is_las30 is True.  Buffer data lines so they aren't silently
             # discarded.  After ~V is parsed, _replay_deferred_well replays
             # them if the file is LAS 3.0; if not, they are discarded.
-            if not self._version_found:
-                if len(self._deferred_ascii_data_lines) > _data_reader.MAX_DATA_LINES:
+            if not self._state.version_found:
+                if len(self._state.deferred_ascii_data_lines) > _data_reader.MAX_DATA_LINES:
                     raise LASParseError(
                         f"Deferred ASCII data line count exceeds maximum "
                         f"allowed ({_data_reader.MAX_DATA_LINES}). "
@@ -2308,14 +2255,14 @@ class LASParser:
                 # grouping.  section_idx disambiguates consecutive bare
                 # sections.  curve_start/curve_end preserve pipe-target
                 # scoping across the deferred replay (I2-D2-01).
-                self._deferred_ascii_data_lines.append(
+                self._state.deferred_ascii_data_lines.append(
                     (
-                        self._current_data_section_type,
-                        self._current_section_name,
-                        self._current_data_section_idx,
+                        self._state.current_data_section_type,
+                        self._state.current_section_name,
+                        self._state.current_data_section_idx,
                         line,
-                        self._section_curve_start_idx,
-                        self._section_curve_end_idx,
+                        self._state.section_curve_start_idx,
+                        self._state.section_curve_end_idx,
                     )
                 )
             return
@@ -2323,25 +2270,25 @@ class LASParser:
         # list grows unbounded.  The main check in _process_ascii_data runs
         # AFTER all lines are collected, offering no protection during the
         # accumulation phase itself.
-        if len(self._ascii_data_lines) > _data_reader.MAX_DATA_LINES:
+        if len(self._state.ascii_data_lines) > _data_reader.MAX_DATA_LINES:
             raise LASParseError(
                 f"ASCII data line count exceeds maximum allowed "
                 f"({_data_reader.MAX_DATA_LINES}) during accumulation. "
                 f"The file may be malformed or corrupt."
             )
-        self._ascii_data_lines.append(line)
+        self._state.ascii_data_lines.append(line)
         # F-09: Cumulative cross-section data line counter — defense-in-depth
         # against multi-section files where each section passes the per-section
         # MAX_DATA_LINES bound individually.
-        self._cumulative_data_lines += 1
+        self._state.cumulative_data_lines += 1
         if (
-            self._cumulative_data_lines > _data_reader.MAX_DATA_LINES * 10
-            and not self._cumulative_data_lines_warned
+            self._state.cumulative_data_lines > _data_reader.MAX_DATA_LINES * 10
+            and not self._state.cumulative_data_lines_warned
         ):
-            self._cumulative_data_lines_warned = True
+            self._state.cumulative_data_lines_warned = True
             warnings.warn(
-                f"Cumulative data line count ({self._cumulative_data_lines}) "
-                f"across {self._current_data_section_idx + 1} sections "
+                f"Cumulative data line count ({self._state.cumulative_data_lines}) "
+                f"across {self._state.current_data_section_idx + 1} sections "
                 f"is unusually high.  The file may be malformed or corrupt.",
                 UserWarning,
                 stacklevel=2,
@@ -2396,7 +2343,7 @@ class LASParser:
             # (out-of-order group).
             per_type_param_after_def: list[str] = []
 
-            for label in self._section_sequence:
+            for label in self._state.section_sequence:
                 section_word = label.split(":")[0]
                 is_data = (
                     section_word in _DATA_SECTION_WORDS
@@ -2536,14 +2483,14 @@ class LASParser:
             _reserved_single.update({"C", "P", "A"})
 
         _type_counts: dict[str, int] = {}
-        for stype in self._section_type_sequence:
+        for stype in self._state.section_type_sequence:
             _type_counts[stype] = _type_counts.get(stype, 0) + 1
 
         for stype, count in _type_counts.items():
             if count > 1 and stype in _reserved_single:
                 _duplicates = [
                     lbl for lbl, st in zip(
-                        self._section_sequence, self._section_type_sequence, strict=True
+                        self._state.section_sequence, self._state.section_type_sequence, strict=True
                     ) if st == stype
                 ]
                 _dup_labels = ", ".join(f"'~{d}'" for d in _duplicates)
