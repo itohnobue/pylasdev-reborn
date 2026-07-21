@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from ._version_spec import _LASVersionSpec
 from .data_reader import _get_null_value
 from .exceptions import LASDataError, LASWriteError, PylasdevError
 from .models import CurveDefinition, LASFile, ParameterEntry
@@ -369,7 +370,7 @@ def _write_version_section(las_file: LASFile) -> list[str]:
     lines: list[str] = []
     is_las30 = las_file.is_las30
     # F-014: Detect LAS 1.2 to guard DLM emission (DLM is LAS 2.0/3.0 only).
-    is_las12 = las_file.version.vers.startswith("1.")
+    is_las12 = _LASVersionSpec(las_file.version.vers).is_las12
     lines.append("~VERSION INFORMATION")
     vers_desc = "CWLS LOG ASCII STANDARD -VERSION 3.0" if is_las30 else "CWLS LOG ASCII STANDARD"
     # Guard against empty vers field (analogous to wrap guard below).
@@ -437,7 +438,7 @@ def _write_well_section(las_file: LASFile) -> list[str]:
     (value before colon, description after).
     """
     lines: list[str] = []
-    is_las12 = las_file.version.vers.startswith("1.")
+    is_las12 = _LASVersionSpec(las_file.version.vers).is_las12
     lines.append("~WELL INFORMATION")
 
     # Validate mandatory well fields — emit warnings for missing fields
@@ -876,16 +877,13 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
     lines: list[str] = []
     null_value = _get_null_value(las_file.well)
     delimiter = las_file.version.delimiter_char
-    is_las30 = las_file.is_las30
-    is_las12 = las_file.version.vers.startswith("1.")
+    spec = _LASVersionSpec(las_file.version.vers)
     import warnings  # consolidated — shared by all warning paths below
 
     # F-28: LAS 2.0 WRAP=NO also has the 256-char line-length limit per
     # the CWLS specification.  Extend the line-length check to cover both
     # LAS 1.2 (all modes) and LAS 2.0 with WRAP=NO.
-    is_las20 = las_file.version.vers.startswith("2.")
-    _wrap = (las_file.version.wrap or "NO").upper()
-    check_line_limit = is_las12 or (is_las20 and _wrap == "NO")
+    check_line_limit = spec.line_length_limit_for_wrap(las_file.version.wrap) is not None
 
     # F-02-H: Save original DLM before the LAS 1.2 SPACE-override
     # mutation below.  Restored in the finally block so the caller's
@@ -897,7 +895,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
     # _write_version_section L172-176) but data rows used the non-SPACE
     # delimiter from delimiter_char, creating a header/data mismatch
     # that would corrupt roundtrip re-reads.  Force SPACE and warn.
-    if is_las12 and delimiter != " ":
+    if spec.is_las12 and delimiter != " ":
         warnings.warn(
             f"LAS 1.2 does not support the '{las_file.version.dlm}' delimiter. "
             "Forcing SPACE delimiter for data rows to match the header section.",
@@ -927,14 +925,16 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
     # is a writer-internal FORCE), WRAP is NOT restored — the model must
     # honestly reflect the actual disk state, per F2-26 / G-018.
     _actual_wrap = (las_file.version.wrap or "NO").upper()
-    if _actual_wrap == "YES" or (is_las30 and _actual_wrap != "NO"):
+    if _actual_wrap == "YES" or (spec.is_las30 and _actual_wrap != "NO"):
         las_file.version.wrap = "NO"
 
     # F-28 / M-06: Recompute line-limit check AFTER WRAP mutation.
     # LAS 2.0 WRAP=YES input is forced to WRAP=NO output above, but
     # check_line_limit was computed from the PRE-MUTATION _wrap value.
     # The 256-char line-limit warning must use the actual output state.
-    check_line_limit = is_las12 or (is_las20 and (las_file.version.wrap or "NO").upper() == "NO")
+    check_line_limit = spec.line_length_limit_for_wrap(
+        las_file.version.wrap
+    ) is not None
 
     try:
         # F-I2-M17 / F-019: Guard against data_sections in non-LAS-3.0 files.
@@ -943,7 +943,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
         # cause guaranteed roundtrip data loss (parser skips all data for
         # non-LAS-3.0 settings).  A single section can safely fall back to
         # legacy ~A format.
-        if las_file.data_sections and not is_las30:
+        if las_file.data_sections and not spec.is_las30:
             if len(las_file.data_sections) > 1:
                 raise LASWriteError(
                     f"Multiple data_sections ({len(las_file.data_sections)}) "
@@ -1030,7 +1030,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
                         stacklevel=3,
                     )
 
-        if las_file.data_sections and is_las30:
+        if las_file.data_sections and spec.is_las30:
             # F-ITER2-W-M01 / F-ITER2-W-R08: The LAS 3.0 writer path only
             # iterates data_sections and never reads las_file.logs.  If
             # las_file.logs contains curve data not covered by any
@@ -1097,7 +1097,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
                 # the pipe notation on the data section header so the parser
                 # can re-associate per-section curves on re-read.
                 def_prefix: str | None = None
-                if is_las30 and sec_type != "LOG_DATA":
+                if spec.is_las30 and sec_type != "LOG_DATA":
                     def_prefix = _SECTION_TYPE_TO_DEFINITION_PREFIX.get(sec_type)
                     if def_prefix is None:
                         if sec_type.endswith("_DATA"):
@@ -1136,7 +1136,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
                 # same section type get separate numbered Definition blocks
                 # (e.g., Core_Definition, Core_Definition_2).
                 pipe_def_name: str | None = None
-                if is_las30 and sec_type != "LOG_DATA" and section.section_curves:
+                if spec.is_las30 and sec_type != "LOG_DATA" and section.section_curves:
                     # Build a curve identity signature from the visible fields
                     # that distinguish one curve set from another.
                     sig = tuple(
@@ -1159,7 +1159,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
                             sig_map[sig] = def_section_name
                             lines.append(f"~{def_section_name}")
                             for curve in section.section_curves:
-                                lines.append(_format_curve_line(curve, is_las30))
+                                lines.append(_format_curve_line(curve, spec.is_las30))
                             lines.append("")  # blank line after definition
                         pipe_def_name = sig_map[sig]
 
@@ -1173,9 +1173,9 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
                 # pipe_def_name).  Without this guard, a section with a valid
                 # def_prefix but empty section_curves would emit a phantom
                 # pipe reference to a non-existent Definition section.
-                if sec_type == "LOG_DATA" and is_las30:
+                if sec_type == "LOG_DATA" and spec.is_las30:
                     lines.append(f"~{section_prefix}{section_name} | CURVE")
-                elif is_las30 and sec_type != "LOG_DATA" and pipe_def_name:
+                elif spec.is_las30 and sec_type != "LOG_DATA" and pipe_def_name:
                     lines.append(
                         f"~{section_prefix}{section_name} | {pipe_def_name}"
                     )

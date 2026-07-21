@@ -16,6 +16,8 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from ._version_spec import _LASVersionSpec
+
 # I2F-09: Maximum field length for string values — matches parser's limit
 # (parser.py:86).  Without this, from_dict paths accept arbitrarily-long
 # strings that bypass all item-count and element-count guards.
@@ -577,7 +579,7 @@ class VersionSection:
             raise ValueError("VersionSection: DLM cannot be None")
         if self.dlm:
             _dlm = self.dlm.upper()
-            is_las12 = self.vers.strip().startswith("1")
+            _spec = _LASVersionSpec(self.vers)
             # F-I2-MD3-01: Validate DLM value first, then check LAS
             # version compatibility.  The previous if/elif structure
             # warned for LAS 1.2 with non-SPACE DLM but skipped the
@@ -592,7 +594,7 @@ class VersionSection:
                     f"VersionSection: invalid DLM value "
                     f"{self.dlm!r}.  Expected SPACE, TAB, or COMMA."
                 )
-            if is_las12 and _dlm != "SPACE":
+            if _spec.is_las12 and _dlm != "SPACE":
                 import warnings as _w
                 _w.warn(
                     f"DLM '{self.dlm}' is not valid for LAS 1.2 "
@@ -1730,7 +1732,7 @@ class LASFile:
         _INDEX_CURVE_ALIASES = frozenset({"DEPT", "DEPTH", "TIME", "INDEX"})
         if (
             self.curves_order
-            and self.version.vers.startswith("2")
+            and _LASVersionSpec(self.version.vers).is_las20
             and self.curves_order[0].upper() not in _INDEX_CURVE_ALIASES
         ):
             if not self._from_dict:

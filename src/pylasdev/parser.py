@@ -20,6 +20,7 @@ from typing import ClassVar
 import numpy as np
 
 from . import data_reader as _data_reader
+from ._version_spec import _LASVersionSpec
 from .data_reader import (
     _get_null_value,
     _parse_float_with_d_notation,
@@ -650,7 +651,9 @@ class LASParser:
         # 1.2 spec requiring STRT/STOP/STEP/NULL.
         # F-014: Previous version gate only checked startswith("2."),
         # silently skipping mandatory-field validation for LAS 3.0 files.
-        is_las12_or_later = self.las_file.version.vers.startswith(("1.", "2.", "3."))
+        is_las12_or_later = _LASVersionSpec(
+            self.las_file.version.vers
+        ).is_las12_or_later
         if is_las12_or_later and self._version_found:
             # M-03: All 8 LAS 1.2 mandatory well fields (was 4).
             # WELL, LOC, SRVC, and UWI are commonly missing in real-world
@@ -1520,7 +1523,9 @@ class LASParser:
             # VERS in non-standard ~V ordering, the DLM version guard at
             # L1501 uses the default "2.0" and incorrectly allows
             # non-SPACE DLM.  Now that the true version is known, re-validate.
-            if self.las_file.version.vers.startswith("1.") and self.las_file.version.dlm != "SPACE":
+            if _LASVersionSpec(
+                self.las_file.version.vers
+            ).is_las12 and self.las_file.version.dlm != "SPACE":
                 _prev_dlm = self.las_file.version.dlm
                 self.las_file.version.dlm = "SPACE"
                 warnings.warn(
@@ -1545,7 +1550,12 @@ class LASParser:
         elif mnemonic == "DLM":
             dlm_upper = value.upper()
             if dlm_upper in {"SPACE", "TAB", "COMMA"}:
-                if not self.las_file.version.vers.startswith("1.") or dlm_upper == "SPACE":
+                if (
+                    not _LASVersionSpec(
+                        self.las_file.version.vers
+                    ).is_las12
+                    or dlm_upper == "SPACE"
+                ):
                     self.las_file.version.dlm = dlm_upper
                 else:
                     warnings.warn(
@@ -1803,7 +1813,9 @@ class LASParser:
                     f"allowed ({2 * MAX_DEFERRED_WELL_ENTRIES}). "
                     f"The file may be malformed or corrupt."
                 )
-            is_las12 = self.las_file.version.vers.startswith("1.")
+            is_las12 = _LASVersionSpec(
+                self.las_file.version.vers
+            ).is_las12
             for entry in self._deferred_well_entries:
                 self._store_well_entry(
                     mnemonic=entry["mnemonic"],
@@ -1938,7 +1950,9 @@ class LASParser:
         # the correct `is_las12` flag.  _store_well_entry splits bare-colon
         # values when is_las12=True and description is None, with timestamp/
         # datetime guards to avoid corrupting "12:34:56" or ISO datetimes.
-        is_las12 = self.las_file.version.vers.startswith("1.")
+        is_las12 = _LASVersionSpec(
+            self.las_file.version.vers
+        ).is_las12
 
         # F-P06: When ~W appears before ~V, the version defaults to "2.0" and
         # is_las12 is False, skipping the LAS 1.2 convention swap.  Buffer raw
