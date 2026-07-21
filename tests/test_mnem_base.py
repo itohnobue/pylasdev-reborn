@@ -67,11 +67,10 @@ class TestMnemBase:
         from pylasdev import read_las_file
 
         test_data = Path(__file__).parent.parent / "test_data"
-        las_files = list(test_data.glob("*.las"))
-        if las_files:
-            # Just verify it doesn't crash with mnem_base
-            data = read_las_file(las_files[0], mnem_base=MNEM_BASE)
-            assert "logs" in data
+        # Use a LAS 2.0 file — LAS 3.0 disallows ~Other sections
+        las_file = test_data / "sample_2.0.las"
+        data = read_las_file(las_file, mnem_base=MNEM_BASE)
+        assert "logs" in data
 
     # --- T12/G-15: MNEM_BASE reader integration end-to-end ---
     def test_mnem_base_normalizes_curve_names(self, tmp_path: Path) -> None:

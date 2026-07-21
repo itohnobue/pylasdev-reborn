@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from pylasdev.compare import compare_las_dicts
+from pylasdev.compare import _compare_lists, compare_las_dicts
 from pylasdev.models import CurveDefinition
 
 
@@ -714,3 +714,450 @@ class TestProductionCheckCompareFix:
         d2 = {"logs": {"VAL": np.array([np.float64(np.nan)])}}
         # Both are NaN → comparison should return True (NaN==NaN via per-element path)
         assert compare_las_dicts(d1, d2) is True
+
+
+# ──────────────────────────────────────────────────────────────
+# M-01 Regression: list-of-arrays dispatch branches
+# ──────────────────────────────────────────────────────────────
+
+class TestF01HListOfArraysNestedDict:
+    """F-01-H: Regression tests for isinstance(val2[in_key], list) branch
+    in compare_las_dicts (compare.py:168-189).
+
+    Without this branch, nested dicts containing list-of-numpy-arrays
+    values would fall through to _scalars_equal, which raises ValueError
+    on list-equality-with-ndarray-values (ambiguous truth value), causing
+    identical dicts to return False.
+    """
+
+    def test_identical_nested_dict_with_list_of_arrays(self) -> None:
+        """Identical nested dict with list-of-arrays values returns True."""
+        arr = np.array([1.0, 2.0, 3.0])
+        d1 = {
+            "sections": {
+                "data": {"curves": [arr, arr]},
+            },
+        }
+        d2 = {
+            "sections": {
+                "data": {"curves": [arr, arr]},
+            },
+        }
+        assert compare_las_dicts(d1, d2) is True
+
+    def test_nested_dict_list_of_arrays_different_values(self) -> None:
+        """Nested dict with list-of-arrays where arrays differ returns False."""
+        d1 = {
+            "sections": {
+                "data": {"curves": [np.array([1.0, 2.0]), np.array([3.0, 4.0])]},
+            },
+        }
+        d2 = {
+            "sections": {
+                "data": {"curves": [np.array([1.0, 2.0]), np.array([3.0, 5.0])]},
+            },
+        }
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_nested_dict_list_of_arrays_single_element(self) -> None:
+        """List-of-arrays with a single element matches."""
+        d1 = {
+            "data": {
+                "channels": [np.array([1.0, 2.0, 3.0])],
+            },
+        }
+        d2 = {
+            "data": {
+                "channels": [np.array([1.0, 2.0, 3.0])],
+            },
+        }
+        assert compare_las_dicts(d1, d2) is True
+
+    def test_nested_dict_list_of_arrays_empty(self) -> None:
+        """Empty list-of-arrays values match."""
+        d1 = {
+            "data": {
+                "channels": [],
+            },
+        }
+        d2 = {
+            "data": {
+                "channels": [],
+            },
+        }
+        assert compare_las_dicts(d1, d2) is True
+
+    def test_nested_dict_list_of_arrays_length_mismatch(self) -> None:
+        """Lists of different lengths inside nested dict return False."""
+        d1 = {
+            "data": {
+                "curves": [np.array([1.0, 2.0])],
+            },
+        }
+        d2 = {
+            "data": {
+                "curves": [np.array([1.0, 2.0]), np.array([3.0, 4.0])],
+            },
+        }
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_nested_dict_val1_not_list_type_mismatch(self) -> None:
+        """When val1 is not a list but val2 is, returns False with warning."""
+        d1 = {
+            "data": {
+                "channels": np.array([1.0, 2.0]),  # ndarray, not list
+            },
+        }
+        d2 = {
+            "data": {
+                "channels": [np.array([1.0, 2.0])],  # list
+            },
+        }
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_nested_dict_list_of_arrays_multiple_keys(self) -> None:
+        """Nested dict with multiple keys, one containing list-of-arrays."""
+        d1 = {
+            "meta": {
+                "curves": [np.array([1.0, 2.0]), np.array([3.0, 4.0])],
+                "name": "section_a",
+            },
+        }
+        d2 = {
+            "meta": {
+                "curves": [np.array([1.0, 2.0]), np.array([3.0, 4.0])],
+                "name": "section_a",
+            },
+        }
+        assert compare_las_dicts(d1, d2) is True
+
+    def test_nested_dict_list_of_arrays_with_nan(self) -> None:
+        """List-of-arrays containing NaN values match when identical."""
+        d1 = {
+            "data": {
+                "signals": [np.array([1.0, np.nan, 3.0]), np.array([np.nan, 5.0])],
+            },
+        }
+        d2 = {
+            "data": {
+                "signals": [np.array([1.0, np.nan, 3.0]), np.array([np.nan, 5.0])],
+            },
+        }
+        assert compare_las_dicts(d1, d2) is True
+
+
+class TestF43DataSectionsListOfArrays:
+    """F-43: Regression tests for isinstance(v2[in_key], list) branch
+    in _compare_data_sections (compare.py:573-597).
+
+    When data_sections entries contain nested dicts with list values,
+    the list dispatch branch handles list-of-ndarray values at depth 3+
+    inside the data_sections comparison loop.
+    """
+
+    def test_data_sections_nested_dict_list_of_arrays_match(self) -> None:
+        """Data section nested dict with list-of-arrays values matches."""
+        d1 = {
+            "data_sections": [
+                {
+                    "data": {
+                        "channels": [np.array([1.0, 2.0]), np.array([3.0, 4.0])],
+                    },
+                    "name": "S1",
+                    "curves_order": [],
+                },
+            ],
+        }
+        d2 = {
+            "data_sections": [
+                {
+                    "data": {
+                        "channels": [np.array([1.0, 2.0]), np.array([3.0, 4.0])],
+                    },
+                    "name": "S1",
+                    "curves_order": [],
+                },
+            ],
+        }
+        assert compare_las_dicts(d1, d2) is True
+
+    def test_data_sections_nested_dict_list_different_arrays(self) -> None:
+        """Data section list-of-arrays with different values returns False."""
+        d1 = {
+            "data_sections": [
+                {
+                    "data": {
+                        "signals": [np.array([1.0, 2.0]), np.array([3.0, 4.0])],
+                    },
+                    "name": "S1",
+                    "curves_order": [],
+                },
+            ],
+        }
+        d2 = {
+            "data_sections": [
+                {
+                    "data": {
+                        "signals": [np.array([1.0, 2.0]), np.array([9.0, 10.0])],
+                    },
+                    "name": "S1",
+                    "curves_order": [],
+                },
+            ],
+        }
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_data_sections_nested_dict_list_single_element(self) -> None:
+        """Data section list-of-arrays with single element matches."""
+        d1 = {
+            "data_sections": [
+                {
+                    "data": {
+                        "trace": [np.array([10.0, 20.0, 30.0])],
+                    },
+                    "name": "S1",
+                    "curves_order": [],
+                },
+            ],
+        }
+        d2 = {
+            "data_sections": [
+                {
+                    "data": {
+                        "trace": [np.array([10.0, 20.0, 30.0])],
+                    },
+                    "name": "S1",
+                    "curves_order": [],
+                },
+            ],
+        }
+        assert compare_las_dicts(d1, d2) is True
+
+    def test_data_sections_nested_dict_list_empty(self) -> None:
+        """Data section with empty list inside nested dict matches."""
+        d1 = {
+            "data_sections": [
+                {
+                    "data": {
+                        "channels": [],
+                    },
+                    "name": "S1",
+                    "curves_order": [],
+                },
+            ],
+        }
+        d2 = {
+            "data_sections": [
+                {
+                    "data": {
+                        "channels": [],
+                    },
+                    "name": "S1",
+                    "curves_order": [],
+                },
+            ],
+        }
+        assert compare_las_dicts(d1, d2) is True
+
+    def test_data_sections_nested_dict_list_length_mismatch(self) -> None:
+        """Data section list-of-arrays with different lengths returns False."""
+        d1 = {
+            "data_sections": [
+                {
+                    "data": {
+                        "curves": [np.array([1.0, 2.0])],
+                    },
+                    "name": "S1",
+                    "curves_order": [],
+                },
+            ],
+        }
+        d2 = {
+            "data_sections": [
+                {
+                    "data": {
+                        "curves": [np.array([1.0, 2.0]), np.array([3.0, 4.0])],
+                    },
+                    "name": "S1",
+                    "curves_order": [],
+                },
+            ],
+        }
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_data_sections_nested_dict_val1_not_list(self) -> None:
+        """Data section: val1 is ndarray but val2 is list → type mismatch."""
+        d1 = {
+            "data_sections": [
+                {
+                    "data": {
+                        "values": np.array([1.0, 2.0]),
+                    },
+                    "name": "S1",
+                    "curves_order": [],
+                },
+            ],
+        }
+        d2 = {
+            "data_sections": [
+                {
+                    "data": {
+                        "values": [np.array([1.0, 2.0])],
+                    },
+                    "name": "S1",
+                    "curves_order": [],
+                },
+            ],
+        }
+        assert compare_las_dicts(d1, d2) is False
+
+    def test_data_sections_nested_dict_list_with_nan(self) -> None:
+        """Data section list-of-arrays with NaN values matches."""
+        d1 = {
+            "data_sections": [
+                {
+                    "data": {
+                        "readings": [np.array([np.nan, 2.0, 3.0])],
+                    },
+                    "name": "S1",
+                    "curves_order": [],
+                },
+            ],
+        }
+        d2 = {
+            "data_sections": [
+                {
+                    "data": {
+                        "readings": [np.array([np.nan, 2.0, 3.0])],
+                    },
+                    "name": "S1",
+                    "curves_order": [],
+                },
+            ],
+        }
+        assert compare_las_dicts(d1, d2) is True
+
+
+class TestCompareListsDirect:
+    """Direct tests for _compare_lists() (compare.py:374-432).
+
+    _compare_lists had zero test coverage before M-01. These tests
+    exercise it directly with edge cases including empty lists,
+    single elements, nested lists, and numpy arrays in lists.
+    """
+
+    def test_empty_lists_match(self) -> None:
+        """Two empty lists are equal."""
+        assert _compare_lists([], [], "test", 1e-7, 0.0) is True
+
+    def test_single_element_lists_match(self) -> None:
+        """Single-element lists with identical scalars match."""
+        assert _compare_lists([1], [1], "test", 1e-7, 0.0) is True
+
+    def test_different_lengths(self) -> None:
+        """Lists of different lengths return False."""
+        assert _compare_lists([1, 2], [1], "test", 1e-7, 0.0) is False
+
+    def test_identical_list_of_arrays(self) -> None:
+        """Lists containing identical numpy arrays match."""
+        assert _compare_lists(
+            [np.array([1.0, 2.0]), np.array([3.0, 4.0])],
+            [np.array([1.0, 2.0]), np.array([3.0, 4.0])],
+            "test",
+            1e-7,
+            0.0,
+        ) is True
+
+    def test_different_arrays_in_list(self) -> None:
+        """Lists containing different numpy arrays return False."""
+        assert _compare_lists(
+            [np.array([1.0, 2.0]), np.array([3.0, 4.0])],
+            [np.array([1.0, 2.0]), np.array([3.0, 5.0])],
+            "test",
+            1e-7,
+            0.0,
+        ) is False
+
+    def test_nested_list_of_arrays(self) -> None:
+        """Nested lists containing numpy arrays match correctly."""
+        # _compare_lists dispatches per-element via _compare_values
+        # which handles ndarray elements via _compare_arrays
+        assert _compare_lists(
+            [np.array([1.0, 2.0])],
+            [np.array([1.0, 2.0])],
+            "test",
+            1e-7,
+            0.0,
+        ) is True
+
+    def test_nested_list_of_arrays_mismatch(self) -> None:
+        """Nested lists with different arrays return False."""
+        assert _compare_lists(
+            [np.array([1.0, 2.0])],
+            [np.array([9.0, 10.0])],
+            "test",
+            1e-7,
+            0.0,
+        ) is False
+
+    def test_list_of_arrays_within_tolerance(self) -> None:
+        """List of arrays matches within floating-point tolerance."""
+        assert _compare_lists(
+            [np.array([1.0, 2.0])],
+            [np.array([1.0, 2.0 + 1e-12])],
+            "test",
+            1e-7,
+            0.0,
+        ) is True
+
+    def test_list_scalar_elements(self) -> None:
+        """Lists of scalars match via _compare_values fallthrough."""
+        assert _compare_lists(
+            ["a", "b", "c"],
+            ["a", "b", "c"],
+            "test",
+            1e-7,
+            0.0,
+        ) is True
+
+    def test_list_scalar_elements_mismatch(self) -> None:
+        """Lists of scalars with different values return False."""
+        assert _compare_lists(
+            ["a", "b", "c"],
+            ["a", "x", "c"],
+            "test",
+            1e-7,
+            0.0,
+        ) is False
+
+    def test_list_with_nan_values(self) -> None:
+        """Lists containing NaN float values match when identical."""
+        assert _compare_lists(
+            [np.nan, 2.0],
+            [np.nan, 2.0],
+            "test",
+            1e-7,
+            0.0,
+        ) is True
+
+    def test_mixed_types_in_list(self) -> None:
+        """Lists with mixed scalar types match."""
+        assert _compare_lists(
+            [1, "hello", 3.14],
+            [1, "hello", 3.14],
+            "test",
+            1e-7,
+            0.0,
+        ) is True
+
+    def test_empty_vs_nonempty_list(self) -> None:
+        """Empty list vs non-empty list returns False."""
+        assert _compare_lists(
+            [], [np.array([1.0])], "test", 1e-7, 0.0
+        ) is False
+
+    def test_large_list_of_arrays(self) -> None:
+        """Larger lists of arrays with many elements match."""
+        arrays1 = [np.array([float(i), float(i + 1)]) for i in range(10)]
+        arrays2 = [np.array([float(i), float(i + 1)]) for i in range(10)]
+        assert _compare_lists(arrays1, arrays2, "test", 1e-7, 0.0) is True

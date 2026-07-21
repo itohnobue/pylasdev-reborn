@@ -93,7 +93,7 @@ def _normalize_dev_column(name: str) -> str:
     Returns:
         Canonical column name if an alias exists, otherwise the original.
     """
-    return _DEV_ALIASES.get(name.strip().upper(), name)
+    return _DEV_ALIASES.get(name.strip().upper(), name.strip().upper())
 
 
 def _deduplicate_string_list(
@@ -750,6 +750,29 @@ def _validate_dev_data(
                     stacklevel=_stacklevel,
                 )
 
+            # --- 4 (F-34). Check for negative MD values ---
+            neg_md = finite_md < 0
+            if np.any(neg_md):
+                n_neg = int(np.sum(neg_md))
+                neg_vals = finite_md[neg_md][:3]
+                warnings.warn(
+                    f"Found {n_neg} negative MD value(s): "
+                    f"{', '.join(str(v) for v in neg_vals)}"
+                    f"{'...' if n_neg > 3 else ''}. "
+                    f"Negative measured depth values are physically "
+                    f"impossible in normal well logging.",
+                    stacklevel=_stacklevel,
+                )
+
+    else:
+        warnings.warn(
+            "MD column not found in DEV data — validation of MD "
+            "monotonicity, NaN density, and repeated stations will be "
+            "skipped. Column names found: "
+            f"{list(dev.columns.keys()) if dev.columns else '(none)'}.",
+            stacklevel=_stacklevel,
+        )
+
     # --- 4. Check azimuth range [0, 360] ---
     _azi_names = ("AZI", "AZIM", "AZ", "AZM", "AZIMUTH")
     for azi_name in _azi_names:
@@ -1038,7 +1061,7 @@ def read_dev_file_as_object(
         detected_encoding, content = read_with_encoding(file_path, encoding, max_file_size)
     except OSError as e:
         raise DEVReadError(f"Cannot read file (I/O error): {file_path}") from e
-    except (ValueError, LookupError) as e:
+    except (ValueError, LookupError, LASEncodingError) as e:
         raise DEVReadError(
             f"Cannot read file (size exceeded or invalid parameter): {file_path}"
         ) from e
@@ -1122,6 +1145,16 @@ def read_dev_file_as_object(
                 tab_tokens = hdr.split("\t")
                 if len(tab_tokens) >= 2:
                     delimiter = "\t"
+                elif len(comma_tokens) >= len(space_tokens) and len(comma_tokens) >= 2:
+                    delimiter = ","
+                else:
+                    delimiter = " "
+            elif ";" in hdr:
+                # Semicolon-delimited file: use semicolon if it yields
+                # more tokens than comma splitting (F-30).
+                semicolon_tokens = [t for t in hdr.split(";", maxsplit=_max_tokens) if t.strip()]
+                if len(semicolon_tokens) > len(comma_tokens) and len(semicolon_tokens) >= 2:
+                    delimiter = ";"
                 elif len(comma_tokens) >= len(space_tokens) and len(comma_tokens) >= 2:
                     delimiter = ","
                 else:

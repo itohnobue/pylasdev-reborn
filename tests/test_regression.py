@@ -605,3 +605,124 @@ class TestR8_009SectionTypeNone:
         temp_file = tmp_path / "empty_section_type.las"
         write_las_file(temp_file, las)  # Must not crash
         assert temp_file.exists()
+
+
+# ──────────────────────────────────────────────────────────────
+# M-10 (writer, MEDIUM): version.dlm preserved after write.
+# ──────────────────────────────────────────────────────────────
+
+class TestM10DlmPreservation:
+    """M-10: Writer preserves version.dlm after write_las_file returns.
+
+    The writer temporarily mutates DLM to SPACE for LAS 1.2 output
+    (since LAS 1.2 only supports SPACE delimiter per spec), then
+    restores the original DLM in the finally block (writer.py:893→1228).
+    For LAS 2.0 and 3.0, no DLM mutation occurs — the original value
+    is preserved unchanged.
+
+    Equivalent WRAP preservation is tested in TestG018WrapPreservation."""
+
+    def test_las12_dlm_comma_restored_after_write(self, tmp_path: Path) -> None:
+        """M-10: LAS 1.2 with DLM=COMMA restored after write.
+
+        The writer temporarily mutates DLM to SPACE for LAS 1.2 data
+        output (the spec only supports SPACE), then restores the
+        original value in the finally block."""
+        las = LASFile()
+        las.version = VersionSection(vers="1.2", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0, 101.0])
+
+        temp_file = tmp_path / "las12_dlm_comma.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(temp_file, las)
+
+        assert las.version.dlm == "COMMA", (
+            f"Expected version.dlm='COMMA' after write (restored), "
+            f"got dlm={las.version.dlm!r}"
+        )
+
+    def test_las12_dlm_space_unchanged_after_write(self, tmp_path: Path) -> None:
+        """M-10: LAS 1.2 with DLM=SPACE unchanged after write.
+
+        No temporary mutation needed — DLM is already SPACE to begin with."""
+        las = LASFile()
+        las.version = VersionSection(vers="1.2", wrap="NO", dlm="SPACE")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        temp_file = tmp_path / "las12_dlm_space.las"
+        write_las_file(temp_file, las)
+        assert las.version.dlm == "SPACE", (
+            f"Expected version.dlm='SPACE' after write (unchanged), "
+            f"got dlm={las.version.dlm!r}"
+        )
+
+    def test_las20_dlm_comma_preserved_after_write(self, tmp_path: Path) -> None:
+        """M-10: LAS 2.0 with DLM=COMMA preserved after write.
+
+        LAS 2.0 supports COMMA; no temporary DLM mutation occurs.
+        WRAP may be overridden (YES→NO) but DLM remains COMMA."""
+        las = LASFile()
+        las.version = VersionSection(vers="2.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        temp_file = tmp_path / "las20_dlm_comma.las"
+        write_las_file(temp_file, las)
+        assert las.version.dlm == "COMMA", (
+            f"Expected version.dlm='COMMA' after write, "
+            f"got dlm={las.version.dlm!r}"
+        )
+
+    def test_las30_dlm_comma_preserved_after_write(self, tmp_path: Path) -> None:
+        """M-10: LAS 3.0 with DLM=COMMA preserved after write.
+
+        LAS 3.0 supports COMMA; no temporary DLM mutation occurs."""
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        temp_file = tmp_path / "las30_dlm_comma.las"
+        write_las_file(temp_file, las)
+        assert las.version.dlm == "COMMA", (
+            f"Expected version.dlm='COMMA' after write, "
+            f"got dlm={las.version.dlm!r}"
+        )
+
+    def test_dlm_not_permanently_mutated_to_space(self, tmp_path: Path) -> None:
+        """M-10: DLM is NOT permanently mutated to SPACE after writing.
+
+        LAS 1.2 with DLM=COMMA writes SPACE-delimited output (per spec)
+        but restores the original DLM.  This test explicitly asserts
+        that the model is not left with a mutated DLM value."""
+        las = LASFile()
+        las.version = VersionSection(vers="1.2", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0, 101.0])
+
+        temp_file = tmp_path / "las12_not_mutated.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(temp_file, las)
+
+        assert las.version.dlm != "SPACE", (
+            "Expected version.dlm to NOT be 'SPACE' after write — "
+            "it was permanently mutated to SPACE"
+        )
+        assert las.version.dlm == "COMMA", (
+            f"Expected version.dlm='COMMA' (restored), "
+            f"got dlm={las.version.dlm!r}"
+        )

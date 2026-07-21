@@ -512,6 +512,11 @@ class LASParser:
         # to prevent multi-section files from exhausting memory when
         # each individual section passes the per-section bound.
         self._cumulative_elements: int = 0
+        # F-09: Cumulative cross-section raw data line counter — tracks
+        # total lines across ALL sections to catch multi-section files
+        # where each individual section passes per-section bounds.
+        self._cumulative_data_lines: int = 0
+        self._cumulative_data_lines_warned: bool = False
         self._version_found = False  # flag for required ~V section validation
         # F-3: Accumulate other-section lines in a list to avoid O(n^2)
         # string concatenation (self.las_file.other += ... per line).
@@ -695,6 +700,12 @@ class LASParser:
                 "LAS 1.2/2.0 processing paths.",
                 len(self.las_file.data_sections),
             )
+
+        # F-07: Re-run validations skipped during incremental construction.
+        # The parser populates curves_order and curves after __post_init__,
+        # so index-curve validation (and other __post_init__ guards) never
+        # saw the fully-populated state.  validate() re-checks now.
+        self.las_file.validate()
 
         return self.las_file
 
@@ -893,11 +904,11 @@ class LASParser:
                 section_name = section_rest or ""
                 # F-05: ~Other is DEPRECATED and NOT ALLOWED in LAS 3.0.
                 if self.las_file.version.is_las30:
-                    logger.warning(
-                        "~Other section at line '%s' — ~Other is deprecated "
-                        "in LAS 3.0. Content is preserved but should be "
-                        "migrated to user-defined Parameter or Column Data sections.",
-                        line[:80].strip(),
+                    _other_line = line[:80].strip()
+                    raise LASParseError(
+                        f"~Other section at line '{_other_line}' — ~Other is "
+                        f"NOT ALLOWED in LAS 3.0.  Migrate content to "
+                        f"user-defined Parameter or Column Data sections."
                     )
             elif (
                 section_word in _DATA_SECTION_WORDS
@@ -2228,6 +2239,15 @@ class LASParser:
                     try:
                         _validate_curve_data_format(param_data_format, raw_mnemonic)
                     except LASParseError:
+                        warnings.warn(
+                            f"Parameter '{raw_mnemonic}' has unrecognized data "
+                            f"format specifier '{{{param_data_format}}}'. "
+                            f"Valid LAS data format codes are single-letter "
+                            f"F, E, D, S, A or Fortran-style F8.3/E10.2. "
+                            f"Clearing to empty string.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
                         param_data_format = ""  # Not a valid data format — clear to prevent accumulation
                     else:
                         param_data_format = param_data_format[0]
@@ -2415,6 +2435,22 @@ class LASParser:
                 f"The file may be malformed or corrupt."
             )
         self._ascii_data_lines.append(line)
+        # F-09: Cumulative cross-section data line counter — defense-in-depth
+        # against multi-section files where each section passes the per-section
+        # MAX_DATA_LINES bound individually.
+        self._cumulative_data_lines += 1
+        if (
+            self._cumulative_data_lines > _data_reader.MAX_DATA_LINES * 10
+            and not self._cumulative_data_lines_warned
+        ):
+            self._cumulative_data_lines_warned = True
+            warnings.warn(
+                f"Cumulative data line count ({self._cumulative_data_lines}) "
+                f"across {self._current_data_section_idx + 1} sections "
+                f"is unusually high.  The file may be malformed or corrupt.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     def _deduplicate_curves(
         self, section_curves: list[CurveDefinition], is_first_section: bool
@@ -2823,6 +2859,10 @@ class LASParser:
         extra_count = 0  # I2-XPD-03: Row-count accumulator for extra columns
         short_count = 0  # I2-XPD-03: Row-count accumulator for short rows
         _fc = [0]  # F-002: Mutable counter for float conversion diagnostics
+        # F-39, F-40, I2-F-03: Desanitize reversal warning dedup flags.
+        _desan_warned_ws = False   # whitespace→underscore (F-39)
+        _desan_warned_tab = False  # tab→space (F-40)
+        _desan_warned_empty = False  # empty→"-" (I2-F-03)
         for line in self._ascii_data_lines:
             # Skip comment lines and blank/whitespace-only lines.
             # F-32: EMPTY_PATTERN was defined at module level but never
@@ -2886,6 +2926,42 @@ class LASParser:
                 # F-007: Reverse the writer's _sanitize_las_value #-prefix escape
                 val_str = _desanitize_las_value(val_str)
                 if string_curves.get(i, False):
+                    # F-39, F-40, I2-F-03: Desanitize reversal warnings for
+                    # writer-side one-way sanitization transformations.  Each
+                    # transformation is lossy (original form cannot be
+                    # recovered), so we warn rather than blindly convert.
+                    # Warnings are per-section deduplicated to avoid log spam.
+                    if delimiter == " " and "_" in val_str and not _desan_warned_ws:
+                        _desan_warned_ws = True
+                        warnings.warn(
+                            "String curve data contains underscore "
+                            "characters with SPACE delimiter. Original "
+                            "whitespace characters may have been replaced "
+                            "with underscores by the writer. Roundtrip "
+                            "fidelity may be lost.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                    if "  " in val_str and not _desan_warned_tab:
+                        _desan_warned_tab = True
+                        warnings.warn(
+                            "String curve data contains consecutive spaces. "
+                            "Original tab characters may have been replaced "
+                            "with spaces by the writer. Roundtrip fidelity "
+                            "may be lost.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                    if delimiter == " " and val_str == "-" and not _desan_warned_empty:
+                        _desan_warned_empty = True
+                        warnings.warn(
+                            "String curve data contains '-' value with SPACE "
+                            "delimiter. This may be an originally-empty "
+                            "string value replaced by the writer sentinel. "
+                            "Roundtrip fidelity may be lost.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
                     string_data_lists[i].append(val_str)
                 else:
                     val = _to_finite_float(val_str, null_value, _failure_counter=_fc)

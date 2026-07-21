@@ -967,15 +967,20 @@ def _read_wrapped(
     # Combined bound: protect against combination attacks.
     # In wrapped mode each depth step spans ~curve_count lines
     # (1 depth + curve_count-1 data values).  Estimate depth steps
-    # conservatively from total line count — the alternative heuristic
-    # of counting single-value lines overcounts depth steps when curve
-    # values legitimately appear one per line, causing false rejection.
+    # from total line count using the known curve_count.  The
+    # alternative heuristic of counting single-value lines (or using
+    # ceil(_count/2)) overcounts depth steps when curve values
+    # legitimately appear one per line, causing false rejection.
     if curve_count > 0:
         # F-54-upgrade: Use math.ceil instead of integer division to avoid
         # undercounting depth steps in wrapped mode.  Integer division
         # _count // curve_count can undercount by up to curve_count-1
         # steps, allowing malicious files to bypass the resource guard.
-        depth_steps = max(1, math.ceil(_count / curve_count), math.ceil(_count / 2))
+        # F-37: Removed overly aggressive ceil(_count/2) which over-estimates
+        # by up to curve_count/2x for files with many curves, falsely
+        # rejecting valid wrapped files.  ceil(_count/curve_count) is the
+        # accurate estimate per depth step in wrapped mode.
+        depth_steps = max(1, math.ceil(_count / curve_count))
         if curve_count * depth_steps > MAX_TOTAL_ELEMENTS:
             raise LASParseError(
                 f"Total allocation ({curve_count} curves x ~{depth_steps} depth steps ≈ "

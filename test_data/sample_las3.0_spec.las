@@ -216,7 +216,6 @@ DEVI.DEG                                : Borehole Deviation    {F}
  551.20,554.90,12,BIG HOLE
  575.00,595.00,12,BIG HOLE
 
-~OTHER
 #     Note: The logging tools became stuck at 625 meters causing the data 
 #     between 625 meters and 615 meters to be invalid.
 

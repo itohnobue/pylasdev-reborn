@@ -55,9 +55,13 @@ _CONTROL_CHARS_RE = re.compile(
 # and the replacement \1 strips both the whitespace and tilde.
 _LEADING_SECTION_RE = re.compile(r"^\s*~([A-Za-z])")
 
-# LAS 1.2 spec mandates a maximum line length of 256 characters.
-# LAS 2.0+ has no line-length limit.  We warn when LAS 1.2 data rows
-# exceed this limit but do NOT truncate (truncation would cause data loss).
+# The 256-character line-length limit applies to:
+#   - LAS 1.2 (all modes) per the LAS 1.2 specification.
+#   - LAS 2.0 WRAP=NO per the CWLS specification.
+# LAS 2.0 WRAP=YES has no line-length limit (lines are joined).
+# LAS 3.0 mandates one data row per line with no explicit length limit.
+# We warn when data rows exceed this limit but do NOT truncate
+# (truncation would cause data loss).
 MAX_LINE_LENGTH_LAS12: int = 256
 
 
@@ -85,10 +89,21 @@ def _sanitize_las_value(value: str) -> str:
         .replace("\u2029", " ")
         .replace("\x85", " ")
     )
-    # F2-005: Replace tab characters with spaces.  While tab is valid
+    # F-40 (F2-005): Replace tab characters with spaces.  While tab is valid
     # LAS whitespace between fields, a tab inside an identifier or
     # value causes mis-tokenization on re-read (str.split() treats
     # tab as a field separator, corrupting the parsed structure).
+    #
+    # WRITER->PARSER CONTRACT: Tab->space is a permanently one-way
+    # sanitization - the parser cannot distinguish a space that was
+    # originally a tab from a space that was originally a space.
+    # PARSER FIX NEEDED (in _desanitize_las_value, parser.py):
+    #   Exact reversal is inherently ambiguous, but for roundtrip
+    #   best-effort, add a sentinel-based encoding:
+    #   - Writer: replace "\t" with "_TAB_" (reversible sentinel)
+    #   - Parser: replace "_TAB_" back to "\t"
+    #   OR: Accept this as a documented one-way transformation
+    #   when using SPACE or TAB delimiter for string curve data.
     value = value.replace("\t", " ")
     # Strip control characters
     value = _CONTROL_CHARS_RE.sub("", value)
@@ -376,10 +391,11 @@ def _write_version_section(las_file: LASFile) -> list[str]:
             stacklevel=3,
         )
         actual_wrap = "NO"
-        # F-ITER2-W-M08: Write back to the model so the in-memory
-        # LASFile agrees with the file on disk.  Without this, a
-        # subsequent write or to_dict() would still report WRAP=YES.
-        las_file.version.wrap = "NO"
+        # F-03-H: WRAP mutation moved to _write_ascii_sections
+        # (after save, inside try/finally) to prevent model corruption
+        # if content generation fails between _write_version_section
+        # and the restore point.  The header line above correctly emits
+        # WRAP=NO via the local actual_wrap variable.
     # F-M-027: LAS 3.0 requires one data row per line (non-wrapped output).
     # Force WRAP=NO regardless of user-supplied wrap parameter to prevent
     # data rows from being joined inline, which would produce a single
@@ -394,7 +410,7 @@ def _write_version_section(las_file: LASFile) -> list[str]:
             stacklevel=3,
         )
         actual_wrap = "NO"
-        las_file.version.wrap = "NO"
+        # F-03-H: WRAP mutation moved to _write_ascii_sections.
     wrap_desc = (
         "ONE LINE PER DEPTH STEP" if actual_wrap == "NO" else "MULTIPLE LINES PER DEPTH STEP"
     )
@@ -864,6 +880,18 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
     is_las12 = las_file.version.vers.startswith("1.")
     import warnings  # consolidated — shared by all warning paths below
 
+    # F-28: LAS 2.0 WRAP=NO also has the 256-char line-length limit per
+    # the CWLS specification.  Extend the line-length check to cover both
+    # LAS 1.2 (all modes) and LAS 2.0 with WRAP=NO.
+    is_las20 = las_file.version.vers.startswith("2.")
+    _wrap = (las_file.version.wrap or "NO").upper()
+    check_line_limit = is_las12 or (is_las20 and _wrap == "NO")
+
+    # F-02-H: Save original DLM before the LAS 1.2 SPACE-override
+    # mutation below.  Restored in the finally block so the caller's
+    # LASFile DLM is unchanged after writing.
+    _saved_dlm = las_file.version.dlm
+
     # F-04: LAS 1.2 only supports SPACE delimiter per spec.  The header
     # correctly suppresses non-SPACE DLM emission for LAS 1.2 (see
     # _write_version_section L172-176) but data rows used the non-SPACE
@@ -890,7 +918,23 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
     _saved_string_data = dict(las_file.string_data)
     _saved_curves_order = list(las_file.curves_order)
     _saved_curves = list(las_file.curves)
-    _saved_wrap = las_file.version.wrap
+
+    # F-03-H (G-018): Mutate WRAP for model-disk consistency.  The writer
+    # always produces WRAP=NO output regardless of input wrap value.
+    # _write_version_section already emitted the correct WRAP=NO header
+    # line; this mutation syncs the in-memory model with what was written
+    # to disk.  Unlike DLM (restored in finally because the SPACE override
+    # is a writer-internal FORCE), WRAP is NOT restored — the model must
+    # honestly reflect the actual disk state, per F2-26 / G-018.
+    _actual_wrap = (las_file.version.wrap or "NO").upper()
+    if _actual_wrap == "YES" or (is_las30 and _actual_wrap != "NO"):
+        las_file.version.wrap = "NO"
+
+    # F-28 / M-06: Recompute line-limit check AFTER WRAP mutation.
+    # LAS 2.0 WRAP=YES input is forced to WRAP=NO output above, but
+    # check_line_limit was computed from the PRE-MUTATION _wrap value.
+    # The 256-char line-limit warning must use the actual output state.
+    check_line_limit = is_las12 or (is_las20 and (las_file.version.wrap or "NO").upper() == "NO")
 
     try:
         # F-I2-M17 / F-019: Guard against data_sections in non-LAS-3.0 files.
@@ -1145,7 +1189,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
                         null_value,
                         delimiter,
                         precision,
-                        is_las12=is_las12,
+                        is_las12=check_line_limit,
                     )
                 )
         else:
@@ -1172,7 +1216,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
                         null_value,
                         delimiter,
                         precision,
-                        is_las12=is_las12,
+                        is_las12=check_line_limit,
                     )
                 )
 
@@ -1181,11 +1225,13 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
         # The save above captured the pre-mutation values of las_file.logs,
         # string_data, curves_order, and curves.  Restoring them ensures the
         # caller's LASFile is unchanged regardless of which write path executed.
+        # WRAP is intentionally NOT restored — the model must honestly reflect
+        # the actual WRAP=NO state written to disk (F2-26 / G-018 / H-01).
         las_file.logs = _saved_logs
         las_file.string_data = _saved_string_data
         las_file.curves_order = _saved_curves_order
         las_file.curves = _saved_curves
-        las_file.version.wrap = _saved_wrap
+        las_file.version.dlm = _saved_dlm
 
     return lines
 
@@ -1193,7 +1239,7 @@ def _write_ascii_sections(las_file: LASFile, precision: str = ".8g") -> list[str
 def _format_data_rows(
     curve_names: list[str],
     data: dict[str, NDArray[np.float64]],
-    string_data: dict[str, NDArray[np.str_]],
+    string_data: dict[str, NDArray[np.object_]],
     null_value: float,
     delimiter: str,
     precision: str = ".8g",
@@ -1205,9 +1251,9 @@ def _format_data_rows(
     String curves are emitted as-is; numeric curves use configurable formatting.
     Missing values are filled with the null_value. NaN values are output as null.
 
-    When *is_las12* is True, warns if any data row exceeds the LAS 1.2
-    256-character line limit.  Lines are NOT truncated — truncation would
-    cause data loss.
+    When *is_las12* is True, warns if any data row exceeds the 256-character
+    line limit (applies to LAS 1.2 and LAS 2.0 WRAP=NO per CWLS spec).
+    Lines are NOT truncated — truncation would cause data loss.
     """
     lines: list[str] = []
     if not curve_names:
@@ -1215,7 +1261,7 @@ def _format_data_rows(
 
     # Pre-extract curve data arrays to avoid O(rows x curves) dict lookups
     # inside the inner loop (F-23 performance optimization).
-    curve_arrays: list[tuple[NDArray[np.float64] | NDArray[np.str_] | None, bool]] = []
+    curve_arrays: list[tuple[NDArray[np.float64] | NDArray[np.object_] | None, bool]] = []
     for name in curve_names:
         if name in string_data:
             curve_arrays.append((string_data[name], True))
@@ -1277,11 +1323,28 @@ def _format_data_rows(
                                 stacklevel=4,
                             )
                         warned_delim_str = True
-                        # F-I2-XWP-04: Whitespace→underscore replacement is
-                        # permanently one-way — the parser has no mechanism to
+                        # F-39 (F-I2-XWP-04): Whitespace->underscore replacement
+                        # for SPACE-delimiter string data.  re.sub(r"\s", "_", val)
+                        # replaces all Unicode whitespace with underscores to
+                        # prevent column misalignment on re-read (str.split()
+                        # would split on the whitespace, creating phantom fields).
+                        #
+                        # WRITER->PARSER CONTRACT: Whitespace->underscore is
+                        # permanently one-way - the parser has no mechanism to
                         # recover the original whitespace characters from
-                        # underscores.  Full roundtrip fidelity requires
-                        # parser-side _desanitize reversal.
+                        # underscores.  An underscore in the output may be an
+                        # original underscore or originally whitespace.
+                        # PARSER FIX NEEDED (in _desanitize_las_value, parser.py):
+                        #   Exact reversal is inherently ambiguous, but for
+                        #   roundtrip best-effort, add a sentinel-based encoding:
+                        #   - Writer: replace each whitespace char with a
+                        #     reversible sentinel (e.g., spaces -> "_S_",
+                        #     non-breaking spaces -> "_N_", tabs -> "_T_")
+                        #     instead of the blanket re.sub(r"\s", "_", val).
+                        #   - Parser: reverse each sentinel back to its
+                        #     original whitespace character.
+                        #   OR: Accept this as a documented one-way
+                        #   transformation when using SPACE delimiter.
                         val = re.sub(r"\s", "_", val)
                 elif raw_has_delim:
                     # COMMA or TAB delimiter: the delimiter character itself
@@ -1308,16 +1371,24 @@ def _format_data_rows(
                         warned_delim_str = True
                     replacement = ";" if delimiter == "," else " "
                     val = val.replace(delimiter, replacement)
-                # F-21: Empty string after sanitization causes column misalignment
-                # with SPACE delimiter.  " ".join(["a", "", "b"]) produces "a  b"
-                # (two consecutive spaces).  On re-read, str.split() collapses to
-                # ["a", "b"] — one column permanently lost.  Replace with "-"
-                # (traditional LAS placeholder for missing data).  COMMA/TAB
-                # delimiters are unaffected — empty fields survive split(",").
-                # F-I2-XWP-03: The "-" sentinel is a permanently one-way
-                # transformation — the parser cannot distinguish an original
-                # "-" value from an originally-empty one.  Full roundtrip
-                # fidelity requires parser-side _desanitize reversal.
+                # I2-F-03 (F-21/F-I2-XWP-03): Empty string after sanitization
+                # causes column misalignment with SPACE delimiter.
+                # " ".join(["a", "", "b"]) produces "a  b" (two consecutive
+                # spaces).  On re-read, str.split() collapses to ["a", "b"] -
+                # one column permanently lost.  Replace with "-" (traditional
+                # LAS placeholder for missing data).  COMMA/TAB delimiters
+                # are unaffected - empty fields survive split(",").
+                #
+                # WRITER->PARSER CONTRACT: The "-" sentinel is a permanently
+                # one-way transformation - the parser cannot distinguish an
+                # original "-" value from an originally-empty one.
+                # PARSER FIX NEEDED (in _desanitize_las_value, parser.py):
+                #   - When delimiter is SPACE and the parsed value is
+                #     exactly "-", restore it to the empty string "".
+                #   - This will incorrectly convert genuinely "-" values
+                #     to empty strings (inherent ambiguity).
+                #   - Alternative: use a more distinctive sentinel that
+                #     is less likely to be real data, e.g., "_EMPTY_".
                 if not val and delimiter == " ":
                     if not warned_empty_str:
                         import warnings
@@ -1344,7 +1415,7 @@ def _format_data_rows(
                 import warnings
 
                 warnings.warn(
-                    f"Data line exceeds LAS 1.2 256-character limit "
+                    f"Data line exceeds 256-character limit "
                     f"(length: {len(line)}).  Lines are NOT truncated "
                     f"to avoid data loss.  Subsequent violations in this "
                     f"section will not be reported.",

@@ -48,7 +48,11 @@ def _scalars_equal(a: Any, b: Any) -> bool:
             return True
     try:
         return bool(a == b)
-    except Exception:
+    except (TypeError, ValueError):
+        # numpy arrays that pass the size guards can still raise
+        # ValueError ("ambiguous truth value") or TypeError on
+        # incompatible type comparisons.  Do not swallow other
+        # exceptions (KeyboardInterrupt, MemoryError, etc.).
         return False
 
 
@@ -159,6 +163,28 @@ def compare_las_dicts(
                             return False
                         if not compare_las_dicts(
                             val1[in_key], val2[in_key], rtol, atol
+                        ):
+                            return False
+                    elif isinstance(val2[in_key], list):
+                        # F-01-H: Handle list-of-arrays in nested dict
+                        # values. Without this branch, both values fall
+                        # through to _scalars_equal which raises ValueError
+                        # on list equality with ndarray values (ambiguous
+                        # truth value), returning False for identical data.
+                        if not isinstance(val1[in_key], list):
+                            logger.warning(
+                                "Type mismatch at '%s.%s': %s vs list",
+                                key,
+                                in_key,
+                                type(val1[in_key]).__name__,
+                            )
+                            return False
+                        if not _compare_lists(
+                            val1[in_key],
+                            val2[in_key],
+                            f"{key}.{in_key}",
+                            rtol,
+                            atol,
                         ):
                             return False
                     elif not _scalars_equal(val1[in_key], val2[in_key]):
@@ -542,6 +568,31 @@ def _compare_data_sections(
                             return False
                         if not compare_las_dicts(
                             v1[in_key], v2[in_key], rtol, atol
+                        ):
+                            return False
+                    elif isinstance(v2[in_key], list):
+                        # F-43: Handle list-of-arrays in nested dict
+                        # values (data_sections path). Same structural
+                        # gap as F-01-H — without this branch, both
+                        # values fall through to _scalars_equal which
+                        # raises ValueError on list equality with
+                        # ndarray values, returning False for identical
+                        # data.
+                        if not isinstance(v1[in_key], list):
+                            logger.warning(
+                                "Type mismatch at 'data_sections[%d].%s.%s': %s vs list",
+                                i,
+                                k,
+                                in_key,
+                                type(v1[in_key]).__name__,
+                            )
+                            return False
+                        if not _compare_lists(
+                            v1[in_key],
+                            v2[in_key],
+                            f"data_sections[{i}].{k}.{in_key}",
+                            rtol,
+                            atol,
                         ):
                             return False
                     elif not _scalars_equal(v1[in_key], v2[in_key]):

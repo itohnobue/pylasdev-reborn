@@ -717,8 +717,8 @@ class TestDugFormat:
 
         data = read_dev_file(test_file)
         # Third content line is all-numeric → not DUG → falls to simple
-        assert list(data.keys()) == ["Survey"]
-        assert len(data["Survey"]) == 2  # "3" and "0.0 0.0 0.0"
+        assert list(data.keys()) == ["SURVEY"]
+        assert len(data["SURVEY"]) == 2  # "3" and "0.0 0.0 0.0"
 
     def test_dug_format_with_ragged_data(self, tmp_path: Path) -> None:
         """DUG format with ragged data rows (fewer tokens than columns)."""
@@ -1310,12 +1310,12 @@ class TestExplicitDelimiterParameter:
 
         data = read_dev_file(test_file)
         # col_count=2, 3 tokens on second line, all float → fallback
-        # Column names are the float strings as-is
-        assert "1.0e2" in data
+        # Column names are normalized (uppercased via _normalize_column_name)
+        assert "1.0E2" in data
         assert "2.0E-1" in data
         assert "3.14159" in data
-        assert len(data["1.0e2"]) == 2
-        assert data["1.0e2"][0] == 100.0
+        assert len(data["1.0E2"]) == 2
+        assert data["1.0E2"][0] == 100.0
         assert data["2.0E-1"][0] == 200.0
         assert data["3.14159"][0] == 300.0
 
@@ -1722,14 +1722,13 @@ class TestValidateDevData:
     # ── edge cases (no warning expected) ─────────────────────────────
 
     def test_no_md_column_no_warning(self) -> None:
-        """No MD column → validation is a no-op (returns immediately)."""
+        """No MD column → warns about skipped validation but does not raise."""
         from pylasdev.dev_reader import _validate_dev_data
 
         dev = DevFile()
         dev.columns["TVD"] = np.array([0.0, 100.0])
         dev.columns["X"] = np.array([100.0, 101.0])
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
+        with pytest.warns(UserWarning, match="MD column not found"):
             _validate_dev_data(dev)
 
     def test_single_row_non_nan_no_warning(self) -> None:
