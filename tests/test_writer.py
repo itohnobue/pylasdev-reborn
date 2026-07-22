@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -2650,3 +2651,73 @@ class TestProductionCheckWriterFixes:
         # Also verify sensible inputs still work
         normal = _format_fixed_precision(3.14, ".4g")
         assert "3.14" in normal
+
+    # --- I2F-007: string_data-only curves included in curves_order ---
+
+    def test_string_data_only_curves_in_legacy_writer(self, tmp_path: Path) -> None:
+        """I2F-007: string_data-only curves appear in legacy (~A) writer output.
+
+        Before the fix, the merge guard at _writer_base.py:590 checked only
+        ``k in self._las_file.logs``, silently skipping curves that exist
+        only in ``string_data``.  After the fix, the condition also checks
+        ``k in self._las_file.string_data``.
+
+        The merge code (Path A in _write_ascii_legacy) handles data_sections
+        for LAS 1.2/2.0 files.  LAS 3.0 files use a separate writer path
+        (_write_ascii_las30) that is not affected by this fix.
+
+        We set data_sections after construction because models.py blocks
+        non-LAS-3.0 data_sections at init time (design choice).
+        We also set curves/curves_order pre-write because the ~C section
+        is written before the data_sections copy-back.
+        """
+        ds = DataSection(
+            name="ASCII",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "CONTINENT"],
+            data={"DEPT": np.array([100.0, 200.0], dtype=np.float64)},
+            string_data={"CONTINENT": np.array(["NA", "NA"], dtype=object)},
+            section_curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M"),
+                CurveDefinition(mnemonic="CONTINENT", unit=""),
+            ],
+        )
+        las = LASFile(version=VersionSection(vers="2.0"))
+        # Set data_sections post-construction to bypass __post_init__
+        # validation (which requires LAS 3.0 for data_sections).
+        las.data_sections = [ds]
+        # Set curves pre-write — the ~C section is written before the
+        # data_sections copy-back in _write_ascii_legacy.
+        las.curves = list(ds.section_curves)
+        las.curves_order = ["DEPT"]
+        # NOTE: curves_order has only DEPT initially — the fix at
+        # _writer_base.py:590 appends CONTINENT during the merge because
+        # it now checks string_data (not just logs).
+
+        temp_file = tmp_path / "string_data_only_output.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(temp_file, las)
+
+        content = temp_file.read_text(encoding="utf-8")
+
+        # Both curves must appear in the written ~A header line.
+        # LAS 2.0 legacy format doesn't support {S} string markers in
+        # ~C section, so "NA" values for CONTINENT won't roundtrip
+        # correctly on re-read.  The fix is verified by the presence
+        # of CONTINENT in the output content.
+        assert "DEPT" in content, (
+            "Numeric curve DEPT not found in writer output"
+        )
+        assert "CONTINENT" in content, (
+            "string_data-only curve CONTINENT not found in writer output — "
+            "I2F-007 fix not applied"
+        )
+        # Verify the ~A header line includes both curves
+        assert "~A" in content
+        # The ~A line should list DEPT and CONTINENT (space-separated)
+        a_line = [ln for ln in content.splitlines() if ln.startswith("~A")]
+        assert len(a_line) == 1, f"Expected one ~A line, found {len(a_line)}"
+        assert "CONTINENT" in a_line[0], (
+            f"CONTINENT missing from ~A header: {a_line[0]!r}"
+        )

@@ -318,12 +318,14 @@ def _detect_actual_wrap(lines: list[str], curve_count: int, delimiter: str = " "
                 continue
             if _is_ascii_section(stripped):
                 in_ascii = True
-            else:
-                # F-ITER2-D2-M05: Reset in_ascii on non-A section headers.
-                # Without this, _detect_actual_wrap would never exit an empty
-                # ~A section and would scan lines from subsequent sections
-                # (e.g. ~O) as wrap-detection input, producing false results.
-                in_ascii = False
+            elif in_ascii:
+                # F-048: Standardize section-detection guard with
+                # _iter_ascii_data_lines (uses return/break instead of
+                # just resetting in_ascii).  When we encounter a recognized
+                # non-~A section header while inside an ~A block, exit the
+                # loop — we've left the data section and no more data lines
+                # should be used for wrap detection.
+                break
             continue
 
         if not in_ascii or not stripped or stripped.startswith("#"):
@@ -882,22 +884,21 @@ def _read_wrapped(
                             f"values (total curves={curve_count}). File is "
                             f"irrecoverably misaligned."
                         )
-                    # Warn but continue: the padding logic at the end of
-                    # _read_wrapped will fill gaps with null_value.
-                    warnings.warn(
-                        f"Wrapped mode: previous depth line had extra values, "
-                        f"and this data line has only {len(values)} values but "
-                        f"{remaining_curves} non-depth curves still need values "
-                        f"(total curves={curve_count}). Recovery resets "
-                        f"depth-step alignment — curve values after this line "
-                        f"may shift by 1 column from expected positions. "
-                        f"Consider reloading with wrapped=False if the "
-                        f"original unwrapped file is available.",
-                        stacklevel=2,
+                    # Non-truly-pathological: data line has fewer values
+                    # than needed but the shift is ≤2 curves — recovery
+                    # would silently produce corrupt data (curve values
+                    # shifted by 1 depth step).  Hard-fail with a clear
+                    # diagnostic instead of producing corrupt output.
+                    raise LASParseError(
+                        f"Wrapped mode: unrecoverable data misalignment — "
+                        f"the previous depth line had extra values, and "
+                        f"this data line has only {len(values)} values "
+                        f"but {remaining_curves} non-depth curves still "
+                        f"need values (total curves={curve_count}). "
+                        f"Continuing would produce corrupt data.  Consider "
+                        f"reloading with wrapped=False if the original "
+                        f"unwrapped file is available."
                     )
-                    depth_had_extra = False  # This line handled the extra-values case
-                    depth_line = True
-                    counter = 0
 
             for i, val_str in enumerate(values):
                 counter += 1

@@ -584,10 +584,10 @@ class _WriterBase:
                 self._las_file.curves = list(_ds.section_curves)
 
             if (self._las_file.curves_order and _ds.curves_order
-                    and self._las_file.logs):
+                    and (self._las_file.logs or self._las_file.string_data)):
                 existing = set(self._las_file.curves_order)
                 for k in _ds.curves_order:
-                    if k in self._las_file.logs and k not in existing:
+                    if (k in self._las_file.logs or k in self._las_file.string_data) and k not in existing:
                         self._las_file.curves_order.append(k)
 
             if (

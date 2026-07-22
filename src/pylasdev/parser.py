@@ -31,7 +31,7 @@ from ._version_spec import _LASVersionSpec
 from .data_reader import (
     _parse_float_with_d_notation,
 )
-from .exceptions import LASParseError
+from .exceptions import LASDataError, LASParseError
 from .mnem_base import build_mnemonic_lookup
 from .models import (
     _VALID_DATA_FORMATS,
@@ -633,18 +633,32 @@ class LASParser:
         # Process collected ASCII data only for LAS 3.0
         # For LAS 1.2/2.0, data_reader handles ASCII data with proper wrap mode support
         if self.las_file.version.is_las30:
-            ctx = AsciiDataContext(
-                las_file=self.las_file,
-                ascii_data_lines=self._state.ascii_data_lines,
-                section_curve_start_idx=self._state.section_curve_start_idx,
-                section_curve_end_idx=self._state.section_curve_end_idx,
-                current_section_name=self._state.current_section_name,
-                current_data_section_type=self._state.current_data_section_type,
-                current_data_section_idx=self._state.current_data_section_idx,
-                cumulative_elements=self._state.cumulative_elements,
-            )
-            process_ascii_data(ctx)
-            self._state.cumulative_elements = ctx.cumulative_elements
+            # I2F-020: Only process data when there are accumulated lines.
+            # _flush_ascii_data() (L2470) applies the same guard — its
+            # finally-block cleanup (ascii_data_lines = [],
+            # current_data_section_idx += 1) only fires after actual
+            # processing, never for an empty section.
+            if self._state.ascii_data_lines:
+                ctx = AsciiDataContext(
+                    las_file=self.las_file,
+                    ascii_data_lines=self._state.ascii_data_lines,
+                    section_curve_start_idx=self._state.section_curve_start_idx,
+                    section_curve_end_idx=self._state.section_curve_end_idx,
+                    current_section_name=self._state.current_section_name,
+                    current_data_section_type=self._state.current_data_section_type,
+                    current_data_section_idx=self._state.current_data_section_idx,
+                    cumulative_elements=self._state.cumulative_elements,
+                )
+                try:
+                    process_ascii_data(ctx)
+                    self._state.cumulative_elements = ctx.cumulative_elements
+                finally:
+                    # Mirror _flush_ascii_data() L2495-2496: clear
+                    # accumulated lines and advance the section counter
+                    # so _check_data_section_idx_consistency does not
+                    # fire a false-positive "dangling data" warning.
+                    self._state.ascii_data_lines = []
+                    self._state.current_data_section_idx += 1
 
         # Validate mandatory well fields (STRT, STOP, STEP, NULL).
         # LAS 1.2 and 2.0 both require these fields; LAS 3.0 inherits the
@@ -709,11 +723,54 @@ class LASParser:
                 len(self.las_file.data_sections),
             )
 
-        # F-07: Re-run validations skipped during incremental construction.
-        # The parser populates curves_order and curves after __post_init__,
-        # so index-curve validation (and other __post_init__ guards) never
-        # saw the fully-populated state.  validate(complete=True) re-checks now.
-        self.las_file.validate(complete=True)
+        # F-07/F-036/F-037/F-039: Re-run validations skipped during
+        # incremental construction.  The parser populates curves_order
+        # and curves after __post_init__, so __post_init__ guards never
+        # saw the fully-populated state.
+        #
+        # F-037: We cannot safely re-invoke __post_init__() here
+        # because it is not idempotent for real-world files.  The
+        # duplicate-curve-name check (models.py:1608-1616) raises
+        # LASDataError for legitimate duplicate curves that the parser
+        # previously handled silently.  Instead, we replicate only the
+        # format-vs-placement check from __post_init__
+        # (models.py:1907-1930) — the check that raises for data-integrity
+        # issues — then capture validate(complete=True) return value
+        # and log all remaining warning-level issues.
+        #
+        # Format-vs-placement: string-format curves must be in string_data,
+        # not logs; numeric-format curves must be in logs, not string_data.
+        if self.las_file.curves and (self.las_file.logs or self.las_file.string_data):
+            _log_keys = set(self.las_file.logs.keys()) if self.las_file.logs else set()
+            _str_keys = set(self.las_file.string_data.keys()) if self.las_file.string_data else set()
+            for _sc in self.las_file.curves:
+                _df = _sc.data_format
+                _mnem = _sc.mnemonic
+                if not _df:
+                    continue
+                if _mnem in _log_keys and (
+                    _df == "S" or (_df == "A" and not _sc.is_array_element)
+                ):
+                    raise LASDataError(
+                        f"LASFile: curve '{_mnem}' has "
+                        f"data_format='{_df}' (string-format) but is "
+                        f"in logs (numeric).  String-format curves "
+                        f"must be in string_data."
+                    )
+                if _df not in ("S", "A") and _mnem in _str_keys:
+                    raise LASDataError(
+                        f"LASFile: curve '{_mnem}' has "
+                        f"data_format='{_df}' (numeric-format) but "
+                        f"is in string_data.  Numeric-format curves "
+                        f"must be in logs."
+                    )
+        # F-036/F-039: Capture validate(complete=True) return value and
+        # log each issue.  All remaining issues (STEP=0, NULL empty,
+        # STRT==STOP, DLM-on-LAS-1.2, cross-section consistency, etc.)
+        # are spec-compliance warnings — not data-integrity errors.
+        _complete_issues = self.las_file.validate(complete=True)
+        for _issue in _complete_issues:
+            logger.warning("LASFile validation issue: %s", _issue)
 
         # Cross-validate _ParserState against las_file.
         _state_issues = self._state.validate(self.las_file)
@@ -1101,6 +1158,22 @@ class LASParser:
             self._transition_handler.enter_new_section(
                 new_section, section_label, section_word, section_name
             )
+
+            # F-040: Pre-~V A→A transitions need distinct section indices.
+            # When bare ~A sections appear before ~V is parsed, each ~A
+            # section should receive a unique current_data_section_idx so
+            # that _replay_deferred_well can group deferred lines by
+            # (section_type, section_name, section_idx) without merging
+            # distinct sections that happen to share the same type and name.
+            # Post-~V sections are handled by _flush_ascii_data's finally
+            # block (line 2410); this only applies to pre-~V transitions.
+            if (
+                new_section == "A"
+                and captured.previous_section == "A"
+                and not captured.version_found
+            ):
+                self._state.current_data_section_idx += 1
+
             return
 
         if COMMENT_PATTERN.match(line) or EMPTY_PATTERN.match(line):
@@ -1722,12 +1795,23 @@ class LASParser:
                     ))
 
                 # Save current state before processing deferred groups.
+                # F-A2: Also save current_data_section_idx and
+                # cumulative_elements — they are mutated in the loop body
+                # (lines 1767, 1772) and must roll back on exception so
+                # the intermediate state is not observable.
                 saved_lines = self._state.ascii_data_lines
                 saved_curve_start = self._state.section_curve_start_idx
                 saved_curve_end = self._state.section_curve_end_idx
                 saved_section_type = self._state.current_data_section_type
                 saved_section_name = self._state.current_section_name
+                saved_data_section_idx = self._state.current_data_section_idx
+                saved_cumulative_elements = self._state.cumulative_elements
 
+                # F-A1: Track whether replay completed successfully.
+                # On exception, preserve the deferred buffer so the
+                # caller can diagnose what failed (permanent data-loss
+                # path when clear() was unconditional in finally).
+                replay_successful = False
                 try:
                     # Process each deferred group as its own DataSection.
                     for (section_type, _section_name, _section_idx), raw_lines, curve_start, curve_end in groups:
@@ -1770,6 +1854,7 @@ class LASParser:
                         # but with 2+ deferred groups the counter must
                         # increment once per group, not once total.
                         self._state.current_data_section_idx += 1
+                    replay_successful = True
                 finally:
                     # Restore state.
                     if saved_lines:
@@ -1781,9 +1866,24 @@ class LASParser:
                     self._state.current_data_section_type = saved_section_type
                     # F-I2-M01: Reset section name (defense-in-depth).
                     self._state.current_section_name = saved_section_name or ""
+                    # F-A1/F-A2: On exception, roll back current_data_section_idx
+                    # and cumulative_elements to pre-replay values so
+                    # intermediate state from partial replay is not observable.
+                    if not replay_successful:
+                        self._state.current_data_section_idx = saved_data_section_idx
+                        self._state.cumulative_elements = saved_cumulative_elements
                     # F-M3: Per-group current_data_section_idx increment
                     # moved back inside the for loop (one per deferred group).
-                    self._state.deferred_ascii_data_lines.clear()
+                    # F-A1: Only clear on success — preserve buffer on
+                    # exception so callers can diagnose what failed.
+                    if replay_successful:
+                        self._state.deferred_ascii_data_lines.clear()
+            else:
+                # F-021: Non-LAS 3.0 files — clear deferred lines to
+                # prevent false-positive _ParserState.validate() warnings
+                # about "dangling data."  Without this, the deferred buffer
+                # persists across file boundaries (only _reset() clears it).
+                self._state.deferred_ascii_data_lines.clear()
 
     def _parse_well(self, line: str) -> None:
         """Parse ~W (well information) section line.

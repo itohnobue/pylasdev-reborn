@@ -57,23 +57,10 @@ class _LASVersionSpec:
         return self.is_las12 or self.is_las20 or self.is_las30
 
     # --- delimiter rules ---------------------------------------------------
-
-    @property
-    def allows_non_space_dlm(self) -> bool:
-        """LAS 1.2 forces SPACE delimiter; 2.0+ allow TAB/COMMA."""
-        return not self.is_las12
-
-    @property
-    def emits_dlm_line(self) -> bool:
-        """DLM line in ~V section is only emitted for LAS 2.0+ (not LAS 1.2)."""
-        return not self.is_las12
+    # Deleted: allows_non_space_dlm, emits_dlm_line (F-033: zero callers)
 
     # --- wrap / line-length rules ------------------------------------------
-
-    @property
-    def supports_wrap(self) -> bool:
-        """LAS 3.0 forces WRAP=NO; 1.2 and 2.0 accept YES/NO."""
-        return not self.is_las30
+    # Deleted: supports_wrap (F-033: zero callers)
 
     def line_length_limit_for_wrap(self, wrap: str | None) -> int | None:
         """Return the line-length limit for the given WRAP mode, or None.
@@ -92,15 +79,7 @@ class _LASVersionSpec:
         return None
 
     # --- well-section rules ------------------------------------------------
-
-    @property
-    def well_format_swap_value_desc(self) -> bool:
-        """LAS 1.2 CWLS well format: non-mandatory fields use DESC:VALUE ordering.
-
-        When True, the parser's ``_store_well_entry`` applies the CWLS/lasio
-        swap logic for non-mandatory well fields.
-        """
-        return self.is_las12
+    # Deleted: well_format_swap_value_desc (F-033: zero callers)
 
     @property
     def mandatory_well_fields(self) -> tuple[str, ...]:
@@ -114,60 +93,14 @@ class _LASVersionSpec:
         return ("STRT", "STOP", "STEP", "NULL")
 
     # --- section structure rules -------------------------------------------
-
-    @property
-    def has_structured_sections(self) -> bool:
-        """LAS 3.0 has typed data/parameter sections (~Core, ~Log_Definition, etc.)."""
-        return self.is_las30
-
-    @property
-    def supports_data_sections(self) -> bool:
-        """Multi-section typed data only valid in LAS 3.0."""
-        return self.is_las30
-
-    @property
-    def supports_other_section(self) -> bool:
-        """~Other is deprecated and not allowed in LAS 3.0."""
-        return not self.is_las30
-
-    @property
-    def supports_data_format(self) -> bool:
-        """LAS 3.0 supports {F}, {E}, {A:0} data-format specifiers."""
-        return self.is_las30
-
-    @property
-    def supports_zone_notation(self) -> bool:
-        """LAS 3.0 supports | ZONE[idx] pipe notation."""
-        return self.is_las30
+    # Deleted: has_structured_sections, supports_data_sections,
+    # supports_other_section, supports_data_format, supports_zone_notation
+    # (F-033: zero external callers across src/ and tests/)
 
     # --- index curve rules -------------------------------------------------
-
-    @property
-    def requires_index_curve(self) -> bool:
-        """LAS 2.0 spec requires first curve to be DEPT/DEPTH/TIME/INDEX."""
-        return self.is_las20
+    # Deleted: requires_index_curve (F-033: zero callers)
 
     # --- section duplication rules -----------------------------------------
-
-    @property
-    def duplicate_allowed_sections(self) -> frozenset[str]:
-        """Section types that MAY appear more than once.
-
-        LAS 1.2/2.0: only V, W, O are single-occurrence; C, P, A may repeat.
-        LAS 3.0: V, W, O are single-occurrence; C, P, A may repeat.
-        (In LAS 3.0 the parser already allows multiple ~C, ~P, ~A via typed sections.)
-        """
-        if self.is_las30:
-            return frozenset({"C", "P", "A"})
-        return frozenset()
-
-    @property
-    def single_section_types(self) -> frozenset[str]:
-        """Section types that MUST appear at most once.
-
-        LAS 1.2/2.0: V, W, O, C, P, A.
-        LAS 3.0: V, W, O (C/P/A may repeat per typed group).
-        """
-        if self.is_las30:
-            return frozenset({"V", "W", "O"})
-        return frozenset({"V", "W", "O", "C", "P", "A"})
+    # Deleted: duplicate_allowed_sections, single_section_types
+    # (F-033: 12 dead properties — zero external callers across src/ and tests/.
+    # Version-specific decisions use identity properties is_las12/is_las20/is_las30.)

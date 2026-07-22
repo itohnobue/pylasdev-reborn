@@ -20,6 +20,18 @@ from .encoding import read_with_encoding
 from .exceptions import DEVReadError, LASDataError, LASEncodingError  # noqa: F401
 from .models import DevFile
 
+# Sentinel tokens recognized in DEV data lines — values that indicate
+# missing/absent data rather than column names.  Shared by both the
+# comma-delimited and whitespace-delimited detection paths.  This is
+# the single source of truth; when new sentinels are added they are
+# covered in both paths automatically (root cause fix for F-044).
+_DEV_SENTINELS: frozenset[str] = frozenset({
+    "na", "null", "err", "n/a", "nan", "+nan", "-nan",
+    "none", "-", "null.", "n.a.", "nil", "nd", "missing",
+    "inf", "-inf", "+inf",
+    "infinity", "-infinity", "+infinity",
+})
+
 # Characters that Python's splitlines() treats as line breaks beyond \n and \r.
 # When present in file content, they cause splitlines() to produce fake section
 # headers and corrupt parsed data.  Matches the full character class used by
@@ -445,20 +457,13 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 _non_float_tokens = [
                     t for t in comma_tokens if not _is_float_token(t)
                 ]
-                _SENTINELS = {
-                    "na", "null", "err", "n/a", "nan", "none", "-",
-                    "null.", "n.a.", "nil", "nd", "missing",
-                    # F-023: _is_float_token rejects these special float
-                    # strings, so they become non-float tokens.  Without
-                    # these entries a row like "1.0, inf, 2.0" is treated
-                    # as a header and falls through to whitespace detection
-                    # instead of being correctly recognised as headerless
-                    # sentinel-bearing data.
-                    "inf", "-inf", "+inf",
-                    "infinity", "-infinity", "+infinity",
-                }
+                # F-023: _is_float_token rejects special float strings
+                # (inf, nan, etc.), so they become non-float tokens.
+                # Without these sentinels, a row like "1.0, inf, 2.0"
+                # is treated as a header instead of being correctly
+                # recognised as headerless sentinel-bearing data.
                 _is_sentinel = all(
-                    t.lower().strip() in _SENTINELS
+                    t.lower().strip() in _DEV_SENTINELS
                     for t in _non_float_tokens
                 )
                 if not _is_sentinel:
@@ -498,8 +503,18 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 # count-match heuristic.  Without this guard a 2-line file
                 # like "4\\n100.0 200.0 300.0 400.0\\n" is misdetected as
                 # DUG, skip_content_lines=2, zero data lines → total data loss.
+                #
+                # I2F-001: When the second line is all-float AND the column
+                # count matches exactly, the file is ambiguous — it could be
+                # DUG with numeric column names OR headerless data with a
+                # column-count prefix.  Prefer headerless (safer default) and
+                # let the headerless detection at L569 handle it.  Without
+                # this guard a file like "4\\n1.0 2.0 3.0 4.0\\n5.0..." is
+                # falsely detected as DUG and the first data row is consumed
+                # as a column-count header.
                 if len(content_entries) >= 3 and col_count == len(second_tokens):
-                    return ("dug", 2)
+                    # Do NOT return DUG — fall through to headerless detection.
+                    pass
                 # F-DV01: Count-mismatch fallback — when the second line is
                 # all-float but the count doesn't match the first line's
                 # integer, it's STILL DUG format (not headerless) as long as
@@ -516,7 +531,11 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 # first-line "100" with 3 actual columns) from being misdetected
                 # as DUG.  Genuine DUG count mismatches are typically off by 1-2
                 # tokens; a 33x mismatch means the first line is data, not a count.
-                if len(second_tokens) > 1 and len(content_entries) >= 3 and all(
+                #
+                # I2F-001: Only fire for genuine count mismatches (count !=
+                # token count).  When count == token count the case above
+                # covers it (fall-through to headerless for all-float).
+                elif len(second_tokens) > 1 and len(content_entries) >= 3 and all(
                     _is_float_token(t) for t in second_tokens
                 ) and col_count <= len(second_tokens) + 1:
                     return ("dug", 2)
@@ -607,14 +626,8 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
         )
         if mostly_float:
             _non_float_tokens = [t for t in first_tokens if not _is_float_token(t)]
-            _SENTINELS = {
-                "na", "null", "err", "n/a", "nan", "none", "-",
-                "null.", "n.a.", "nil", "nd", "missing",
-                "inf", "-inf", "+inf",
-                "infinity", "-infinity", "+infinity",
-            }
             _is_sentinel = all(
-                t.lower().strip() in _SENTINELS for t in _non_float_tokens
+                t.lower().strip() in _DEV_SENTINELS for t in _non_float_tokens
             )
             if _is_sentinel:
                 return ("headerless", 0)
@@ -668,24 +681,17 @@ def _validate_dev_data(
     exceptions so that users can inspect raw data even when it
     contains quality issues.
     """
-    # --- NaN/Inf check for all numeric columns (F-47: reconcile
-    #     with DevFile.validate(complete=True)) ---
-    for _col_name, _col_data in dev.columns.items():
-        if _col_name == "MD":
-            continue  # MD has its own NaN-density check below
-        if isinstance(_col_data, np.ndarray) and _col_data.dtype.kind in ('f', 'c'):
-            if not np.all(np.isfinite(_col_data)):
-                warnings.warn(
-                    f"DevFile: column '{_col_name}' contains "
-                    f"non-finite values (NaN/Inf).",
-                    stacklevel=_stacklevel,
-                )
-    # --- Check MD column exists ---
+    # --- Check MD column exists (case-insensitive; F-043) ---
     # Each validation block independently guards its prerequisite
     # columns; azimuth and inclination range checks still run when
     # MD is absent but those columns are present.
-    if "MD" in dev.columns:
-        md = dev.columns["MD"]
+    _md_col = None
+    for _cn in dev.columns:
+        if _cn.upper() == "MD":
+            _md_col = _cn
+            break
+    if _md_col is not None:
+        md = dev.columns[_md_col]
         total = len(md)
         # --- Check for negative MD values (F-45: moved outside
         #     _md_check_ok gate — runs even with single finite value) ---
@@ -788,11 +794,13 @@ def _validate_dev_data(
         )
 
     # --- 4. Check azimuth range [0, 360] ---
-    _azi_names = ("AZI", "AZIM", "AZ", "AZM", "AZIMUTH")
-    for azi_name in _azi_names:
-        if azi_name not in dev.columns:
+    # F-043: Iterate over all columns and match case-insensitively
+    # so lowercase headers (e.g. "azi", "azim") are validated.
+    _azi_names_upper = {"AZI", "AZIM", "AZ", "AZM", "AZIMUTH"}
+    for azi_name, azi_data in dev.columns.items():
+        if azi_name.upper() not in _azi_names_upper:
             continue
-        azi = dev.columns[azi_name]
+        azi = azi_data
         azi_finite = azi[~np.isnan(azi)]
         if len(azi_finite) == 0:
             continue
@@ -809,17 +817,24 @@ def _validate_dev_data(
                 f"trajectory calculations.",
                 stacklevel=_stacklevel,
             )
-        break  # Found one recognised azimuth column — done checking.
+        # I2F-004: Do NOT break — continue checking all matching
+        # azimuth columns.  When multiple distinct base-name variants
+        # co-exist (e.g., AZI + AZIM with normalize_aliases=False),
+        # both must be validated.
 
     # F-025: When normalize_aliases=True deduplicates columns (e.g.,
     # AZIM + AZ1 both normalise to AZI, producing AZI and AZI_2),
     # the _N-suffixed survivor bypasses the exact-name check above.
     # Validate those deduplication survivors.
+    # F-043: Use case-insensitive startswith for column name matching.
+    _azi_names = ("AZI", "AZIM", "AZ", "AZM", "AZIMUTH")
     for azi_name in _azi_names:
+        _azi_upper = azi_name.upper()
         for col_name in dev.column_order:
+            _col_upper = col_name.upper()
             _suffix = col_name[len(azi_name):]
             if (
-                col_name.startswith(azi_name)
+                _col_upper.startswith(_azi_upper)
                 and _suffix.startswith("_")
                 and _suffix[1:].isdigit()
             ):
@@ -842,11 +857,13 @@ def _validate_dev_data(
                     )
 
     # --- 5. Check inclination range [0, 180] ---
-    _inc_names = ("INC", "INCL", "DEVI", "DIP")
-    for inc_name in _inc_names:
-        if inc_name not in dev.columns:
+    # F-043: Iterate over all columns and match case-insensitively
+    # so lowercase headers (e.g. "inc", "incl") are validated.
+    _inc_names_upper = {"INC", "INCL", "DEVI", "DIP"}
+    for inc_name, inc_data in dev.columns.items():
+        if inc_name.upper() not in _inc_names_upper:
             continue
-        inc = dev.columns[inc_name]
+        inc = inc_data
         inc_finite = inc[~np.isnan(inc)]
         if len(inc_finite) == 0:
             continue
@@ -863,15 +880,20 @@ def _validate_dev_data(
                 f"trajectory calculations.",
                 stacklevel=_stacklevel,
             )
-        break  # Found one recognised inclination column — done checking.
+        # I2F-004: Do NOT break — continue checking all matching
+        # inclination columns.
 
     # F-025: Deduplication survivors for inclination columns
     # (e.g., INCL + DIP both normalise to INC, producing INC and INC_2).
+    # F-043: Use case-insensitive startswith for column name matching.
+    _inc_names = ("INC", "INCL", "DEVI", "DIP")
     for inc_name in _inc_names:
+        _inc_upper = inc_name.upper()
         for col_name in dev.column_order:
+            _col_upper = col_name.upper()
             _suffix = col_name[len(inc_name):]
             if (
-                col_name.startswith(inc_name)
+                _col_upper.startswith(_inc_upper)
                 and _suffix.startswith("_")
                 and _suffix[1:].isdigit()
             ):
@@ -896,11 +918,12 @@ def _validate_dev_data(
     # F-100: TVD validation — minimal sanity checks to detect misparsed
     # or corrupt TVD data.  TVD is a fundamental survey column; NaN density
     # and MD-consistency checks catch delimiter mismatches and data corruption.
-    _tvd_names = ("TVD", "TVDKB", "TVDSS", "TVDBML")
-    for tvd_name in _tvd_names:
-        if tvd_name not in dev.columns:
+    # F-043: Iterate over all columns and match case-insensitively.
+    _tvd_names_upper = {"TVD", "TVDKB", "TVDSS", "TVDBML"}
+    for tvd_name, tvd_data in dev.columns.items():
+        if tvd_name.upper() not in _tvd_names_upper:
             continue
-        tvd = dev.columns[tvd_name]
+        tvd = tvd_data
         tvd_total = len(tvd)
 
         # NaN density: >50% NaN suggests delimiter mismatch or corrupt data.
@@ -918,12 +941,12 @@ def _validate_dev_data(
         # decrease where MD increases (in normal wells TVD increases with
         # depth).  This is a soft check — TVD can stay constant in horizontal
         # sections, but backward jumps signal data corruption.
-        if "MD" not in dev.columns:
-            break
-        md = dev.columns["MD"]
+        if _md_col is None:
+            continue
+        md = dev.columns[_md_col]
         both_finite = ~np.isnan(tvd) & ~np.isnan(md)
         if np.sum(both_finite) < 2:
-            break
+            continue
         md_finite = md[both_finite]
         tvd_finite = tvd[both_finite]
         md_increasing = np.diff(md_finite) > 0
@@ -947,7 +970,73 @@ def _validate_dev_data(
                 f"Unexpected TVD reversals may indicate data corruption.",
                 stacklevel=_stacklevel,
             )
-        break  # Found one recognised TVD column — done checking.
+        # I2F-004: Do NOT break — continue checking all matching
+        # TVD columns.
+
+    # F-045: Deduplication survivors for TVD columns
+    # (e.g., TVDSS + TVDKB both normalise to TVD, producing TVD and TVD_2).
+    # Validate NaN density and MD-consistency for deduplicated survivors
+    # matching the pattern used for AZI/INC dedup survivors (F-025).
+    _tvd_names = ("TVD", "TVDKB", "TVDSS", "TVDBML")
+    for tvd_name in _tvd_names:
+        _tvd_upper = tvd_name.upper()
+        for col_name in dev.column_order:
+            _col_upper = col_name.upper()
+            _suffix = col_name[len(tvd_name):]
+            if (
+                _col_upper.startswith(_tvd_upper)
+                and _suffix.startswith("_")
+                and _suffix[1:].isdigit()
+            ):
+                tvd = dev.columns[col_name]
+                tvd_total = len(tvd)
+
+                # NaN density: >50% NaN suggests delimiter mismatch.
+                tvd_nan_count = int(np.isnan(tvd).sum())
+                if tvd_total > 0 and tvd_nan_count / tvd_total > 0.5:
+                    warnings.warn(
+                        f"TVD column '{col_name}' has "
+                        f"{tvd_nan_count}/{tvd_total} "
+                        f"({tvd_nan_count / tvd_total:.1%}) NaN values. "
+                        f"Possible delimiter mismatch: data may have been "
+                        f"parsed with the wrong separator.",
+                        stacklevel=_stacklevel,
+                    )
+
+                # MD-consistency: TVD should not decrease where MD increases.
+                if _md_col is None:
+                    continue
+                md = dev.columns[_md_col]
+                both_finite = ~np.isnan(tvd) & ~np.isnan(md)
+                if np.sum(both_finite) < 2:
+                    continue
+                md_finite = md[both_finite]
+                tvd_finite = tvd[both_finite]
+                md_increasing = np.diff(md_finite) > 0
+                tvd_decreasing_where_md_increases = np.diff(tvd_finite) < 0
+                violations = np.logical_and(
+                    md_increasing, tvd_decreasing_where_md_increases
+                )
+                if np.any(violations):
+                    n_bad = int(np.sum(violations))
+                    violations_idx = np.where(violations)[0]
+                    example_pairs = []
+                    for idx in violations_idx[:3]:
+                        example_pairs.append(
+                            f"MD {md_finite[idx]:.1f}->"
+                            f"{md_finite[idx + 1]:.1f}, "
+                            f"TVD {tvd_finite[idx]:.1f}->"
+                            f"{tvd_finite[idx + 1]:.1f}"
+                        )
+                    warnings.warn(
+                        f"TVD column '{col_name}' decreases at "
+                        f"{n_bad} station(s) where MD increases. "
+                        f"Examples: {'; '.join(example_pairs)}"
+                        f"{'...' if n_bad > 3 else ''}. "
+                        f"Unexpected TVD reversals may indicate "
+                        f"data corruption.",
+                        stacklevel=_stacklevel,
+                    )
 
     # --- 6. Check MD NaN density (already checked above; note that
     #       the NaN-density check on the full md array covers all
@@ -1195,23 +1284,30 @@ def read_dev_file_as_object(
         else:
             delimiter = " "
 
-        # Cross-validate auto-detected delimiter against first data line
+        # Cross-validate auto-detected delimiter against data lines
         # (F-M27).  When the header uses commas but data lines are
         # space-delimited, the auto-detected comma delimiter produces a
         # single token from the entire data line, causing all values to
         # become NaN.  Skip for headerless — the header line IS the data.
+        #
+        # F-047: Validate multiple data lines (up to 5), not just the
+        # first.  A wrong delimiter with a matching first-line field
+        # count goes undetected when only one line is checked.  Multi-line
+        # sampling catches inconsistent delimiters across lines.
         if hdr and format_type != "headerless":
             _content_seen = 0
-            _first_data: str | None = None
+            _data_lines: list[str] = []
             for _lin in lines:
                 _s = _lin.strip()
                 if not _s or _s.startswith("#"):
                     continue
                 _content_seen += 1
                 if _content_seen > skip_content_lines:
-                    _first_data = _s
-                    break
-            if _first_data is not None:
+                    _data_lines.append(_s)
+                    if len(_data_lines) >= 5:
+                        break
+            if _data_lines:
+                _first_data = _data_lines[0]
                 if delimiter == " ":
                     _hdr_cols = len(hdr.split())
                     _data_cols = len(_first_data.split())
@@ -1269,6 +1365,37 @@ def read_dev_file_as_object(
                         f"line (difference: {abs(_hdr_cols - _data_cols)}). "
                         f"Specify delimiter explicitly."
                     )
+                # F-047: Multi-line consistency check.  When the first
+                # data line passed validation, verify that subsequent
+                # data lines are consistent with the same delimiter.
+                # A mismatch across lines (e.g., comma-delimited line
+                # in a space-delimited file) indicates data corruption.
+                elif len(_data_lines) >= 3:
+                    _mismatch_lines: list[int] = []
+                    for _idx, _dline in enumerate(_data_lines[1:], start=2):
+                        if delimiter == " ":
+                            _dl_cols = len(_dline.split())
+                        else:
+                            _dl_cols = len(
+                                [t for t in _dline.split(delimiter) if t.strip()]
+                            )
+                        if _dl_cols != _data_cols:
+                            _mismatch_lines.append(_idx)
+                    if _mismatch_lines:
+                        _sample = _mismatch_lines[:3]
+                        warnings.warn(
+                            f"Delimiter consistency warning: "
+                            f"{len(_mismatch_lines)} of {len(_data_lines)} "
+                            f"sampled data line(s) have a different number "
+                            f"of tokens than the first data line "
+                            f"({_data_cols} tokens). "
+                            f"Affected line(s): {_sample}"
+                            f"{'...' if len(_mismatch_lines) > 3 else ''}. "
+                            f"The auto-detected delimiter {delimiter!r} may "
+                            f"be incorrect for some lines. Consider specifying "
+                            f"the delimiter explicitly.",
+                            stacklevel=2,
+                        )
 
     # Guard against empty delimiter — str.split("") raises ValueError.
     # The auto-detection above always produces "," or " " but a caller
@@ -1628,5 +1755,12 @@ def read_dev_file_as_object(
             stacklevel=2,
         )
 
+    # F-041: Re-invoke structural invariants and validate(complete=True)
+    # after populating all columns.  The initial __post_init__ call during
+    # DevFile() construction early-returns because columns is empty.
+    # Calling it here verifies column_order consistency, array length
+    # uniformity, and runs data-quality validation (NaN/Inf, MD
+    # monotonicity, AZI/INC range via validate(complete=True)).
+    dev.__post_init__()
     _validate_dev_data(dev, _stacklevel=3)
     return dev

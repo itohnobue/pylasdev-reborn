@@ -2862,3 +2862,326 @@ class TestValidateCrossSectionConsistency:
             assert "Parameter sections should precede" in warning_text, (
                 f"Expected param-after-def warning; got: {warning_text}"
             )
+
+    # --- I2F-018 / I2F-019 / I2F-020: Regression tests ---
+
+    def test_replay_deferred_well_preserves_state_on_data_loss_path(
+        self,
+    ) -> None:
+        """I2F-018 + I2F-019: _replay_deferred_well() must preserve deferred
+        buffer and state fields on partial replay failure.
+
+        Before the fix, the finally block unconditionally cleared
+        ``deferred_ascii_data_lines``, permanently destroying data from
+        groups N through last on exception.  ``current_data_section_idx``
+        and ``cumulative_elements`` were not saved/restored, leaving the
+        state inconsistent after partial failure.
+
+        The fix (applied by s5-impl-parser-1) adds:
+        - ``replay_successful`` flag — clear deferred buffer only on success
+        - save/restore of ``current_data_section_idx`` + ``cumulative_elements``
+
+        This test verifies the structural fix is in place by checking that
+        the save block and conditional-clear guard exist in the source code.
+        """
+        import inspect
+
+        from pylasdev import parser as parser_mod
+
+        source = inspect.getsource(parser_mod.LASParser._replay_deferred_well)
+
+        # Verify save block includes current_data_section_idx
+        assert "saved_data_section_idx" in source, (
+            "current_data_section_idx must be saved before deferred replay"
+        )
+        assert "saved_cumulative_elements" in source, (
+            "cumulative_elements must be saved before deferred replay"
+        )
+
+        # Verify conditional clear (only on success)
+        assert "replay_successful" in source, (
+            "replay_successful flag must guard deferred_ascii_data_lines.clear()"
+        )
+        assert "if replay_successful:" in source, (
+            "deferred_ascii_data_lines.clear() must be conditional on replay_successful"
+        )
+
+        # Verify exception rollback
+        assert "if not replay_successful:" in source, (
+            "On exception, current_data_section_idx and cumulative_elements "
+            "must roll back to pre-replay values"
+        )
+
+    def test_final_flush_clears_state_preventing_dangling_warning(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """I2F-020: parse() final flush MUST clear ascii_data_lines and
+        increment current_data_section_idx — mirroring _flush_ascii_data()
+        cleanup at L2495-2496.
+
+        Before the fix, after the parse() final flush processed the last
+        data section's lines, ``ascii_data_lines`` still held the processed
+        data and ``current_data_section_idx`` was not advanced.  Together
+        this triggered ``_check_data_section_idx_consistency`` which
+        emitted a false-positive "dangling data would produce corrupt
+        output" warning.
+
+        This test constructs a LAS 3.0 file with two consecutive data
+        sections (~A then ~Core) and verifies no false-positive warning
+        is logged.
+        """
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.   -999.25 :
+~CURVE INFORMATION
+ DEPT.M  : DEPTH {F}
+ DT.US/M : SONIC {F}
+~A
+100.0,50.0
+101.0,51.0
+~Core
+550.0,1.0
+"""
+        parser = LASParser()
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            las = parser.parse(content)
+        # Must have processed both sections
+        assert len(las.data_sections) == 2
+        # No false-positive "dangling data" warning
+        warning_text = caplog.text
+        assert "dangling data would produce corrupt output" not in warning_text, (
+            f"False-positive dangling data warning after fix: {warning_text}"
+        )
+
+    def test_final_flush_state_cleaned_after_parse(
+        self,
+    ) -> None:
+        """I2F-020: After the parse() final flush processes accumulated
+        ascii data, the parser state must be clean — no stale data
+        in ascii_data_lines and current_data_section_idx must be advanced.
+
+        This test accesses _ParserState.validate() directly to confirm
+        that the internal consistency check passes after parsing a file
+        with consecutive data sections.
+        """
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ STRT.M    : 1670.0000
+ STOP.M    : 1680.0000
+ STEP.M    : 0.1000
+ NULL.    : -999.25
+~CURVE INFORMATION
+ DEPT.M  : DEPTH {F}
+ GR.API  : GAMMA RAY {F}
+~A DEPTH
+ 1670.0000,100.0
+ 1680.0000,200.0
+~A GR
+ 1670.0000,50.0
+ 1680.0000,60.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+
+        # Validate parser state — must not contain "dangling data" issue
+        state_issues = parser._state.validate(las)
+        dangling_issues = [
+            iss for iss in state_issues
+            if "dangling data" in iss
+        ]
+        assert len(dangling_issues) == 0, (
+            f"Unexpected dangling data issues after fix: {dangling_issues}"
+        )
+
+    # --- R-005: format-vs-placement raise path coverage ---
+
+    def test_parse_s_format_in_logs_raises(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R-005: String-format curve placed in logs triggers LASDataError
+        during parser finalization (parser.py:743-766).
+
+        The check at parse() lines 743-766 iterates all las_file.curves
+        and verifies format-vs-placement consistency.  A curve with
+        data_format='S' must appear in string_data, not logs.  This path
+        IS tested through LASFile.__post_init__ and DataSection.__post_init__
+        in test_models.py, but the parser-specific copy at lines 743-766
+        had zero coverage.
+
+        We inject mismatched state via monkeypatch on _reset() because
+        the parser itself always routes data correctly — the check is a
+        defensive guard for state that should never arise during normal
+        parsing.  After injecting the mismatch, we parse minimal valid
+        content that survives all earlier checks to reach line 743.
+        """
+        import numpy as np
+
+        from pylasdev import (
+            CurveDefinition,
+            LASDataError,
+            LASFile,
+            VersionSection,
+            WellSection,
+        )
+
+        # --- Build mismatched LASFile without triggering __post_init__ ---
+        # LASFile.__post_init__ has the same format-vs-placement check,
+        # so we cannot construct with mismatched logs.  Construct with NO
+        # logs/string_data (beyond __post_init__'s scope), then add
+        # mismatched data afterward.  Dataclass __setattr__ does not
+        # re-fire __post_init__.
+        _mismatched = LASFile(
+            version=VersionSection(vers="3.0", wrap="NO", dlm="SPACE"),
+            well=WellSection(entries={
+                "STRT": "0", "STOP": "100", "STEP": "10", "NULL": "-999",
+            }),
+            curves=[CurveDefinition(mnemonic="STR", data_format="S")],
+            curves_order=["STR"],
+            # No logs / string_data — avoid __post_init__ format check
+        )
+        _mismatched.logs = {"STR": np.array([1.0, 2.0])}
+        _mismatched.string_data = {}
+
+        def _inject_mismatch(self_parser: LASParser) -> None:
+            self_parser.las_file = _mismatched
+            self_parser._state.reset()
+            self_parser._state.version_found = True
+            self_parser._state.section_sequence = ["VERSION", "WELL", "CURVE"]
+            self_parser._state.section_type_sequence = ["V", "W", "C"]
+
+        monkeypatch.setattr(LASParser, "_reset", _inject_mismatch)
+
+        parser = LASParser()
+        # Minimal content that survives early checks:
+        # - Has ~V section (avoid "missing required ~V" error)
+        # - No ~C / ~A sections (would overwrite injected state)
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   :\n"
+            "~WELL INFORMATION\n"
+            " STRT.M    : 0\n"
+            " STOP.M    : 100\n"
+            " STEP.M    : 10\n"
+            " NULL.     : -999\n"
+        )
+        with pytest.raises(LASDataError, match=r"string-format.*logs"):
+            parser.parse(content)
+
+    def test_parse_numeric_format_in_string_data_raises(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R-005: Numeric-format curve in string_data triggers LASDataError
+        during parser finalization (parser.py:743-766, second branch).
+
+        The check raises when a curve with numeric data_format (not S/A)
+        appears in string_data.  This complements the S-format-in-logs
+        branch tested above.
+        """
+        import numpy as np
+
+        from pylasdev import (
+            CurveDefinition,
+            LASDataError,
+            LASFile,
+            VersionSection,
+            WellSection,
+        )
+
+        _mismatched = LASFile(
+            version=VersionSection(vers="3.0", wrap="NO", dlm="SPACE"),
+            well=WellSection(entries={
+                "STRT": "0", "STOP": "100", "STEP": "10", "NULL": "-999",
+            }),
+            curves=[CurveDefinition(mnemonic="GR", data_format="F")],
+            curves_order=["GR"],
+            # No logs / string_data — avoid __post_init__ format check
+        )
+        _mismatched.string_data = {"GR": np.array(["a", "b"], dtype=str)}
+        _mismatched.logs = {}
+
+        def _inject_mismatch(self_parser: LASParser) -> None:
+            self_parser.las_file = _mismatched
+            self_parser._state.reset()
+            self_parser._state.version_found = True
+            self_parser._state.section_sequence = ["VERSION", "WELL", "CURVE"]
+            self_parser._state.section_type_sequence = ["V", "W", "C"]
+
+        monkeypatch.setattr(LASParser, "_reset", _inject_mismatch)
+
+        parser = LASParser()
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   :\n"
+            "~WELL INFORMATION\n"
+            " STRT.M    : 0\n"
+            " STOP.M    : 100\n"
+            " STEP.M    : 10\n"
+            " NULL.     : -999\n"
+        )
+        with pytest.raises(LASDataError, match=r"numeric-format.*string_data"):
+            parser.parse(content)
+
+    # --- R-006: pre-~V section_idx increment coverage ---
+
+    def test_pre_v_consecutive_a_sections_increment_idx(
+        self,
+    ) -> None:
+        """R-006: Two consecutive bare ~A sections before ~V increment
+        current_data_section_idx (parser.py:1162-1175).
+
+        When two ~A sections appear before the ~VERSION INFORMATION section,
+        the parser increments current_data_section_idx on the A→A transition.
+        Without this increment, distinct pre-~V data sections would share
+        the same (section_type, section_name, section_idx) tuple, causing
+        _replay_deferred_well to merge them into a single group.
+
+        We construct a LAS file with:
+        1. A ~C section before ~V (defines curves the pre-~V data references)
+        2. Two consecutive ~A sections with data
+        3. ~V and remaining sections afterward
+
+        After parsing, we verify current_data_section_idx has advanced
+        past the value that would result from only the _flush_ascii_data
+        finally-block increment, confirming the explicit pre-~V A→A
+        check at parser.py:1170-1175 fired.
+        """
+        content = (
+            "~C\n"
+            " DEPT.M  : DEPTH {F}\n"
+            " GR.API  : GAMMA RAY {F}\n"
+            "~A Section_1\n"
+            " 0.0 100.0\n"
+            " 10.0 110.0\n"
+            "~A Section_2\n"
+            " 20.0 120.0\n"
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   :\n"
+            " DLM.   SPACE :\n"
+            "~WELL INFORMATION\n"
+            " STRT.M    : 0\n"
+            " STOP.M    : 100\n"
+            " STEP.M    : 10\n"
+            " NULL.     : -999\n"
+        )
+        parser = LASParser()
+        parser.parse(content)
+
+        # The pre-~V A→A transition at parser.py:1170-1175 increments
+        # current_data_section_idx in ADDITION to the _flush_ascii_data
+        # finally-block increment.  After two pre-~V ~A sections plus
+        # the A→V transition flush, idx should be >= 2.  Without the
+        # explicit increment at 1175, the two ~A sections would share
+        # the same idx, causing group merging on replay.
+        assert parser._state.current_data_section_idx >= 2, (
+            f"Expected current_data_section_idx >= 2 after pre-~V A→A "
+            f"transition, got {parser._state.current_data_section_idx}"
+        )

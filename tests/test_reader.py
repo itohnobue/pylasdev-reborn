@@ -2383,18 +2383,18 @@ class TestProductionCheckReaderFixes:
     def test_wrapped_depth_line_state_machine_non_pathological_ef018(
         self, tmp_path: Path
     ) -> None:
-        """E-F-018: Regression test for depth_line state machine fix in _read_wrapped.
+        """E-F-018: Regression test — non-pathological recovery now hard-fails.
 
         When a depth line has extra values (depth_had_extra=True) and the next
-        data line has fewer values than needed (non-pathological), the fix at
-        data_reader.py:1182-1188 resets depth_line=True and counter=0. Without
-        this fix, the next depth line enters the data branch, causing depth
-        values to silently shift into wrong curve slots (permanent corruption).
+        data line has fewer values than needed but the shift is ≤2 curves,
+        the previous code at data_reader.py:898-900 silently reset the
+        state machine, producing data corruption (SP values shifted by 1
+        depth step).  The F-032 fix hard-fails with a clear diagnostic
+        instead of producing corrupt output.
 
         Test scenario (curve_count=4, DEPT + DT, GR, SP):
           Step 1: depth=1000.0, data=200.0,300.0,400.0  (normal baseline)
-          Step 2: depth=1010.0 + extra 1050.5, data=210.0,310.0 (triggers fix)
-          Step 3: depth=1020.0, data=220.0,320.0,420.0  (proves fix works)
+          Step 2: depth=1010.0 + extra 1050.5, data=210.0,310.0 (triggers fail)
         """
         content = (
             "~VERSION INFORMATION\n"
@@ -2411,66 +2411,21 @@ class TestProductionCheckReaderFixes:
             # Step 1 (normal baseline): one value per line
             "1000.0\n"
             "200.0  300.0  400.0\n"
-            # Step 2 (triggers E-F-018 fix path):
+            # Step 2 (triggers F-032 hard-fail):
             #   Depth line: 2 values (>1) → depth_had_extra = True
-            #   Data line: 2 values (<3 remaining curves) → non-pathological
-            #   Fix at data_reader.py:1187-1188: depth_line=True, counter=0
+            #   Data line: 2 values (<3 remaining curves) → unrecoverable
+            #   Fix at data_reader.py now raises LASParseError
             "1010.0  1050.5\n"
             "210.0  310.0\n"
-            # Step 3 (proves fix works):
-            #   With fix: "1020.0" is parsed as DEPT (depth_line=True).
-            #   Without fix: depth_line stays False → "1020.0" goes to DT,
-            #   permanently shifting DEPT values into wrong curve slots.
+            # Step 3 is never reached
             "1020.0\n"
             "220.0  320.0  420.0\n"
         )
         test_file = tmp_path / "ef018_wrapped_state_machine.las"
         test_file.write_text(content, encoding="utf-8")
 
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            data = read_las_file(test_file)
-
-            # Warning 1: depth line has extra values
-            assert any(
-                "depth line has 2 values" in str(x.message) for x in w
-            ), (
-                f"Expected depth-line-extra-values warning, got: "
-                f"{[str(x.message) for x in w]}"
-            )
-            # Warning 2: non-pathological misalignment (data line too short)
-            assert any(
-                "previous depth line had extra values"
-                in str(x.message)
-                for x in w
-            ), (
-                f"Expected non-pathological-misalignment warning, got: "
-                f"{[str(x.message) for x in w]}"
-            )
-
-        # All arrays must have same length (3 depth steps)
-        for curve_name in data["curves_order"]:
-            assert len(data["logs"][curve_name]) == 3, (
-                f"Curve '{curve_name}' has {len(data['logs'][curve_name])} "
-                f"values, expected 3"
-            )
-
-        # DEPT values NOT shifted into data curves (core assertion)
-        np.testing.assert_allclose(
-            data["logs"]["DEPT"], [1000.0, 1010.0, 1020.0]
-        )
-        # Data curves have correct values at correct positions
-        np.testing.assert_allclose(
-            data["logs"]["DT"], [200.0, 210.0, 220.0]
-        )
-        np.testing.assert_allclose(
-            data["logs"]["GR"], [300.0, 310.0, 320.0]
-        )
-        # SP: Step 2 had no SP value, so step 3's value fills slot [1].
-        # The padding logic fills slot [2] with null_value.
-        np.testing.assert_allclose(
-            data["logs"]["SP"], [400.0, 420.0, -999.25]
-        )
+        with pytest.raises(LASParseError, match="unrecoverable data misalignment"):
+            read_las_file(test_file)
 
     # --- F-212 (MEDIUM): _desanitize_las_value unconditional _# strip ---
 

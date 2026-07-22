@@ -1816,16 +1816,23 @@ class TestValidateDevData:
 
         No monotonicity/azimuth checks follow because there are no
         finite values to check.
+
+        F-042: MD is now included in the NaN/Inf validation loop,
+        so two warnings fire: NaN/Inf for MD and the >50% NaN density
+        warning.  Both are expected; no subsequent checks follow.
         """
         from pylasdev.dev_reader import _validate_dev_data
 
         dev = DevFile()
         dev.columns["MD"] = np.array([np.nan, np.nan, np.nan])
         dev.columns["AZIM"] = np.array([10.0, 20.0, 30.0])
-        # Only NaN-density warning fires; no subsequent warnings
-        with pytest.warns(UserWarning, match="NaN values.*delimiter mismatch") as w:
+        # Two warnings expected: NaN/Inf loop + NaN density check
+        with pytest.warns(UserWarning) as w:
             _validate_dev_data(dev)
-        assert len(w) == 1
+        # At least the NaN density warning fires; NaN/Inf warning
+        # also fires for MD since F-042 removed the MD skip.
+        assert len(w) >= 1
+        assert any("NaN values" in str(msg.message) for msg in w)
 
     # ── no azimuth column ───────────────────────────────────────────
 
@@ -2028,3 +2035,440 @@ class TestProductionCheckDevReaderFixes:
         assert data["MD"][1] == 200.0, f"Unexpected MD[1]: {data['MD'][1]!r}"
         assert data["TVD"][0] == 99.0, f"Unexpected TVD[0]: {data['TVD'][0]!r}"
         assert data["TVD"][1] == 198.0, f"Unexpected TVD[1]: {data['TVD'][1]!r}"
+
+    # === F-044: -nan/+nan sentinel recognition ===
+
+    def test_plus_nan_sentinel_headerless_comma(self, tmp_path: Path) -> None:
+        """F-044: '+nan' in comma-delimited line is recognised as sentinel.
+
+        Before the fix, '+nan' and '-nan' were missing from _SENTINELS
+        sets.  A line like "1.0, +nan, 2.0" was treated as a header
+        and the real data was consumed as column names.
+        """
+        content = "1.0, +nan, 2.0, 3.0\n10.0, 50.0, 75.0, 100.0\n"
+        test_file = tmp_path / "plus_nan_sentinel.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Should be headerless (4 columns, not a header line)
+        assert len(data) == 4
+        assert "col_0" in data
+        assert data["col_0"][0] == 1.0
+        assert np.isnan(data["col_1"][0])  # +nan → NaN
+        assert data["col_2"][0] == 2.0
+        assert data["col_3"][0] == 3.0
+
+    def test_minus_nan_sentinel_headerless_whitespace(
+        self, tmp_path: Path
+    ) -> None:
+        """F-044: '-nan' in whitespace-delimited line is recognised as sentinel."""
+        content = "100.0 -nan 200.0\n50.0 75.0 100.0\n"
+        test_file = tmp_path / "minus_nan_sentinel.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Should produce 3 columns (headerless), not treated as header
+        assert len(data) == 3
+        assert "col_0" in data
+        assert data["col_0"][0] == 100.0
+        assert np.isnan(data["col_1"][0])  # -nan → NaN
+
+    # === F-042: MD NaN/Inf validation ===
+
+    def test_single_nan_md_triggers_nan_inf_warning(self, tmp_path: Path) -> None:
+        """F-042: Single NaN in MD triggers NaN/Inf warning via __post_init__.
+
+        F-041/F-047: __post_init__ calls validate(complete=True) which
+        checks NaN/Inf for all columns.  The duplicate NaN/Inf check in
+        _validate_dev_data was removed (F-047).  A single NaN in MD
+        (below the 50% NaN density threshold) is caught by the validate()
+        NaN/Inf check in __post_init__.
+        """
+        content = "MD,AZIM\n100.0,10.0\nnan,20.0\n200.0,30.0\n300.0,40.0\n"
+        test_file = tmp_path / "single_nan_md.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with pytest.warns(UserWarning, match="non-finite values"):
+            read_dev_file_as_object(test_file)
+
+    # === F-043: Case-insensitive column lookups ===
+
+    def test_lowercase_md_header_triggers_validation(
+        self, tmp_path: Path
+    ) -> None:
+        """F-043: Lowercase 'md' header triggers MD validation.
+
+        With normalize_aliases=False and lowercase column names,
+        MD checks (negative, monotonicity, duplicates) were silently
+        skipped.  Now column names are matched case-insensitively.
+        """
+        content = "md,tvd,azi,inc\n"
+        content += "-10.0,0.0,45.0,30.0\n"
+        content += "0.0,10.0,90.0,30.0\n"
+        test_file = tmp_path / "lowercase_md.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        # normalize_aliases=False preserves lowercase column names
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file_as_object(test_file, normalize_aliases=False)
+        # Negative MD should trigger a warning
+        assert any("negative MD" in str(x.message) for x in w), (
+            f"Expected 'negative MD' warning, got: "
+            f"{[str(x.message) for x in w]}"
+        )
+        # Columns should be lowercase as-is
+        assert "md" in data.columns
+        assert data.columns["md"][0] == -10.0
+
+    def test_lowercase_azi_header_triggers_range_check(self) -> None:
+        """F-043: Lowercase 'azi' header triggers azimuth range check.
+
+        Direct _validate_dev_data call with lowercase column names
+        should still validate azimuth range.
+        """
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile()
+        dev.columns["md"] = np.array([100.0, 200.0, 300.0])
+        dev.columns["azi"] = np.array([10.0, 400.0, 50.0])
+        dev.column_order = ["md", "azi"]
+
+        with pytest.warns(UserWarning, match="Azimuth.*outside.*0, 360"):
+            _validate_dev_data(dev)
+
+    # === F-045: TVD dedup survivor validation ===
+
+    def test_tvd_dedup_survivor_nan_density_warns(self) -> None:
+        """F-045: TVD_2 dedup survivor gets NaN density validation.
+
+        Before the fix, TVD dedup survivors (e.g., TVD_2) bypassed all
+        validation because only AZI/INC had dedup survivor blocks.
+        """
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile()
+        dev.columns["MD"] = np.array([100.0, 200.0, 300.0])
+        # TVD_2 is a dedup survivor — 2/3 NaN = 66% > 50%
+        dev.columns["TVD_2"] = np.array([np.nan, np.nan, 300.0])
+        dev.column_order = ["MD", "TVD_2"]
+
+        with pytest.warns(UserWarning, match="TVD.*NaN values"):
+            _validate_dev_data(dev)
+
+    def test_tvd_dedup_survivor_md_consistency_warns(self) -> None:
+        """F-045: TVD_2 dedup survivor gets MD-consistency validation.
+
+        TVD decreases where MD increases should trigger a warning.
+        """
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile()
+        dev.columns["MD"] = np.array([100.0, 200.0, 300.0, 400.0])
+        # TVD decreases from 500→400 while MD increases 200→300
+        dev.columns["TVD_2"] = np.array([100.0, 500.0, 400.0, 450.0])
+        dev.column_order = ["MD", "TVD_2"]
+
+        with pytest.warns(UserWarning, match="TVD.*decreases"):
+            _validate_dev_data(dev)
+
+    # === F-041: DevFile __post_init__ called after reader construction ===
+
+    def test_read_dev_file_as_object_runs_post_init_validation(
+        self, tmp_path: Path
+    ) -> None:
+        """F-041: read_dev_file_as_object calls __post_init__ after construction.
+
+        __post_init__ runs validate(complete=True) which checks NaN/Inf
+        for all columns.  A file with NaN values in non-MD columns
+        should trigger the validate() NaN/Inf warning in addition to
+        _validate_dev_data warnings.
+        """
+        content = "MD,AZI,INC\n100.0,45.0,nan\n200.0,90.0,30.0\n"
+        test_file = tmp_path / "nan_post_init.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            dev = read_dev_file_as_object(test_file)
+        # __post_init__ runs validate(complete=True) which warns about
+        # NaN in INC column
+        inc_nan_warnings = [
+            x for x in w
+            if "DevFile: column 'INC'" in str(x.message)
+        ]
+        assert len(inc_nan_warnings) >= 1, (
+            f"Expected __post_init__ validate() warning for INC NaN, "
+            f"got {len(inc_nan_warnings)}"
+        )
+        # Data should be parsed correctly
+        assert dev.columns["MD"][0] == 100.0
+
+    # === F-046: Semicolon-only auto-detection ===
+
+    def test_semicolon_delimited_basic(self, tmp_path: Path) -> None:
+        """F-046: Pure semicolon-delimited DEV file without tabs.
+
+        Auto-detection must correctly recognise semicolon as delimiter
+        and parse the file with proper column names.
+        """
+        content = "MD;TVD;X;Y\n0.0;0.0;100.0;200.0\n100.0;99.0;101.0;201.0\n"
+        test_file = tmp_path / "semicolon.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "X", "Y"]
+        assert len(data["MD"]) == 2
+        assert data["MD"][0] == 0.0
+        assert data["MD"][1] == 100.0
+        assert data["TVD"][0] == 0.0
+        assert data["TVD"][1] == 99.0
+        assert data["X"][0] == 100.0
+        assert data["Y"][0] == 200.0
+
+    def test_semicolon_delimited_with_whitespace(self, tmp_path: Path) -> None:
+        """F-046: Semicolon-delimited with whitespace around values."""
+        content = "MD; TVD ; X ; Y\n0.0 ; 0.0 ; 100.0 ; 200.0\n"
+        test_file = tmp_path / "semicolon_ws.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "X", "Y"]
+        assert data["MD"][0] == 0.0
+        assert data["TVD"][0] == 0.0
+        assert data["X"][0] == 100.0
+        assert data["Y"][0] == 200.0
+
+    def test_semicolon_delimited_trailing_semicolons(
+        self, tmp_path: Path
+    ) -> None:
+        """F-046: Semicolon-delimited file with trailing semicolons."""
+        content = "MD;TVD;X;\n0.0;0.0;100.0;\n100.0;99.0;101.0;\n"
+        test_file = tmp_path / "semicolon_trail.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD", "TVD", "X"]
+        assert len(data["MD"]) == 2
+        assert data["MD"][0] == 0.0
+        assert data["MD"][1] == 100.0
+
+    def test_semicolon_delimited_single_column(self, tmp_path: Path) -> None:
+        """F-046: Semicolon-delimited file with a single column.
+
+        Single-column files have only 1 semicolon token, so the
+        auto-detection falls back to other delimiter checks.
+        """
+        content = "MD\n0.0\n100.0\n"
+        test_file = tmp_path / "semicolon_single.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        assert list(data.keys()) == ["MD"]
+        assert data["MD"][0] == 0.0
+        assert data["MD"][1] == 100.0
+
+    # === F-047: Multi-line delimiter cross-validation ===
+
+    def test_multi_line_delimiter_consistency_warns(
+        self, tmp_path: Path
+    ) -> None:
+        """F-047: Inconsistent delimiter across data lines triggers warning.
+
+        A file where some lines have a different number of tokens
+        than the first data line (but not enough to trigger the
+        single-line >=3 difference error) should emit a consistency
+        warning.
+        """
+        import warnings
+
+        content = (
+            "MD TVD INC\n"             # 3-column header
+            "0.0 0.0 0.0\n"            # 3 tokens (consistent)
+            "100.0 99.0\n"             # 2 tokens (mismatch)
+            "200.0 198.0 30.0 40.0\n"  # 4 tokens (mismatch)
+            "300.0 297.0 60.0\n"       # 3 tokens (back to consistent)
+        )
+        test_file = tmp_path / "multi_line_inconsist.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        # Verify data was parsed (4 rows, despite inconsistencies)
+        assert len(data["MD"]) == 4
+
+        # Check for delimiter consistency warning
+        consistency_warnings = [
+            str(x.message) for x in w
+            if "Delimiter consistency warning" in str(x.message)
+        ]
+        assert len(consistency_warnings) >= 1, (
+            f"Expected delimiter consistency warning, got: "
+            f"{[str(x.message) for x in w]}"
+        )
+
+    def test_multi_line_delimiter_consistent_no_warning(
+        self, tmp_path: Path
+    ) -> None:
+        """F-047: Consistent delimiter across data lines — no spurious warning."""
+        import warnings
+
+        content = (
+            "MD TVD INC\n"
+            "0.0 0.0 0.0\n"
+            "100.0 99.0 30.0\n"
+            "200.0 198.0 60.0\n"
+            "300.0 297.0 90.0\n"
+            "400.0 396.0 120.0\n"
+        )
+        test_file = tmp_path / "multi_line_consist.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _ = read_dev_file(test_file)
+
+        consistency_warnings = [
+            str(x.message) for x in w
+            if "Delimiter consistency warning" in str(x.message)
+        ]
+        assert len(consistency_warnings) == 0, (
+            f"Expected NO delimiter consistency warning, got: "
+            f"{consistency_warnings}"
+        )
+
+    # === I2F-001: DUG Pattern A all-float false positive ===
+
+    def test_dug_pattern_a_all_float_count_match_is_headerless(
+        self, tmp_path: Path
+    ) -> None:
+        """I2F-001: All-float second line with count match → headerless, not DUG.
+
+        Reproducer: "4\\n1.0 2.0 3.0 4.0\\n5.0 6.0 7.0 8.0\\n9.0..."
+        Before fix: col_count (4) == len(second_tokens) (4), >=3 content
+        entries → detected as DUG, consuming first data row as header.
+        After fix: all-float second line → falls through to headerless
+        detection, all data rows preserved.
+        """
+        content = (
+            "4\n"
+            "1.0 2.0 3.0 4.0\n"
+            "5.0 6.0 7.0 8.0\n"
+            "9.0 10.0 11.0 12.0\n"
+        )
+        test_file = tmp_path / "dug_float_count_match.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        data = read_dev_file(test_file)
+        # Should be headerless (NOT DUG with numeric column "1.0", "2.0", etc.)
+        # First line "4" has 1 token → 1 column → col_0
+        assert len(data) == 1, (
+            f"Expected 1 column (headerless), got {len(data)} columns: "
+            f"{list(data.keys())}"
+        )
+        assert "col_0" in data
+        assert len(data["col_0"]) == 4, (
+            f"Expected 4 data rows, got {len(data['col_0'])}"
+        )
+        # All 4 values preserved (not consumed as header)
+        assert data["col_0"][0] == 4.0
+        assert data["col_0"][1] == 1.0
+        assert data["col_0"][2] == 5.0
+        assert data["col_0"][3] == 9.0
+
+    # === I2F-002: _DEV_SENTINELS shared constant ===
+
+    def test_dev_sentinels_constant_shared(self) -> None:
+        """I2F-002: Comma and whitespace paths use same _DEV_SENTINELS constant.
+
+        Verifies the module-level constant exists and contains all
+        expected sentinels (including +nan/-nan from F-044).
+        """
+        from pylasdev.dev_reader import _DEV_SENTINELS
+
+        # Must be a frozenset (module-level constant)
+        assert isinstance(_DEV_SENTINELS, frozenset)
+
+        # Must contain standard sentinels
+        assert "na" in _DEV_SENTINELS
+        assert "null" in _DEV_SENTINELS
+        assert "err" in _DEV_SENTINELS
+        assert "nan" in _DEV_SENTINELS
+        assert "inf" in _DEV_SENTINELS
+
+        # Must contain +nan/-nan from F-044 fix
+        assert "+nan" in _DEV_SENTINELS
+        assert "-nan" in _DEV_SENTINELS
+
+        # Must contain infinity variants
+        assert "infinity" in _DEV_SENTINELS
+        assert "+infinity" in _DEV_SENTINELS
+        assert "-infinity" in _DEV_SENTINELS
+
+    # === I2F-004: Co-existing variant column validation ===
+
+    def test_coexisting_azi_variants_both_validated(self) -> None:
+        """I2F-004: AZI + AZIM variants both get range validation.
+
+        With normalize_aliases=False, multiple distinct base-name variants
+        (AZI + AZIM) should both be validated.  Before fix, break after
+        first match skipped AZIM.
+        """
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile()
+        dev.columns["MD"] = np.array([100.0, 200.0, 300.0])
+        dev.columns["AZI"] = np.array([10.0, 90.0, 350.0])  # valid
+        dev.columns["AZIM"] = np.array([400.0, 50.0, -10.0])  # out of range
+        dev.column_order = ["MD", "AZI", "AZIM"]
+
+        with pytest.warns(UserWarning) as w:
+            _validate_dev_data(dev)
+
+        # Both AZI and AZIM should be validated; AZIM has out-of-range values
+        azi_warnings = [
+            str(x.message) for x in w
+            if "Azimuth column" in str(x.message)
+        ]
+        assert len(azi_warnings) >= 1, (
+            f"Expected at least 1 azimuth warning (AZIM out of range), got "
+            f"{len(azi_warnings)}: {azi_warnings}"
+        )
+        # AZIM specifically should have an out-of-range warning
+        assert any("AZIM" in msg for msg in azi_warnings), (
+            f"Expected AZIM out-of-range warning, got: {azi_warnings}"
+        )
+
+    def test_coexisting_tvd_variants_both_validated(self) -> None:
+        """I2F-004: TVDKB + TVDSS variants both get NaN density validated.
+
+        With normalize_aliases=False, both TVD variants should get NaN
+        density validation.  Before fix, break after first match skipped
+        TVDSS.
+        """
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile()
+        dev.columns["MD"] = np.array([100.0, 200.0, 300.0])
+        dev.columns["TVDKB"] = np.array([100.0, 200.0, 300.0])  # all valid
+        dev.columns["TVDSS"] = np.array([np.nan, np.nan, 100.0])  # 66% NaN
+        dev.column_order = ["MD", "TVDKB", "TVDSS"]
+
+        with pytest.warns(UserWarning) as w:
+            _validate_dev_data(dev)
+
+        # TVDSS has >50% NaN → NaN density warning expected
+        tvd_nan_warnings = [
+            str(x.message) for x in w
+            if "TVD" in str(x.message) and "NaN" in str(x.message)
+        ]
+        assert len(tvd_nan_warnings) >= 1, (
+            f"Expected at least 1 TVD NaN warning, got "
+            f"{len(tvd_nan_warnings)}: {[str(x.message) for x in w]}"
+        )
+        # TVDSS should be specifically mentioned
+        assert any("TVDSS" in msg for msg in tvd_nan_warnings), (
+            f"Expected TVDSS NaN warning, got: {tvd_nan_warnings}"
+        )

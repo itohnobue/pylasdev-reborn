@@ -1161,3 +1161,82 @@ class TestCompareListsDirect:
         arrays1 = [np.array([float(i), float(i + 1)]) for i in range(10)]
         arrays2 = [np.array([float(i), float(i + 1)]) for i in range(10)]
         assert _compare_lists(arrays1, arrays2, "test", 1e-7, 0.0) is True
+
+
+class TestMaskedArrayComparison:
+    """Tests for 0-d (scalar) MaskedArray comparison — F-035.
+
+    The 0-d MaskedArray -> .item() coercion path in _coerce_and_compare
+    (compare.py:147-156) had zero test coverage.  These tests exercise
+    that path via _compare_lists (which calls _coerce_and_compare for
+    each element).
+    """
+
+    def test_0d_masked_scalar_vs_regular_scalar(self) -> None:
+        """0-d MaskedArray with mask=False vs regular scalar matches."""
+        ma_val = np.ma.array(42.0)
+        assert not np.ma.is_masked(ma_val), "Precondition: mask should be False"
+        # Single-element list triggers _coerce_and_compare per element
+        assert _compare_lists(
+            [ma_val], [42.0], "test", 1e-7, 0.0
+        ) is True
+
+    def test_0d_masked_true_vs_regular_scalar(self) -> None:
+        """0-d MaskedArray with mask=True vs regular scalar returns False.
+
+        The mask check in compare.py:148 converts a masked 0-d array to
+        np.ma.masked, which causes a type mismatch and returns False.
+        """
+        ma_val = np.ma.array(42.0, mask=True)
+        assert np.ma.is_masked(ma_val), "Precondition: mask should be True"
+        assert _compare_lists(
+            [ma_val], [42.0], "test", 1e-7, 0.0
+        ) is False
+
+    def test_0d_masked_vs_same_masked(self) -> None:
+        """0-d MaskedArray vs same 0-d MaskedArray matches."""
+        ma_val = np.ma.array(3.14)
+        assert _compare_lists(
+            [ma_val], [np.ma.array(3.14)], "test", 1e-7, 0.0
+        ) is True
+
+    def test_0d_masked_vs_different_masked(self) -> None:
+        """0-d MaskedArray vs different value 0-d MaskedArray returns False."""
+        ma_val = np.ma.array(3.14)
+        assert _compare_lists(
+            [ma_val], [np.ma.array(2.72)], "test", 1e-7, 0.0
+        ) is False
+
+    def test_0d_masked_true_vs_masked_true(self) -> None:
+        """Two 0-d MaskedArrays both with mask=True are considered unequal.
+
+        np.ma.masked == np.ma.masked returns np.ma.masked (not True/False),
+        causing the scalar fallthrough to treat them as a mismatch.  This is
+        the current behavior — the comparison layer does not treat two
+        masked values as equal.
+        """
+        ma1 = np.ma.array(42.0, mask=True)
+        ma2 = np.ma.array(99.0, mask=True)
+        assert np.ma.is_masked(ma1), "Precondition: ma1 should be masked"
+        assert np.ma.is_masked(ma2), "Precondition: ma2 should be masked"
+        # Both become np.ma.masked → but masked == masked != True
+        assert _compare_lists(
+            [ma1], [ma2], "test", 1e-7, 0.0
+        ) is False
+
+    def test_0d_masked_vs_regular_scalar_mask_preserved(self) -> None:
+        """0-d MaskedArray mask is preserved through nesting in lists."""
+        # Two-element list with masked and non-masked values
+        ma_masked = np.ma.array(42.0, mask=True)
+        ma_normal = np.ma.array(3.14)
+        assert _compare_lists(
+            [ma_normal, ma_masked], [np.ma.array(3.14), ma_masked], "test", 1e-7, 0.0
+        ) is True
+
+    def test_0d_regular_ndarray_scalar_vs_scalar(self) -> None:
+        """0-d regular ndarray vs Python scalar — .item() path still works."""
+        arr = np.array(42.0)  # 0-d ndarray, NOT MaskedArray
+        assert not isinstance(arr, np.ma.MaskedArray)
+        assert _compare_lists(
+            [arr], [42.0], "test", 1e-7, 0.0
+        ) is True

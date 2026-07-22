@@ -100,6 +100,17 @@ class TestCurveDefinition:
         assert c2.is_array_element is True
         assert c2.base_mnemonic == "NMR"
 
+    # F-030: Dots in mnemonics cause roundtrip corruption.
+    def test_reject_dot_in_mnemonic(self) -> None:
+        """F-030: CurveDefinition rejects dots in mnemonics.
+
+        The writer uses dot as a structural separator; the parser
+        splits on the first dot.  ``GR.CO`` → written as
+        ``GR.CO.M/FT`` → parsed as mnemonic=GR, unit=CO.M/FT.
+        """
+        with pytest.raises(ValueError, match=r"mnemonic must not be empty"):
+            CurveDefinition(mnemonic="GR.CO")
+
 
 class TestParameterEntry:
     """Tests for ParameterEntry dataclass."""
@@ -150,6 +161,16 @@ class TestParameterEntry:
         p = ParameterEntry(mnemonic="RUN", value="1", array_index=1)
         # array_index is set but mnemonic has no '[' -> returns mnemonic
         assert p.base_mnemonic == "RUN"
+
+    # F-030: Dots in mnemonics cause roundtrip corruption.
+    def test_reject_dot_in_mnemonic(self) -> None:
+        """F-030: ParameterEntry rejects dots in mnemonics.
+
+        Same roundtrip corruption as CurveDefinition — the writer
+        uses dot as a structural separator.
+        """
+        with pytest.raises(ValueError, match=r"mnemonic must not be empty"):
+            ParameterEntry(mnemonic="GR.CO", value="1.0")
 
 
 class TestLASFile:
@@ -1648,16 +1669,16 @@ class TestDevFile:
     # --- F-006: DevFile columns cross-array length ---
 
     def test_dev_file_from_dict_inconsistent_column_lengths(self) -> None:
-        """F-006: DevFile columns with inconsistent lengths raises ValueError.
+        """F-006: DevFile columns with inconsistent lengths raises LASDataError.
 
-        models.py:1078-1086 validates that all column arrays in DevFile have
-        the same length.
+        models.py from_dict validates that all column arrays in DevFile have
+        the same length, wrapping any ValueError as LASDataError.
         """
         data: dict[str, Any] = {
             "MD": np.array([0.0, 100.0, 200.0]),
             "TVD": np.array([0.0, 99.0]),
         }
-        with pytest.raises(ValueError, match="inconsistent lengths"):
+        with pytest.raises(LASDataError, match=r"has length.*but existing columns"):
             DevFile.from_dict(data)
 
     # --- F2-003: non-dict input to DevFile.from_dict ---
@@ -1791,6 +1812,45 @@ class TestDevFile:
         assert dev2.encoding == "utf-8"
         np.testing.assert_array_equal(dev2.columns["MD"], np.array([0.0, 100.0]))
         np.testing.assert_array_equal(dev2.columns["TVD"], np.array([0.0, 99.0]))
+
+    # --- I2F-011: Column order preservation during alias normalization ---
+
+    def test_from_dict_alias_normalization_preserves_column_order(self) -> None:
+        """I2F-011: Alias normalization preserves original column order.
+
+        ``DEPTH`` normalises to ``MD`` via ``_DEV_ALIASES``.  The old
+        ``pop() + assign`` pattern moved renamed columns to the dict
+        end, corrupting ``column_order`` inference.  After the fix,
+        ``MD`` stays where ``DEPTH`` was (position 0), not at the end.
+        """
+        data: dict[str, Any] = {
+            "DEPTH": np.array([1.0, 2.0]),
+            "INC": np.array([3.0, 4.0]),
+            "AZI": np.array([5.0, 6.0]),
+        }
+        dev = DevFile.from_dict(data)
+        # DEPTH → MD via alias; MD should be first (where DEPTH was)
+        assert dev.column_order == ["MD", "INC", "AZI"]
+        # Verify all columns are accessible under normalized names
+        assert "MD" in dev.columns
+        assert "INC" in dev.columns
+        assert "AZI" in dev.columns
+
+    # --- I2F-024: Duplicate column_order detection ---
+
+    def test_post_init_duplicate_column_order_raises(self) -> None:
+        """I2F-024: Duplicate entries in column_order raise LASDataError.
+
+        ``set(["MD","MD","TVD"]) == {"MD","TVD"}``, so the set-based
+        comparison between ``column_order`` and ``columns`` keys passes
+        even when duplicates exist.  An explicit duplicate check catches
+        this.
+        """
+        with pytest.raises(LASDataError, match="duplicate entries"):
+            DevFile(
+                columns={"MD": np.array([0.0]), "TVD": np.array([0.0])},
+                column_order=["MD", "MD", "TVD"],
+            )
 
 
 class TestF038DlmNoneRaisesValueError:

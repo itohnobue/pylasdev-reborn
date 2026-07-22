@@ -38,7 +38,11 @@ def _safe_str(
     # F-I2-MD3-03: str(float('nan')) → "nan", str(float('inf')) → "inf".
     # Non-finite float values produce corrupted string representations
     # that propagate silently through from_dict roundtrip paths.
-    if isinstance(value, float) and not math.isfinite(value):
+    # F-003: np.float32 (and other numpy floating types) do NOT
+    # inherit from Python's builtin ``float``.  ``isinstance(value, float)``
+    # misses numpy float types, allowing np.float32(np.nan) and
+    # np.float32(np.inf) to bypass the non-finite guard.
+    if isinstance(value, (float, np.floating)) and not math.isfinite(value):
         raise ValueError(
             f"Cannot safely convert non-finite float {value} to string"
         )
@@ -587,12 +591,6 @@ class VersionSection:
         # str.startswith("3") which fails on leading whitespace.
         if self.vers:
             self.vers = self.vers.strip()
-        # VERS: reject whitespace-only version strings when non-empty.
-        if self.vers and not self.vers.strip():
-            raise ValueError(
-                f"VersionSection: VERS must not be whitespace-only, "
-                f"got {self.vers!r}"
-            )
         # WRAP: reject None before any string operations.
         if self.wrap is None:
             raise ValueError("VersionSection: WRAP cannot be None")
@@ -760,6 +758,15 @@ class WellSection:
                     stacklevel=2,
                 )
                 self.entries[_key] = _safe_str(_val)
+            # F-001: MAX_FIELD_LENGTH bypass for already-string values.
+            # __setitem__ guards length on mutation (L804-808), but direct
+            # construction with a long string skips both _safe_str() and
+            # __setitem__ — the isinstance(…, str) gate above short-circuits.
+            elif len(_val) > MAX_FIELD_LENGTH:
+                raise ValueError(
+                    f"WellSection: value length {len(_val)} for key "
+                    f"{_key!r} exceeds maximum allowed ({MAX_FIELD_LENGTH})"
+                )
         # I2F-05: Validate units and descriptions dicts.
         # WellSection.__post_init__ validates entries key/value types but
         # does NOT validate units dict or descriptions dict.  Non-string
@@ -909,10 +916,25 @@ class CurveDefinition:
         # strip() catches leading/trailing whitespace but "GR 1"
         # passes — embedded spaces survive to produce corrupted
         # LAS output (space is the field delimiter).
-        if not self.mnemonic or not self.mnemonic.strip() or self.mnemonic != self.mnemonic.strip() or ' ' in self.mnemonic.strip() or '\t' in self.mnemonic.strip():
+        # F-004: Reject \n and \r in mnemonics.  The writer replaces
+        # them with spaces, producing corrupted output where field
+        # boundaries shift.  strip() catches leading/trailing newlines
+        # but embedded \n/\r (e.g. "GR\nCAL") pass the space/tab checks.
+        # F-030: Reject dots in mnemonics.  The writer uses dot as a
+        # structural separator in LAS output; the parser splits on the
+        # first dot.  A mnemonic like "GR.CO" would be written as
+        # "GR.CO.M/FT" and parsed back as mnemonic="GR", unit="CO.M/FT"
+        # — causing roundtrip corruption.
+        if (not self.mnemonic or not self.mnemonic.strip()
+                or self.mnemonic != self.mnemonic.strip()
+                or ' ' in self.mnemonic.strip()
+                or '\t' in self.mnemonic.strip()
+                or '\n' in self.mnemonic
+                or '\r' in self.mnemonic
+                or '.' in self.mnemonic):
             raise ValueError(
                 f"CurveDefinition: mnemonic must not be empty, "
-                f"whitespace-only, or contain spaces/tabs, "
+                f"whitespace-only, or contain spaces/tabs/newlines/dots, "
                 f"got {self.mnemonic!r}"
             )
         if self.data_format and self.data_format not in _VALID_DATA_FORMATS:
@@ -1061,10 +1083,20 @@ class ParameterEntry:
         # strip() catches leading/trailing whitespace but "GR 1"
         # passes — embedded spaces survive to produce corrupted
         # LAS output (space is the field delimiter).
-        if not self.mnemonic or not self.mnemonic.strip() or self.mnemonic != self.mnemonic.strip() or ' ' in self.mnemonic.strip() or '\t' in self.mnemonic.strip():
+        # F-004: Reject \n and \r in mnemonics — same gap as
+        # CurveDefinition.__post_init__ above.
+        # F-030: Reject dots in mnemonics — same roundtrip corruption
+        # as CurveDefinition (writer uses dot as structural separator).
+        if (not self.mnemonic or not self.mnemonic.strip()
+                or self.mnemonic != self.mnemonic.strip()
+                or ' ' in self.mnemonic.strip()
+                or '\t' in self.mnemonic.strip()
+                or '\n' in self.mnemonic
+                or '\r' in self.mnemonic
+                or '.' in self.mnemonic):
             raise ValueError(
                 f"ParameterEntry: mnemonic must not be empty, "
-                f"whitespace-only, or contain spaces/tabs, "
+                f"whitespace-only, or contain spaces/tabs/newlines/dots, "
                 f"got {self.mnemonic!r}"
             )
         # F-21: Validate that unit, value, and description are strings.
@@ -1199,6 +1231,14 @@ class DataSection:
 
     def validate(self, complete: bool = False) -> list[str]:
         """Validate data section fields.
+
+        .. note::
+
+            This method **mutates** ``self.data`` and ``self.string_data``
+            in-place: any non-``numpy.ndarray`` values are coerced via
+            ``np.asarray()`` so that dtype checks are reliable.  This
+            conversion is lossless — lists and array-likes are wrapped
+            into equivalent numpy arrays without changing data values.
 
         Args:
             complete: If True, also run deferred/semantic checks
@@ -1908,6 +1948,14 @@ class LASFile:
     def validate(self, complete: bool = False) -> list[str]:
         """Validate LASFile state.
 
+        .. note::
+
+            This method **mutates** ``self.logs`` and ``self.string_data``
+            in-place: any non-``numpy.ndarray`` values are coerced via
+            ``np.asarray()`` so that dtype checks are reliable.  This
+            conversion is lossless — lists and array-likes are wrapped
+            into equivalent numpy arrays without changing data values.
+
         Args:
             complete: If True, also run deferred cross-field checks
                 including children delegation, cross-section consistency,
@@ -2003,6 +2051,25 @@ class LASFile:
                     "data_sections requires LAS 3.0 version"
                 )
 
+            # F-012: Cross-section data_sections name dedup.
+            # __post_init__ (L1730-1741) checks for duplicate data section
+            # names, but validate(complete=True) did not — post-construction
+            # mutation followed by validate() would pass with duplicates.
+            # Mirror the __post_init__ logic here as a warning-producing check.
+            if len(self.data_sections) > 1:
+                _ds_names: list[str] = []
+                for _ds in self.data_sections:
+                    _ds_names.append(_ds.name or "<unnamed>")
+                _seen_ds: set[str] = set()
+                for _ds_name in _ds_names:
+                    if _ds_name in _seen_ds:
+                        issues.append(
+                            f"LASFile: duplicate data section name "
+                            f"{_ds_name!r}.  Data section names must "
+                            f"be unique."
+                        )
+                    _seen_ds.add(_ds_name)
+
         return issues
 
     def to_dict(self) -> dict[str, Any]:
@@ -2093,7 +2160,12 @@ class LASFile:
         # (models.py ← parser.py/data_reader.py which import from models.py).
         from .data_reader import MAX_CURVES, MAX_DATA_LINES, MAX_TOTAL_ELEMENTS
         from .exceptions import LASDataError
-        from .parser import MAX_DATA_SECTIONS, MAX_OTHER_LINES, MAX_PARAMETERS
+        from .parser import (
+            MAX_DATA_SECTIONS,
+            MAX_OTHER_LINES,
+            MAX_PARAMETERS,
+            _validate_data_section_column_counts,
+        )
 
         # F-057: Bound well-related iterables to match the parser's
         # MAX_DEFERRED_WELL_ENTRIES guard on the well re-processing path.
@@ -2116,7 +2188,7 @@ class LASFile:
             # (parser.py:440-450) for case-insensitive lookup + chain
             # resolution.  When mnem_base is None, _norm_mnem is an
             # identity function — backward-compatible.
-            from .mnem_base import resolve_mnemonic as _resolve_mnemonic
+            from .mnem_base import build_mnemonic_lookup
 
             _mnem_base_upper: dict[str, str] | None = None
 
@@ -2131,26 +2203,12 @@ class LASFile:
                     return raw
                 return _mnem_base_upper.get(raw.upper(), raw)
 
-            if mnem_base:
-                _raw_up: dict[str, str] = {}
-                # F-M-037: Sort mnem_base items before iteration to
-                # guarantee deterministic first-wins semantics.  Without
-                # this sort, a dict where lowercase aliases (e.g. "bk")
-                # precede canonical entries ("BK") could break chain
-                # resolution.  Mirroring parser.py:438-440.
-                _sorted_items = sorted(
-                    mnem_base.items(),
-                    key=lambda item: (not item[0].isupper(), item[0]),
-                )
-                for _k, _v in _sorted_items:
-                    _key = _k.upper()
-                    if _key not in _raw_up:
-                        _raw_up[_key] = _v
-                _mnem_base_upper = {}
-                for _k in _raw_up:
-                    _mnem_base_upper[_k] = _resolve_mnemonic(_raw_up, _k)
-            else:
-                _mnem_base_upper = None
+            # F-019: Use shared build_mnemonic_lookup() from mnem_base.py
+            # instead of the 25-LOC inlined algorithm that was duplicated
+            # between models.py and mnem_base.py.  The shared function
+            # provides identical deterministic first-wins semantics with
+            # chain resolution via resolve_mnemonic().
+            _mnem_base_upper = build_mnemonic_lookup(mnem_base) if mnem_base else None
 
             las_file = cls()
 
@@ -2904,6 +2962,13 @@ class LASFile:
                     stacklevel=2,
                 )
 
+            # F-020: Wire _validate_data_section_column_counts() into the
+            # from_dict path.  The function was extracted from the parser
+            # specifically so that from_dict could also call it (per its
+            # docstring), but the import and call were never added.
+            if las_file.data_sections:
+                _validate_data_section_column_counts(las_file.data_sections)
+
             # Restore LAS 3.0 string data (top-level, backward compat
             # with data serialized before string_data was moved to
             # per-section DataSection objects).
@@ -3191,6 +3256,54 @@ class LASFile:
         return [c for c in self.curves if c.array_info and c.array_info.base_name == base_name]
 
 
+# F-015: Validating dict wrapper for DevFile.columns.  Direct mutation
+# like ``dev.columns["NEW"] = arr`` bypasses all validation when columns
+# is a plain dict — no __setitem__ guard, no column_order sync, no
+# length consistency check.  This wrapper intercepts __setitem__ and
+# __delitem__ to validate, sync column_order, and enforce resource limits.
+class _DevColumns(dict[str, NDArray[np.float64]]):
+    """Validating dict for DevFile columns that intercepts mutation."""
+
+    __slots__ = ('_dev',)
+
+    def __init__(self, dev: DevFile, mapping: dict[str, NDArray[np.float64]] | None = None, /, **kwargs: Any) -> None:
+        self._dev = dev
+        super().__init__(mapping or {}, **kwargs)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if not isinstance(key, str):
+            raise TypeError(
+                f"DevFile column keys must be str, "
+                f"got {type(key).__name__}"
+            )
+        # Convert to numpy array matching from_dict behaviour.
+        arr = np.atleast_1d(np.asarray(value, dtype=np.float64))
+        # Validate length consistency with existing columns.
+        if self:
+            existing_len = len(next(iter(self.values())))
+            if len(arr) != existing_len:
+                raise ValueError(
+                    f"DevFile: column '{key}' has length {len(arr)} "
+                    f"but existing columns have length {existing_len}"
+                )
+        # F-016: Per-column size guard mirrors from_dict guards.
+        from .data_reader import MAX_DATA_LINES
+        if len(arr) > MAX_DATA_LINES:
+            raise ValueError(
+                f"DevFile: column '{key}' length ({len(arr)}) "
+                f"exceeds maximum allowed ({MAX_DATA_LINES})"
+            )
+        super().__setitem__(key, arr)
+        # Sync column_order — add key if not already present.
+        if key not in self._dev.column_order:
+            self._dev.column_order.append(key)
+
+    def __delitem__(self, key: str) -> None:
+        super().__delitem__(key)
+        if key in self._dev.column_order:
+            self._dev.column_order.remove(key)
+
+
 @dataclass(eq=False)
 class DevFile:
     """DEV (deviation survey) file data structure."""
@@ -3297,12 +3410,34 @@ class DevFile:
         downstream.  Empty construction is allowed for incremental
         population.
         """
+        # F-015: Wrap columns in _DevColumns if not already wrapped.
+        # This intercepts `dev.columns["KEY"] = arr` mutations so they
+        # go through validation, column_order sync, and length checks.
+        # Re-wrapping is idempotent — if columns is already a
+        # _DevColumns, the isinstance guard skips re-initialisation.
+        if not isinstance(self.columns, _DevColumns):
+            self.columns = _DevColumns(self, self.columns)
+
         if not self.columns:
             return
 
         from .exceptions import LASDataError
 
         # column_order must match columns keys exactly
+        # I2F-024: Reject duplicate entries in column_order.
+        # The set() comparison below cannot detect duplicates
+        # (set(["MD","MD","TVD"]) == {"MD","TVD"} is True).
+        # Duplicates indicate a caller bug and would cause
+        # double-emission downstream.
+        if len(self.column_order) != len(set(self.column_order)):
+            _dupes = sorted(
+                c for c in set(self.column_order)
+                if self.column_order.count(c) > 1
+            )
+            raise LASDataError(
+                f"DevFile: column_order contains duplicate entries: "
+                f"{_dupes}.  Each column may only appear once."
+            )
         _col_keys = set(self.columns.keys())
         _ord_keys = set(self.column_order)
         if _col_keys != _ord_keys:
@@ -3322,6 +3457,34 @@ class DevFile:
                     f"DevFile: columns have inconsistent array "
                     f"lengths: {_col_lens}"
                 )
+
+        # F-016: Resource-exhaustion guards for direct construction.
+        # The from_dict path has MAX_CURVES, MAX_DATA_LINES, and
+        # MAX_TOTAL_ELEMENTS guards (imported from .data_reader);
+        # __post_init__ previously had none — direct construction with
+        # 200+ columns or multi-MB arrays bypassed all limits.
+        from .data_reader import MAX_CURVES, MAX_DATA_LINES, MAX_TOTAL_ELEMENTS
+
+        if len(self.columns) >= MAX_CURVES:
+            raise LASDataError(
+                f"DevFile: number of columns ({len(self.columns)}) "
+                f"exceeds maximum allowed ({MAX_CURVES})"
+            )
+
+        _max_dev_len = max(len(arr) for arr in self.columns.values())
+        if _max_dev_len > MAX_DATA_LINES:
+            raise LASDataError(
+                f"DevFile: maximum column length ({_max_dev_len}) "
+                f"exceeds maximum allowed ({MAX_DATA_LINES})"
+            )
+
+        _dev_total = len(self.columns) * _max_dev_len
+        if _dev_total > MAX_TOTAL_ELEMENTS:
+            raise LASDataError(
+                f"DevFile: total elements ({len(self.columns)} columns x "
+                f"{_max_dev_len} rows = {_dev_total}) exceeds maximum "
+                f"allowed ({MAX_TOTAL_ELEMENTS})"
+            )
 
         # I2F-01: Run data-quality validation checks from __post_init__
         # when constructed directly (not via from_dict).  Matches the
@@ -3412,7 +3575,14 @@ class DevFile:
             # storage.  Controlled by normalize_aliases parameter.
             if normalize_aliases:
                 from .dev_reader import _normalize_dev_column
-                for _raw_key in list(data.keys()):
+                # I2F-011: Build a normalization map first, then
+                # rebuild the data dict in original key order so
+                # renamed columns stay in their original positions.
+                # The old pop+append pattern (data[norm]=data.pop(raw))
+                # moved renamed columns to the dict end, corrupting
+                # column_order inference.
+                _norm_map: dict[str, str] = {}
+                for _raw_key in data:
                     # F-M-G03: Don't normalize metadata keys — they are
                     # checked case-sensitively against metadata_keys below.
                     # Normalizing e.g. "encoding" → "ENCODING" would cause
@@ -3427,13 +3597,30 @@ class DevFile:
                         continue
                     _norm_key = _normalize_dev_column(_raw_key)
                     if _norm_key != _raw_key:
-                        if _norm_key in data:
+                        # Collision: two raw keys normalise to the same value
+                        if _norm_key in _norm_map.values():
+                            raise ValueError(
+                                f"DevFile.from_dict: column name collision: "
+                                f"'{_raw_key}' and another key normalise "
+                                f"to the same canonical column name '{_norm_key}'"
+                            )
+                        # Collision: normalised key already exists as a
+                        # raw key that itself does not normalise away
+                        if _norm_key in data and _norm_key not in _norm_map:
                             raise ValueError(
                                 f"DevFile.from_dict: column name collision: "
                                 f"'{_raw_key}' and '{_norm_key}' normalize "
                                 f"to the same canonical column name"
                             )
-                        data[_norm_key] = data.pop(_raw_key)
+                        _norm_map[_raw_key] = _norm_key
+                # Rebuild data dict with normalized keys, preserving
+                # original insertion order (the order of the caller's
+                # input dict).
+                if _norm_map:
+                    data = {
+                        _norm_map.get(k, k): v
+                        for k, v in data.items()
+                    }
 
             # F-M01: Resource-exhaustion guard — bound column count.
             # Exclude _meta_-prefixed keys (metadata stored under prefix
@@ -3582,7 +3769,7 @@ class DevFile:
                             f"maximum allowed ({MAX_DATA_LINES})"
                         )
                     try:
-                        dev.columns[key] = np.atleast_1d(np.array(value, dtype=np.float64))
+                        dev.columns[key] = np.atleast_1d(np.asarray(value, dtype=np.float64))
                     except (ValueError, TypeError, MemoryError, OverflowError) as e:
                         raise ValueError(
                             f"Cannot convert data for column '{key}' to numeric array: {e}"
@@ -3622,6 +3809,18 @@ class DevFile:
             # F2-30: Reject empty DevFile — no columns found.
             if not dev.columns:
                 raise LASDataError("No columns found in input dict")
+            # I2F-011: Sync column_order entries to match actual
+            # case-sensitive keys in dev.columns.  The from_dict
+            # normalization loop uppercases column_order entries via
+            # _normalize_dev_column, but metadata-key columns (e.g.
+            # "encoding" when a collision produces _meta_encoding) are
+            # stored with their original case.  Map each column_order
+            # entry back to the matching dev.columns key.
+            if dev.column_order and normalize_aliases:
+                _actual_keys = {k.upper(): k for k in dev.columns}
+                dev.column_order = [
+                    _actual_keys.get(c.upper(), c) for c in dev.column_order
+                ]
             # F2-32: Cross-validate column_order entries against
             # columns.keys().  Orphaned entries (e.g. ["INC", "AZI"]
             # when only "MD" exists) produce silently broken output.
