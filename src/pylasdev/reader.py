@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 import warnings
 from pathlib import Path
 from typing import Any
@@ -161,6 +162,12 @@ def read_las_file_as_object(
     # splitting to prevent section-header injection.
     lines = _SPLITLINES_CHARS_RE.sub(" ", content).splitlines()
     parser.source_file = str(file_path)
+    # F-047: Thread the desanitize parameter through to header parsing.
+    # data_reader sets this flag before processing data, but header
+    # parsing (well, curve, parameter, version) runs earlier — without
+    # this, all 8 header desanitization call sites always run with the
+    # default True, ignoring the caller's desanitize parameter.
+    sys.modules["pylasdev.parser"]._DESANITIZE_ENABLED = desanitize  # type: ignore[attr-defined]
     try:
         las_file = parser.parse(content, lines=lines)
     except LASParseError as e:

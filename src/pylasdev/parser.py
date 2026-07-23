@@ -472,7 +472,8 @@ def _validate_data_section_column_counts(data_sections: Sequence[Any]) -> None:
 # data section) bypassed format checking because the validator sat inside
 # data-processing code.  Also used by _process_ascii_data (replaces the
 # inlined check) so both call sites share the same validator.
-def _validate_curve_data_format(data_format: str, mnemonic: str) -> None:
+def _validate_curve_data_format(data_format: str, mnemonic: str,
+                                 line_no: int = 0) -> None:
     """Validate a curve data_format against known LAS format specifiers.
 
     Accepts single-letter codes (F, E, D, S, A) and extended Fortran-style
@@ -483,6 +484,7 @@ def _validate_curve_data_format(data_format: str, mnemonic: str) -> None:
     Args:
         data_format: The format specifier string (already uppercased).
         mnemonic: The curve mnemonic for error messages.
+        line_no: Optional line number for error messages (0 = omitted).
 
     Raises:
         LASParseError: If the format specifier is not a recognised single-letter
@@ -492,8 +494,9 @@ def _validate_curve_data_format(data_format: str, mnemonic: str) -> None:
         return
     if data_format in _KNOWN_CURVE_FORMATS or _FORMAT_SPEC_RE.match(data_format):
         return
+    prefix = f"Line {line_no}: " if line_no else ""
     raise LASParseError(
-        f"Curve '{mnemonic}' has unsupported format "
+        f"{prefix}curve '{mnemonic}' has unsupported format "
         f"specifier '{{{data_format}}}'. Non-numeric format types "
         f"(e.g., {{DEG}}, date templates) are not valid LAS "
         f"data format specifiers. "
@@ -556,6 +559,7 @@ class LASParser:
         """Reset parser state for a new file."""
         self.las_file = LASFile()
         self._state.reset()
+        self._line_no = 0  # F-049: Track current line number for error messages
 
     @property
     def data_line_count(self) -> int:
@@ -597,7 +601,8 @@ class LASParser:
             lines = [_SPLITLINES_CHARS_RE.sub(" ", ln) for ln in lines]
         self._pre_scan(lines)
 
-        for line in lines:
+        for line_no, line in enumerate(lines, 1):
+            self._line_no = line_no  # F-049: Track line number for error messages
             self._parse_line(line)
 
         # F-P06: Re-process well entries parsed before ~V was known.
@@ -871,8 +876,9 @@ class LASParser:
         # regex backtracking and string allocation.
         if len(line) > MAX_LINE_LENGTH:
             raise LASParseError(
-                f"Line length ({len(line)}) exceeds maximum allowed "
-                f"({MAX_LINE_LENGTH}). The file may be malformed or corrupt."
+                f"Line {self._line_no}: line length ({len(line)}) exceeds "
+                f"maximum allowed ({MAX_LINE_LENGTH}). "
+                f"The file may be malformed or corrupt."
             )
         # F-M-07: Strip leading whitespace before matching SECTION_PATTERN,
         # matching _pre_scan behavior.  Leading spaces would otherwise break
@@ -946,9 +952,10 @@ class LASParser:
                 if self.las_file.version.is_las30:
                     _other_line = line[:80].strip()
                     raise LASParseError(
-                        f"~Other section at line '{_other_line}' — ~Other is "
-                        f"NOT ALLOWED in LAS 3.0.  Migrate content to "
-                        f"user-defined Parameter or Column Data sections."
+                        f"Line {self._line_no}: ~Other section "
+                        f"('{_other_line}') — ~Other is NOT ALLOWED in "
+                        f"LAS 3.0.  Migrate content to user-defined "
+                        f"Parameter or Column Data sections."
                     )
             elif (
                 section_word in _DATA_SECTION_WORDS
@@ -1076,6 +1083,13 @@ class LASParser:
                     start, end = self._state.definition_curve_ranges["__MAIN__"]
                     self._state.section_curve_start_idx = start
                     self._state.section_curve_end_idx = end
+                else:
+                    # H-01: LOG_DATA section with neither a matching
+                    # _Definition nor __MAIN__ fallback — reset to all
+                    # curves to avoid retaining stale curve scope from
+                    # a previous typed data section.
+                    self._state.section_curve_start_idx = 0
+                    self._state.section_curve_end_idx = None  # None → all curves
             else:
                 # Unknown section type — accumulate lines as free-form text (like ~O).
                 new_section = None
@@ -1204,7 +1218,8 @@ class LASParser:
         """Append a line to _other_lines with a bounds check (F-M-02)."""
         if len(self._state.other_lines) >= MAX_OTHER_LINES:
             raise LASParseError(
-                f"Other section line count ({len(self._state.other_lines) + 1}) exceeds "
+                f"Line {self._line_no}: other section line count "
+                f"({len(self._state.other_lines) + 1}) exceeds "
                 f"maximum allowed ({MAX_OTHER_LINES}). "
                 f"The file may be malformed or corrupt."
             )
@@ -1358,8 +1373,9 @@ class LASParser:
             val = groupdict.get(group_name)
             if val and len(val) > MAX_FIELD_LENGTH:
                 raise LASParseError(
-                    f"Field '{group_name}' length ({len(val)}) exceeds "
-                    f"maximum allowed ({MAX_FIELD_LENGTH}). "
+                    f"Line {self._line_no}: field '{group_name}' length "
+                    f"({len(val)}) exceeds maximum allowed "
+                    f"({MAX_FIELD_LENGTH}). "
                     f"The file may be malformed or corrupt."
                 )
 
@@ -1473,6 +1489,24 @@ class LASParser:
             wrap_upper = value.upper()
             if wrap_upper in {"YES", "NO"}:
                 self.las_file.version.wrap = wrap_upper
+                # F-051: WRAP is a LAS 1.2/2.0 concept — it is not valid
+                # in LAS 3.0 where data is handled in structured sections.
+                # Non-wrapped data (full rows) works fine; the downstream
+                # check in _las30_data.py detects actual wrap mode and
+                # raises for genuinely wrapped data.  This warning covers
+                # the gap where metadata-only LAS 3.0 files bypass the
+                # data-section check entirely.
+                if (wrap_upper == "YES"
+                        and _LASVersionSpec(self.las_file.version.vers).is_las30):
+                    warnings.warn(
+                        "WRAP=YES is not supported in LAS 3.0. "
+                        "LAS 3.0 uses structured data sections "
+                        "instead of line wrapping. "
+                        "Resetting WRAP to NO.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    self.las_file.version.wrap = "NO"
             else:
                 warnings.warn(
                     f"Unknown WRAP value '{value}'. Expected YES or NO. "
@@ -1589,7 +1623,8 @@ class LASParser:
         # string_data); the parser path had zero protection.
         if len(self.las_file.well.entries) >= MAX_PARAMETERS:
             raise LASParseError(
-                f"Well entry count ({len(self.las_file.well.entries) + 1}) exceeds "
+                f"Line {self._line_no}: well entry count "
+                f"({len(self.las_file.well.entries) + 1}) exceeds "
                 f"maximum allowed ({MAX_PARAMETERS}). "
                 f"The file may be malformed or corrupt."
             )
@@ -1741,17 +1776,6 @@ class LASParser:
         and replayed here after the version is known.
         """
         if self._state.deferred_well_entries:
-            # F-M-006: Combined-count guard before replay.  well.entries
-            # may already contain entries + _deferred_well_entries may
-            # independently have up to MAX_DEFERRED_WELL_ENTRIES (100K),
-            # creating a transient memory pool of up to ~200K dict entries.
-            combined = len(self.las_file.well.entries) + len(self._state.deferred_well_entries)
-            if combined > 2 * MAX_DEFERRED_WELL_ENTRIES:
-                raise LASParseError(
-                    f"Combined well entry count ({combined}) exceeds maximum "
-                    f"allowed ({2 * MAX_DEFERRED_WELL_ENTRIES}). "
-                    f"The file may be malformed or corrupt."
-                )
             is_las12 = _LASVersionSpec(
                 self.las_file.version.vers
             ).is_las12
@@ -1948,7 +1972,8 @@ class LASParser:
             # a ~V section could grow this list without bound.
             if len(self._state.deferred_well_entries) >= MAX_DEFERRED_WELL_ENTRIES:
                 raise LASParseError(
-                    f"Deferred well entry count ({len(self._state.deferred_well_entries) + 1}) "
+                    f"Line {self._line_no}: deferred well entry count "
+                    f"({len(self._state.deferred_well_entries) + 1}) "
                     f"exceeds maximum allowed ({MAX_DEFERRED_WELL_ENTRIES}). "
                     f"The file may be malformed or corrupt."
                 )
@@ -2040,7 +2065,8 @@ class LASParser:
             # templates and pass through unchanged — same behavior
             # as the parameter path (line ~2077).
             try:
-                _validate_curve_data_format(data_format, raw_mnemonic)
+                _validate_curve_data_format(data_format, raw_mnemonic,
+                                             line_no=self._line_no)
             except LASParseError:
                 # Not a valid data format — clear it so CurveDefinition
                 # __post_init__ does not reject the multi-char string.
@@ -2060,15 +2086,16 @@ class LASParser:
                     array_time_offset = float(first_offset)
                 except ValueError as exc:
                     raise LASParseError(
-                        f"Invalid format specifier offset: "
-                        f"'{first_offset}' is not a valid number "
+                        f"Line {self._line_no}: invalid format specifier "
+                        f"offset: '{first_offset}' is not a valid number "
                         f"in curve description '{description}'"
                     ) from exc
                 if not np.isfinite(array_time_offset):
                     raise LASParseError(
-                        f"Format specifier offset overflow: "
-                        f"'{first_offset}' produced "
-                        f"{array_time_offset} in curve description '{description}'"
+                        f"Line {self._line_no}: format specifier offset "
+                        f"overflow: '{first_offset}' produced "
+                        f"{array_time_offset} in curve description "
+                        f"'{description}'"
                     )
             if len(format_matches) > 1:
                 extra_formats = [f[0] for f in format_matches[1:]]
@@ -2089,7 +2116,8 @@ class LASParser:
             def _keep_non_format(m: re.Match[str]) -> str:
                 try:
                     _validate_curve_data_format(
-                        m.group("format").upper(), raw_mnemonic
+                        m.group("format").upper(), raw_mnemonic,
+                        line_no=self._line_no,
                     )
                     return ""  # Valid format specifier → strip it
                 except LASParseError:
@@ -2108,8 +2136,9 @@ class LASParser:
                 index = int(array_match.group("index"))
             except ValueError as exc:
                 raise LASParseError(
-                    f"Invalid array index '{array_match.group('index')}' in "
-                    f"curve mnemonic '{raw_mnemonic}'"
+                    f"Line {self._line_no}: invalid array index "
+                    f"'{array_match.group('index')}' in curve "
+                    f"mnemonic '{raw_mnemonic}'"
                 ) from exc
             array_info = ArrayElementInfo(
                 base_name=base_name,
@@ -2143,7 +2172,8 @@ class LASParser:
             )
         except ValueError as e:
             raise LASParseError(
-                f"Invalid curve definition for mnemonic {raw_mnemonic!r}: {e}"
+                f"Line {self._line_no}: invalid curve definition for "
+                f"mnemonic {raw_mnemonic!r}: {e}"
             ) from e
         # F-28: Guard against unbounded curve accumulation during ~C parsing.
         # Without this check, a metadata-only LAS 3.0 file can accumulate
@@ -2152,8 +2182,10 @@ class LASParser:
         # which early-returns when no data section exists).
         if len(self.las_file.curves) >= _data_reader.MAX_CURVES:
             raise LASParseError(
-                f"Curve count ({len(self.las_file.curves) + 1}) exceeds maximum "
-                f"allowed ({_data_reader.MAX_CURVES}). The file may be malformed or corrupt."
+                f"Line {self._line_no}: curve count "
+                f"({len(self.las_file.curves) + 1}) exceeds maximum "
+                f"allowed ({_data_reader.MAX_CURVES}). "
+                f"The file may be malformed or corrupt."
             )
         self.las_file.curves.append(curve)
         self.las_file.curves_order.append(normalized)
@@ -2234,7 +2266,10 @@ class LASParser:
                 # unchanged — same as the existing documented behavior.
                 if len(param_data_format) > 1:
                     try:
-                        _validate_curve_data_format(param_data_format, raw_mnemonic)
+                        _validate_curve_data_format(
+                            param_data_format, raw_mnemonic,
+                            line_no=self._line_no,
+                        )
                     except LASParseError:
                         warnings.warn(
                             f"Parameter '{raw_mnemonic}' has unrecognized data "
@@ -2271,7 +2306,8 @@ class LASParser:
         def _keep_non_format_param(m: re.Match[str]) -> str:
             try:
                 _validate_curve_data_format(
-                    m.group("format").upper(), raw_mnemonic
+                    m.group("format").upper(), raw_mnemonic,
+                    line_no=self._line_no,
                 )
                 return ""  # Valid format specifier → strip it
             except LASParseError:
@@ -2291,7 +2327,8 @@ class LASParser:
                     zone_index = int(zone_match.group("index"))
                 except ValueError as exc:
                     raise LASParseError(
-                        f"Invalid zone index '{zone_match.group('index')}' in "
+                        f"Line {self._line_no}: invalid zone index "
+                        f"'{zone_match.group('index')}' in "
                         f"parameter '{raw_mnemonic}'"
                     ) from exc
             # F-01: Preserve original zone name casing
@@ -2311,7 +2348,8 @@ class LASParser:
                 array_index = int(array_match.group("index"))
             except ValueError as exc:
                 raise LASParseError(
-                    f"Invalid array index '{array_match.group('index')}' in "
+                    f"Line {self._line_no}: invalid array index "
+                    f"'{array_match.group('index')}' in "
                     f"parameter mnemonic '{raw_mnemonic}'"
                 ) from exc
         elif "[" in raw_mnemonic:
@@ -2361,7 +2399,8 @@ class LASParser:
             )
         except ValueError as e:
             raise LASParseError(
-                f"Invalid parameter entry for mnemonic {raw_mnemonic!r}: {e}"
+                f"Line {self._line_no}: invalid parameter entry for "
+                f"mnemonic {raw_mnemonic!r}: {e}"
             ) from e
         # F-M15: Store data_format as an instance attribute for roundtrip
         # fidelity.  Forward-compatible — works before and after the field
@@ -2373,7 +2412,8 @@ class LASParser:
         # protection anywhere despite following the same append pattern.
         if len(self.las_file.parameters) >= MAX_PARAMETERS:
             raise LASParseError(
-                f"Parameter count ({len(self.las_file.parameters) + 1}) exceeds "
+                f"Line {self._line_no}: parameter count "
+                f"({len(self.las_file.parameters) + 1}) exceeds "
                 f"maximum allowed ({MAX_PARAMETERS}). "
                 f"The file may be malformed or corrupt."
             )
@@ -2400,8 +2440,9 @@ class LASParser:
             if not self._state.version_found:
                 if len(self._state.deferred_ascii_data_lines) > _data_reader.MAX_DATA_LINES:
                     raise LASParseError(
-                        f"Deferred ASCII data line count exceeds maximum "
-                        f"allowed ({_data_reader.MAX_DATA_LINES}). "
+                        f"Line {self._line_no}: deferred ASCII data line "
+                        f"count exceeds maximum allowed "
+                        f"({_data_reader.MAX_DATA_LINES}). "
                         f"The file may be malformed or corrupt."
                     )
                 # F-H01: Store per-line (section_type, section_name,
@@ -2427,8 +2468,9 @@ class LASParser:
         # accumulation phase itself.
         if len(self._state.ascii_data_lines) > _data_reader.MAX_DATA_LINES:
             raise LASParseError(
-                f"ASCII data line count exceeds maximum allowed "
-                f"({_data_reader.MAX_DATA_LINES}) during accumulation. "
+                f"Line {self._line_no}: ASCII data line count exceeds "
+                f"maximum allowed ({_data_reader.MAX_DATA_LINES}) "
+                f"during accumulation. "
                 f"The file may be malformed or corrupt."
             )
         self._state.ascii_data_lines.append(line)

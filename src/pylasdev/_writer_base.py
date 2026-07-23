@@ -170,7 +170,13 @@ def _format_curve_line(curve: CurveDefinition, is_las30: bool) -> str:
             offset = curve.array_info.time_offset
             if math.isfinite(offset):
                 if offset == int(offset):
-                    format_str += f":{int(offset)}"
+                    # IEEE 754 negative zero: int(-0.0) == 0 loses the sign.
+                    # Use float formatting to preserve "-0" in the output,
+                    # matching the copysign guard in _format_number.
+                    if offset == 0 and math.copysign(1.0, offset) < 0:
+                        format_str += f":{offset}"
+                    else:
+                        format_str += f":{int(offset)}"
                 else:
                     format_str += f":{offset}"
         format_str += "}"
@@ -710,9 +716,14 @@ def write_las_file(
     elif spec.is_las20:
         from ._writer_las20 import _Las20Writer
         writer = _Las20Writer(las_file, precision)
-    else:
+    elif spec.is_las30:
         from ._writer_las30 import _Las30Writer
         writer = _Las30Writer(las_file, precision)
+    else:
+        raise LASWriteError(
+            f"Unsupported LAS version: {las_file.version.vers!r}. "
+            f"Supported versions are LAS 1.2, 2.0, and 3.0."
+        )
 
     with _WriterMutationGuard(las_file):
         try:

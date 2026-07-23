@@ -1504,7 +1504,7 @@ class TestMaxLimitsGuards:
         test_file.write_text(content, encoding="utf-8")
 
         with mock.patch("pylasdev.data_reader.MAX_CURVES", 1):
-            with pytest.raises(LASParseError, match="Curve count"):
+            with pytest.raises(LASParseError, match=r"(?i)curve count"):
                 read_las_file(test_file)
 
     def test_max_curves_wrapped_mode(self, tmp_path: Path) -> None:
@@ -1528,7 +1528,7 @@ class TestMaxLimitsGuards:
         test_file.write_text(content, encoding="utf-8")
 
         with mock.patch("pylasdev.data_reader.MAX_CURVES", 1):
-            with pytest.raises(LASParseError, match="Curve count"):
+            with pytest.raises(LASParseError, match=r"(?i)curve count"):
                 read_las_file(test_file)
 
 

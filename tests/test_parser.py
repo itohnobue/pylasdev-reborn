@@ -1323,7 +1323,7 @@ class TestFormatSpecOffsetError:
  NMR[1].ms    : NMR Echo Array {A:..}
 """
         parser = LASParser()
-        with pytest.raises(LASParseError, match="Invalid format specifier offset"):
+        with pytest.raises(LASParseError, match=r"(?i)invalid format specifier offset"):
             parser.parse(content)
 
     def test_malformed_offset_multiple_dots(self) -> None:
@@ -1337,7 +1337,7 @@ class TestFormatSpecOffsetError:
  NMR[1].ms    : NMR Echo Array {A:1.2.3}
 """
         parser = LASParser()
-        with pytest.raises(LASParseError, match="Invalid format specifier offset"):
+        with pytest.raises(LASParseError, match=r"(?i)invalid format specifier offset"):
             parser.parse(content)
 
 
@@ -2039,14 +2039,13 @@ class TestValueOnlyPattern:
     # ── F2-03: WRAP=YES warning in LAS 3.0 ──────────────────────
 
     def test_las30_wrap_yes_warns(self) -> None:
-        """F-003: LAS 3.0 WRAP=YES should raise LASParseError.
+        """F-051: LAS 3.0 WRAP=YES should warn and reset to NO.
 
-        WRAP=YES data processing is not implemented — previously a
-        logger.warning allowed corrupt parsing to continue; now a
-        LASParseError prevents silent data corruption.
+        WRAP is a LAS 1.2/2.0 concept; in LAS 3.0, WRAP=YES triggers a
+        UserWarning and is reset to NO, allowing the parse to continue.
+        Non-wrapped data (full rows) parses correctly; genuinely wrapped
+        data is caught by the downstream check in _las30_data.py.
         """
-        from pylasdev.exceptions import LASParseError
-
         content = (
             "~VERSION INFORMATION\n"
             " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
@@ -2057,8 +2056,10 @@ class TestValueOnlyPattern:
             " 1670.0\n"  # at least one data line so _process_ascii_data runs
         )
         parser = LASParser()
-        with pytest.raises(LASParseError, match="WRAP=YES"):
-            parser.parse(content)
+        with pytest.warns(UserWarning, match="WRAP=YES"):
+            result = parser.parse(content)
+        # WRAP should be reset to NO after warning
+        assert result.version.wrap == "NO"
 
     def test_las30_wrap_no_silent(self, caplog) -> None:
         """F2-03: LAS 3.0 WRAP=NO should NOT produce a WRAP=YES warning."""
@@ -2096,14 +2097,17 @@ class TestValueOnlyPattern:
     # --- F-8-003: WRAP=YES trailing-comma regression ---
 
     def test_las30_wrap_yes_multi_curve_trailing_comma_raises(self) -> None:
-        """F-8-003: WRAP=YES single-value line with trailing comma correctly detected.
+        """F-8-003 + F-051: WRAP=YES trailing comma data parsed as non-wrapped.
 
         When WRAP=YES with 2+ curves and COMMA delimiter, a data line containing
         a single value plus a trailing comma (e.g. "1670.0,") would produce
         ["1670.0", ""] → len=2 tokens.  Without the F-7-003 fix stripping
         trailing empty tokens, len(_tokens) == 1 is False, incorrectly classifying
-        the wrapped data as non-wrapped.  After the fix, trailing empties are
-        stripped and the line is correctly identified as wrapped.
+        the wrapped data as non-wrapped.
+
+        F-051: WRAP=YES in LAS 3.0 now emits a UserWarning and resets WRAP to NO,
+        so the downstream _las30_data.py wrap-detection heuristic no longer fires.
+        The data is parsed as non-wrapped (one value fills DEPT, GR gets NULL).
         """
         content = (
             "~VERSION INFORMATION\n"
@@ -2114,11 +2118,15 @@ class TestValueOnlyPattern:
             " DEPT.M       :  Depth {F}\n"
             " GR.API       :  Gamma Ray {F}\n"
             "~ASCII\n"
-            " 1670.0,\n"  # single value + trailing comma → wrapped data
+            " 1670.0,\n"  # single value + trailing comma → parsed as non-wrapped
         )
         parser = LASParser()
-        with pytest.raises(LASParseError, match="WRAP=YES"):
-            parser.parse(content)
+        with pytest.warns(UserWarning, match="WRAP=YES"):
+            result = parser.parse(content)
+        # WRAP should be reset to NO after warning
+        assert result.version.wrap == "NO"
+        # Data parsed in non-wrapped mode: one value assigned to DEPT
+        assert result.logs.get("DEPT") is not None
 
     def test_las30_wrap_yes_multi_curve_full_row_no_raise(self) -> None:
         """F-8-003: WRAP=YES with full multi-curve row does NOT raise.
@@ -2209,7 +2217,7 @@ class TestMaxGuardLimits:
  DT.US/M      : SONIC  {F}
 """
         parser = LASParser()
-        with pytest.raises(LASParseError, match=r"Curve count.*exceeds"):
+        with pytest.raises(LASParseError, match=r"(?i)curve count.*exceeds"):
             parser.parse(content)
 
     # ── MAX_PARAMETERS (parser.py:1625) ──────────────────────────
@@ -2225,7 +2233,7 @@ class TestMaxGuardLimits:
  BS .MM      200  : BIT SIZE
 """
         parser = LASParser()
-        with pytest.raises(LASParseError, match=r"Parameter count.*exceeds"):
+        with pytest.raises(LASParseError, match=r"(?i)parameter count.*exceeds"):
             parser.parse(content)
 
     # ── MAX_OTHER_LINES (parser.py:985) ──────────────────────────
@@ -2240,7 +2248,7 @@ class TestMaxGuardLimits:
  Some body text here.
 """
         parser = LASParser()
-        with pytest.raises(LASParseError, match=r"Other section line count.*exceeds"):
+        with pytest.raises(LASParseError, match=r"(?i)other section line count.*exceeds"):
             parser.parse(content)
 
     # ── MAX_SECTION_SEQUENCE (parser.py:950) ─────────────────────
@@ -2272,7 +2280,7 @@ class TestMaxGuardLimits:
  WRAP.   NO   :
 """
         parser = LASParser()
-        with pytest.raises(LASParseError, match=r"Deferred well entry count.*exceeds"):
+        with pytest.raises(LASParseError, match=r"(?i)deferred well entry count.*exceeds"):
             parser.parse(content)
 
     # ── MAX_DATA_LINES (parser.py:1927) ──────────────────────────

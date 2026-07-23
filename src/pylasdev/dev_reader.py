@@ -573,7 +573,7 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 # header) AND the third line has more than 1 token.
                 if len(third_tokens) > 1 and len(content_entries) >= 4 and all(
                     _is_float_token(t) for t in third_tokens
-                ):
+                ) and col_count <= len(third_tokens) + 1:
                     return ("dug", 3)
 
     # Headerless format: every token on the first content line parses as
@@ -1207,32 +1207,38 @@ def read_dev_file_as_object(
     # line with the wrong (space) delimiter.
     _cached_hdr_names: list[str] | None = None
 
-    if delimiter is None:
-        # Use the actual header line for delimiter detection:
-        # - simple:   first content line
-        # - dug:      third content line (the header — skip title+count)
-        # - headerless: first content line (the data), but when the first
-        #   line has no commas and a later line does (e.g. column-count
-        #   prefix like "4\\n1.0,2.0,3.0,4.0"), use the first
-        #   comma-containing line for delimiter detection.  (I2F-30)
-        if format_type == "dug" and len(content_entries) > skip_content_lines - 1:
-            hdr = content_entries[skip_content_lines - 1][1]
-        elif content_entries:
-            _first = content_entries[
-                skip_content_lines - 1 if skip_content_lines > 1 else 0
-            ][1]
-            if format_type == "headerless" and "," not in _first:
-                # Headerless format where the first line is a column count
-                # (no commas).  Check subsequent lines for comma presence.
-                _comma_hdr = next(
-                    (entry[1] for entry in content_entries[1:3] if "," in entry[1]),
-                    None,
-                )
-                hdr = _comma_hdr if _comma_hdr else _first
-            else:
-                hdr = _first
+    # Extract the header line for delimiter detection and validation.
+    # - simple:   first content line
+    # - dug:      third content line (the header — skip title+count)
+    # - headerless: first content line (the data), but when the first
+    #   line has no commas and a later line does (e.g. column-count
+    #   prefix like "4\\n1.0,2.0,3.0,4.0"), use the first
+    #   comma-containing line for delimiter detection.  (I2F-30)
+    if format_type == "dug" and len(content_entries) > skip_content_lines - 1:
+        hdr = content_entries[skip_content_lines - 1][1]
+    elif content_entries:
+        _first = content_entries[
+            skip_content_lines - 1 if skip_content_lines > 1 else 0
+        ][1]
+        if format_type == "headerless" and "," not in _first:
+            # Headerless format where the first line is a column count
+            # (no commas).  Check subsequent lines for comma presence.
+            _comma_hdr = next(
+                (entry[1] for entry in content_entries[1:3] if "," in entry[1]),
+                None,
+            )
+            hdr = _comma_hdr if _comma_hdr else _first
         else:
-            hdr = ""
+            hdr = _first
+    else:
+        hdr = ""
+
+    # Remember whether delimiter was auto-detected so cross-validation
+    # can auto-correct for auto-detected delimiters only. User-provided
+    # delimiters get validated but not silently changed.
+    _delimiter_was_auto = delimiter is None
+
+    if delimiter is None:
 
         if hdr:
             # If the header contains commas and splitting on comma
@@ -1284,122 +1290,10 @@ def read_dev_file_as_object(
         else:
             delimiter = " "
 
-        # Cross-validate auto-detected delimiter against data lines
-        # (F-M27).  When the header uses commas but data lines are
-        # space-delimited, the auto-detected comma delimiter produces a
-        # single token from the entire data line, causing all values to
-        # become NaN.  Skip for headerless — the header line IS the data.
-        #
-        # F-047: Validate multiple data lines (up to 5), not just the
-        # first.  A wrong delimiter with a matching first-line field
-        # count goes undetected when only one line is checked.  Multi-line
-        # sampling catches inconsistent delimiters across lines.
-        if hdr and format_type != "headerless":
-            _content_seen = 0
-            _data_lines: list[str] = []
-            for _lin in lines:
-                _s = _lin.strip()
-                if not _s or _s.startswith("#"):
-                    continue
-                _content_seen += 1
-                if _content_seen > skip_content_lines:
-                    _data_lines.append(_s)
-                    if len(_data_lines) >= 5:
-                        break
-            if _data_lines:
-                _first_data = _data_lines[0]
-                if delimiter == " ":
-                    _hdr_cols = len(hdr.split())
-                    _data_cols = len(_first_data.split())
-                else:
-                    _hdr_cols = len(
-                        [t for t in hdr.split(delimiter) if t.strip()]
-                    )
-                    _data_cols = len(
-                        [t for t in _first_data.split(delimiter) if t.strip()]
-                    )
-                if _hdr_cols >= 2 and _data_cols == 1:
-                    # Auto-detected delimiter fails on first data line
-                    # (produces only 1 token).  Try the alternative delimiter
-                    # for auto-correction before raising an error.
-                    _alt_delim = " " if delimiter == "," else ","
-                    if _alt_delim == " ":
-                        _data_alt_cols = len(_first_data.split())
-                    else:
-                        _data_alt_cols = len(
-                            [t for t in _first_data.split(_alt_delim)
-                             if t.strip()]
-                        )
-                    if _data_alt_cols >= 2 and _data_alt_cols == _hdr_cols:
-                        warnings.warn(
-                            f"Auto-corrected delimiter from {delimiter!r} "
-                            f"to {_alt_delim!r}: header has {_hdr_cols} "
-                            f"columns but first data line produced only "
-                            f"{_data_cols} token(s) with {delimiter!r} "
-                            f"delimiter.",
-                            stacklevel=2,
-                        )
-                        # F-01: Cache header column names parsed with the
-                        # ORIGINAL delimiter before switching.  Without this,
-                        # Pass 2 re-parses the header line with the new
-                        # (space) delimiter, collapsing a comma-delimited
-                        # header like "MD,TVD,INC" into a single bogus
-                        # column name.  The cached names are passed to both
-                        # the simple-format and DUG-format header paths.
-                        _cached_hdr_names = [t.strip() for t in hdr.split(delimiter) if t.strip()]
-                        delimiter = _alt_delim
-                    else:
-                        raise DEVReadError(
-                            f"Delimiter mismatch: auto-detected delimiter "
-                            f"{delimiter!r} produces {_hdr_cols} columns "
-                            f"from header but only {_data_cols} token(s) "
-                            f"from first data line. Alternative delimiter "
-                            f"{_alt_delim!r} does not match ({_data_alt_cols} "
-                            f"tokens). Specify delimiter explicitly."
-                        )
-                elif abs(_hdr_cols - _data_cols) >= 3:
-                    raise DEVReadError(
-                        f"Delimiter mismatch: auto-detected delimiter "
-                        f"{delimiter!r} produces {_hdr_cols} columns from "
-                        f"header but {_data_cols} tokens from first data "
-                        f"line (difference: {abs(_hdr_cols - _data_cols)}). "
-                        f"Specify delimiter explicitly."
-                    )
-                # F-047: Multi-line consistency check.  When the first
-                # data line passed validation, verify that subsequent
-                # data lines are consistent with the same delimiter.
-                # A mismatch across lines (e.g., comma-delimited line
-                # in a space-delimited file) indicates data corruption.
-                elif len(_data_lines) >= 3:
-                    _mismatch_lines: list[int] = []
-                    for _idx, _dline in enumerate(_data_lines[1:], start=2):
-                        if delimiter == " ":
-                            _dl_cols = len(_dline.split())
-                        else:
-                            _dl_cols = len(
-                                [t for t in _dline.split(delimiter) if t.strip()]
-                            )
-                        if _dl_cols != _data_cols:
-                            _mismatch_lines.append(_idx)
-                    if _mismatch_lines:
-                        _sample = _mismatch_lines[:3]
-                        warnings.warn(
-                            f"Delimiter consistency warning: "
-                            f"{len(_mismatch_lines)} of {len(_data_lines)} "
-                            f"sampled data line(s) have a different number "
-                            f"of tokens than the first data line "
-                            f"({_data_cols} tokens). "
-                            f"Affected line(s): {_sample}"
-                            f"{'...' if len(_mismatch_lines) > 3 else ''}. "
-                            f"The auto-detected delimiter {delimiter!r} may "
-                            f"be incorrect for some lines. Consider specifying "
-                            f"the delimiter explicitly.",
-                            stacklevel=2,
-                        )
-
     # Guard against empty delimiter — str.split("") raises ValueError.
     # The auto-detection above always produces "," or " " but a caller
     # may pass delimiter="" explicitly, bypassing the is-None check.
+    # Must run BEFORE cross-validation (which calls str.split(delimiter)).
     if not delimiter:
         raise DEVReadError(
             "Delimiter must be a non-empty string (e.g., ' ' for "
@@ -1416,6 +1310,144 @@ def read_dev_file_as_object(
             f"whitespace, ',' for comma). Got {delimiter!r} "
             f"({len(delimiter)} characters)."
         )
+
+    # Cross-validate delimiter against data lines (runs for BOTH
+    # auto-detected and user-provided delimiters).  When the header
+    # uses commas but data lines are space-delimited, the comma
+    # delimiter produces a single token from the entire data line,
+    # causing all values to become NaN.  Skip for headerless — the
+    # header line IS the data.
+    # Auto-correction (switching delimiters) only fires for
+    # auto-detected delimiters; user-provided delimiters get a
+    # clear error when mismatched.
+    #
+    # F-047: Validate multiple data lines (up to 5), not just the
+    # first.  A wrong delimiter with a matching first-line field
+    # count goes undetected when only one line is checked.  Multi-line
+    # sampling catches inconsistent delimiters across lines.
+    if hdr and format_type != "headerless":
+        _content_seen = 0
+        _data_lines: list[str] = []
+        for _lin in lines:
+            _s = _lin.strip()
+            if not _s or _s.startswith("#"):
+                continue
+            _content_seen += 1
+            if _content_seen > skip_content_lines:
+                _data_lines.append(_s)
+                if len(_data_lines) >= 5:
+                    break
+        if _data_lines:
+            _first_data = _data_lines[0]
+            if delimiter == " ":
+                _hdr_cols = len(hdr.split())
+                _data_cols = len(_first_data.split())
+            else:
+                _hdr_cols = len(
+                    [t for t in hdr.split(delimiter) if t.strip()]
+                )
+                _data_cols = len(
+                    [t for t in _first_data.split(delimiter) if t.strip()]
+                )
+            if _hdr_cols >= 2 and _data_cols == 1:
+                # Delimiter fails on first data line (produces only 1
+                # token).  Try the alternative delimiter.
+                _alt_delim = " " if delimiter == "," else ","
+                if _alt_delim == " ":
+                    _data_alt_cols = len(_first_data.split())
+                else:
+                    _data_alt_cols = len(
+                        [t for t in _first_data.split(_alt_delim)
+                         if t.strip()]
+                    )
+                # F-013: Auto-correct only for auto-detected delimiters.
+                # User-provided delimiters get a clear error instead of
+                # silent data corruption.
+                if _delimiter_was_auto and _data_alt_cols >= 2 and _data_alt_cols == _hdr_cols:
+                    warnings.warn(
+                        f"Auto-corrected delimiter from {delimiter!r} "
+                        f"to {_alt_delim!r}: header has {_hdr_cols} "
+                        f"columns but first data line produced only "
+                        f"{_data_cols} token(s) with {delimiter!r} "
+                        f"delimiter.",
+                        stacklevel=2,
+                    )
+                    # F-01: Cache header column names parsed with the
+                    # ORIGINAL delimiter before switching.  Without this,
+                    # Pass 2 re-parses the header line with the new
+                    # (space) delimiter, collapsing a comma-delimited
+                    # header like "MD,TVD,INC" into a single bogus
+                    # column name.  The cached names are passed to both
+                    # the simple-format and DUG-format header paths.
+                    _cached_hdr_names = [t.strip() for t in hdr.split(delimiter) if t.strip()]
+                    delimiter = _alt_delim
+                elif _delimiter_was_auto:
+                    raise DEVReadError(
+                        f"Delimiter mismatch: auto-detected delimiter "
+                        f"{delimiter!r} produces {_hdr_cols} columns "
+                        f"from header but only {_data_cols} token(s) "
+                        f"from first data line. Alternative delimiter "
+                        f"{_alt_delim!r} does not match ({_data_alt_cols} "
+                        f"tokens). Specify delimiter explicitly."
+                    )
+                else:
+                    raise DEVReadError(
+                        f"Delimiter mismatch: explicitly specified "
+                        f"delimiter {delimiter!r} produces {_hdr_cols} "
+                        f"columns from header but only {_data_cols} "
+                        f"token(s) from first data line. The file "
+                        f"appears to use {_alt_delim!r} as delimiter "
+                        f"({_data_alt_cols} tokens). Either omit the "
+                        f"`delimiter` parameter for auto-detection or "
+                        f"specify {_alt_delim!r}."
+                    )
+            elif abs(_hdr_cols - _data_cols) >= 3:
+                _source = (
+                    "auto-detected" if _delimiter_was_auto
+                    else "explicitly specified"
+                )
+                raise DEVReadError(
+                    f"Delimiter mismatch: {_source} delimiter "
+                    f"{delimiter!r} produces {_hdr_cols} columns from "
+                    f"header but {_data_cols} tokens from first data "
+                    f"line (difference: {abs(_hdr_cols - _data_cols)}). "
+                    f"Specify the correct delimiter explicitly."
+                )
+            # F-047: Multi-line consistency check.  When the first
+            # data line passed validation, verify that subsequent
+            # data lines are consistent with the same delimiter.
+            # A mismatch across lines (e.g., comma-delimited line
+            # in a space-delimited file) indicates data corruption.
+            elif len(_data_lines) >= 3:
+                _mismatch_lines: list[int] = []
+                for _idx, _dline in enumerate(_data_lines[1:], start=2):
+                    if delimiter == " ":
+                        _dl_cols = len(_dline.split())
+                    else:
+                        _dl_cols = len(
+                            [t for t in _dline.split(delimiter) if t.strip()]
+                        )
+                    if _dl_cols != _data_cols:
+                        _mismatch_lines.append(_idx)
+                if _mismatch_lines:
+                    _sample = _mismatch_lines[:3]
+                    _delim_source = (
+                        "auto-detected" if _delimiter_was_auto
+                        else "user-specified"
+                    )
+                    warnings.warn(
+                        f"Delimiter consistency warning: "
+                        f"{len(_mismatch_lines)} of {len(_data_lines)} "
+                        f"sampled data line(s) have a different number "
+                        f"of tokens than the first data line "
+                        f"({_data_cols} tokens). "
+                        f"Affected line(s): {_sample}"
+                        f"{'...' if len(_mismatch_lines) > 3 else ''}. "
+                        f"The {_delim_source} delimiter {delimiter!r} may "
+                        f"be incorrect for some lines. Consider specifying "
+                        f"the delimiter explicitly.",
+                        stacklevel=2,
+                    )
 
     # --- Pass 1: Count data lines ---
     # skip_content_lines is returned by _detect_dev_format:

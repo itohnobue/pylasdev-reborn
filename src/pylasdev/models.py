@@ -11,7 +11,7 @@ import re
 import warnings
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, SupportsIndex
 
 import numpy as np
 from numpy.typing import NDArray
@@ -61,6 +61,89 @@ def _safe_str(
             f"({max_length})"
         )
     return result
+
+
+class _GuardedDict(dict[str, Any]):
+    """Dict wrapper that validates key types on mutation.
+
+    Prevents non-string keys from being inserted into data/logs/string_data
+    dicts, avoiding downstream crashes on string operations (``key.upper()``,
+    ``key.strip()``, etc.).
+
+    ``update()``, ``setdefault()``, and ``|=`` all delegate to
+    ``__setitem__`` internally, so key validation is automatic.
+    """
+
+    __slots__ = ("_container_name",)
+
+    def __init__(
+        self, *args: Any, _container_name: str = "data", **kwargs: Any
+    ) -> None:
+        self._container_name = _container_name
+        super().__init__(*args, **kwargs)
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if not isinstance(key, str):
+            raise TypeError(
+                f"{self._container_name}: keys must be str, "
+                f"got {type(key).__name__}"
+            )
+        super().__setitem__(key, value)
+
+
+class _GuardedList(list[Any]):
+    """List wrapper that validates item types on mutation.
+
+    Prevents non-conforming items from being appended/inserted into curves
+    or parameters lists, avoiding downstream crashes on attribute access
+    (``curve.mnemonic``, ``param.value``, etc.).
+
+    ``append()``, ``insert()``, ``extend()``, ``__setitem__``, and ``__iadd__``
+    are all validated.
+    """
+
+    __slots__ = ("_container_name", "_expected_type")
+
+    def __init__(
+        self,
+        *args: Any,
+        _container_name: str = "list",
+        _expected_type: type = object,
+        **kwargs: Any,
+    ) -> None:
+        self._container_name = _container_name
+        self._expected_type = _expected_type
+        super().__init__(*args, **kwargs)
+
+    def _validate_item(self, item: Any) -> None:
+        if not isinstance(item, self._expected_type):
+            raise TypeError(
+                f"{self._container_name}: items must be "
+                f"{self._expected_type.__name__}, "
+                f"got {type(item).__name__}"
+            )
+
+    def append(self, item: Any) -> None:
+        self._validate_item(item)
+        super().append(item)
+
+    def insert(self, index: SupportsIndex, item: Any) -> None:
+        self._validate_item(item)
+        super().insert(index, item)
+
+    def extend(self, items: Iterable[Any]) -> None:
+        for item in items:
+            self._validate_item(item)
+        super().extend(items)
+
+    def __setitem__(self, index: Any, item: Any) -> None:
+        self._validate_item(item)
+        super().__setitem__(index, item)
+
+    def __iadd__(self, other: Iterable[Any]) -> _GuardedList:  # type: ignore[misc]
+        for item in other:
+            self._validate_item(item)
+        return super().__iadd__(other)
 
 
 def _create_parameter_entry(param_dict: dict[str, Any]) -> ParameterEntry:
@@ -252,11 +335,17 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
     # (populated but incomplete) triggered it.  Both are equally invalid.
     well = data.get("well")
     if isinstance(well, dict):
-        # M-24: All 8 LAS 1.2 mandatory well fields (was 4: STRT, STOP,
-        # STEP, NULL).  WELL, LOC, SRVC, and UWI are commonly missing in
-        # real-world files — we warn but do NOT raise an error, matching
-        # parser.py behavior.
-        _mandatory = {"STRT", "STOP", "STEP", "NULL", "WELL", "LOC", "SRVC", "UWI"}
+        # F-033: Use version-aware mandatory well fields instead of
+        # hardcoding the 8-field LAS 1.2 set for all versions.
+        # _LASVersionSpec.mandatory_well_fields returns 8 fields for
+        # LAS 1.2 (STRT, STOP, STEP, NULL, WELL, LOC, SRVC, UWI)
+        # and 4 fields (STRT, STOP, STEP, NULL) for LAS 2.0/3.0.
+        _version = data.get("version")
+        _vers_str = ""
+        if isinstance(_version, dict):
+            _vers_str = str(_version.get("VERS", ""))
+        _spec = _LASVersionSpec(_vers_str)
+        _mandatory = set(_spec.mandatory_well_fields)
         _well_keys = {k.upper() for k in well if isinstance(k, str)}
         _missing = _mandatory - _well_keys
         if _missing:
@@ -591,6 +680,16 @@ class VersionSection:
         # str.startswith("3") which fails on leading whitespace.
         if self.vers:
             self.vers = self.vers.strip()
+        # F-005: Empty VERS (after stripping) silently bypassed all
+        # version recognition.  The writer falls back to "2.0" for
+        # unknown versions; normalise here so downstream code sees a
+        # known version instead of a falsy string.
+        if not self.vers:
+            warnings.warn(
+                "VersionSection: VERS is empty, defaulting to '2.0'.",
+                stacklevel=2,
+            )
+            self.vers = "2.0"
         # WRAP: reject None before any string operations.
         if self.wrap is None:
             raise ValueError("VersionSection: WRAP cannot be None")
@@ -804,6 +903,21 @@ class WellSection:
         return self.entries[key]
 
     def __setitem__(self, key: str, value: str) -> None:
+        # F-002: Guard against non-string keys — the writer calls
+        # key.upper() which crashes on int/float/None keys.
+        if not isinstance(key, str):
+            raise TypeError(
+                f"WellSection: keys must be str, "
+                f"got {type(key).__name__} ({key!r})"
+            )
+        # F-006: Coerce non-str values via _safe_str(), matching
+        # __post_init__ behaviour.  _safe_str() also enforces
+        # MAX_FIELD_LENGTH and rejects non-finite floats / bytes,
+        # so the manual length check below is redundant for
+        # non-str values but preserved for already-str values
+        # (which bypass _safe_str's length guard).
+        if not isinstance(value, str):
+            value = _safe_str(value)
         # F-06: Validate value length matches __post_init__ guard.
         # Direct API users and post-transform length changes bypass
         # parser's _validate_data_line_fields() mitigation.
@@ -1273,7 +1387,10 @@ class DataSection:
                     f"'string_data' arrays must be non-numeric."
                 )
 
-        # --- NaN/Inf validation for numeric data arrays ---
+        # --- NaN/Inf validation for numeric data arrays (complete only) ---
+        if not complete:
+            return issues
+
         for _k, _arr in self.data.items():
             if isinstance(_arr, np.ndarray) and _arr.dtype.kind in ('f', 'c'):
                 if not np.all(np.isfinite(_arr)):
@@ -1530,6 +1647,14 @@ class DataSection:
         if not self._from_dict:
             for issue in self.validate(complete=False):
                 warnings.warn(issue, stacklevel=2)
+
+        # F-008: Wrap data/string_data with guarded dicts to catch
+        # invalid mutations post-construction.  __post_init__ already
+        # validated the contents; the guards prevent future corruption.
+        self.data = _GuardedDict(self.data, _container_name="DataSection.data")
+        self.string_data = _GuardedDict(
+            self.string_data, _container_name="DataSection.string_data"
+        )
 
 
 @dataclass(eq=False)
@@ -1944,6 +2069,44 @@ class LASFile:
         if not self._from_dict:
             for issue in self.validate(complete=False):
                 warnings.warn(issue, stacklevel=2)
+            # F-036: Validate mandatory well fields for direct construction.
+            # from_dict and parser paths check this separately
+            # (_validate_from_dict_input / _parse_well); direct LASFile()
+            # construction previously had zero mandatory well field
+            # validation.  Warn (not raise) — the writer produces valid
+            # LAS output with defaults for missing fields, matching the
+            # from_dict warning contract.
+            if self.well.entries:
+                _spec = _LASVersionSpec(self.version.vers)
+                _mandatory = set(_spec.mandatory_well_fields)
+                _well_keys = {k.upper() for k in self.well.entries}
+                _missing = _mandatory - _well_keys
+                if _missing:
+                    warnings.warn(
+                        f"Mandatory well field(s) missing: "
+                        f"{', '.join(sorted(_missing))}",
+                        stacklevel=2,
+                    )
+
+        # F-009: Wrap logs/string_data with guarded dicts to catch
+        # invalid mutations post-construction.  __post_init__ already
+        # validated the contents; the guards prevent future corruption.
+        self.logs = _GuardedDict(self.logs, _container_name="LASFile.logs")
+        self.string_data = _GuardedDict(
+            self.string_data, _container_name="LASFile.string_data"
+        )
+        # F-030: Wrap curves/parameters with guarded lists to catch
+        # invalid items appended post-construction.
+        self.curves = _GuardedList(
+            self.curves,
+            _container_name="LASFile.curves",
+            _expected_type=CurveDefinition,
+        )
+        self.parameters = _GuardedList(
+            self.parameters,
+            _container_name="LASFile.parameters",
+            _expected_type=ParameterEntry,
+        )
 
     def validate(self, complete: bool = False) -> list[str]:
         """Validate LASFile state.
@@ -2069,6 +2232,23 @@ class LASFile:
                             f"be unique."
                         )
                     _seen_ds.add(_ds_name)
+
+            # F-067: Mandatory well field presence check.
+            # __post_init__ warns on direct construction; from_dict warns
+            # via _validate_from_dict_input; the parser checks during
+            # _parse_well.  validate(complete=True) previously delegated
+            # to WellSection.validate which does NOT check mandatory well
+            # field presence (only STEP=0, NULL empty, STRT==STOP).
+            if self.well.entries:
+                _spec = _LASVersionSpec(self.version.vers)
+                _mandatory = set(_spec.mandatory_well_fields)
+                _well_keys = {k.upper() for k in self.well.entries}
+                _missing = _mandatory - _well_keys
+                if _missing:
+                    issues.append(
+                        f"LASFile: mandatory well field(s) missing: "
+                        f"{', '.join(sorted(_missing))}"
+                    )
 
         return issues
 
@@ -2232,7 +2412,10 @@ class LASFile:
                     raise TypeError(
                         f"Well dict key must be str, got {type(key).__name__}: {key!r}"
                     )
-                las_file.well[key] = _safe_str(value)
+                # F-058: Normalize well entry keys through mnem_base,
+                # matching the parser's behaviour (parser.py:1932-1938).
+                _norm_key = _norm_mnem(key)
+                las_file.well[_norm_key] = _safe_str(value)
             # Restore well units if present (from v1.7+ roundtrip data)
             well_units = _resolve_dict_entry(data, "well_units", dict, dict)
             if len(well_units) >= MAX_WELL_ENTRIES:
@@ -2246,7 +2429,8 @@ class LASFile:
                         f"Well unit dict key must be str, "
                         f"got {type(key).__name__}: {key!r}"
                     )
-                las_file.well.units[key] = _safe_str(unit)
+                _norm_key = _norm_mnem(key)
+                las_file.well.units[_norm_key] = _safe_str(unit)
 
             # Restore well descriptions if present (from v1.8+ roundtrip data)
             well_descriptions = _resolve_dict_entry(data, "well_descriptions", dict, dict)
@@ -2261,7 +2445,8 @@ class LASFile:
                         f"Well description dict key must be str, "
                         f"got {type(key).__name__}: {key!r}"
                     )
-                las_file.well.descriptions[key] = _safe_str(desc)
+                _norm_key = _norm_mnem(key)
+                las_file.well.descriptions[_norm_key] = _safe_str(desc)
 
             curves_order = data.get("curves_order", [])
             # F-21: Guard against non-list iterables.  list(string) silently
@@ -3237,6 +3422,12 @@ class LASFile:
         for curve in self.curves:
             if curve.mnemonic == mnemonic or curve.base_mnemonic == mnemonic:
                 return curve
+        # F-038: Also search data_sections[].section_curves for LAS 3.0.
+        # Curves may be defined per-section rather than at top level.
+        for ds in self.data_sections:
+            for curve in ds.section_curves:
+                if curve.mnemonic == mnemonic or curve.base_mnemonic == mnemonic:
+                    return curve
         return None
 
     def get_array_curves(self, base_name: str) -> list[CurveDefinition]:
@@ -3253,7 +3444,12 @@ class LASFile:
             List of ``CurveDefinition`` objects whose ``array_info.base_name``
             matches *base_name*. Returns an empty list if no array curves match.
         """
-        return [c for c in self.curves if c.array_info and c.array_info.base_name == base_name]
+        return [c for c in self.curves if c.array_info and c.array_info.base_name == base_name] + [
+            c
+            for ds in self.data_sections
+            for c in ds.section_curves
+            if c.array_info and c.array_info.base_name == base_name
+        ]
 
 
 # F-015: Validating dict wrapper for DevFile.columns.  Direct mutation
@@ -3837,9 +4033,14 @@ class DevFile:
             # column_order/columns consistency and consistent lengths.
             dev.__post_init__()
             # F-43: Minimum data-quality validation matching reader's
-            # _validate_dev_data checks.  Now delegated to validate(complete=True).
+            # _validate_dev_data checks.  validate(complete=True) covers
+            # NaN/Inf, MD monotonicity, AZI/INC range; _validate_dev_data
+            # additionally covers negative MD, NaN density, repeated
+            # stations, TVD, and dedup survivors (F-012).
             for issue in dev.validate(complete=True):
                 warnings.warn(issue, stacklevel=2)
+            from .dev_reader import _validate_dev_data
+            _validate_dev_data(dev, _stacklevel=2)
 
             return dev
         except (ValueError, TypeError, OverflowError) as e:
