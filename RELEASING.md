@@ -39,9 +39,9 @@ version = "X.Y.Z"
 ```
 
 Bump the version according to [Semantic Versioning](https://semver.org/):
-- **Patch** (`1.6.0` → `1.6.1`): bug fixes
-- **Minor** (`1.6.0` → `1.7.0`): new features, backward compatible
-- **Major** (`1.6.0` → `2.0.0`): breaking changes
+- **Patch** (`2.0.0` → `2.0.1`): bug fixes
+- **Minor** (`2.0.0` → `2.1.0`): new features, backward compatible
+- **Major** (`2.0.0` → `3.0.0`): breaking changes
 
 Commit the version bump:
 

@@ -29,6 +29,7 @@ It is "Reborn" because it was updated, fixed and refactored to work with modern 
 - [Troubleshooting](#troubleshooting)
 - [Requirements](#requirements)
 - [Development](#development)
+- [Changelog](CHANGELOG.md)
 - [License](#license)
 
 ## Installation
