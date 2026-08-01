@@ -5,6 +5,35 @@ All notable changes to pylasdev will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] — 2026-08-01
+
+### Production Check
+
+A full production check audit (3 discovery iterations, 63 specialized agents) fixed **88 verified defects**
+across the source tree, with ~200 new regression tests. Coverage now passes the 85% gate (85.6%).
+
+### Fixed
+
+- **Parser**: deferred pre-~V data sections no longer merge (P-03); well-format swap logic corrected (P-01);
+  LAS 3.0 WRAP=YES detection restored (P-02); colon-in-description truncation fixed (P-04);
+  `~ASCII|CURVE` pipe headers parse data rows (P-05); exception escapes normalized to `LASParseError` (P-11)
+- **Data reader**: wrap-mode detection rewritten to be curve-count-aware and corroborated over ≥3 lines (D-01/D-02/D-03);
+  `{I}` integer curves preserve exact precision beyond 2^53 (L-03); wrapped-mode under-fill detection (N-I-08);
+  desanitize flag hoisted from the per-value hot path (IT3-F-01); scalar finite checks use `math.*` (IT3-F-02);
+  wrapped reads pre-allocate instead of Python-float accumulation (IT3-F-03)
+- **Models**: guarded-container wrappers now validate all mutation entry points (M-01/M-02);
+  identifier/unit validation whitelisted against the parser grammar (M-03/M-04); numpy scalars accepted (M-06);
+  `from_dict` string-data roundtrip fixed (M-28); unnamed data sections auto-named (M-22); direct construction
+  deep-copies caller dicts (N-I-11); `_DevColumns` mutation guards completed (N-I-14)
+- **Writer**: duplicate curve emission fixed with per-section scoping (W-01/N-I-20); bare precision crash fixed (W-02);
+  mutation guards re-established after write (W-06); array `array_index`/`array_info` preserved (W-08/W-09);
+  integer precision preserved on write (EXT-04)
+- **DEV reader**: DUG/Petrel/headerless format detection hardened (V-01..V-08); all-integer first-row data preserved (V-13);
+  MD dedup-survivor validation added (V-17); empty middle header cells rejected (V-18); count-prefix handling corrected (N-I-24)
+- **Encoding/comparison**: Cyrillic detection widened and near-tie preference fixed (E-06/E-07); symmetric compare guards (E-08);
+  thread-local desanitize flag restored in `finally` (E-04)
+- **Null sentinel**: declared NULL now reconciles with baked fill sentinel consistently (N-I-31/IT3-THR-01)
+
 ## [2.0.0] — 2026-07-23
 
 ### Stable Release

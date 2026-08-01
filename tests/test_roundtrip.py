@@ -7,7 +7,16 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from pylasdev import read_las_file, write_las_file
+from pylasdev import (
+    CurveDefinition,
+    LASFile,
+    ParameterEntry,
+    ParameterZone,
+    VersionSection,
+    read_las_file,
+    read_las_file_as_object,
+    write_las_file,
+)
 
 
 class TestRoundTrip:
@@ -379,3 +388,171 @@ class TestDEVRoundtripSkipped:
     def test_dev_roundtrip_skipped(self) -> None:
         """DEV read → write → read roundtrip — not yet testable."""
         pass
+
+
+# ──────────────────────────────────────────────────────────────
+# G2 (N-I-22 / N-I-02): parser/writer iter-2 new findings
+# ──────────────────────────────────────────────────────────────
+
+class TestNI22UnitRoundtrip:
+    """N-I-22 (HIGH): units containing ``%`` / ``°C`` / ``ohm.m`` must
+    survive the write→read roundtrip.  Previously the parser's unit
+    character class rejected them and the whole curve + data column were
+    silently dropped."""
+
+    _LAS20 = (
+        "~VERSION INFORMATION\n"
+        " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+        "~WELL INFORMATION\n"
+        " STRT.M   100.0 : \n"
+        " STOP.M   200.0 : \n"
+        " STEP.M   1.0 : \n"
+        " NULL.    -999.25 : \n"
+    )
+
+    def _write_read(self, content: str, tmp_path: Path) -> object:
+        import warnings
+
+        src = tmp_path / "unit_src.las"
+        src.write_text(content)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(src)
+            out = tmp_path / "unit_out.las"
+            write_las_file(out, las)
+            return read_las_file_as_object(out)
+
+    def test_roundtrip_percent_and_ohm_m_units(self, tmp_path: Path) -> None:
+        content = (
+            self._LAS20
+            + "~CURVE INFORMATION\n"
+            + " DEPT.M      1000.0 : DEPTH\n"
+            + " PHIT.%      25.5 : POROSITY\n"
+            + " RT.ohm.m    15.5 : RESISTIVITY\n"
+            + "~A DEPTH PHIT RT\n"
+            + "1000.0 25.5 15.5\n"
+            + "1001.0 26.5 16.5\n"
+        )
+        rt = self._write_read(content, tmp_path)
+        units = {c.mnemonic: c.unit for c in rt.curves}
+        assert units.get("PHIT") == "%", units
+        assert units.get("RT") == "ohm.m", units
+        # Data columns preserved (previously the curve was dropped entirely).
+        assert "PHIT" in rt.logs and "RT" in rt.logs
+        assert list(rt.logs["RT"]) == [15.5, 16.5]
+
+    def test_roundtrip_degree_celsius_unit(self, tmp_path: Path) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : LAS 3.0\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   100.0 : \n"
+            " STOP.M   200.0 : \n"
+            " STEP.M   1.0 : \n"
+            " NULL.    -999.25 : \n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M      1000.0 : DEPTH\n"
+            " TEMP.°C     23.5 : TEMPERATURE\n"
+            "~A DEPTH TEMP\n"
+            "1000.0 23.5\n"
+            "1001.0 24.5\n"
+        )
+        rt = self._write_read(content, tmp_path)
+        units = {c.mnemonic: c.unit for c in rt.curves}
+        assert units.get("TEMP") == "°C", units
+        assert list(rt.logs["TEMP"]) == [23.5, 24.5]
+
+
+class TestNI02ParameterPipeRoundtrip:
+    """N-I-02 (MEDIUM): ZONE_ASSOC_PATTERN ran unconditionally, so a
+    LAS 1.2/2.0 description ending in a pipe (``Run number | Main Zone``)
+    was truncated, a bogus ParameterZone attached, and the pipe text
+    permanently lost on roundtrip (the writer never re-emits zones for
+    non-3.0).  Zone extraction is now LAS 3.0-only, and the writer escapes
+    literal pipes (``|`` → ``\\|``) which the parser unescapes."""
+
+    _LAS20 = (
+        "~VERSION INFORMATION\n"
+        " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+        "~WELL INFORMATION\n"
+        " STRT.M   100.0 : \n"
+        " STOP.M   200.0 : \n"
+        " STEP.M   1.0 : \n"
+        " NULL.    -999.25 : \n"
+    )
+
+    def test_las20_pipe_description_roundtrips(self, tmp_path: Path) -> None:
+        import warnings
+
+        content = (
+            self._LAS20
+            + "~PARAMETER INFORMATION\n"
+            + " RUN. 5 : Run number | Main Zone\n"
+            + "~CURVE INFORMATION\n"
+            + " DEPT.M 100.0 : DEPTH\n"
+            + "~A DEPTH\n"
+            + "100.0\n"
+            + "200.0\n"
+        )
+        src = tmp_path / "pipe_src.las"
+        src.write_text(content)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(src)
+            out = tmp_path / "pipe_out.las"
+            write_las_file(out, las)
+            rt = read_las_file_as_object(out)
+        # Description preserved (pipe text NOT truncated), no bogus zone.
+        assert rt.parameters[0].description == "Run number | Main Zone"
+        assert rt.parameters[0].zone is None
+
+    def test_las30_pipe_description_not_misparsed_as_zone(self, tmp_path: Path) -> None:
+        import warnings
+
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+        # Genuine description text with a pipe — NOT a zone association.
+        las.parameters.append(
+            ParameterEntry(mnemonic="NOTE", value="x", description="Note | Extra text")
+        )
+        out = tmp_path / "pipe_las30.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+            rt = read_las_file_as_object(out)
+        assert rt.parameters[0].description == "Note | Extra text", (
+            rt.parameters[0].description
+        )
+        assert rt.parameters[0].zone is None
+
+    def test_las30_real_zone_still_roundtrips(self, tmp_path: Path) -> None:
+        import warnings
+
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+        las.parameters.append(
+            ParameterEntry(
+                mnemonic="MATR",
+                unit="",
+                value="SAND",
+                description="Neutron Matrix",
+                zone=ParameterZone(zone_name="RUN", zone_index=1),
+            )
+        )
+        out = tmp_path / "zone_las30.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+            rt = read_las_file_as_object(out)
+        assert rt.parameters[0].zone is not None
+        assert rt.parameters[0].zone.zone_name == "RUN"
+        assert rt.parameters[0].zone.zone_index == 1
+        assert rt.parameters[0].description == "Neutron Matrix"

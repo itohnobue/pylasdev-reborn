@@ -167,11 +167,21 @@ def read_las_file_as_object(
     # parsing (well, curve, parameter, version) runs earlier — without
     # this, all 8 header desanitization call sites always run with the
     # default True, ignoring the caller's desanitize parameter.
-    sys.modules["pylasdev.parser"]._DESANITIZE_ENABLED = desanitize  # type: ignore[attr-defined]
+    parser_mod = sys.modules["pylasdev.parser"]
+    # E-04: Save the prior thread-local value and restore it in a finally
+    # block.  The flag is thread-local (parser.py F-21/F-088); an
+    # unconditional reset-to-True would clobber another caller's value on
+    # the same thread.  Without the restore, a desanitize=False read left
+    # the flag False for the whole thread, silently changing the behavior
+    # of subsequent direct LASParser.parse()/read_ascii_data() users.
+    _prev_desanitize = parser_mod._DESANITIZE_ENABLED
+    parser_mod._DESANITIZE_ENABLED = desanitize  # type: ignore[attr-defined]
     try:
         las_file = parser.parse(content, lines=lines)
     except LASParseError as e:
         raise LASParseError(f"Error reading {file_path}: {e}") from e
+    finally:
+        parser_mod._DESANITIZE_ENABLED = _prev_desanitize  # type: ignore[attr-defined]
     las_file.source_file = str(file_path)
     las_file.encoding = detected_encoding
 

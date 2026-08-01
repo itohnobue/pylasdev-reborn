@@ -14,7 +14,7 @@ from ._writer_base import (
     _WriterBase,
 )
 from .data_reader import _get_null_value
-from .models import LASFile, ParameterEntry
+from .models import CurveDefinition, LASFile, ParameterEntry
 
 
 class _Las30Writer(_WriterBase):
@@ -30,6 +30,11 @@ class _Las30Writer(_WriterBase):
 
     def __init__(self, las_file: LASFile, precision: str) -> None:
         super().__init__(las_file, precision)
+        # N-I-20: Set by _write_curve_section — the main ~C block's curve
+        # set.  Used by _write_ascii_las30 to decide whether a LOG_DATA
+        # section pipes ``| CURVE`` (matches the main block) or gets a
+        # per-section Definition (distinct curve set).
+        self._main_curve_mnemonics: frozenset[str] = frozenset()
 
     # ── Version section ──────────────────────────────────────────────
 
@@ -84,38 +89,135 @@ class _Las30Writer(_WriterBase):
         lines.append("~CURVE INFORMATION")
 
         if self._las_file.data_sections:
-            curves_to_emit = []
+            curves_to_emit: list[CurveDefinition] = []
+            emitted_mnems: set[str] = set()
+            # W-01: Dedup during the FIRST extension loop.  Previously the
+            # primary accumulation path (extend of each section's curves)
+            # had NO dedup — `emitted_mnems` was computed AFTER the extend
+            # and only guarded the fallback loop.  Two LOG_DATA sections
+            # sharing a mnemonic (e.g. DEPT in section 1 and section 2)
+            # therefore emitted DEPT twice in ~C, and on re-read the
+            # parser inflated the curve count (2→4) and null-filled the
+            # phantom columns.  Dedup by mnemonic here so the shared
+            # definition is emitted once.
             for ds in self._las_file.data_sections:
                 if (ds.section_type or "LOG_DATA").upper() == "LOG_DATA":
                     if ds.section_curves:
-                        curves_to_emit.extend(ds.section_curves)
-            emitted_mnems = {c.mnemonic for c in curves_to_emit}
-            curves_by_mnem = {c.mnemonic: c for c in self._las_file.curves}
-            for ds in self._las_file.data_sections:
-                if (ds.section_type or "LOG_DATA").upper() == "LOG_DATA":
-                    if not ds.section_curves and ds.curves_order:
-                        for mnem in ds.curves_order:
-                            if mnem not in emitted_mnems:
-                                curve_def = curves_by_mnem.get(mnem)
-                                if curve_def is not None:
-                                    curves_to_emit.append(curve_def)
-                                    emitted_mnems.add(mnem)
+                        for curve in ds.section_curves:
+                            if curve.mnemonic not in emitted_mnems:
+                                emitted_mnems.add(curve.mnemonic)
+                                curves_to_emit.append(curve)
+                            else:
+                                # W-01: dedup-by-mnemonic silently drops a
+                                # SECOND section's DIFFERING definition
+                                # (e.g. DEPT.M in A1 vs DEPT.FT in A2) — the
+                                # ~C shows one unit for both sections.  Warn
+                                # on unit/format mismatch so the drop is
+                                # visible instead of silent.
+                                for emitted in curves_to_emit:
+                                    if emitted.mnemonic == curve.mnemonic:
+                                        _emitted_unit = emitted.unit or ""
+                                        _curve_unit = curve.unit or ""
+                                        if (
+                                            _emitted_unit != _curve_unit
+                                            or (emitted.data_format or "")
+                                            != (curve.data_format or "")
+                                        ):
+                                            import warnings
 
-            if not curves_to_emit:
+                                            warnings.warn(
+                                                f"Duplicate curve mnemonic "
+                                                f"'{curve.mnemonic}' in LAS 3.0 "
+                                                f"data sections has a differing "
+                                                f"definition (unit "
+                                                f"{_emitted_unit!r} vs "
+                                                f"{_curve_unit!r}).  Keeping the "
+                                                f"first definition in ~C; the "
+                                                f"second section's curve "
+                                                f"metadata is not re-emitted.",
+                                                UserWarning,
+                                                stacklevel=3,
+                                            )
+                                        break
+            curves_by_mnem = {c.mnemonic: c for c in self._las_file.curves}
+            # N-I-15: the fallback loop was gated on LOG_DATA only, so a
+            # non-LOG_DATA section (e.g. CORE_DATA) with curves_order+data
+            # but empty section_curves never entered ~C at all — the
+            # written file had more data columns than ~C definitions and
+            # re-read silently discarded the extra columns' data.  Process
+            # ANY section that lacks section_curves (its curves must come
+            # from the top-level ~C block; sections WITH section_curves get
+            # their definitions in ~X_Definition instead).
+            for ds in self._las_file.data_sections:
+                if not ds.section_curves and ds.curves_order:
+                    for mnem in ds.curves_order:
+                        if mnem not in emitted_mnems:
+                            curve_def = curves_by_mnem.get(mnem)
+                            if curve_def is not None:
+                                emitted_mnems.add(mnem)
+                                curves_to_emit.append(curve_def)
+                            else:
+                                # N-I-15: the section curve is absent from
+                                # top-level curves and cannot be emitted —
+                                # warn so the data loss on re-read is
+                                # visible at write time instead of silent.
+                                import warnings
+
+                                warnings.warn(
+                                    f"Curve '{mnem}' appears in a LAS 3.0 "
+                                    f"data section's curves_order but has no "
+                                    f"definition in the top-level curves or "
+                                    f"any section's section_curves.  The "
+                                    f"written file will have more data "
+                                    f"columns than ~C curve definitions; "
+                                    f"this curve's data will be discarded "
+                                    f"on re-read.",
+                                    UserWarning,
+                                    stacklevel=3,
+                                )
+
+            # W-01: When ALL data sections are non-LOG_DATA and carry their
+            # own section_curves (e.g. CORE-only files), the curve
+            # definitions belong in the typed ~X_Definition sections — the
+            # top-level fallback would duplicate them in ~C AND the
+            # Definition block, inflating the re-read curve count (2→4).
+            curves_in_definitions = bool(
+                self._las_file.data_sections
+            ) and all(
+                (ds.section_type or "LOG_DATA").upper() != "LOG_DATA"
+                and bool(ds.section_curves)
+                for ds in self._las_file.data_sections
+            )
+            if not curves_to_emit and not curves_in_definitions:
                 curves_to_emit = list(self._las_file.curves)
             if not curves_to_emit:
-                import warnings
+                if not curves_in_definitions:
+                    import warnings
 
-                warnings.warn(
-                    "No curves to emit for ~C section — skipping",
-                    UserWarning,
-                    stacklevel=3,
-                )
+                    warnings.warn(
+                        "No curves to emit for ~C section — skipping",
+                        UserWarning,
+                        stacklevel=3,
+                    )
+                self._main_curve_mnemonics = frozenset()
                 lines.append("")
                 return lines
+            # N-I-20: Record the main ~C block's curve set so the ASCII
+            # writer can decide per-section pipe targets.  A LOG_DATA
+            # section whose curves exactly match the main block pipes
+            # ``| CURVE``; a section with a DIFFERENT curve set gets a
+            # per-section Definition section + pipe so its own scope
+            # survives re-read (the hardcoded ``| CURVE`` re-scoped every
+            # section to the global union, mislabeling columns).
+            self._main_curve_mnemonics = frozenset(
+                c.mnemonic for c in curves_to_emit
+            )
             for curve in curves_to_emit:
                 lines.append(_format_curve_line(curve, self._spec.is_las30))
         else:
+            self._main_curve_mnemonics = frozenset(
+                c.mnemonic for c in self._las_file.curves
+            )
             for curve in self._las_file.curves:
                 lines.append(_format_curve_line(curve, self._spec.is_las30))
 
@@ -270,7 +372,12 @@ class _Las30Writer(_WriterBase):
             )
             section_name = raw_section_name
 
-            # Definition prefix for non-LOG_DATA sections.
+            # Definition prefix for sections that need per-section curve
+            # scoping.  Non-LOG_DATA sections always emit a Definition
+            # (dedup by signature) so their curves survive re-read.
+            # LOG_DATA sections get one ONLY when their curve set differs
+            # from the main ~C block — otherwise ``| CURVE`` scopes them
+            # to the main block correctly (N-I-20).
             def_prefix: str | None = None
             if sec_type != "LOG_DATA":
                 def_prefix = _SECTION_TYPE_TO_DEFINITION_PREFIX.get(sec_type)
@@ -290,37 +397,52 @@ class _Las30Writer(_WriterBase):
                         )
                         st = _sanitize_las_value(sec_type)
                         def_prefix = st.title().replace("_", "")
+            elif section.section_curves:
+                section_mnems = frozenset(
+                    c.mnemonic for c in section.section_curves
+                )
+                if section_mnems != self._main_curve_mnemonics:
+                    # N-I-20: distinct curve set — emit a per-section
+                    # Definition and pipe to it.  The hardcoded ``| CURVE``
+                    # re-scoped EVERY LOG_DATA section to the global union
+                    # on re-read, silently relabeling columns (e.g. DT
+                    # landing in GR) for sections with their own scope.
+                    def_prefix = "Log"
 
             # Emit per-section Definition section (dedup by curve signature).
             pipe_def_name: str | None = None
-            if sec_type != "LOG_DATA" and section.section_curves:
+            if def_prefix and section.section_curves:
                 sig = tuple(
                     (curve.mnemonic, curve.unit or "", curve.description or "", curve.data_format or "",
                      curve.api_code or "",
                      curve.array_info.time_offset if curve.array_info else None)
                     for curve in section.section_curves
                 )
-                if def_prefix:
-                    if def_prefix not in emitted_defs:
-                        emitted_defs[def_prefix] = {}
-                    sig_map = emitted_defs[def_prefix]
-                    if sig not in sig_map:
-                        emit_idx = len(sig_map) + 1
-                        def_section_name = (
-                            f"{def_prefix}_Definition"
-                            if emit_idx == 1
-                            else f"{def_prefix}_Definition_{emit_idx}"
-                        )
-                        sig_map[sig] = def_section_name
-                        lines.append(f"~{def_section_name}")
-                        for curve in section.section_curves:
-                            lines.append(_format_curve_line(curve, self._spec.is_las30))
-                        lines.append("")
-                    pipe_def_name = sig_map[sig]
+                if def_prefix not in emitted_defs:
+                    emitted_defs[def_prefix] = {}
+                sig_map = emitted_defs[def_prefix]
+                if sig not in sig_map:
+                    emit_idx = len(sig_map) + 1
+                    def_section_name = (
+                        f"{def_prefix}_Definition"
+                        if emit_idx == 1
+                        else f"{def_prefix}_Definition_{emit_idx}"
+                    )
+                    sig_map[sig] = def_section_name
+                    lines.append(f"~{def_section_name}")
+                    for curve in section.section_curves:
+                        lines.append(_format_curve_line(curve, self._spec.is_las30))
+                    lines.append("")
+                pipe_def_name = sig_map[sig]
 
             # Data section header with pipe notation.
             if sec_type == "LOG_DATA":
-                lines.append(f"~{section_prefix}{section_name} | CURVE")
+                if pipe_def_name:
+                    lines.append(
+                        f"~{section_prefix}{section_name} | {pipe_def_name}"
+                    )
+                else:
+                    lines.append(f"~{section_prefix}{section_name} | CURVE")
             elif pipe_def_name:
                 lines.append(
                     f"~{section_prefix}{section_name} | {pipe_def_name}"

@@ -222,6 +222,97 @@ def _is_float_token(token: str) -> bool:
         return False
 
 
+# --- Locale-style number handling (V-07 / V-08) ---
+
+# Comma-decimal locale token: digits with a single comma as the decimal
+# separator and no other punctuation (e.g. "1,00", "-2,5").  Used by the
+# Directional Drilling export variants that are semicolon-delimited but
+# use a comma for the decimal point.
+_COMMA_DECIMAL_RE = re.compile(r"^([+-]?\d+),(\d+)$")
+
+# Suffix fragment of a thousands-separator number as it appears after
+# comma-splitting a comma-delimited data row: exactly 3 digits followed by
+# an optional decimal/exponent part (e.g. "234.5" from "1,234.5").
+_THOUSANDS_FRAG_RE = re.compile(r"^\d{3}(?:\.\d+)?(?:[eE][+-]?\d+)?$")
+
+
+def _convert_comma_decimal(value: str) -> str:
+    """Convert a comma-decimal locale token (e.g. ``"1,00"``) to dot notation.
+
+    Some Directional Drilling export variants use a comma as the decimal
+    separator while the column delimiter is ``;`` (or space/tab) (V-07).
+    Only whole tokens matching ``digits,digits`` with no other punctuation
+    are converted — tokens that already contain a dot or exponent are left
+    untouched (those use commas as thousands separators, handled separately
+    by ``_recombine_thousands_separators``).
+
+    Args:
+        value: Raw data token from a data line.
+
+    Returns:
+        Token with the comma replaced by a dot when it matches the
+        comma-decimal pattern, otherwise the original token.
+    """
+    m = _COMMA_DECIMAL_RE.match(value)
+    if m is None:
+        return value
+    return f"{m.group(1)}.{m.group(2)}"
+
+
+def _dev_to_finite_float(
+    value_str: str,
+    null_value: float,
+    _failure_counter: list[int] | None = None,
+) -> float:
+    """Convert a DEV data token to a finite float.
+
+    Thin wrapper around :func:`data_reader._to_finite_float` that first
+    applies comma-decimal locale conversion (V-07) so values like
+    ``"1,00"`` parse as ``1.00`` instead of NaN.
+    """
+    return _to_finite_float(
+        _convert_comma_decimal(value_str),
+        null_value,
+        _failure_counter=_failure_counter,
+    )
+
+
+def _recombine_thousands_separators(
+    values: list[str], expected: int
+) -> tuple[list[str], str, str] | None:
+    """Recombine comma-split thousands-separator fragments in a data row.
+
+    In comma-delimited files a value like ``1,234.5`` is split by the
+    delimiter into two tokens (``"1"`` and ``"234.5"``), silently shifting
+    every subsequent column (V-08).  When a row has exactly one extra token
+    beyond the declared column count, consecutive tokens matching the
+    thousands pattern (a short integer prefix + a 3-digit suffix, optionally
+    with a decimal part) are recombined into a single value with the comma
+    removed (``"1,234.5"`` → ``"1234.5"``).
+
+    Args:
+        values:   Tokens from a comma-delimited data row.
+        expected: Number of columns declared by the header.
+
+    Returns:
+        Tuple of ``(recombined_token_list, original_fragment, merged_value)``
+        when a recombination applies, or ``None`` when none does (row already
+        matches the expected count, has multiple extra tokens, or contains
+        no thousands pattern).
+    """
+    if len(values) != expected + 1:
+        return None
+    for i in range(len(values) - 1):
+        if values[i].isdigit() and _THOUSANDS_FRAG_RE.match(values[i + 1]):
+            merged = values[i] + values[i + 1]
+            return (
+                [*values[:i], merged, *values[i + 2:]],
+                f"{values[i]},{values[i + 1]}",
+                merged,
+            )
+    return None
+
+
 # --- *COLUMNS keyword helpers (F-012) ---
 
 
@@ -235,14 +326,48 @@ def _is_columns_header(tokens: list[str]) -> bool:
     return bool(tokens) and tokens[0].upper().startswith("*COLUMNS")
 
 
+def _filter_header_names(values: list[str]) -> list[str]:
+    """Filter empty tokens from a header row, preserving positional alignment.
+
+    Only TRAILING empty tokens (from trailing delimiters like ``"MD,TVD,"``)
+    are dropped — the data-row ``min()`` guard already tolerates those.  An
+    empty token in the MIDDLE of the header (``"MD,TVD,,X,Y"``) would
+    silently shift every subsequent column because data rows keep the
+    position while the dropped name shortens the list (V-18); reject such
+    malformed headers loudly instead of corrupting the column mapping.
+
+    Args:
+        values: Raw header tokens (whitespace already stripped).
+
+    Returns:
+        Header names with trailing empty tokens removed.
+
+    Raises:
+        DEVReadError: When a non-trailing token is empty.
+    """
+    _end = len(values)
+    while _end > 0 and not values[_end - 1].strip():
+        _end -= 1
+    _head = values[:_end]
+    if any(not t.strip() for t in _head):
+        raise DEVReadError(
+            "Empty column name in the middle of the header line. "
+            f"Header tokens: {values!r}. Column names must be non-empty; "
+            "a trailing delimiter is allowed but an empty middle cell "
+            "would shift every subsequent column."
+        )
+    return _head
+
+
 def _parse_columns_tokens(tokens: list[str]) -> list[str]:
     """Extract column names from a *COLUMNS-format header line.
 
     Strips the ``*COLUMNS`` keyword token, removes the ``*`` prefix from
-    every remaining token, and filters out any empty names that result
-    (e.g. from a trailing ``*``).
+    every remaining token, and filters out trailing empty names that
+    result (e.g. from a trailing ``*``).  Middle empty cells (V-18) are
+    rejected by :func:`_filter_header_names`.
     """
-    return [t.lstrip("*") for t in tokens[1:] if t.lstrip("*")]
+    return _filter_header_names([t.lstrip("*") for t in tokens[1:]])
 
 
 # --- Delimited-line splitting with quoting support (F2-015) ---
@@ -402,6 +527,12 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                         # ("simple", 1) before the DUG check can fire.
                         # E-F-001: DUG Pattern A check first — first line
                         # may be an integer column count.
+                        # V-02 (G9): When the count-prefix DUG pattern is
+                        # detected (single-integer first line whose count
+                        # matches the comma token count), do NOT return DUG —
+                        # the second line is all-integer DATA, not a header.
+                        # Return headerless instead, mirroring the whitespace
+                        # I2F-001 contract (test_dev_reader.py:2344-2379).
                         first_line_tokens = content_entries[0][1].split(maxsplit=_max_tokens)
                         if (
                             len(first_line_tokens) == 1
@@ -413,7 +544,12 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                                 pass
                             else:
                                 if dug_count == len(comma_tokens):
-                                    return ("dug", 2)
+                                    # N-I-24: count-prefix comma file — skip
+                                    # the count line (("headerless", 1)) so
+                                    # Pass 2 derives columns from the first
+                                    # real data line (matches the whitespace
+                                    # I2F-001/N-I-24 contract).
+                                    return ("headerless", 1)
                         # Not DUG Pattern A — check second line for matching
                         # column count (numeric column names like "100,200,300").
                         if len(content_entries) >= 2:
@@ -432,6 +568,12 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                         # are definitely data, not column names.
                         # E-F-001: DUG Pattern A check before headerless
                         # return.  First line may be an integer column count.
+                        # V-02 (G9): count-prefix DUG misdetection — when
+                        # the single-integer first line's count matches the
+                        # comma token count, the second line is DATA, not a
+                        # numeric header.  Fall through to headerless like
+                        # the whitespace I2F-001 path; both comma branches
+                        # (integer above, float here) must not return DUG.
                         first_line_tokens = content_entries[0][1].split(maxsplit=_max_tokens)
                         if (
                             len(first_line_tokens) == 1
@@ -443,7 +585,12 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                                 pass
                             else:
                                 if dug_count == len(comma_tokens):
-                                    return ("dug", 2)
+                                    # N-I-24: count-prefix comma file — skip
+                                    # the count line (("headerless", 1)) so
+                                    # Pass 2 derives columns from the first
+                                    # real data line (matches the whitespace
+                                    # I2F-001/N-I-24 contract).
+                                    return ("headerless", 1)
                         return ("headerless", 0)
                 else:
                     # Single-column all-float comma token — headerless data.
@@ -476,6 +623,28 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
             # Otherwise: too many non-float tokens for this to be headerless
             # data.  Fall through to whitespace-based format detection.
 
+    # V-04 (G9): Semicolon-delimited headerless data detection.
+    # The comma pre-check above handles comma-delimited data and the
+    # whitespace path below handles space-delimited data, but a
+    # semicolon-delimited all-numeric first line (e.g. "1.0;2.0;3.0")
+    # previously fell through to simple-format detection, consuming the
+    # first data row as column names.  Detect it here so the file is
+    # treated as headerless.  Comma-decimal tokens (e.g. "1,00") are
+    # normalised before the float check so locale-style data is detected
+    # as well (V-07 family).
+    _semi_texts = [entry[1] for entry in content_entries[:3] if ";" in entry[1]]
+    if _semi_texts:
+        _semi_text = _semi_texts[0]
+        semi_tokens = [
+            t.strip()
+            for t in _semi_text.split(";", maxsplit=_max_tokens)
+            if t.strip()
+        ]
+        if semi_tokens and all(
+            _is_float_token(_convert_comma_decimal(t)) for t in semi_tokens
+        ):
+            return ("headerless", 0)
+
     # DUG Insight format detection — two patterns.
     #
     # Pattern A: single-token first line = column count (no separate title).
@@ -507,14 +676,20 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 # I2F-001: When the second line is all-float AND the column
                 # count matches exactly, the file is ambiguous — it could be
                 # DUG with numeric column names OR headerless data with a
-                # column-count prefix.  Prefer headerless (safer default) and
-                # let the headerless detection at L569 handle it.  Without
-                # this guard a file like "4\\n1.0 2.0 3.0 4.0\\n5.0..." is
+                # column-count prefix.  Prefer headerless (safer default).
+                # Without this guard a file like "4\\n1.0 2.0 3.0 4.0\\n5.0..." is
                 # falsely detected as DUG and the first data row is consumed
                 # as a column-count header.
                 if len(content_entries) >= 3 and col_count == len(second_tokens):
-                    # Do NOT return DUG — fall through to headerless detection.
-                    pass
+                    # N-I-24: Do NOT return DUG, and do NOT fall through to
+                    # plain ("headerless", 0) either — that path derives the
+                    # column count from the FIRST line ("4" -> 1 token -> 1
+                    # column), silently losing 3 of 4 columns (the I2F-001
+                    # regression test asserted exactly that wrong result).
+                    # Return ("headerless", 1) so Pass 2 skips the count line
+                    # and derives column names from the first REAL data line,
+                    # mirroring the comma I2F-30 count-prefix handling.
+                    return ("headerless", 1)
                 # F-DV01: Count-mismatch fallback — when the second line is
                 # all-float but the count doesn't match the first line's
                 # integer, it's STILL DUG format (not headerless) as long as
@@ -558,23 +733,19 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 # means it's a header (text column names).
                 if third_tokens and any(not _is_float_token(t) for t in third_tokens):
                     return ("dug", 3)
-                # F-21: Port Pattern A's count-match and count-mismatch
-                # fallback heuristics to Pattern B.  When all third-line
-                # tokens parse as floats (all-numeric column names), the
-                # integer count from line 2 matching the token count on
-                # line 3 is a strong signal of DUG format.  Requires 4+
-                # content entries (1+ data lines) to avoid 3-line false
-                # positives.
-                if len(content_entries) >= 4 and col_count == len(third_tokens):
-                    return ("dug", 3)
-                # Count-mismatch fallback — when the third line is all-float
-                # but the count doesn't match, it's still DUG format as long
-                # as there are 4+ content entries (data lines beyond the
-                # header) AND the third line has more than 1 token.
-                if len(third_tokens) > 1 and len(content_entries) >= 4 and all(
-                    _is_float_token(t) for t in third_tokens
-                ) and col_count <= len(third_tokens) + 1:
-                    return ("dug", 3)
+                # V-01 / V-03 (G9): An all-float third line is DATA, not a
+                # DUG header.  The F-21 count-match / count-mismatch numeric
+                # column-name heuristics misdetect a normal header file with
+                # a ragged or all-zero FIRST data row (e.g. "MD TVD X Y",
+                # then "0", then "100.0 1000.0 100.0 200.0") as DUG Pattern
+                # B, consuming the real header as a title and the data rows
+                # as a column count + numeric column names — total parse
+                # corruption with zero warnings.  Mirror Pattern A's I2F-001
+                # all-float guard: fall through to simple-format detection
+                # (which treats content[0] as the column header) so ragged
+                # rows are NaN-filled by Pass 2 instead of corrupting the
+                # parse.  Genuine DUG Pattern B files always have a text
+                # header line (handled by the primary check above).
 
     # Headerless format: every token on the first content line parses as
     # a float (no column names present).  No content lines to skip.
@@ -596,19 +767,19 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 and "e" not in t.lower().replace("d", "e")
             ]
             if len(first_ints) == len(first_tokens):
-                # F-213: All-zero first row is headerless data, not integer
-                # column headers.  Column names like "0 0 0 0" are
-                # nonsensical; a row of all zeros is a common first data
-                # row in deviation surveys (e.g., MD=0 at surface).
-                if all(
-                    float(t.replace("D", "E").replace("d", "e")) == 0.0
-                    for t in first_tokens
-                ):
-                    return ("headerless", 0)
-                if len(content_entries) >= 2:
-                    second_tokens = content_entries[1][1].split(maxsplit=_max_tokens)
-                    if len(second_tokens) == len(first_tokens):
-                        return ("simple", 1)
+                # V-13: ANY all-integer first row is headerless DATA, not
+                # integer column headers.  The F-92 numeric-column-names
+                # heuristic previously consumed realistic integer-valued
+                # surface stations ("0 0 45" = MD0/INC0/AZI45) as column
+                # names whenever the second line's token count matched —
+                # fully integer-valued survey files lost their first
+                # station and fabricated columns like "0"/"0_2"/"45".
+                # F-213's all-zero guard covered only the all-zero row;
+                # the second-line count-match branch is the same defect
+                # for non-zero integer data (e.g. "100 200 300 400").
+                # Prefer headerless (data-preserving default): every row
+                # survives as data and no column is fabricated.
+                return ("headerless", 0)
         return ("headerless", 0)
 
     # F-021: Mostly-float whitespace-delimited line with sentinel tokens.
@@ -638,11 +809,24 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
     # followed by numeric parameters (e.g., depths, coordinates).  Without
     # detection, the well-header is consumed as column names and the real
     # header line becomes NaN data, shifting all columns.
+    # V-05 (G9): The original check required >= 2 whitespace tokens, so a
+    # comma-delimited well-header like "WELL-1,1000.0,2000.0,50.0" (a single
+    # whitespace token) was not detected.  Use the comma-split tokens as the
+    # candidate when the whitespace split yields a single token.
+    _hdr_tokens = first_tokens
+    if len(first_tokens) < 2:
+        _cand_tokens = [
+            t.strip()
+            for t in content_entries[0][1].split(",", maxsplit=_max_tokens)
+            if t.strip()
+        ]
+        if len(_cand_tokens) >= 2:
+            _hdr_tokens = _cand_tokens
     if (
         len(content_entries) >= 2
-        and len(first_tokens) >= 2
-        and not _is_float_token(first_tokens[0])
-        and any(_is_float_token(t) for t in first_tokens[1:])
+        and len(_hdr_tokens) >= 2
+        and not _is_float_token(_hdr_tokens[0])
+        and any(_is_float_token(t) for t in _hdr_tokens[1:])
     ):
         second_line_tokens = content_entries[1][1].split(maxsplit=_max_tokens)
         # Real column header line has ALL non-numeric tokens (MD, TVD, etc.).
@@ -651,8 +835,8 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
         ):
             warnings.warn(
                 f"Detected Petrel well-header line with "
-                f"{len(first_tokens)} mixed tokens before column header "
-                f"(first token: {first_tokens[0]!r}).  Skipping well-header; "
+                f"{len(_hdr_tokens)} mixed tokens before column header "
+                f"(first token: {_hdr_tokens[0]!r}).  Skipping well-header; "
                 f"using second content line as column names.",
                 stacklevel=3,
             )
@@ -685,13 +869,35 @@ def _validate_dev_data(
     # Each validation block independently guards its prerequisite
     # columns; azimuth and inclination range checks still run when
     # MD is absent but those columns are present.
+    # V-17: MD dedup survivors (MD_2, MD_3 from MD+MDKB/DEPTH alias
+    # collisions) previously escaped ALL MD validation because only the
+    # exact "MD" name was checked (a6096f4 added the TVD survivor, not
+    # MD).  Validate every MD-family column: the primary exact match
+    # plus any _N-suffixed survivor, using the same pattern as the
+    # AZI/INC/TVD survivor blocks below.  The survivor scan runs even
+    # when ``_md_col is None`` so a file whose depth column is naturally
+    # named ``MD_2`` is validated instead of triggering the misleading
+    # "MD column not found" warning.
     _md_col = None
     for _cn in dev.columns:
         if _cn.upper() == "MD":
             _md_col = _cn
             break
-    if _md_col is not None:
-        md = dev.columns[_md_col]
+
+    _md_survivors: list[str] = []
+    for _col_name in dev.column_order:
+        _col_upper = _col_name.upper()
+        _suffix = _col_name[len("MD"):]
+        if (
+            _col_upper.startswith("MD")
+            and _suffix.startswith("_")
+            and _suffix[1:].isdigit()
+        ):
+            _md_survivors.append(_col_name)
+
+    def _check_md_column(_md_name: str) -> None:
+        """Run the MD-family data-quality checks on one column."""
+        md = dev.columns[_md_name]
         total = len(md)
         # --- Check for negative MD values (F-45: moved outside
         #     _md_check_ok gate — runs even with single finite value) ---
@@ -702,7 +908,8 @@ def _validate_dev_data(
                 n_neg = int(np.sum(neg_md))
                 neg_vals = md_finite_all[neg_md][:3]
                 warnings.warn(
-                    f"Found {n_neg} negative MD value(s): "
+                    f"Found {n_neg} negative MD value(s) in column "
+                    f"'{_md_name}': "
                     f"{', '.join(str(v) for v in neg_vals)}"
                     f"{'...' if n_neg > 3 else ''}. "
                     f"Negative measured depth values are physically "
@@ -721,7 +928,7 @@ def _validate_dev_data(
             # NaN-density check still applies for single-row files.
             if total == 1 and np.isnan(md[0]):
                 warnings.warn(
-                    "MD column has 1/1 NaN value. "
+                    f"{_md_name} column has 1/1 NaN value. "
                     "Possible delimiter mismatch: data may have been parsed "
                     "with the wrong separator. Specify the correct delimiter "
                     "explicitly.",
@@ -734,7 +941,8 @@ def _validate_dev_data(
             nan_count = int(np.isnan(md).sum())
             if nan_count / total > 0.5:
                 warnings.warn(
-                    f"MD column has {nan_count}/{total} ({nan_count / total:.1%}) "
+                    f"{_md_name} column has {nan_count}/{total} "
+                    f"({nan_count / total:.1%}) "
                     f"NaN values. Possible delimiter mismatch: data may have been "
                     f"parsed with the wrong separator. Specify the correct "
                     f"delimiter explicitly.",
@@ -762,7 +970,7 @@ def _validate_dev_data(
                 for idx in violations[:3]:
                     example_lines.append(f"{finite_md[idx]} -> {finite_md[idx + 1]}")
                 warnings.warn(
-                    f"MD values are not monotonically increasing: "
+                    f"{_md_name} values are not monotonically increasing: "
                     f"{n_violations} decrease(s) found. "
                     f"First violations: {', '.join(example_lines)}. "
                     f"Unsorted MD values can cause inaccurate trajectory "
@@ -777,14 +985,20 @@ def _validate_dev_data(
                 n_dup = len(duplicates)
                 example_vals = sorted(duplicates)[:3]
                 warnings.warn(
-                    f"Found {n_dup} repeated MD station value(s): "
+                    f"Found {n_dup} repeated MD station value(s) in column "
+                    f"'{_md_name}': "
                     f"{', '.join(str(v) for v in example_vals)}"
                     f"{'...' if n_dup > 3 else ''}. "
                     f"Repeated stations may indicate merged multi-tool surveys.",
                     stacklevel=_stacklevel,
                 )
 
-    else:
+    if _md_col is not None:
+        _check_md_column(_md_col)
+    for _surv in _md_survivors:
+        _check_md_column(_surv)
+
+    if _md_col is None and not _md_survivors:
         warnings.warn(
             "MD column not found in DEV data — validation of MD "
             "monotonicity, NaN density, and repeated stations will be "
@@ -1074,8 +1288,6 @@ def read_dev_file(
     Raises:
         DEVReadError: If file cannot be read, parsed, or exceeds
             max_file_size.
-        LASEncodingError: If the explicit encoding parameter fails to decode
-            the file.
     """
     dev = read_dev_file_as_object(
         file_path,
@@ -1130,8 +1342,6 @@ def read_dev_file_as_object(
     Raises:
         DEVReadError: If file cannot be read, parsed, or exceeds
             max_file_size.
-        LASEncodingError: If the explicit encoding parameter fails to decode
-            the file.
 
     Example:
         >>> from pylasdev import read_dev_file_as_object
@@ -1221,13 +1431,31 @@ def read_dev_file_as_object(
             skip_content_lines - 1 if skip_content_lines > 1 else 0
         ][1]
         if format_type == "headerless" and "," not in _first:
-            # Headerless format where the first line is a column count
-            # (no commas).  Check subsequent lines for comma presence.
-            _comma_hdr = next(
-                (entry[1] for entry in content_entries[1:3] if "," in entry[1]),
-                None,
-            )
-            hdr = _comma_hdr if _comma_hdr else _first
+            # N-I-25: Only prefer a later comma-containing line when the
+            # first line is a single-token integer column-count prefix
+            # (I2F-30, e.g. "4\\n1.0,2.0,3.0,4.0").  For a real
+            # space-delimited data first line, a later comma line is a
+            # MIXED-delimiter file — the first line's own delimiter must
+            # govern, otherwise the comma search derives a 1-column
+            # header from a comma line and the space-delimited data is
+            # silently reduced to a single col_0 with NaN values.
+            _first_tokens = _first.split(maxsplit=_max_tokens)
+            _is_count_prefix = False
+            if len(_first_tokens) == 1:
+                try:
+                    int(_first_tokens[0])
+                except ValueError:
+                    pass
+                else:
+                    _is_count_prefix = True
+            if _is_count_prefix:
+                _comma_hdr = next(
+                    (entry[1] for entry in content_entries[1:3] if "," in entry[1]),
+                    None,
+                )
+                hdr = _comma_hdr if _comma_hdr else _first
+            else:
+                hdr = _first
         else:
             hdr = _first
     else:
@@ -1247,11 +1475,15 @@ def read_dev_file_as_object(
             # that "MD, TVD, INC, AZI" (commas with trailing spaces)
             # correctly detects comma delimiter.
             comma_tokens = [t for t in hdr.split(",", maxsplit=_max_tokens) if t.strip()]
-            space_tokens = hdr.split()
+            # N-I-26: bound the space/tab splits with maxsplit so the
+            # delimiter-detection block cannot allocate unbounded token
+            # lists before the G-18 token-cap guard (in Pass 2 /
+            # _split_delimited_line) ever runs.
+            space_tokens = hdr.split(maxsplit=_max_tokens)
             if "\t" in hdr:
                 # Tab-delimited file: use str.split("\t") to preserve
                 # empty fields between consecutive tabs.
-                tab_tokens = hdr.split("\t")
+                tab_tokens = hdr.split("\t", maxsplit=_max_tokens)
                 # When both tab and semicolon are present, compare token
                 # counts to pick the real delimiter.  A semicolon-delimited
                 # header with a stray tab (e.g., extra whitespace) should
@@ -1339,25 +1571,45 @@ def read_dev_file_as_object(
                     break
         if _data_lines:
             _first_data = _data_lines[0]
+            # N-I-26: all split sites in this block are bounded with
+            # maxsplit so the G-18 token cap applies before any unbounded
+            # token-list allocation (the delimiter-detection block runs on
+            # the full header string before Pass 2's guards).
             if delimiter == " ":
-                _hdr_cols = len(hdr.split())
-                _data_cols = len(_first_data.split())
+                _hdr_cols = len(hdr.split(maxsplit=_max_tokens))
+                _data_cols = len(_first_data.split(maxsplit=_max_tokens))
             else:
                 _hdr_cols = len(
-                    [t for t in hdr.split(delimiter) if t.strip()]
+                    [t for t in hdr.split(delimiter, maxsplit=_max_tokens) if t.strip()]
                 )
                 _data_cols = len(
-                    [t for t in _first_data.split(delimiter) if t.strip()]
+                    [t for t in _first_data.split(delimiter, maxsplit=_max_tokens) if t.strip()]
                 )
+            # V-06 (G9): Count how many sampled data lines AFTER the first
+            # have exactly the header's token count under the current
+            # delimiter.  When a short FIRST data row (ragged format, e.g.
+            # an MD-only surface station) is followed by full rows, the
+            # delimiter is correct and the short row should be NaN-filled
+            # by Pass 2 rather than treated as a delimiter mismatch.
+            _later_full_rows = 0
+            for _dline in _data_lines[1:]:
+                if delimiter == " ":
+                    _dcols = len(_dline.split(maxsplit=_max_tokens))
+                else:
+                    _dcols = len(
+                        [t for t in _dline.split(delimiter, maxsplit=_max_tokens) if t.strip()]
+                    )
+                if _dcols == _hdr_cols:
+                    _later_full_rows += 1
             if _hdr_cols >= 2 and _data_cols == 1:
                 # Delimiter fails on first data line (produces only 1
                 # token).  Try the alternative delimiter.
                 _alt_delim = " " if delimiter == "," else ","
                 if _alt_delim == " ":
-                    _data_alt_cols = len(_first_data.split())
+                    _data_alt_cols = len(_first_data.split(maxsplit=_max_tokens))
                 else:
                     _data_alt_cols = len(
-                        [t for t in _first_data.split(_alt_delim)
+                        [t for t in _first_data.split(_alt_delim, maxsplit=_max_tokens)
                          if t.strip()]
                     )
                 # F-013: Auto-correct only for auto-detected delimiters.
@@ -1379,8 +1631,27 @@ def read_dev_file_as_object(
                     # header like "MD,TVD,INC" into a single bogus
                     # column name.  The cached names are passed to both
                     # the simple-format and DUG-format header paths.
-                    _cached_hdr_names = [t.strip() for t in hdr.split(delimiter) if t.strip()]
+                    # N-I-26: bound the split; V-18: middle empty cells
+                    # are rejected (trailing empties dropped) instead of
+                    # silently shifting columns.
+                    _cached_hdr_names = _filter_header_names(
+                        [t.strip() for t in hdr.split(delimiter, maxsplit=_max_tokens)]
+                    )
                     delimiter = _alt_delim
+                elif _delimiter_was_auto and _later_full_rows > 0:
+                    # V-06: The first data row is a single token under
+                    # BOTH delimiters but later rows confirm the current
+                    # delimiter — the row is genuinely ragged, not a
+                    # delimiter mismatch.  Warn and let Pass 2 NaN-fill.
+                    warnings.warn(
+                        f"First data line has only {_data_cols} token(s) "
+                        f"but header declares {_hdr_cols} column(s). "
+                        f"Missing values will be filled with NaN because "
+                        f"later data line(s) confirm the delimiter "
+                        f"{delimiter!r} is correct. This may indicate a "
+                        f"ragged first data row.",
+                        stacklevel=2,
+                    )
                 elif _delimiter_was_auto:
                     raise DEVReadError(
                         f"Delimiter mismatch: auto-detected delimiter "
@@ -1402,17 +1673,37 @@ def read_dev_file_as_object(
                         f"specify {_alt_delim!r}."
                     )
             elif abs(_hdr_cols - _data_cols) >= 3:
-                _source = (
-                    "auto-detected" if _delimiter_was_auto
-                    else "explicitly specified"
-                )
-                raise DEVReadError(
-                    f"Delimiter mismatch: {_source} delimiter "
-                    f"{delimiter!r} produces {_hdr_cols} columns from "
-                    f"header but {_data_cols} tokens from first data "
-                    f"line (difference: {abs(_hdr_cols - _data_cols)}). "
-                    f"Specify the correct delimiter explicitly."
-                )
+                # V-06: A short first data row (>= 3 token deficit) with
+                # corroborating full rows is a ragged row, not a delimiter
+                # mismatch — NaN-fill instead of raising.  The long
+                # direction and user-provided delimiters keep raising.
+                if (
+                    _delimiter_was_auto
+                    and _data_cols < _hdr_cols
+                    and _later_full_rows > 0
+                ):
+                    warnings.warn(
+                        f"First data line has {_data_cols} token(s) but "
+                        f"header declares {_hdr_cols} column(s) "
+                        f"(difference: {abs(_hdr_cols - _data_cols)}). "
+                        f"Missing values will be filled with NaN because "
+                        f"later data line(s) confirm the delimiter "
+                        f"{delimiter!r} is correct. This may indicate a "
+                        f"ragged first data row.",
+                        stacklevel=2,
+                    )
+                else:
+                    _source = (
+                        "auto-detected" if _delimiter_was_auto
+                        else "explicitly specified"
+                    )
+                    raise DEVReadError(
+                        f"Delimiter mismatch: {_source} delimiter "
+                        f"{delimiter!r} produces {_hdr_cols} columns from "
+                        f"header but {_data_cols} tokens from first data "
+                        f"line (difference: {abs(_hdr_cols - _data_cols)}). "
+                        f"Specify the correct delimiter explicitly."
+                    )
             # F-047: Multi-line consistency check.  When the first
             # data line passed validation, verify that subsequent
             # data lines are consistent with the same delimiter.
@@ -1422,10 +1713,10 @@ def read_dev_file_as_object(
                 _mismatch_lines: list[int] = []
                 for _idx, _dline in enumerate(_data_lines[1:], start=2):
                     if delimiter == " ":
-                        _dl_cols = len(_dline.split())
+                        _dl_cols = len(_dline.split(maxsplit=_max_tokens))
                     else:
                         _dl_cols = len(
-                            [t for t in _dline.split(delimiter) if t.strip()]
+                            [t for t in _dline.split(delimiter, maxsplit=_max_tokens) if t.strip()]
                         )
                     if _dl_cols != _data_cols:
                         _mismatch_lines.append(_idx)
@@ -1506,9 +1797,35 @@ def read_dev_file_as_object(
         else:
             values = _split_delimited_line(stripped, delimiter)
 
+        # V-08 (G9): Thousands-separator recombination for comma-delimited
+        # data rows.  A value like "1,234.5" is split by the comma delimiter
+        # into two tokens ("1" and "234.5"), silently shifting every
+        # subsequent column.  When a row has one extra token beyond the
+        # declared columns and consecutive tokens match the thousands
+        # pattern, recombine them (with a warning) before assignment.
+        # Headerless first rows are exempt — they define the column count.
+        if delimiter == "," and names and len(values) > len(names):
+            _recombined = _recombine_thousands_separators(values, len(names))
+            if _recombined is not None:
+                _merged_vals, _original_frag, _merged_value = _recombined
+                warnings.warn(
+                    f"Data value '{_original_frag}' contains a thousands "
+                    f"separator, which is not natively supported in "
+                    f"comma-delimited DEV files; recombined to "
+                    f"'{_merged_value}' for column mapping. Review the "
+                    f"data line if this row has genuine extra columns.",
+                    stacklevel=2,
+                )
+                values = _merged_vals
+
         if format_type == "headerless":
-            if content_seen == 1:
-                # Auto-generate column names from the first data row.
+            if content_seen <= skip_content_lines:
+                # N-I-24: column-count prefix line(s) (e.g. a DUG-style
+                # integer count "4" before headerless data).  Skip — it is
+                # neither a data row nor a column name.
+                continue
+            if content_seen == skip_content_lines + 1:
+                # Auto-generate column names from the first real data row.
                 names = [f"col_{i}" for i in range(len(values))]
                 if len(names) >= MAX_CURVES:
                     raise DEVReadError(
@@ -1535,7 +1852,7 @@ def read_dev_file_as_object(
                 # Store first data row (G-04 bounds guard).
                 if current_line < data_lines:
                     for k in range(len(names)):
-                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan, _failure_counter=_fc)
+                        dev.columns[names[k]][current_line] = _dev_to_finite_float(values[k], np.nan, _failure_counter=_fc)
                     current_line += 1
                 else:
                     discarded_lines += 1
@@ -1567,7 +1884,7 @@ def read_dev_file_as_object(
                         else:
                             short_row_count += 1
                     for k in range(min(len(values), len(names))):
-                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan, _failure_counter=_fc)
+                        dev.columns[names[k]][current_line] = _dev_to_finite_float(values[k], np.nan, _failure_counter=_fc)
                     current_line += 1
                 else:
                     discarded_lines += 1
@@ -1586,10 +1903,11 @@ def read_dev_file_as_object(
                 if _is_columns_header(values):
                     names = _parse_columns_tokens(values)
                 else:
-                    # Filter out empty strings from trailing delimiters (e.g.,
-                    # "MD,TVD," → ["MD","TVD",""]) so empty column names are
-                    # rejected instead of creating dev.columns[""].
-                    names = [v for v in values if v]
+                    # V-18: drop only TRAILING empty tokens (trailing
+                    # delimiters like "MD,TVD,"); an empty MIDDLE cell
+                    # (e.g. "MD,TVD,,X,Y") is rejected instead of
+                    # silently shifting every subsequent column.
+                    names = _filter_header_names(values)
                 if not names:
                     raise DEVReadError(
                         "Empty header line in DUG-format DEV file. "
@@ -1651,7 +1969,7 @@ def read_dev_file_as_object(
                         else:
                             short_row_count += 1
                     for k in range(min(len(values), len(names))):
-                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan, _failure_counter=_fc)
+                        dev.columns[names[k]][current_line] = _dev_to_finite_float(values[k], np.nan, _failure_counter=_fc)
                     current_line += 1
                 else:
                     discarded_lines += 1
@@ -1672,10 +1990,11 @@ def read_dev_file_as_object(
                 if _is_columns_header(values):
                     names = _parse_columns_tokens(values)
                 else:
-                    # Filter out empty strings from trailing delimiters (e.g.,
-                    # "MD,TVD," → ["MD","TVD",""]) so empty column names are
-                    # rejected instead of creating dev.columns[""].
-                    names = [v for v in values if v]
+                    # V-18: drop only TRAILING empty tokens (trailing
+                    # delimiters like "MD,TVD,"); an empty MIDDLE cell
+                    # (e.g. "MD,TVD,,X,Y") is rejected instead of
+                    # silently shifting every subsequent column.
+                    names = _filter_header_names(values)
                 if not names:
                     raise DEVReadError(
                         "Empty header line in DEV file. "
@@ -1737,7 +2056,7 @@ def read_dev_file_as_object(
                         else:
                             short_row_count += 1
                     for k in range(min(len(values), len(names))):
-                        dev.columns[names[k]][current_line] = _to_finite_float(values[k], np.nan, _failure_counter=_fc)
+                        dev.columns[names[k]][current_line] = _dev_to_finite_float(values[k], np.nan, _failure_counter=_fc)
                     current_line += 1
                 else:
                     discarded_lines += 1

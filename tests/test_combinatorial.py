@@ -35,8 +35,10 @@ def _make_version_dict(vers: str, wrap: str, dlm: str) -> dict[str, str]:
 def _make_well_dict(vers: str, numeric_only: bool = True) -> dict[str, str]:
     """Build a well section dict appropriate for the given LAS version.
 
-    LAS 1.2 mandates 8 fields: STRT, STOP, STEP, NULL, COMP, WELL, FLD, LOC.
-    LAS 2.0/3.0 add more fields but the same minimum applies.
+    M-11: LAS 1.2/2.0 mandate the lascheck 10-field set for ~W:
+    STRT, STOP, STEP, NULL, COMP, WELL, FLD, LOC, SRVC, DATE.
+    UWI is optional (present but not required).  LAS 3.0 uses the
+    same minimum set.
     """
     well: dict[str, str] = {
         "STRT": "100.0",
@@ -50,6 +52,8 @@ def _make_well_dict(vers: str, numeric_only: bool = True) -> dict[str, str]:
             "WELL": "TEST-WELL-01",
             "FLD": "TEST FIELD",
             "LOC": "12-34-56-78W5",
+            "SRVC": "TEST SRVC",
+            "DATE": "01/01/2020",
         })
     return well
 

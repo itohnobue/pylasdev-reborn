@@ -1240,3 +1240,60 @@ class TestMaskedArrayComparison:
         assert _compare_lists(
             [arr], [42.0], "test", 1e-7, 0.0
         ) is True
+
+
+class TestE08DataSectionsSymmetricGuards:
+    """E-08: _compare_data_sections must handle malformed sections2 operands.
+
+    Previously only sections1 was checked for list-ness, so sections2=None
+    raised a bare TypeError on len(), a non-dict element raised a bare
+    AttributeError on .keys(), and empty-container mismatches ([] == {},
+    [] == (), [] == "") silently compared equal.  All cases must now
+    return False (or True for genuinely equal operands) without raising.
+    """
+
+    def test_sections2_none_returns_false(self) -> None:
+        """E-08: sections2=None returns False instead of raising TypeError."""
+        assert compare_las_dicts(
+            {"data_sections": []}, {"data_sections": None}
+        ) is False
+
+    def test_sections2_dict_vs_list_returns_false(self) -> None:
+        """E-08: sections2={} vs sections1=[] returns False, not True.
+
+        The empty-container silent FALSE-EQUAL: [] == {} previously
+        returned True because both had length 0 and the loop never ran.
+        """
+        assert compare_las_dicts(
+            {"data_sections": []}, {"data_sections": {}}
+        ) is False
+
+    def test_sections2_tuple_returns_false(self) -> None:
+        """E-08: sections2=() vs sections1=[] returns False, not True."""
+        assert compare_las_dicts(
+            {"data_sections": []}, {"data_sections": ()}
+        ) is False
+
+    def test_sections2_string_returns_false(self) -> None:
+        """E-08: sections2='' vs sections1=[] returns False, not True."""
+        assert compare_las_dicts(
+            {"data_sections": []}, {"data_sections": ""}
+        ) is False
+
+    def test_non_dict_element_returns_false(self) -> None:
+        """E-08: non-dict element returns False instead of AttributeError."""
+        assert compare_las_dicts(
+            {"data_sections": [{"a": 1}]}, {"data_sections": ["notadict"]}
+        ) is False
+
+    def test_non_dict_first_element_returns_false(self) -> None:
+        """E-08: non-dict element in sections1 also returns False."""
+        assert compare_las_dicts(
+            {"data_sections": ["notadict"]}, {"data_sections": [{"a": 1}]}
+        ) is False
+
+    def test_matching_sections_still_equal(self) -> None:
+        """E-08: well-formed matching data_sections still compare equal."""
+        d1 = {"data_sections": [{"DEPT": np.array([1.0, 2.0])}]}
+        d2 = {"data_sections": [{"DEPT": np.array([1.0, 2.0])}]}
+        assert compare_las_dicts(d1, d2) is True

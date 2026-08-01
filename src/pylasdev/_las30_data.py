@@ -11,7 +11,6 @@ All state that was previously on ``self`` is passed through an
 
 from __future__ import annotations
 
-import logging
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -26,11 +25,10 @@ from .data_reader import (
     _get_null_value,
     _resolve_max_tokens_per_line,
     _to_finite_float,
+    _to_integer_value,
 )
 from .exceptions import LASDataError, LASParseError
 from .models import CurveDefinition, DataSection
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -169,6 +167,68 @@ def _deduplicate_curves(
     return deduped_order
 
 
+# N-I-31: Private attribute names used to record null-value fill cells on a
+# DataSection when the ~Well section is not yet known at fill time.  The
+# cells are re-filled with the declared NULL once the well section is parsed.
+_NULL_FILL_CELLS_ATTR = "_pylasdev_null_fill_cells"
+_NULL_FILL_SENTINEL_ATTR = "_pylasdev_null_fill_sentinel"
+
+
+def _reconcile_null_sentinels(las_file: LASFile) -> None:
+    """Re-fill tracked null cells with the well's declared NULL (N-I-31).
+
+    When a LAS 3.0 data section is processed before the ~Well section, its
+    null-value fill cells (padding for short rows, conversion failures) are
+    baked with the default sentinel (-999.25) because the declared NULL is
+    not yet known.  Once the well declares a different NULL, later
+    ``process_ascii_data`` calls invoke this helper to replace the tracked
+    fill cells so the in-memory data agrees with the declared sentinel —
+    downstream consumers using the declared NULL no longer misread fill
+    cells as real data.
+
+    Genuine data values that happen to equal the default sentinel are NOT
+    touched: only positions recorded at fill time are re-filled.
+
+    Args:
+        las_file: The LASFile being built.  Prior data sections are
+            mutated in place.
+    """
+    try:
+        declared_null = _get_null_value(las_file.well)
+    except LASParseError:
+        # Non-finite declared NULL already raises during the fill path;
+        # nothing safe to reconcile against.
+        return
+    for data_section in las_file.data_sections:
+        fill_cells = getattr(data_section, _NULL_FILL_CELLS_ATTR, None)
+        if not fill_cells:
+            continue
+        sentinel = getattr(data_section, _NULL_FILL_SENTINEL_ATTR, None)
+        if sentinel is None or sentinel == declared_null:
+            continue
+        for row, col in fill_cells:
+            if col >= len(data_section.curves_order):
+                continue
+            mnemonic = data_section.curves_order[col]
+            arr = data_section.data.get(mnemonic)
+            if arr is not None and row < len(arr):
+                arr[row] = declared_null
+                # Keep the top-level logs convenience view in sync — it is
+                # a defensive copy of the same arrays made at fill time.
+                log_arr = las_file.logs.get(mnemonic)
+                if log_arr is not None and row < len(log_arr):
+                    log_arr[row] = declared_null
+        setattr(data_section, _NULL_FILL_CELLS_ATTR, [])
+        warnings.warn(
+            f"Data section '{data_section.name or 'ASCII'}': null-value "
+            f"fill cells were baked with the default sentinel ({sentinel:g}) "
+            f"before the ~Well section declared NULL={declared_null:g}. "
+            f"Fill cells were updated to match the declared NULL.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
 def process_ascii_data(ctx: AsciiDataContext) -> None:
     """Process collected ASCII data lines into numpy arrays.
 
@@ -201,29 +261,56 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
             f"The file may be malformed or corrupt."
         )
 
+    # N-I-31: When the ~Well section is already known at this point, re-fill
+    # null-value fill cells of EARLIER data sections that were processed
+    # before ~Well declared its NULL (they were baked with the default
+    # -999.25 sentinel).  Runs even when the current section is empty so a
+    # trailing non-data section cannot skip reconciliation.
+    well_known = bool(ctx.las_file.well.get("NULL"))
+    if well_known:
+        _reconcile_null_sentinels(ctx.las_file)
+
     if not ctx.ascii_data_lines:
         return
 
     # F-M-004: LAS 3.0 WRAP=YES check — detect actual wrap from data
     # lines before rejecting.  Files with WRAP=YES in the header but
     # non-wrapped data (one full row per line) should parse normally.
-    # The heuristic mirrors _detect_actual_wrap in data_reader.py:
-    # first data line with >= curve_count values → non-wrapped.
-    # Single-curve files cannot distinguish wrap mode so keep the reject.
+    # The heuristic mirrors _detect_actual_wrap in data_reader.py.
+    # P-15: Single-curve files (n_curves <= 1) are exempt — like
+    # data_reader's curve_count<=1 rule, they cannot distinguish wrap
+    # mode and are treated as non-wrapped (previously always rejected).
+    # N-I-05: Use second-line corroboration for the SPACE delimiter
+    # (mirroring data_reader F-M16) so a valid WRAP=YES file with a
+    # sparse first row is not falsely rejected.
     if ctx.las_file.version.wrap.upper() == "YES":
         if ctx.section_curve_end_idx is not None:
             n_curves = len(ctx.las_file.curves[ctx.section_curve_start_idx : ctx.section_curve_end_idx])
         else:
             n_curves = len(ctx.las_file.curves[ctx.section_curve_start_idx :])
         actual_wrap = True
-        if n_curves > 1:
+        if n_curves <= 1:
+            # P-15: single-curve files cannot distinguish wrap mode.
+            actual_wrap = False
+        else:
             delimiter = ctx.las_file.version.delimiter_char
+            _first_wrap: bool | None = None
             for line in ctx.ascii_data_lines:
                 stripped = line.strip()
                 if not stripped or stripped.startswith("#"):
                     continue
                 if delimiter == " ":
-                    actual_wrap = len(stripped.split(maxsplit=_resolve_max_tokens_per_line())) < n_curves
+                    _sparse = len(stripped.split(maxsplit=_resolve_max_tokens_per_line())) < n_curves
+                    if _first_wrap is None:
+                        _first_wrap = _sparse
+                        if not _first_wrap:
+                            actual_wrap = False
+                            break
+                        # Sparse first line — corroborate with second.
+                        continue
+                    # Second data line: F-M16 corroboration.
+                    actual_wrap = _sparse
+                    break
                 else:
                     _tokens = stripped.split(delimiter, maxsplit=_resolve_max_tokens_per_line())
                     # F8M-02: Strip trailing empty strings before wrap check.
@@ -234,8 +321,10 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
                     # legitimate sparse data values that must be preserved.
                     while _tokens and _tokens[-1] == "":
                         _tokens.pop()
+                    # Non-space delimiter: the depth-line heuristic is
+                    # definitive (matches data_reader._detect_actual_wrap).
                     actual_wrap = len(_tokens) == 1
-                break
+                    break
         if actual_wrap:
             raise LASParseError(
                 "LAS 3.0 WRAP=YES is not supported by pylasdev.  "
@@ -275,9 +364,8 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
         return
 
     # F1: Local dedup on per-section curves.  Global curve writeback
-    # (lines 2363-2368, 2389-2394) is deferred until after the
-    # actual_count > 0 check — see F2-07 writeback block below.
-    is_first_section = not ctx.las_file.data_sections
+    # (see F2-07 block below) is deferred until after the actual_count
+    # > 0 check — see F2-07 writeback block below.
     deduped_order = _deduplicate_curves(ctx, section_curves, is_first_section=False)
 
     # F-10: Validate cross-curve array continuity per LAS 3.0 spec
@@ -348,6 +436,13 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
         for i, c in enumerate(section_curves)
     }
 
+    # L-03: Detect {I} integer-format curves.  Stored as int64 (when the
+    # null sentinel is integral) and parsed via int() so values above 2^53
+    # are not silently rounded by float().
+    integer_curves = {
+        i: c.data_format == "I" for i, c in enumerate(section_curves)
+    }
+
     # F2-05: Validate curve format types — unrecognized formats silently
     # produce null data when routed through _to_finite_float().  Known
     # numeric format types are F (float), E (exponential), D (Fortran
@@ -365,13 +460,17 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
     # NULL key was not set in the well section.  This typically occurs
     # when the data section (~A/ASCII) precedes the ~Well section in
     # LAS 3.0 files, causing section-ordering-dependent null value.
-    if not ctx.las_file.well.get("NULL"):
-        logger.warning(
-            "NULL value not found in well section for data section '%s'; "
-            "using default null value (%.4g). This may indicate that the "
-            "data section precedes the ~Well section in the file.",
-            ctx.current_section_name or "ASCII",
-            null_value,
+    # L-01: Use warnings.warn (not logger.warning) for symmetry with the
+    # LAS 1.2/2.0 data-quality diagnostics (data_reader.py) so LAS 3.0
+    # corruption is visible to warnings-API monitoring.
+    if not well_known:
+        warnings.warn(
+            f"NULL value not found in well section for data section "
+            f"'{ctx.current_section_name or 'ASCII'}'; using default null "
+            f"value ({null_value:.4g}). This may indicate that the data "
+            f"section precedes the ~Well section in the file.",
+            UserWarning,
+            stacklevel=2,
         )
 
     # Create data section with per-section curves.
@@ -435,13 +534,18 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
     # confirming actual_count > 0, preventing stale deduped names
     # in global curves/curves_order when a data section has no
     # actual data rows and is discarded.
-    if is_first_section:
-        for i, curve in enumerate(section_curves):
-            global_idx = ctx.section_curve_start_idx + i
-            if curve.original_mnemonic and not ctx.las_file.curves[global_idx].original_mnemonic:
-                ctx.las_file.curves[global_idx].original_mnemonic = curve.original_mnemonic
-            ctx.las_file.curves[global_idx].mnemonic = curve.mnemonic
-            ctx.las_file.curves_order[global_idx] = deduped_order[i]
+    # L-02: Apply to EVERY data section, not just the first.  The
+    # writeback is scoped to the section's own curve slice
+    # (section_curve_start_idx + i), so dedup renames in non-first
+    # sections propagate to the global curves/curves_order that the
+    # writer and to_dict() consume — without them, a re-read of the
+    # written file sees more data columns than ~C curve definitions.
+    for i, curve in enumerate(section_curves):
+        global_idx = ctx.section_curve_start_idx + i
+        if curve.original_mnemonic and not ctx.las_file.curves[global_idx].original_mnemonic:
+            ctx.las_file.curves[global_idx].original_mnemonic = curve.original_mnemonic
+        ctx.las_file.curves[global_idx].mnemonic = curve.mnemonic
+        ctx.las_file.curves_order[global_idx] = deduped_order[i]
 
     # Use ``>`` for consistency with data_reader.py and models.py which use ``>``
     # throughout all MAX_DATA_LINES guards (accepts files at exactly MAX_DATA_LINES).
@@ -480,20 +584,41 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
         )
 
     # PERF-03: Pre-allocate numpy arrays for numeric curves.
+    # L-03: {I} integer-format curves get int64 arrays when the null
+    # sentinel is integral — int64 would truncate a fractional NULL (e.g.
+    # -999.25 → -999), silently corrupting null cells, so the int64 branch
+    # is gated on null integrality (same rule as data_reader).
+    _null_is_integral = float(null_value).is_integer()
     string_data_lists: dict[int, list[str]] = {}
     for i, curve in enumerate(section_curves):
         if string_curves.get(i, False):
             string_data_lists[i] = []
+        elif integer_curves.get(i, False) and _null_is_integral:
+            # L-03: int64 storage for {I} curves — preserves exact integer
+            # values above 2^53 that float64 cannot represent.
+            data_section.data[curve.mnemonic] = np.zeros(
+                actual_count, dtype=np.int64
+            )
+        elif integer_curves.get(i, False):
+            # EXT-04: fractional declared NULL — object dtype preserves
+            # exact {I} integers above 2^53 while null cells keep the
+            # fractional sentinel (int64 would truncate -999.25 → -999).
+            data_section.data[curve.mnemonic] = np.zeros(
+                actual_count, dtype=object
+            )
         else:
-            arr = np.zeros(actual_count, dtype=np.float64)
-            data_section.data[curve.mnemonic] = arr
+            data_section.data[curve.mnemonic] = np.zeros(
+                actual_count, dtype=np.float64
+            )
             # F2-014: las_file.logs assigned via defensive copy after data
             # fill to avoid shared mutable ndarray between LASFile.logs
             # and DataSection.data — in-place mutations were silently
             # corrupting both views.
 
     # Fill arrays by index (no list accumulation overhead for numerics)
-    numeric_arrays = [
+    # L-03: numeric arrays may be float64 or int64 (for {I} curves) —
+    # annotate the union explicitly so mypy accepts both dtypes.
+    numeric_arrays: list[np.ndarray | None] = [
         data_section.data[c.mnemonic] if not string_curves.get(i, False) else None
         for i, c in enumerate(section_curves)
     ]
@@ -505,6 +630,12 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
     _desan_warned_ws = False   # whitespace→underscore (F-39)
     _desan_warned_tab = False  # tab→space (F-40)
     _desan_warned_empty = False  # empty→"-" (I2-F-03)
+    # N-I-31: When the ~Well section is not yet known, record every cell
+    # that is filled with the default null sentinel (padding for short
+    # rows, conversion failures) so a later pass can re-fill them with the
+    # well's declared NULL.  Genuine data values are never tracked.
+    track_fill = not well_known
+    fill_cells: list[tuple[int, int]] = []  # (row_idx, col_idx) null fills
     for line in ctx.ascii_data_lines:
         # Skip comment lines and blank/whitespace-only lines.
         # F-32: EMPTY_PATTERN was defined at module level but never
@@ -558,13 +689,23 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
         # String curves use "" (empty string) to avoid width-ambiguity
         # from str(null_value) padding (matching data_reader.py:836-840).
         while len(values) < num_curves:
-            if string_curves.get(len(values), False):
+            _pad_idx = len(values)
+            if string_curves.get(_pad_idx, False):
                 values.append("")
             else:
                 values.append(str(null_value))
+                if track_fill:
+                    fill_cells.append((idx, _pad_idx))
 
         for i in range(num_curves):
-            val_str = values[i].strip()
+            # IT3-F1: Do NOT strip per-token whitespace.  The LAS 1.2/2.0
+            # path (_split_data_line) keeps token-edge whitespace, so
+            # stripping here silently destroyed leading/trailing spaces in
+            # {S} string data on LAS 3.0 reads.  Numeric parsing is
+            # whitespace-tolerant (float()) and _desanitize_las_value
+            # handles whitespace-prefixed "_#" escapes (case 2), so the
+            # token is passed through untouched.
+            val_str = values[i]
             # F-007: Reverse the writer's _sanitize_las_value #-prefix escape
             val_str = _desanitize_las_value(val_str)
             if string_curves.get(i, False):
@@ -605,9 +746,35 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
                         stacklevel=2,
                     )
                 string_data_lists[i].append(val_str)
+            elif integer_curves.get(i, False):
+                # L-03/EXT-04: {I} curve — parse via int() to preserve
+                # exactness above 2^53 (float() would round).  With a
+                # fractional NULL the array is object dtype and failures
+                # return the float sentinel (not int(null_value)).
+                _fc_before = _fc[0]
+                int_val = _to_integer_value(
+                    val_str, null_value, _failure_counter=_fc,
+                    _null_as_float=not _null_is_integral,
+                )
+                if track_fill and (_fc[0] > _fc_before or not val_str):
+                    fill_cells.append((idx, i))
+                arr = numeric_arrays[i]
+                if arr is None:
+                    raise LASParseError(
+                        f"Internal error: numeric array '{i}' was not pre-allocated"
+                    )
+                # L-03: int64-allocated arrays accept int values directly.
+                arr[idx] = int_val
             else:
+                _fc_before = _fc[0]
                 val = _to_finite_float(val_str, null_value, _failure_counter=_fc)
-                arr = numeric_arrays[i]  # type: ignore[assignment]
+                if track_fill and (_fc[0] > _fc_before or not val_str):
+                    # Conversion failure or empty token — the cell was
+                    # replaced with the default null sentinel.  Empty
+                    # tokens return null_value without incrementing the
+                    # failure counter, so they need an explicit check.
+                    fill_cells.append((idx, i))
+                arr = numeric_arrays[i]
                 if arr is None:
                     raise LASParseError(
                         f"Internal error: numeric array '{i}' was not pre-allocated"
@@ -620,36 +787,37 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
     # row counts, replacing the previous boolean-once pattern that
     # suppressed all diagnostics after the first occurrence.  This
     # allows automated data quality tools to enumerate affected rows.
+    # L-01: Use warnings.warn (not logger.warning) for symmetry with the
+    # LAS 1.2/2.0 data-quality diagnostics (data_reader.py) so LAS 3.0
+    # data-quality issues are visible to warnings-API monitoring.
     if extra_count > 0:
-        logger.warning(
-            "Data section '%s': %d row(s) had more values than the %d "
-            "declared curves. Extra columns were silently discarded.",
-            ctx.current_section_name or "ASCII",
-            extra_count,
-            num_curves,
+        warnings.warn(
+            f"Data section '{ctx.current_section_name or 'ASCII'}': "
+            f"{extra_count} row(s) had more values than the {num_curves} "
+            f"declared curves. Extra columns were silently discarded.",
+            UserWarning,
+            stacklevel=2,
         )
     if short_count > 0:
-        logger.warning(
-            "Data section '%s': %d row(s) had fewer values than the %d "
-            "declared curves. Missing values are filled with the null "
-            "value (%s).",
-            ctx.current_section_name or "ASCII",
-            short_count,
-            num_curves,
-            null_value,
+        warnings.warn(
+            f"Data section '{ctx.current_section_name or 'ASCII'}': "
+            f"{short_count} row(s) had fewer values than the {num_curves} "
+            f"declared curves. Missing values are filled with the null "
+            f"value ({null_value}).",
+            UserWarning,
+            stacklevel=2,
         )
 
     # F-002: Emit diagnostic warning when float conversions fail in
     # the LAS 3.0 data path — data processing is correct (values fall
     # back to null_value), but users should know about unparseable data.
     if _fc[0] > 0:
-        logger.warning(
-            "Data section '%s': %d value(s) could not be converted "
-            "to finite floats and were replaced with the null value "
-            "(%s).",
-            ctx.current_section_name or "ASCII",
-            _fc[0],
-            null_value,
+        warnings.warn(
+            f"Data section '{ctx.current_section_name or 'ASCII'}': "
+            f"{_fc[0]} value(s) could not be converted to finite floats "
+            f"and were replaced with the null value ({null_value}).",
+            UserWarning,
+            stacklevel=2,
         )
 
     # F2-014: Copy filled numeric arrays from data_section.data to
@@ -658,7 +826,15 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
     # numeric_arrays (which references data_section.data).  Now copy
     # the fully-populated arrays so in-place mutations on one view do
     # not silently corrupt the other.
-    if is_first_section:
+    # N-I-32: Populate the top-level logs/string_data views from the
+    # LOG_DATA section (the main log), not from the FIRST data section
+    # regardless of section_type.  Typed-first files (e.g. ~Core_Data
+    # before LOG_DATA) previously gave logs = CORE curves with the main
+    # DEPT/GR absent from to_dict()["logs"].  Only the first LOG_DATA
+    # section populates the view (matching the single-population
+    # semantics of the previous order-based gate).
+    is_log_data = ctx.current_data_section_type == "LOG_DATA"
+    if is_log_data and not ctx.las_file.logs:
         for curve in section_curves:
             if curve.mnemonic in data_section.data:
                 ctx.las_file.logs[curve.mnemonic] = (
@@ -670,11 +846,18 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
         if i in string_data_lists:
             string_arr = np.array(string_data_lists[i], dtype=object)
             data_section.string_data[curve.mnemonic] = string_arr
-            if is_first_section:
+            if is_log_data and not ctx.las_file.string_data:
                 # F2-014: Defensive copy — prevents shared-reference
                 # mutation between LASFile.string_data and
                 # DataSection.string_data.
                 ctx.las_file.string_data[curve.mnemonic] = string_arr.copy()
+
+    # N-I-31: Attach the tracked fill cells to the section so a later
+    # process_ascii_data call (once ~Well is known) can re-fill them
+    # with the declared NULL.  Only needed when the well was unknown.
+    if track_fill and fill_cells:
+        setattr(data_section, _NULL_FILL_CELLS_ATTR, fill_cells)
+        setattr(data_section, _NULL_FILL_SENTINEL_ATTR, null_value)
 
     # Store data section (LAS 3.0)
     ctx.las_file.data_sections.append(data_section)

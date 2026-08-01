@@ -12,6 +12,7 @@ import pytest
 from pylasdev import read_dev_file, read_las_file, read_las_file_as_object
 from pylasdev.exceptions import LASParseError, LASReadError
 from pylasdev.models import LASFile
+from pylasdev.parser import LASParser
 
 
 class TestReadLASFile:
@@ -2468,6 +2469,62 @@ class TestProductionCheckReaderFixes:
             f"Expected '#test_value' after desanitize, got {result!r}"
         )
 
+    # --- E-04 (MEDIUM): thread-local _DESANITIZE_ENABLED never reset ---
+
+    def test_desanitize_flag_restored_after_false_read(self, tmp_path: Path) -> None:
+        """E-04: read_las_file_as_object(desanitize=False) restores the flag.
+
+        The thread-local _DESANITIZE_ENABLED flag is set before parser
+        header parsing and must be restored afterwards.  Previously a
+        desanitize=False read left the flag False on the current thread,
+        silently changing the behavior of subsequent direct
+        LASParser.parse() users that never passed desanitize=False.
+        """
+        import pylasdev.parser as _parser_mod
+
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            " STRT.M   100.0   : START DEPTH\n"
+            " STOP.M   200.0   : STOP DEPTH\n"
+            " STEP.M   0.5     : STEP DEPTH\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.API   :  Gamma\n"
+            "~A  DEPT  GR\n"
+            "100.0  50.0\n"
+            "101.0  51.0\n"
+        )
+        test_file = tmp_path / "e04_desanitize_restore.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        # Record the thread-local default before the read.
+        prior = _parser_mod._DESANITIZE_ENABLED
+        read_las_file_as_object(test_file, desanitize=False)
+        # The flag must be restored — the read must not leak desanitize=False
+        # to subsequent same-thread callers.
+        assert _parser_mod._DESANITIZE_ENABLED is prior, (
+            "E-04: _DESANITIZE_ENABLED not restored after desanitize=False "
+            f"read (got {_parser_mod._DESANITIZE_ENABLED}, expected {prior})"
+        )
+        # And a subsequent read with default desanitize=True still works.
+        read_las_file_as_object(test_file)
+
+    def test_desanitize_flag_restored_on_parse_error(self, tmp_path: Path) -> None:
+        """E-04: flag restored even when parsing fails (finally semantics)."""
+        import pylasdev.parser as _parser_mod
+
+        test_file = tmp_path / "e04_parse_error.las"
+        test_file.write_text("not a las file at all\n", encoding="utf-8")
+
+        prior = _parser_mod._DESANITIZE_ENABLED
+        with pytest.raises(LASParseError):
+            read_las_file_as_object(test_file)
+        assert _parser_mod._DESANITIZE_ENABLED is prior
+
     # --- F-219 (MEDIUM): LASEncodingError propagation ---
 
     def test_encoding_error_wrapped_as_las_read_error(self, tmp_path: Path) -> None:
@@ -2488,3 +2545,894 @@ class TestProductionCheckReaderFixes:
             with mock.patch("pylasdev.encoding.HAS_CHARDET", False):
                 with pytest.raises(LASReadError, match="Cannot read file"):
                     read_las_file(test_file)
+
+
+class TestG6DataReaderFixes:
+    """G6 regression tests: D-01/D-02/D-03 wrap detection, L-03 {I}
+    precision, N-I-08 mid-file under-fill, IT3-F-01 desanitize hoist,
+    IT3-F-02 math.isfinite swap, IT3-F-03 wrapped pre-allocation."""
+
+    # --- D-01 (HIGH): COMMA/TAB wrap misdetection ---
+
+    def test_d01_comma_sparse_first_row_not_wrapped(self, tmp_path: Path) -> None:
+        """D-01: WRAP=NO comma file with a sparse first row (trailing comma)
+        must NOT be misdetected as wrapped.
+
+        Pre-fix, the comma/tab path returned wrapped on any 1-value first
+        line without corroboration — 50% of rows were lost and the depth
+        value landed in the GR column.  The protocol-based detector sees the
+        full rows that follow and classifies the file non-wrapped.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            " GR.GAPI  :  Gamma Ray\n"
+            "~A DEPT DT GR\n"
+            "100.0,\n"
+            "101.0,50.0,75.0\n"
+            "102.0,51.0,76.0\n"
+            "103.0,52.0,77.0\n"
+        )
+        test_file = tmp_path / "d01_comma.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+
+        assert len(data["logs"]["DEPT"]) == 4, (
+            f"Expected 4 rows, got {len(data['logs']['DEPT'])} — file was "
+            f"misdetected as wrapped"
+        )
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 101.0, 102.0, 103.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [-999.25, 75.0, 76.0, 77.0])
+
+    def test_d01_tab_sparse_first_row_not_wrapped(self, tmp_path: Path) -> None:
+        """D-01: same trigger with TAB delimiter."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    TAB  :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A DEPT DT\n"
+            "100.0\n"
+            "101.0\t50.0\n"
+            "102.0\t51.0\n"
+        )
+        test_file = tmp_path / "d01_tab.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        assert len(data["logs"]["DEPT"]) == 3
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 101.0, 102.0])
+
+    # --- D-02 (MEDIUM): two consecutive sparse rows ---
+
+    def test_d02_two_sparse_rows_not_wrapped(self, tmp_path: Path) -> None:
+        """D-02: WRAP=NO space file with TWO consecutive sparse rows must
+        not be misdetected as wrapped (pre-fix, the 2-line F-M16
+        corroboration returned wrapped on two sparse rows)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            " GR.GAPI  :  Gamma Ray\n"
+            "~A DEPT DT GR\n"
+            "100.0\n"
+            "101.0\n"
+            "102.0 50.0 75.0\n"
+            "103.0 51.0 76.0\n"
+            "104.0 52.0 77.0\n"
+        )
+        test_file = tmp_path / "d02_two_sparse.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        assert len(data["logs"]["DEPT"]) == 5, (
+            f"Expected 5 rows, got {len(data['logs']['DEPT'])} — file was "
+            f"misdetected as wrapped"
+        )
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 101.0, 102.0, 103.0, 104.0])
+
+    # --- D-03 (MEDIUM): genuine WRAP=YES with overfull second line ---
+
+    def test_d03_genuine_wrap_overfull_second_line(self, tmp_path: Path) -> None:
+        """D-03: a genuine WRAP=YES file whose second data line has
+        >= curve_count values must stay wrapped (pre-fix, the second-line
+        corroboration misdetected it as non-wrapped and the F2 overflow
+        handler became unreachable)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            " GR.GAPI  :  Gamma Ray\n"
+            "~A\n"
+            "100.0\n"
+            "50.0 75.0 99.0\n"
+            "101.0\n"
+            "51.0 76.0\n"
+        )
+        test_file = tmp_path / "d03_overfull.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        # Wrapped: 2 depth steps, DT/GR aligned.
+        assert len(data["logs"]["DEPT"]) == 2, (
+            f"Expected 2 wrapped steps, got {len(data['logs']['DEPT'])} — "
+            f"file was misdetected as non-wrapped"
+        )
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 101.0])
+        np.testing.assert_allclose(data["logs"]["DT"], [50.0, 51.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [75.0, 76.0])
+
+    # --- EXT-01 (regression): wrapped COMMA/TAB >=3 curves ---
+
+    def test_ext01_wrapped_comma_three_curves_parses_wrapped(
+        self, tmp_path: Path
+    ) -> None:
+        """EXT-01: a genuine WRAP=YES COMMA file with 3 curves (depth line
+        alone, data lines carrying curve_count-1 = 2 values) must be
+        detected as wrapped.
+
+        Pre-fix, the D-01/D-02/D-03 protocol rewrite defined "full" for
+        COMMA/TAB as ``n > 1``, so continuation lines carrying 2 values
+        counted as full rows → full_count >= 2 → misdetected non-wrapped →
+        DEPT received curve values, columns shifted, null padding.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            " DLM.    COMMA :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " C1.      :  Curve 1\n"
+            " C2.      :  Curve 2\n"
+            "~A DEPT C1 C2\n"
+            "100.0,\n"
+            "1.0,2.0,\n"
+            "200.0,\n"
+            "3.0,4.0,\n"
+            "300.0,\n"
+            "5.0,6.0,\n"
+        )
+        test_file = tmp_path / "ext01_comma_wrap.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        # Wrapped: 3 depth steps with DEPT holding depth values only.
+        assert len(data["logs"]["DEPT"]) == 3, (
+            f"Expected 3 wrapped steps, got {len(data['logs']['DEPT'])} — "
+            f"file was misdetected as non-wrapped"
+        )
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 200.0, 300.0])
+        np.testing.assert_allclose(data["logs"]["C1"], [1.0, 3.0, 5.0])
+        np.testing.assert_allclose(data["logs"]["C2"], [2.0, 4.0, 6.0])
+
+    def test_ext01_wrapped_tab_four_curves_parses_wrapped(
+        self, tmp_path: Path
+    ) -> None:
+        """EXT-01: same misdetection with TAB delimiter and 4 curves
+        (data lines carry curve_count-1 = 3 values)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            " DLM.    TAB  :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " C1.      :  Curve 1\n"
+            " C2.      :  Curve 2\n"
+            " C3.      :  Curve 3\n"
+            "~A DEPT C1 C2 C3\n"
+            "100.0\n"
+            "1.0\t2.0\t3.0\n"
+            "200.0\n"
+            "4.0\t5.0\t6.0\n"
+        )
+        test_file = tmp_path / "ext01_tab_wrap.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        assert len(data["logs"]["DEPT"]) == 2, (
+            f"Expected 2 wrapped steps, got {len(data['logs']['DEPT'])} — "
+            f"file was misdetected as non-wrapped"
+        )
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 200.0])
+        np.testing.assert_allclose(data["logs"]["C1"], [1.0, 4.0])
+        np.testing.assert_allclose(data["logs"]["C2"], [2.0, 5.0])
+        np.testing.assert_allclose(data["logs"]["C3"], [3.0, 6.0])
+
+    def test_ext01_sparse_first_row_comma_still_non_wrapped(
+        self, tmp_path: Path
+    ) -> None:
+        """EXT-01 guard: the D-01 sparse-first-row COMMA file must STILL be
+        detected non-wrapped after the curve_count-aware "full" predicate
+        (a wrapped continuation line carrying curve_count-1 values must not
+        be confused with a non-wrapped full row)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " C1.      :  Curve 1\n"
+            " C2.      :  Curve 2\n"
+            "~A DEPT C1 C2\n"
+            "100.0,\n"
+            "101.0,50.0,75.0\n"
+            "102.0,51.0,76.0\n"
+        )
+        test_file = tmp_path / "ext01_sparse_first.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        assert len(data["logs"]["DEPT"]) == 3, (
+            f"Expected 3 non-wrapped rows, got {len(data['logs']['DEPT'])}"
+        )
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 101.0, 102.0])
+
+    # --- L-03 (MEDIUM): {I} integer precision ---
+
+    def test_l03_integer_curve_precision_las30(self, tmp_path: Path) -> None:
+        """L-03: {I}-format curves must be parsed via int() and stored as
+        int64, preserving values above 2^53 that float64 cannot represent.
+
+        Pre-fix, float('9007199254740993') rounded to 9007199254740992.0.
+        """
+        content = (
+            "~VERSION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE :\n"
+            "~WELL\n"
+            " NULL.   -999 : NULL VALUE\n"
+            "~CURVE\n"
+            " DEPT.M       :  Depth {F}\n"
+            " RUN_NO.      :  Run Number {I}\n"
+            "~ASCII DEPT RUN_NO\n"
+            " 100.0 9007199254740993\n"
+            " 101.0 9007199254740994\n"
+        )
+        test_file = tmp_path / "l03_int.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        assert data["logs"]["RUN_NO"].dtype == np.int64, (
+            f"Expected int64 dtype, got {data['logs']['RUN_NO'].dtype}"
+        )
+        assert data["logs"]["RUN_NO"][0] == 9007199254740993, (
+            f"Precision lost: {data['logs']['RUN_NO'][0]}"
+        )
+        assert data["logs"]["RUN_NO"][1] == 9007199254740994
+
+    def test_l03_integer_curve_precision_las20(self, tmp_path: Path) -> None:
+        """L-03: {I} precision also preserved on the LAS 1.2/2.0
+        data_reader path (_read_normal)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth {F}\n"
+            " RUN_NO.      :  Run Number {I}\n"
+            "~A DEPT RUN_NO\n"
+            " 100.0 9007199254740993\n"
+            " 101.0 9007199254740994\n"
+        )
+        test_file = tmp_path / "l03_int20.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        assert data["logs"]["RUN_NO"].dtype == np.int64
+        assert data["logs"]["RUN_NO"][0] == 9007199254740993
+        assert data["logs"]["RUN_NO"][1] == 9007199254740994
+
+    def test_l03_fractional_null_uses_object_dtype(self, tmp_path: Path) -> None:
+        """L-03/EXT-04 trap: when the declared NULL is non-integral
+        (e.g. -999.25), int64 allocation would truncate it to -999 — the
+        {I} branch stores an object array instead: data values stay exact
+        Python ints, null cells keep the fractional sentinel."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth {F}\n"
+            " RUN_NO.      :  Run Number {I}\n"
+            "~A DEPT RUN_NO\n"
+            " 100.0 5\n"
+            " 101.0 -999.25\n"
+        )
+        test_file = tmp_path / "l03_frac_null.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        # Fractional NULL → object dtype; the null cell keeps -999.25.
+        assert data["logs"]["RUN_NO"].dtype == np.object_, (
+            f"Expected object dtype, got {data['logs']['RUN_NO'].dtype}"
+        )
+        assert data["logs"]["RUN_NO"][0] == 5
+        assert data["logs"]["RUN_NO"][1] == -999.25
+
+    def test_l03_roundtrip_from_dict_preserves_int64(self) -> None:
+        """L-03: from_dict must not coerce {I} log arrays back to float64
+        (roundtrip precision preservation)."""
+        from pylasdev.models import LASFile
+
+        las = LASFile.from_dict({
+            "version": {"VERS": "2.0", "WRAP": "NO"},
+            "well": {"NULL": "-999"},
+            "curves": [
+                {"mnemonic": "DEPT", "unit": "M", "data_format": "F"},
+                {"mnemonic": "RUN_NO", "data_format": "I"},
+            ],
+            "curves_order": ["DEPT", "RUN_NO"],
+            "logs": {
+                "DEPT": np.array([100.0, 101.0]),
+                "RUN_NO": np.array([9007199254740993, 9007199254740994]),
+            },
+        })
+        assert las.logs["RUN_NO"].dtype == np.int64
+        assert las.logs["RUN_NO"][0] == 9007199254740993
+
+    def test_l03_roundtrip_from_dict_fractional_null_preserves_object(
+        self,
+    ) -> None:
+        """L-03/EXT-04: from_dict must NOT coerce {I} arrays to int64 when
+        the declared NULL is fractional (-999.25) — int64 would truncate
+        the null sentinel.  The object dtype (exact ints + float sentinel)
+        is preserved so to_dict → from_dict keeps >2^53 precision."""
+        from pylasdev.models import LASFile
+
+        las = LASFile.from_dict({
+            "version": {"VERS": "2.0", "WRAP": "NO"},
+            "well": {"NULL": "-999.25"},
+            "curves": [
+                {"mnemonic": "DEPT", "unit": "M", "data_format": "F"},
+                {"mnemonic": "RUN_NO", "data_format": "I"},
+            ],
+            "curves_order": ["DEPT", "RUN_NO"],
+            "logs": {
+                "DEPT": np.array([100.0, 101.0]),
+                "RUN_NO": np.array([5, -999.25]),
+            },
+        })
+        assert las.logs["RUN_NO"].dtype == np.object_, (
+            f"Expected object dtype, got {las.logs['RUN_NO'].dtype}"
+        )
+        assert las.logs["RUN_NO"][0] == 5
+        assert las.logs["RUN_NO"][1] == -999.25
+
+    def test_ext04_integer_precision_fractional_null_las20(
+        self, tmp_path: Path
+    ) -> None:
+        """EXT-04: {I} curve value 9007199254740993 (2^53+1) survives
+        exactly on the LAS 1.2/2.0 path with the default/fractional NULL
+        -999.25 (pre-fix it rounded to 9007199254740992.0 float64)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth {F}\n"
+            " RUN_NO.      :  Run Number {I}\n"
+            "~A DEPT RUN_NO\n"
+            " 100.0 9007199254740993\n"
+            " 101.0 -999.25\n"
+        )
+        test_file = tmp_path / "ext04_las20.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        assert int(data["logs"]["RUN_NO"][0]) == 9007199254740993, (
+            f"Precision lost: {data['logs']['RUN_NO'][0]}"
+        )
+        assert data["logs"]["RUN_NO"][1] == -999.25, (
+            "null cell must keep the fractional sentinel"
+        )
+
+    def test_ext04_integer_precision_fractional_null_las30(
+        self, tmp_path: Path
+    ) -> None:
+        """EXT-04: same exactness guarantee on the LAS 3.0 path with the
+        default/fractional NULL -999.25."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth {F}\n"
+            " RUN_NO.      :  Run Number {I}\n"
+            "~A ASCII DEPT RUN_NO\n"
+            " 100.0 9007199254740993\n"
+            " 101.0 -999.25\n"
+        )
+        test_file = tmp_path / "ext04_las30.las"
+        test_file.write_text(content, encoding="utf-8")
+        las = read_las_file_as_object(test_file)
+        run_no = las.data_sections[0].data["RUN_NO"]
+        assert int(run_no[0]) == 9007199254740993, (
+            f"Precision lost: {run_no[0]}"
+        )
+        assert run_no[1] == -999.25, (
+            "null cell must keep the fractional sentinel"
+        )
+
+    def test_ext04_fractional_null_no_spurious_dtype_validate_issue(
+        self, tmp_path: Path
+    ) -> None:
+        """EXT-04 convergence: parsing a valid LAS 3.0 file with an {I}
+        curve and a fractional declared NULL must NOT produce a spurious
+        non-numeric-dtype validation issue.
+
+        The object-dtype exemption must cover DataSection.validate (which
+        LASFile.validate(complete=True) delegates to, and which the parser
+        runs on every parse), not just the top-level logs loop — otherwise
+        every valid {I} + fractional NULL file reports a false-positive
+        "non-numeric dtype (object)" issue.
+        """
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE :\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   100.0 : \n"
+            " STOP.M   101.0 : \n"
+            " STEP.M   1.0 : \n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth {F}\n"
+            " RUN_NO.      :  Run Number {I}\n"
+            "~A ASCII DEPT RUN_NO\n"
+            " 100.0 9007199254740993\n"
+            " 101.0 -999.25\n"
+        )
+        test_file = tmp_path / "ext04_validate.las"
+        test_file.write_text(content, encoding="utf-8")
+        las = read_las_file_as_object(test_file)
+        issues = las.validate(complete=True)
+        dtype_issues = [i for i in issues if "non-numeric dtype" in i]
+        assert dtype_issues == [], (
+            "Spurious non-numeric dtype issue for a valid {I} + fractional "
+            f"NULL file: {dtype_issues}"
+        )
+
+    # --- N-I-08 (MEDIUM): wrapped-mode mid-file under-fill ---
+
+    def test_n08_mid_file_under_fill_warns(self, tmp_path: Path) -> None:
+        """N-I-08: a wrapped file with a MID-FILE under-filled step (a step
+        missing one curve value) must emit a specific under-fill warning
+        instead of silently misaligning depth and curve columns."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            " GR.GAPI  :  Gamma Ray\n"
+            "~A\n"
+            "100.0\n"
+            "50.0\n"
+            "75.0\n"
+            "101.0\n"
+            "51.0\n"
+            "102.0\n"
+            "52.0\n"
+            "76.0\n"
+        )
+        test_file = tmp_path / "n08_underfill.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            read_las_file(test_file)
+            messages = [str(x.message) for x in w]
+        assert any(
+            "under-filled" in m or "not accounted for" in m for m in messages
+        ), f"No under-fill warning emitted. Got: {messages[-3:]}"
+
+    # --- IT3-F-01 (MEDIUM): desanitize flag hoist ---
+
+    def test_it3f01_desanitize_flag_hoist_semantics(self) -> None:
+        """IT3-F-01: the hoisted desanitize flag must preserve the exact
+        _# escape semantics (start-of-value and after-whitespace unescape)."""
+        from pylasdev import parser as _parser_mod
+        from pylasdev.data_reader import _desanitize_las_value
+
+        prior = _parser_mod._DESANITIZE_ENABLED
+        _parser_mod._DESANITIZE_ENABLED = True
+        try:
+            assert _desanitize_las_value("_#comment") == "#comment"
+            assert _desanitize_las_value("_#comment", False) == "_#comment"
+            assert _desanitize_las_value("abc _#def", True) == "abc #def"
+            assert _desanitize_las_value("abc _#def", False) == "abc _#def"
+            assert _desanitize_las_value("plain", True) == "plain"
+            # None (no cache) falls back to the module flag
+            assert _desanitize_las_value("_#x") == "#x"
+        finally:
+            _parser_mod._DESANITIZE_ENABLED = prior
+
+    # --- IT3-F-02 (MEDIUM): math.isfinite swap ---
+
+    def test_it3f02_to_finite_float_non_finite(self) -> None:
+        """IT3-F-02: _to_finite_float must still null non-finite values
+        after the np.isfinite → math.isfinite swap."""
+        from pylasdev.data_reader import _to_finite_float
+
+        for bad in ("nan", "inf", "-inf", "1e309", "1.0D309"):
+            assert _to_finite_float(bad, -999.25) == -999.25, f"{bad} not nulled"
+        assert _to_finite_float("50.5", -999.25) == 50.5
+        assert _to_finite_float("", -999.25) == -999.25
+
+    def test_it3f02_writer_math_isfinite(self) -> None:
+        """IT3-F-02: writer _format_number must still route NaN/Inf to the
+        null sentinel after the np.isnan/np.isinf → math.isfinite swap."""
+        import math
+
+        from pylasdev._writer_base import _format_number
+
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            assert _format_number(bad, ".8g", -999.25) == "-999.25", (
+                f"{bad} not routed to null sentinel"
+            )
+        assert _format_number(50.5, ".8g", -999.25) == "50.5"
+        assert math.isfinite(float("nan")) is False
+        assert math.isfinite(50.5) is True
+
+    # --- IT3-F-03 (MEDIUM): wrapped pre-allocation ---
+
+    def test_it3f03_wrapped_prealloc_correct(self, tmp_path: Path) -> None:
+        """IT3-F-03: _read_wrapped pre-allocated numeric columns must
+        produce identical results to the previous list-accumulation path."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            " GR.GAPI  :  Gamma Ray\n"
+            "~A\n"
+            "100.0\n"
+            "50.0\n"
+            "75.0\n"
+            "101.0\n"
+            "51.0\n"
+            "76.0\n"
+        )
+        test_file = tmp_path / "it3f03_wrapped.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 101.0])
+        np.testing.assert_allclose(data["logs"]["DT"], [50.0, 51.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [75.0, 76.0])
+
+    def test_it3f03_wrapped_growth_capacity(self, tmp_path: Path) -> None:
+        """IT3-F-03: pre-allocated wrapped columns must grow beyond the
+        depth-step estimate (files denser than the ceil estimate)."""
+        # 2 curves, 10 steps, one value per line → 20 lines.  The depth-step
+        # estimate ceil(20/2)=10 exactly; force growth by using more steps
+        # than the estimate allows via overfull lines.
+        lines: list[str] = []
+        for step in range(10):
+            lines.append(f"{100.0 + step}")
+            lines.append(f"{10.0 + step}")
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A\n" + "\n".join(lines) + "\n"
+        )
+        test_file = tmp_path / "it3f03_growth.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0 + s for s in range(10)])
+        np.testing.assert_allclose(data["logs"]["DT"], [10.0 + s for s in range(10)])
+
+    def test_it3f03_wrapped_string_depth_curve(self, tmp_path: Path) -> None:
+        """IT3-F-03: _read_wrapped must handle a wrapped file whose DEPTH
+        curve (index 0) is a {S} string curve — the pre-allocated numeric
+        columns path must not KeyError on a string depth line."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " HOLE.M   :  Hole {S}\n"
+            " GR.GAPI  :  Gamma Ray {F}\n"
+            "~A\n"
+            "A\n50.0\nB\n51.0\n"
+        )
+        test_file = tmp_path / "it3f03_string_depth.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        assert data["string_data"]["HOLE"].tolist() == ["A", "B"]
+        np.testing.assert_allclose(data["logs"]["GR"], [50.0, 51.0])
+
+
+# ──────────────────────────────────────────────────────────────
+# P-16 (reader-side, MEDIUM): unrecognized ~section header inside
+# ~A must terminate data reading (matching the parser's
+# section-boundary classification).
+# ──────────────────────────────────────────────────────────────
+
+class TestP16ReaderUnrecognizedSection:
+    """P-16: `_iter_ascii_data_lines` must STOP reading data when it
+    encounters an unrecognized ~section header (break, not
+    skip-and-continue), matching the parser's section-boundary
+    classification.  Previously the body of an unrecognized section
+    (e.g. ~CUSTOMSECT) was consumed as data rows — the same physical
+    lines landed in BOTH logs AND other_lines (garbage rows +
+    duplicated text)."""
+
+    def test_customsect_body_not_in_logs(self, tmp_path: Path) -> None:
+        """~CUSTOMSECT after ~A: body lines must go to other_lines only."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   1670.0  : START DEPTH\n"
+            " STOP.M   1660.0  : STOP DEPTH\n"
+            " STEP.M   0.1     : STEP\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma Ray\n"
+            "~A\n"
+            " 10.0  50.0\n"
+            " 11.0  51.0\n"
+            "~CUSTOMSECT\n"
+            " 30.0  70.0\n"
+            " 40.0  80.0\n"
+        )
+        test_file = tmp_path / "p16_customsect.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+
+        # Only the ~A rows may land in logs.
+        np.testing.assert_allclose(data["logs"]["DEPT"], [10.0, 11.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [50.0, 51.0])
+        # The ~CUSTOMSECT body goes to other_lines (parser-side routing).
+        assert "~CUSTOMSECT" in data["other"]
+        assert "30.0  70.0" in data["other"]
+        assert "40.0  80.0" in data["other"]
+
+    def test_unrecognized_section_with_trailing_data(self, tmp_path: Path) -> None:
+        """Data after the unrecognized section header is not consumed as
+        ~A rows either (the section boundary ends the ASCII block)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma Ray\n"
+            "~A\n"
+            " 10.0  50.0\n"
+            "~Units\n"
+            " 99.0  99.0\n"
+        )
+        test_file = tmp_path / "p16_units.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        np.testing.assert_allclose(data["logs"]["DEPT"], [10.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [50.0])
+        assert "99.0  99.0" not in str(data["logs"]["DEPT"])
+        assert "~Units" in data["other"]
+
+    def test_tilde_garbage_line_not_data_row(self, tmp_path: Path) -> None:
+        """~-prefixed lines that are NOT section headers (e.g. ~., ~#)
+        must not be consumed as data rows — the parser routes them to
+        other_lines (N-2 adjacent defect, same divergence class)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~A\n"
+            " 10.0\n"
+            "~.\n"
+            " 11.0\n"
+        )
+        test_file = tmp_path / "p16_garbage.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        np.testing.assert_allclose(data["logs"]["DEPT"], [10.0, 11.0])
+        assert "~." in data["other"]
+
+
+# ──────────────────────────────────────────────────────────────
+# P-05 (reader-side, MEDIUM): LAS 1.2/2.0 no-space pipe ASCII
+# header (~ASCII|CURVE) must be recognized by the reader.
+# ──────────────────────────────────────────────────────────────
+
+class TestP05ReaderNoSpacePipeAscii:
+    """P-05: `_is_ascii_section` (and data_reader's section-word
+    detection) must strip the `| <target>` pipe suffix so a LAS 1.2/2.0
+    `~ASCII|CURVE` header is recognized as a data section.  Previously
+    the parser recognized it but the reader silently read ZERO rows."""
+
+    def test_ascii_pipe_curve_parses_data(self, tmp_path: Path) -> None:
+        """LAS 1.2 `~ASCII|CURVE` header produces non-empty data rows."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma Ray\n"
+            "~ASCII|CURVE\n"
+            " 10.0  50.0\n"
+            " 11.0  51.0\n"
+        )
+        test_file = tmp_path / "p05_ascii_pipe.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        assert len(data["logs"]["DEPT"]) == 2, (
+            "~ASCII|CURVE header must produce data rows — got "
+            f"{len(data['logs']['DEPT'])}"
+        )
+        np.testing.assert_allclose(data["logs"]["DEPT"], [10.0, 11.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [50.0, 51.0])
+
+    def test_ascii_pipe_curve_las20(self, tmp_path: Path) -> None:
+        """LAS 2.0 `~ASCII|CURVE` header also produces data rows."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~ASCII|CURVE\n"
+            " 100.0\n"
+            " 101.0\n"
+        )
+        test_file = tmp_path / "p05_ascii_pipe_20.las"
+        test_file.write_text(content, encoding="utf-8")
+        data = read_las_file(test_file)
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 101.0])
+
+
+# ──────────────────────────────────────────────────────────────
+# M-11 (MEDIUM): mandatory_well_fields aligned with lascheck —
+# UWI removed (optional), COMP/FLD/DATE added (required).
+# ──────────────────────────────────────────────────────────────
+
+class TestM11MandatoryWellFields:
+    """M-11: `_LASVersionSpec.mandatory_well_fields` must match lascheck's
+    10-field ~W set for LAS 1.2/2.0 (STRT, STOP, STEP, NULL, COMP, WELL,
+    FLD, LOC, SRVC, DATE).  UWI is optional — a common LAS 1.2 file with
+    no UWI must NOT warn; a file missing COMP/FLD/DATE MUST warn."""
+
+    def test_las12_no_uwi_no_warning(self) -> None:
+        """LAS 1.2 without UWI but with COMP/FLD/DATE produces NO
+        'missing UWI' warning (M-11 false-positive fix)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   1000.5 : START DEPTH\n"
+            " STOP.M   500.0  : STOP DEPTH\n"
+            " STEP.M   -0.125 : STEP\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            " COMP.    ACME : COMPANY\n"
+            " WELL.    W-1 : WELL NAME\n"
+            " FLD.     NORTH : FIELD\n"
+            " LOC.     12-34 : LOCATION\n"
+            " SRVC.    LOGCO : SERVICE COMPANY\n"
+            " DATE.    15/01/2001 : LOG DATE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   : DEPTH\n"
+            "~A\n"
+            " 100.0\n"
+        )
+        parser = LASParser()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            parser.parse(content)
+            mandatory_warnings = [
+                x for x in w if "missing mandatory well field" in str(x.message)
+            ]
+            assert len(mandatory_warnings) == 0, (
+                f"Expected no mandatory well field warnings, got: "
+                f"{[str(x.message) for x in mandatory_warnings]}"
+            )
+            uwi_warnings = [
+                x for x in w if "UWI" in str(x.message)
+                and "missing mandatory well field" in str(x.message)
+            ]
+            assert len(uwi_warnings) == 0, (
+                "UWI is optional per lascheck — must not warn when absent"
+            )
+
+    def test_las12_missing_comp_fld_date_warns(self) -> None:
+        """LAS 1.2 missing COMP/FLD/DATE DOES warn (M-11 false-negative
+        fix) — even when UWI is present."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   1000.5 : START DEPTH\n"
+            " STOP.M   500.0  : STOP DEPTH\n"
+            " STEP.M   -0.125 : STEP\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            " WELL.    W-1 : WELL NAME\n"
+            " LOC.     12-34 : LOCATION\n"
+            " SRVC.    LOGCO : SERVICE COMPANY\n"
+            " UWI.     10006170502W500 : UNIQUE WELL ID\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   : DEPTH\n"
+            "~A\n"
+            " 100.0\n"
+        )
+        parser = LASParser()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            parser.parse(content)
+            mandatory_warnings = [
+                str(x.message) for x in w
+                if "missing mandatory well field" in str(x.message)
+            ]
+            assert any("COMP" in t for t in mandatory_warnings), mandatory_warnings
+            assert any("FLD" in t for t in mandatory_warnings), mandatory_warnings
+            assert any("DATE" in t for t in mandatory_warnings), mandatory_warnings
+            assert not any("UWI" in t for t in mandatory_warnings), (
+                f"UWI must not be reported as missing: {mandatory_warnings}"
+            )

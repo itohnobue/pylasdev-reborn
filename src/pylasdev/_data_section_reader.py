@@ -36,15 +36,28 @@ def _get_section_word(stripped: str) -> str:
 
     Returns the uppercased section word (e.g. "A", "ASCII", "A_DEFINITION")
     or an empty string if the line is not a valid section header.
+
+    P-05: A no-space pipe target (e.g. "~ASCII|CURVE" → "ASCII") is
+    stripped from the word, matching parser._pre_scan / parser._parse_line
+    pipe handling.  Without this, LAS 1.2/2.0 files using a pipe-delimited
+    ASCII header were not recognized as data sections by the reader and
+    silently produced ZERO data rows.
     """
     match = _SECTION_WORD_RE.match(stripped)
-    return match.group(1).upper() if match else ""
+    if not match:
+        return ""
+    word = match.group(1)
+    if "|" in word:
+        word = word[: word.find("|")].strip()
+    return word.upper()
 
 
 def _is_ascii_section(stripped: str) -> bool:
     """Check if a section header targets the ASCII data (~A / ~ASCII) section.
 
     Aligned with parser._pre_scan which uses ``section_word in {"A", "ASCII"}``.
+    P-05: ``_get_section_word`` strips a no-space pipe target, so
+    ``~ASCII|CURVE`` is recognized as an ASCII section (matching the parser).
     """
     return _get_section_word(stripped) in {"A", "ASCII"}
 
@@ -169,22 +182,37 @@ def _iter_ascii_data_lines(
                 in_ascii = True
             else:
                 if in_ascii:
-                    # F-I2-XPD-01: Defense-in-depth against section-header
-                    # injection via SPLITLINES_CHARS_RE.  Only break reading
-                    # for recognized LAS section headers — unrecognized
-                    # patterns (potential artifacts from control-character
-                    # replacement) are warned and skipped.
+                    # P-16: Treat EVERY genuine ~-prefixed section header
+                    # (recognized OR unrecognized) as a section boundary,
+                    # matching the parser's section-boundary classification.
+                    # Unrecognized sections are routed to other_lines by the
+                    # parser, so their body must NOT be consumed as data rows.
+                    # Previously unrecognized words were warn+skip, leaving
+                    # in_ascii=True and reading the section's body as data —
+                    # the same lines landed in BOTH logs AND other (garbage
+                    # rows + duplicated text).
+                    # F-I2-XPD-01 retained: only break on a genuine
+                    # ~-prefixed section-like line (checked by
+                    # _is_section_header); control-char noise (~3D, ~., ~~,
+                    # ~#) fails that check and is skipped below — it never
+                    # breaks data reading.
                     section_word = _get_section_word(stripped)
-                    if _is_recognized_section_word(section_word):
-                        return  # break out of the generator
-                    warnings.warn(
-                        f"Unrecognized section header '~{section_word}' found in ASCII "
-                        f"data section{mode_suffix}.  This may be an "
-                        f"artifact of control-character replacement "
-                        f"(SPLITLINES_CHARS_RE).  Skipping line.",
-                        UserWarning,
-                        stacklevel=2,
-                    )
+                    if not _is_recognized_section_word(section_word):
+                        warnings.warn(
+                            f"Unrecognized section header '~{section_word}' found in ASCII "
+                            f"data section{mode_suffix}.  Data reading stops at this "
+                            f"section boundary.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                    return  # break out of the generator
+            continue
+
+        # P-16: ~-prefixed lines that are NOT section headers (e.g. ~3D,
+        # ~., ~#, bare ~, control-character replacement artifacts) are not
+        # data rows — the parser routes them to other_lines
+        # (parser.py:1277-1283).  Skip them instead of yielding as data rows.
+        if stripped.startswith("~"):
             continue
 
         if not in_ascii or not stripped or stripped.startswith("#"):

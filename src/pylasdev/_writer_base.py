@@ -23,7 +23,14 @@ from numpy.typing import NDArray
 from ._version_spec import _LASVersionSpec
 from .data_reader import _get_null_value
 from .exceptions import LASDataError, LASWriteError, PylasdevError
-from .models import CurveDefinition, LASFile, ParameterEntry
+from .models import (
+    _MNEMONIC_PATTERN,
+    CurveDefinition,
+    LASFile,
+    ParameterEntry,
+    _GuardedDict,
+    _GuardedList,
+)
 
 # ── Module-level constants & compiled regexes ────────────────────────────
 
@@ -115,6 +122,20 @@ def _escape_colons_for_las_value(value: str) -> str:
     return value
 
 
+def _escape_pipes_for_las_value(value: str) -> str:
+    """Escape literal pipes in a LAS description (``|`` → ``\\|``).
+
+    N-I-02: The parser treats a pipe at the END of a parameter description
+    as a LAS 3.0 zone association (``| Zone``) and strips it.  Genuine
+    description text that happens to contain a pipe would therefore be
+    truncated and misinterpreted on re-read.  Escaping literal pipes keeps
+    them out of ZONE_ASSOC_PATTERN's reach while real zone associations
+    (appended separately by the writer, unescaped) still round-trip.
+    The parser reverses this with ``_unescape_pipes_for_las_value``.
+    """
+    return value.replace("|", "\\|")
+
+
 def _validate_precision(precision: str) -> None:
     """Validate the precision format specifier for numeric output."""
     if not re.match(r"^\.\d+([eEfFgGn%])?$", precision):
@@ -164,7 +185,15 @@ def _format_curve_line(curve: CurveDefinition, is_las30: bool) -> str:
     unit = _escape_colons_for_las_value(unit) if unit else ""
     desc = curve.description if curve.description else ""
 
-    if is_las30 and curve.data_format:
+    if curve.data_format and (is_las30 or curve.data_format == "I"):
+        # EXT-04: the braced {I} marker is emitted for integer-format
+        # curves on ALL versions.  LAS 1.2/2.0 have no format-specifier
+        # convention, but without the marker a >2^53 {I} value (e.g.
+        # 9007199254740993) is re-read as float64 and silently rounded —
+        # the marker is the only way the data reader restores integer
+        # parsing on write→read roundtrip.  Other formats (F/E/S/A) remain
+        # unmarked on LAS 1.2/2.0 to preserve existing output (string
+        # curves are lossy on LAS 2.0 by design — see M-29).
         format_str = f"{{{curve.data_format}"
         if curve.data_format == "A" and curve.array_info and curve.array_info.time_offset is not None:
             offset = curve.array_info.time_offset
@@ -187,7 +216,24 @@ def _format_curve_line(curve: CurveDefinition, is_las30: bool) -> str:
     api = f"  {api_code}" if api_code else ""
     desc = _sanitize_las_value(desc)
     desc = _escape_colons_for_las_value(desc)
-    return f" {_sanitize_las_value(curve.mnemonic)}.{unit}{api}  : {desc}"
+
+    mnemonic = _sanitize_las_value(curve.mnemonic)
+    if (
+        is_las30
+        and curve.array_info is not None
+        and "[" not in mnemonic
+    ):
+        # W-09: The parser reconstructs CurveDefinition.array_info ONLY
+        # from bracket mnemonics (ARRAY_MNEMONIC_PATTERN).  A curve whose
+        # mnemonic lacks "[N]" loses its array_info on roundtrip — an
+        # {A:N} format curve with array_info but no bracket is treated as
+        # string-format on re-read and its numeric data is reclassified
+        # into string_data.  Emit the bracket form so array_info survives
+        # and the data stays numeric.  The "[" guard avoids
+        # double-bracketing when the mnemonic already carries "[N]".
+        mnemonic = f"{mnemonic}[{curve.array_info.index}]"
+
+    return f" {mnemonic}.{unit}{api}  : {desc}"
 
 
 def _format_parameter_line(param: ParameterEntry, is_las30: bool) -> str:
@@ -195,15 +241,24 @@ def _format_parameter_line(param: ParameterEntry, is_las30: bool) -> str:
     unit = _sanitize_las_value(param.unit) if param.unit else ""
     unit = _escape_colons_for_las_value(unit) if unit else ""
     desc = param.description if param.description else ""
+    # N-I-02(b): Escape literal pipes in the description BEFORE any zone
+    # association is appended.  A genuine pipe in user text would otherwise
+    # be misparsed as a LAS 3.0 zone association (| Zone) on re-read —
+    # truncating the description and attaching a bogus ParameterZone.  Real
+    # zone associations appended below remain unescaped so the parser's
+    # ZONE_ASSOC_PATTERN still recognizes them.
+    desc = _escape_pipes_for_las_value(desc)
 
     if is_las30 and param.data_format:
-        # Only single-character format codes (F, A, I, D, etc.) are
-        # wrapped in {} per the LAS 3.0 spec.  Multi-character values
-        # (e.g. "DD/MM/YYYY") are metadata annotations, not format codes.
-        if len(param.data_format.strip()) == 1:
-            desc = f"{desc}  {{{param.data_format}}}"
-        else:
-            desc = f"{desc}  {param.data_format}"
+        # N-I-21: Always emit the braced {…} form.  Previously
+        # multi-character values (e.g. "DD/MM/YYYY") were emitted
+        # UNBRACED, which on re-read merged the format text into the
+        # description and lost the data_format field entirely.  The
+        # braced form is the valid LAS 3.0 construct; the parser
+        # recognizes it (extracting or clearing the format while
+        # keeping the description stable), so the roundtrip is
+        # deterministic across construction paths.
+        desc = f"{desc}  {{{param.data_format}}}"
 
     if is_las30 and param.zone:
         zone_str = f" | {param.zone.zone_name}"
@@ -216,7 +271,21 @@ def _format_parameter_line(param: ParameterEntry, is_las30: bool) -> str:
     value = _escape_colons_for_las_value(value)
     desc = _escape_colons_for_las_value(desc)
 
-    return f" {_sanitize_las_value(param.mnemonic)}.{unit}  {value}  : {desc}"
+    mnemonic = _sanitize_las_value(param.mnemonic)
+    if (
+        is_las30
+        and param.array_index is not None
+        and "[" not in mnemonic
+    ):
+        # W-08: The parser reconstructs ParameterEntry.array_index ONLY
+        # from bracket mnemonics (ARRAY_MNEMONIC_PATTERN).  A parameter
+        # whose mnemonic lacks "[N]" loses its array_index on roundtrip
+        # (RUN with array_index=1 → array_index=None).  Emit the bracket
+        # form so the index survives.  The "[" guard avoids
+        # double-bracketing when the mnemonic already carries "[N]".
+        mnemonic = f"{mnemonic}[{param.array_index}]"
+
+    return f" {mnemonic}.{unit}  {value}  : {desc}"
 
 
 def _format_data_rows(
@@ -258,7 +327,31 @@ def _format_data_rows(
             if arr is None or i >= len(arr):
                 row_values.append(_format_number(null_value, precision, null_value))
             elif is_string:
-                raw_val = str(arr[i])
+                _raw = arr[i]
+                # N-I-17: A None/NaN/Inf value in a string-data array was
+                # written as the literal string "None"/"nan" (via str()),
+                # fabricating data on re-read — the numeric branch routes
+                # non-finite values to the null sentinel, but the string
+                # branch had no guard.  Route missing values to the same
+                # '-' sentinel used for empty strings.
+                if _raw is None or (
+                    isinstance(_raw, (float, np.floating))
+                    and not math.isfinite(_raw)
+                ):
+                    if not warned_empty_str:
+                        import warnings
+
+                        warnings.warn(
+                            "Missing string curve value (None/NaN/Inf) "
+                            "replaced by '-' sentinel — roundtrip "
+                            "fidelity is lost: parser cannot distinguish "
+                            "original '-' from the missing value.",
+                            stacklevel=4,
+                        )
+                        warned_empty_str = True
+                    row_values.append("-")
+                    continue
+                raw_val = str(_raw)
                 raw_has_delim = delimiter in raw_val
                 val = _sanitize_las_value(raw_val)
                 if delimiter == " ":
@@ -312,7 +405,12 @@ def _format_data_rows(
                 row_values.append(val)
             else:
                 val = arr[i]
-                if np.isnan(val) or np.isinf(val):
+                # IT3-F-02: math.isfinite is ~15x faster than the numpy
+                # scalar isfinite/isnan/isinf chain for per-value checks and
+                # is semantically identical for Python/numpy float scalars
+                # (verified: no NaN-propagation divergence).  Array-vectorized
+                # numpy uses elsewhere are untouched.
+                if not math.isfinite(val):
                     row_values.append(_format_number(null_value, precision, null_value))
                 else:
                     row_values.append(_format_number(val, precision, null_value))
@@ -335,12 +433,23 @@ def _format_data_rows(
 
 def _format_number(value: float, precision: str = ".8g", null_value: float | None = None) -> str:
     """Format a numeric value with configurable precision."""
-    if np.isnan(value) or np.isinf(value):
+    # IT3-F-02: math.isfinite (~15x faster than np.isnan/np.isinf for
+    # Python float scalars, semantically identical for scalars).
+    if not math.isfinite(value):
         if null_value is not None:
             return _format_null_sentinel(null_value, precision)
         return format(float(value), precision)
     if null_value is not None and value == null_value:
         return _format_null_sentinel(null_value, precision)
+    if isinstance(value, (int, np.integer)):
+        # EXT-04: integer-typed values (exact Python ints from object-dtype
+        # {I} arrays, np.int64 from int64 arrays) must be formatted via
+        # integer formatting.  `format(int(value), precision)` converts
+        # through float64 internally whenever the .Ng result needs
+        # scientific notation, silently rounding values above 2^53
+        # (9007199254740993 → '9007199254740992.00000000').  str(int())
+        # preserves the exact decimal.
+        return str(int(value))
     if value == int(value):
         # IEEE 754 negative zero (-0.0): int(-0.0) == 0 loses the sign,
         # producing "0" instead of "-0".  Use float formatting for the
@@ -383,12 +492,15 @@ def _format_fixed_precision(value: float, precision: str) -> str:
 
 
 def _warn_long_header_lines(lines: list[str], max_length: int) -> None:
-    """Warn if any header section line exceeds the LAS 1.2 length limit.
+    """Warn if any header section line exceeds the LAS length limit.
 
     The LAS 1.2 CWLS specification limits ALL lines (including header
-    lines) to 256 characters.  This check covers header-section lines
-    (version, well, curve, parameter, other) that were not previously
-    validated — data rows are checked separately in ``_format_data_rows``.
+    lines) to 256 characters; the LAS 2.0 specification applies the same
+    256-char limit to WRAP=NO files.  This check covers header-section
+    lines (version, well, curve, parameter, other) that were not
+    previously validated — data rows are checked separately in
+    ``_format_data_rows``.  N-I-16: previously gated on ``is_las12``
+    only, so LAS 2.0 WRAP=NO header lines were never checked.
     """
     warned = False
     for line in lines:
@@ -397,10 +509,10 @@ def _warn_long_header_lines(lines: list[str], max_length: int) -> None:
                 import warnings
 
                 warnings.warn(
-                    f"LAS 1.2 header line exceeds {max_length}-character "
+                    f"LAS header line exceeds {max_length}-character "
                     f"limit: {line[:80]!r}... ({len(line)} chars). "
-                    f"The LAS 1.2 specification limits all lines "
-                    f"(including header lines) to {max_length} "
+                    f"The LAS 1.2/2.0 (WRAP=NO) specification limits all "
+                    f"lines (including header lines) to {max_length} "
                     f"characters.  Subsequent violations in this file "
                     f"will not be reported.",
                     stacklevel=4,
@@ -411,7 +523,22 @@ def _warn_long_header_lines(lines: list[str], max_length: int) -> None:
 # ── _WriterMutationGuard ────────────────────────────────────────────────
 
 class _WriterMutationGuard:
-    """Context manager that runs deferred validation after write."""
+    """Context manager that runs deferred validation after write.
+
+    Saves a snapshot of the LASFile state that is affected by the write
+    pass (wrap/dlm flags, logs/string_data/curves containers).  On the
+    SUCCESS path the model is intentionally NOT restored — the model must
+    honestly reflect what was written to disk (documented G-018 intent:
+    e.g. ``WRAP=YES`` is written as ``NO``).  On the FAILURE path the
+    saved state IS restored so the caller's model is not left partially
+    mutated by an aborted write.
+
+    The version-specific writers' ``finally`` blocks restore the data
+    containers from plain ``dict``/``list`` snapshots, which permanently
+    strips the ``_GuardedDict``/``_GuardedList`` mutation guards.  This
+    guard re-wraps the containers so invalid mutations are still caught
+    after a write (success or failure).
+    """
 
     def __init__(self, las_file: LASFile) -> None:
         self._las_file = las_file
@@ -419,21 +546,72 @@ class _WriterMutationGuard:
         self._saved_dlm: str = las_file.version.dlm
         self._saved_logs = dict(las_file.logs)
         self._saved_string_data = dict(las_file.string_data)
-        self._saved_curves_order = list(las_file.curves_order) if las_file.curves_order is not None else []
-        self._saved_curves = list(las_file.curves) if las_file.curves is not None else []
+        self._saved_curves_order = (
+            list(las_file.curves_order) if las_file.curves_order is not None else None
+        )
+        self._saved_curves = (
+            list(las_file.curves) if las_file.curves is not None else None
+        )
 
     def __enter__(self) -> _WriterMutationGuard:
         return self
 
+    def _restore_saved_state(self) -> None:
+        """Restore the pre-write snapshot on the failure path."""
+        las_file = self._las_file
+        las_file.version.wrap = self._saved_wrap
+        las_file.version.dlm = self._saved_dlm
+        las_file.logs = self._saved_logs
+        las_file.string_data = self._saved_string_data
+        las_file.curves_order = self._saved_curves_order
+        las_file.curves = self._saved_curves
+
+    def _rewrap_guards(self) -> None:
+        """Re-wrap data containers in guarded dict/list after a write.
+
+        W-06: the version-specific writers restore logs/string_data/
+        curves from plain dict/list snapshots in their ``finally`` blocks,
+        permanently stripping the mutation guards installed at LASFile
+        construction.  Re-install the guards so subsequent invalid
+        mutations are still rejected.  None containers (a valid state for
+        directly-constructed files) are left untouched.
+        """
+        las_file = self._las_file
+        if las_file.logs is not None and not isinstance(las_file.logs, _GuardedDict):
+            las_file.logs = _GuardedDict(
+                las_file.logs, _container_name="LASFile.logs"
+            )
+        if las_file.string_data is not None and not isinstance(
+            las_file.string_data, _GuardedDict
+        ):
+            las_file.string_data = _GuardedDict(
+                las_file.string_data, _container_name="LASFile.string_data"
+            )
+        if las_file.curves is not None and not isinstance(las_file.curves, _GuardedList):
+            las_file.curves = _GuardedList(
+                las_file.curves,
+                _container_name="LASFile.curves",
+                _expected_type=CurveDefinition,
+            )
+
     def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
         import warnings
 
-        try:
-            issues = self._las_file.validate(complete=True)
-            for msg in issues:
-                warnings.warn(msg, UserWarning, stacklevel=2)
-        except Exception:
-            pass
+        if exc_type is not None:
+            # W-07: failure path — restore the saved state so the caller's
+            # model is not left partially mutated by the failed write.
+            self._restore_saved_state()
+        else:
+            try:
+                issues = self._las_file.validate(complete=True)
+                for msg in issues:
+                    warnings.warn(msg, UserWarning, stacklevel=2)
+            except Exception:
+                pass
+
+        # W-06: re-install mutation guards stripped by the writers' finally
+        # blocks (runs on both success and failure paths).
+        self._rewrap_guards()
 
         return False  # type: ignore[return-value]
 
@@ -467,8 +645,18 @@ class _WriterBase:
         lines.extend(self._write_curve_section())
         lines.extend(self._write_parameter_section())
         lines.extend(self._write_other_section())
-        if self._spec.is_las12:
-            _warn_long_header_lines(lines, MAX_LINE_LENGTH_LAS12)
+        # N-I-16: The header-line length check was gated on `is_las12` only,
+        # so LAS 2.0 WRAP=NO header lines (also subject to the CWLS 256-char
+        # limit per `line_length_limit_for_wrap`) were never checked.  Use
+        # the effective wrap — the writers ALWAYS emit non-wrapped output
+        # (WRAP=YES is overridden to NO), so the effective limit for LAS
+        # 1.2/2.0 output is always 256, matching the data-row check.
+        effective_wrap = (self._las_file.version.wrap or "NO").upper()
+        if effective_wrap == "YES":
+            effective_wrap = "NO"
+        header_limit = self._spec.line_length_limit_for_wrap(effective_wrap)
+        if header_limit is not None:
+            _warn_long_header_lines(lines, header_limit)
         lines.extend(self._write_ascii_sections())
         return "\n".join(lines) + "\n"
 
@@ -486,6 +674,21 @@ class _WriterBase:
             if not isinstance(key, str):
                 raise TypeError(
                     f"WellSection entry key must be str, got {type(key).__name__}: {key!r}"
+                )
+
+        # N-I-19: Defensive well-key CONTENT validation.  WellSection.
+        # __post_init__ rejects non-roundtrippable keys at construction,
+        # but entries can still be mutated afterwards (well.entries is a
+        # plain dict).  A key containing dots/spaces/colons is emitted and
+        # then silently DROPPED on re-read — the parser's ~W regex
+        # (DATA_LINE_PATTERN mnemonic group) cannot match it.  Reject here
+        # rather than emit metadata that cannot survive a roundtrip.
+        for key in self._las_file.well.entries:
+            if not _MNEMONIC_PATTERN.fullmatch(key):
+                raise ValueError(
+                    f"WellSection entry key {key!r} contains characters "
+                    f"the LAS parser cannot roundtrip.  Well keys must "
+                    f"match {_MNEMONIC_PATTERN.pattern!r}."
                 )
 
         mandatory_order = ["STRT", "STOP", "STEP", "NULL"]
@@ -518,7 +721,23 @@ class _WriterBase:
         lines: list[str] = []
         lines.append("~CURVE INFORMATION")
 
-        for curve in self._las_file.curves:
+        curves = self._las_file.curves
+        if (
+            not curves
+            and not self._spec.is_las30
+            and len(self._las_file.data_sections) == 1
+            and self._las_file.data_sections[0].section_curves
+        ):
+            # W-05: The single-section copy-back (Path A in
+            # _write_ascii_legacy) runs during the ASCII data pass, which
+            # happens AFTER this section is emitted.  Consult the section's
+            # curve definitions directly so ~C is not emitted EMPTY while
+            # ~A carries the data columns — otherwise curve metadata
+            # (units, descriptions, API codes) is silently lost from the
+            # output and the data is discarded on re-read.
+            curves = self._las_file.data_sections[0].section_curves
+
+        for curve in curves:
             lines.append(_format_curve_line(curve, self._spec.is_las30))
 
         lines.append("")
@@ -572,14 +791,35 @@ class _WriterBase:
                     f"{self._las_file.version.vers!r}. Cannot safely write multi-section "
                     f"data for non-LAS-3.0 format."
                 )
-            warnings.warn(
-                "data_sections are only supported for LAS 3.0 files. "
-                "Falling back to single-section ~A format. "
-                "Single-section data will be preserved.",
-                stacklevel=3,
-            )
-
             _ds = self._las_file.data_sections[0]
+            # W-04: The copy-back below only fills EMPTY top-level
+            # containers.  When a top-level container is already
+            # populated, the corresponding section content is dropped.
+            # Warn honestly about the actual copy-back outcome instead
+            # of always claiming "Single-section data will be preserved."
+            _dropped: list[str] = []
+            if _ds.data and self._las_file.logs:
+                _dropped.append("data")
+            if _ds.string_data and self._las_file.string_data:
+                _dropped.append("string data")
+            if _ds.section_curves and self._las_file.curves:
+                _dropped.append("curve definitions")
+            if _dropped:
+                warnings.warn(
+                    "data_sections are only supported for LAS 3.0 files. "
+                    "Falling back to single-section ~A format.  Section "
+                    f"content will NOT be preserved because the "
+                    f"corresponding top-level container is already "
+                    f"populated: {', '.join(_dropped)}.",
+                    stacklevel=3,
+                )
+            else:
+                warnings.warn(
+                    "data_sections are only supported for LAS 3.0 files. "
+                    "Falling back to single-section ~A format. "
+                    "Single-section data will be preserved.",
+                    stacklevel=3,
+                )
             if not self._las_file.logs and _ds.data:
                 self._las_file.logs.update(_ds.data)
             if not self._las_file.string_data and _ds.string_data:
@@ -637,7 +877,27 @@ class _WriterBase:
                 stacklevel=3,
             )
         if any(name in self._las_file.logs or name in self._las_file.string_data for name in curve_names):
-            lines.append("~A  " + "  ".join(_sanitize_las_value(name) for name in curve_names))
+            header_line = "~A  " + "  ".join(_sanitize_las_value(name) for name in curve_names)
+            # N-I-16: The ~A column-header line is appended AFTER the
+            # header-section length check in `write()` (which runs before
+            # `_write_ascii_sections`), so it was NEVER length-checked for
+            # any version.  Data rows ARE checked (`_format_data_rows`), so
+            # a long ~A header slipped through with 0 warnings while the
+            # data rows below it warned.  Apply the same limit here when
+            # `check_line_limit` is active (LAS 1.2 all modes, LAS 2.0
+            # WRAP=NO).
+            if check_line_limit and len(header_line) > MAX_LINE_LENGTH_LAS12:
+                import warnings
+
+                warnings.warn(
+                    f"~A column-header line exceeds 256-character limit "
+                    f"(length: {len(header_line)}).  The LAS 1.2/2.0 "
+                    f"specification limits all lines (including column "
+                    f"headers) to 256 characters.  Lines are NOT truncated "
+                    f"to avoid data loss.",
+                    stacklevel=4,
+                )
+            lines.append(header_line)
             lines.extend(
                 _format_data_rows(
                     curve_names,
@@ -676,6 +936,14 @@ def write_las_file(
         _validate_precision(precision)
     except ValueError as e:
         raise LASWriteError(f"Invalid precision format: {e}") from e
+
+    # W-02: A bare precision specifier (e.g. ".5") is accepted by
+    # _validate_precision but format(int(v), ".5") raises ValueError
+    # ("Precision not allowed in integer format specifier") whenever a
+    # numeric value is integral — depths are commonly integral, so the
+    # write crashes mid-output exactly when real data exists.  Normalize
+    # bare ".N" to ".Ng" so integral values format without crashing.
+    precision = re.sub(r"^\.(\d+)$", r".\1g", precision)
 
     if precision and precision[-1] in ("n", "%"):
         raise LASWriteError(

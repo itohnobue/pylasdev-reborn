@@ -7,7 +7,7 @@ from ._writer_base import (
     _sanitize_las_value,
     _WriterBase,
 )
-from .models import LASFile
+from .models import _MNEMONIC_PATTERN, LASFile
 
 
 class _Las12Writer(_WriterBase):
@@ -67,6 +67,17 @@ class _Las12Writer(_WriterBase):
             if not isinstance(key, str):
                 raise TypeError(
                     f"WellSection entry key must be str, got {type(key).__name__}: {key!r}"
+                )
+        # N-I-19: Defensive well-key CONTENT validation (mirrors the LAS
+        # 2.0/3.0 writer).  A dot/space/colon key is emitted and then
+        # silently dropped on re-read — the parser's ~W regex cannot match
+        # it.  Reject here so metadata is not silently lost.
+        for key in self._las_file.well.entries:
+            if not _MNEMONIC_PATTERN.fullmatch(key):
+                raise ValueError(
+                    f"WellSection entry key {key!r} contains characters "
+                    f"the LAS parser cannot roundtrip.  Well keys must "
+                    f"match {_MNEMONIC_PATTERN.pattern!r}."
                 )
 
         mandatory_order = ["STRT", "STOP", "STEP", "NULL"]

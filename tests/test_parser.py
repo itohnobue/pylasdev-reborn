@@ -1375,8 +1375,13 @@ class TestLAS30AsciiDataBranches:
         assert las.data_sections[0].data["DEPT"][0] == 100.0
         assert las.data_sections[0].data["DEPT"][1] == 101.0
 
-    def test_las30_extra_columns_warning(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Test LAS 3.0 extra-column warning triggered."""
+    def test_las30_extra_columns_warning(self) -> None:
+        """Test LAS 3.0 extra-column warning triggered.
+
+        L-01: The LAS 3.0 data-quality diagnostics use ``warnings.warn``
+        (not ``logger.warning``) for symmetry with the LAS 1.2/2.0 path,
+        so the extra-column summary is asserted via ``pytest.warns``.
+        """
         content = """~VERSION INFORMATION
  VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
  WRAP.   NO   :
@@ -1387,16 +1392,12 @@ class TestLAS30AsciiDataBranches:
  DEPT.M       : DEPTH {F}
  DT.US/M      : SONIC {F}
 ~A
-100.0,50.0,75.0,99.0
-101.0,51.0,76.0,100.0
+ 100.0,50.0,75.0,99.0
+ 101.0,51.0,76.0,100.0
 """
         parser = LASParser()
-        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+        with pytest.warns(UserWarning, match="Extra columns were silently discarded"):
             las = parser.parse(content)
-            # I2-XPD-03: Summary warning with total row count —
-            # the old boolean-once "Extra columns are discarded" message
-            # is now a per-section summary with the affected row count.
-            assert "Extra columns were silently discarded" in caplog.text
 
         assert len(las.data_sections) == 1
         # Extra values are truncated — only first 2 (matching curve count) kept
@@ -1476,8 +1477,8 @@ class TestLAS30AsciiDataBranches:
 ~CURVE INFORMATION
  DEPT.M   : DEPTH
 ~A
-100.0
-101.0
+ 100.0
+ 101.0
 """
         parser = LASParser()
         with warnings.catch_warnings(record=True) as w:
@@ -1486,10 +1487,10 @@ class TestLAS30AsciiDataBranches:
             mandatory_warnings = [
                 x for x in w if "LAS 2.0 file missing mandatory well field" in str(x.message)
             ]
-            # Missing STEP, NULL (2 out of 4 LAS 2.0 mandatory fields).
-            # F-25: LAS 2.0+ only requires STRT, STOP, STEP, NULL.
-            # WELL, LOC, SRVC, UWI are LAS 1.2-specific.
-            assert len(mandatory_warnings) == 2
+            # M-11: LAS 2.0 requires the lascheck 10-field set
+            # (STRT, STOP, STEP, NULL, COMP, WELL, FLD, LOC, SRVC, DATE).
+            # This file has STRT, STOP only → 8 warnings.
+            assert len(mandatory_warnings) == 8
             warning_texts = [str(x.message) for x in mandatory_warnings]
             assert any("STEP" in t for t in warning_texts)
             assert any("NULL" in t for t in warning_texts)
@@ -1504,15 +1505,18 @@ class TestLAS30AsciiDataBranches:
  STOP.M  1680.0000  :
  STEP.M     0.1000  :
  NULL.   -999.25  :
+ COMP.   ACME  :
  WELL.   WELL_A  :
+ FLD.    NORTH  :
  LOC .   LOC_A  :
  SRVC.   SRVC_A  :
+ DATE.   01/01/2020  :
  UWI .   UWI_A  :
 ~CURVE INFORMATION
  DEPT.M   : DEPTH
 ~A
-100.0
-101.0
+ 100.0
+ 101.0
 """
         parser = LASParser()
         with warnings.catch_warnings(record=True) as w:
@@ -1527,7 +1531,8 @@ class TestLAS30AsciiDataBranches:
         """LAS 1.2 files should trigger mandatory well field check.
 
         After F-M24 expanded mandatory field validation to LAS 1.2,
-        missing WELL, LOC, SRVC, and UWI fields should emit warnings.
+        missing COMP, WELL, FLD, LOC, SRVC, DATE fields should emit
+        warnings (M-11: UWI is NOT mandatory per lascheck).
         """
         content = """~VERSION INFORMATION
  VERS.   1.2  : CWLS LOG ASCII STANDARD
@@ -1540,8 +1545,8 @@ class TestLAS30AsciiDataBranches:
 ~CURVE INFORMATION
  DEPT.M   : DEPTH
 ~A
-100.0
-101.0
+ 100.0
+ 101.0
 """
         parser = LASParser()
         with warnings.catch_warnings(record=True) as w:
@@ -1550,7 +1555,17 @@ class TestLAS30AsciiDataBranches:
             mandatory_warnings = [
                 x for x in w if "LAS 1.2 file missing mandatory well field" in str(x.message)
             ]
-            assert len(mandatory_warnings) == 4
+            # M-11: LAS 1.2 requires the lascheck 10-field set — missing
+            # COMP, WELL, FLD, LOC, SRVC, DATE = 6 warnings (no UWI).
+            assert len(mandatory_warnings) == 6
+            warning_texts = [str(x.message) for x in mandatory_warnings]
+            assert not any("UWI" in t for t in warning_texts), (
+                "UWI is not mandatory per lascheck — must not warn"
+            )
+            for _f in ("COMP", "WELL", "FLD", "LOC", "SRVC", "DATE"):
+                assert any(_f in t for t in warning_texts), (
+                    f"Expected missing-field warning for {_f}, got {warning_texts}"
+                )
 
     # --- F-M2: Pre-scan only counts ~A/~ASCII sections ---
     def test_pre_scan_ignores_non_ascii_sections(self, tmp_path: Path) -> None:
@@ -1609,6 +1624,290 @@ class TestLAS30AsciiDataBranches:
         # CORE_DATA section: ~Core
         assert las.data_sections[1].section_type == "CORE_DATA"
         assert len(las.data_sections[1].data["DEPT"]) == 1
+
+
+# ──────────────────────────────────────────────────────────────
+# G4b — _las30_data.py fixes (L-01, L-02, N-I-31, N-I-32, IT3-F1)
+# ──────────────────────────────────────────────────────────────
+
+
+class TestG4bLas30DataFixes:
+    """Regression tests for the _las30_data.py fix group.
+
+    Covers:
+    - L-01: LAS 3.0 data-quality diagnostics use warnings.warn (not
+      logger.warning) for parity with the LAS 1.2/2.0 path.
+    - L-02: dedup renames in NON-first data sections write back to the
+      global curves/curves_order.
+    - N-I-31: null-value fill cells baked before ~Well are re-filled
+      with the declared NULL once the well section is known.
+    - N-I-32: las_file.logs/string_data come from the LOG_DATA section,
+      not from the first data section regardless of section type.
+    - IT3-F1: {S} string data edge whitespace is preserved on LAS 3.0
+      reads (no per-token strip).
+    """
+
+    # --- L-01: warnings.warn channel parity ---
+
+    def test_las30_null_missing_warns_via_warnings_api(self) -> None:
+        """L-01: F-PXR-05 NULL-missing diagnostic uses warnings.warn.
+
+        The well section is absent, so the default null sentinel is used;
+        the diagnostic must be visible to warnings-API monitoring (not
+        only the logging subsystem).
+        """
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DEPT.M  : DEPTH {F}
+ DT.US/M : SONIC {F}
+~A
+ 100.0,
+ 101.0,
+"""
+        parser = LASParser()
+        with pytest.warns(UserWarning, match="NULL value not found in well section"):
+            las = parser.parse(content)
+        # Fill cells still use the default sentinel (no declared NULL).
+        assert las.data_sections[0].data["DT"][0] == -999.25
+
+    def test_las30_short_rows_warn_via_warnings_api(self) -> None:
+        """L-01: short-row summary uses warnings.warn (not logger.warning)."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.   -999.25 : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M  : DEPTH {F}
+ DT.US/M : SONIC {F}
+~A
+ 100.0,
+ 101.0,51.0
+"""
+        parser = LASParser()
+        with pytest.warns(UserWarning, match="had fewer values than the 2 declared curves"):
+            las = parser.parse(content)
+        assert las.data_sections[0].data["DT"][0] == -999.25
+        assert las.data_sections[0].data["DT"][1] == 51.0
+
+    def test_las30_conversion_failures_warn_via_warnings_api(self) -> None:
+        """L-01: float conversion-failure summary uses warnings.warn."""
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.   -999.25 : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M  : DEPTH {F}
+ DT.US/M : SONIC {F}
+~A
+ 100.0,abc
+ 101.0,51.0
+"""
+        parser = LASParser()
+        with pytest.warns(UserWarning, match="could not be converted to finite floats"):
+            las = parser.parse(content)
+        # The unparseable value falls back to the null sentinel.
+        assert las.data_sections[0].data["DT"][0] == -999.25
+
+    # --- L-02: non-first-section dedup writeback ---
+
+    def test_las30_non_first_section_dedup_writes_back_global_curves(self) -> None:
+        """L-02: dedup in a non-first data section updates global curves.
+
+        The ~CORE_DATA section (second section) contains duplicate
+        CORE_DT definitions; the rename to CORE_DT_2 must propagate to
+        las_file.curves/curves_order so the writer and to_dict() see
+        curve definitions consistent with the section's data columns.
+        """
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DEPT.M  : DEPTH {F}
+ DT.US/M : SONIC {F}
+~A
+ 100.0,50.0
+ 101.0,51.0
+~CORE_DEFINITION
+ CORE_DEPT.M  : CORE DEPTH {F}
+ CORE_DT.US/M : CORE SONIC {F}
+ CORE_DT.US/M : CORE SONIC DUP {F}
+~CORE_DATA
+ 100.0,50.0,51.0
+ 101.0,52.0,53.0
+~WELL INFORMATION
+ NULL.   -999.25 : NULL VALUE
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.data_sections) == 2
+        assert las.data_sections[1].curves_order == ["CORE_DEPT", "CORE_DT", "CORE_DT_2"]
+        # Global curves/curves_order must reflect the dedup rename.
+        assert las.curves_order == ["DEPT", "DT", "CORE_DEPT", "CORE_DT", "CORE_DT_2"]
+        assert [c.mnemonic for c in las.curves] == [
+            "DEPT", "DT", "CORE_DEPT", "CORE_DT", "CORE_DT_2",
+        ]
+        assert las.curves[4].original_mnemonic == "CORE_DT"
+
+    # --- N-I-31: null-sentinel reconciliation ---
+
+    def test_las30_null_fill_cells_reconciled_after_well_declared(self) -> None:
+        """N-I-31: fill cells baked before ~Well are re-filled.
+
+        The first ~A section precedes ~WELL (which declares NULL=-999),
+        so its short-row and empty-token fill cells were baked with the
+        default -999.25.  A later data section (processed with the well
+        known) must re-fill those tracked cells with the declared NULL
+        so the written file is internally consistent.
+        """
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DEPT.M  : DEPTH {F}
+ DT.US/M : SONIC {F}
+ GR.API  : GAMMA RAY {F}
+~A First
+ 100.0,
+ 101.0,,76.0
+~WELL INFORMATION
+ NULL.   -999 : NULL VALUE
+~A Second
+ 200.0,50.0,77.0
+ 201.0,51.0,78.0
+"""
+        parser = LASParser()
+        with pytest.warns(UserWarning, match="Fill cells were updated to match the declared NULL"):
+            las = parser.parse(content)
+        # Section 1's fill cells now use the declared NULL (-999):
+        # row 0 was short (DT and GR padded), row 1 had an empty DT token.
+        assert las.data_sections[0].data["DT"].tolist() == [-999.0, -999.0]
+        # Genuine data values are untouched.
+        assert las.data_sections[0].data["DEPT"].tolist() == [100.0, 101.0]
+        assert las.data_sections[0].data["GR"].tolist() == [-999.0, 76.0]
+        # The top-level logs view (defensive copy) stays in sync.
+        assert las.logs["DT"].tolist() == [-999.0, -999.0]
+        # The second section used the declared NULL directly.
+        assert las.data_sections[1].data["DT"].tolist() == [50.0, 51.0]
+        assert las.well.get("NULL") == "-999"
+
+    def test_las30_null_fill_cells_reconciled_single_section_before_well(
+        self,
+    ) -> None:
+        """EXT-02: N-I-31 reconcile must fire even when no LATER data
+        section exists.
+
+        A single ~A data section processed before ~Well (which declares
+        NULL=-999) has its short-row/empty-token fill cells baked with the
+        default -999.25.  process_ascii_data only reconciles at the START
+        of a LATER data-processing call — a trailing well section never
+        triggers it.  The end-of-parse reconcile must re-fill the tracked
+        cells with the declared NULL so the in-memory data agrees with the
+        declared sentinel.
+        """
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DEPT.M  : DEPTH {F}
+ DT.US/M : SONIC {F}
+ GR.API  : GAMMA RAY {F}
+~A Only
+ 100.0,
+ 101.0,,76.0
+~WELL INFORMATION
+ NULL.   -999 : NULL VALUE
+"""
+        parser = LASParser()
+        with pytest.warns(UserWarning, match="Fill cells were updated to match the declared NULL"):
+            las = parser.parse(content)
+        assert len(las.data_sections) == 1
+        # Fill cells now use the declared NULL (-999), not the default.
+        assert las.data_sections[0].data["DT"].tolist() == [-999.0, -999.0]
+        assert las.data_sections[0].data["GR"].tolist() == [-999.0, 76.0]
+        # The tracked fill-cell record is cleared after reconciliation.
+        assert getattr(
+            las.data_sections[0], "_pylasdev_null_fill_cells", []
+        ) == []
+        assert las.well.get("NULL") == "-999"
+
+    # --- N-I-32: logs from LOG_DATA section, not first section ---
+
+    def test_las30_logs_from_log_data_not_first_section(self) -> None:
+        """N-I-32: typed-first files must not hijack las_file.logs.
+
+        When ~Core_Data precedes the LOG_DATA section, logs must contain
+        the main DEPT/GR curves — not the CORE curves.
+        """
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DEPT.M  : DEPTH {F}
+ GR.API  : GAMMA RAY {F}
+~CORE_DEFINITION
+ CORE_LEN.M  : CORE LENGTH {F}
+ CORE_NUM    : CORE NUMBER {F}
+~CORE_DATA
+ 100.0,50.0
+ 101.0,51.0
+~A
+ 1670.0,45.5
+ 1670.5,46.0
+~WELL INFORMATION
+ NULL.   -999.25 : NULL VALUE
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert las.data_sections[0].section_type == "CORE_DATA"
+        assert las.data_sections[1].section_type == "LOG_DATA"
+        # logs must carry the LOG_DATA section curves, not CORE curves.
+        assert set(las.logs.keys()) == {"DEPT", "GR"}
+        assert "CORE_LEN" not in las.logs
+        assert las.to_dict()["logs"].keys() == las.logs.keys()
+
+    # --- IT3-F1: no per-token strip on LAS 3.0 reads ---
+
+    def test_las30_string_edge_whitespace_preserved(self) -> None:
+        """IT3-F1: {S} string data edge whitespace survives LAS 3.0 reads.
+
+        The writer emits token-edge whitespace (e.g. " leading",
+        "trailing " in the middle of a line); the LAS 3.0 fill loop must
+        not strip it, matching the LAS 1.2/2.0 path.
+        """
+        content = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ NULL.   -999.25 : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M  : DEPTH {F}
+ NOTE.S  : NOTE {S}
+ OTHER.F : OTHER {F}
+~A
+ 100.0, leading,10
+ 101.0,trailing ,20
+ 102.0,both  sides,30
+ 103.0,no_ws,40
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        notes = [str(x) for x in las.string_data["NOTE"]]
+        assert notes == [" leading", "trailing ", "both  sides", "no_ws"]
+        # Numeric curves are unaffected by whitespace tolerance.
+        assert las.data_sections[0].data["DEPT"].tolist() == [100.0, 101.0, 102.0, 103.0]
+        assert las.data_sections[0].data["OTHER"].tolist() == [10.0, 20.0, 30.0, 40.0]
 
 
 class TestVERSValidation:
@@ -2039,12 +2338,13 @@ class TestValueOnlyPattern:
     # ── F2-03: WRAP=YES warning in LAS 3.0 ──────────────────────
 
     def test_las30_wrap_yes_warns(self) -> None:
-        """F-051: LAS 3.0 WRAP=YES should warn and reset to NO.
+        """F-051 + P-02: LAS 3.0 WRAP=YES should warn.
 
         WRAP is a LAS 1.2/2.0 concept; in LAS 3.0, WRAP=YES triggers a
-        UserWarning and is reset to NO, allowing the parse to continue.
-        Non-wrapped data (full rows) parses correctly; genuinely wrapped
-        data is caught by the downstream check in _las30_data.py.
+        UserWarning.  P-02: the parser no longer resets WRAP to NO —
+        the declared value is kept so the downstream content-based
+        detection in _las30_data.py stays live (genuinely wrapped data
+        is rejected; non-wrapped data parses normally).
         """
         content = (
             "~VERSION INFORMATION\n"
@@ -2058,8 +2358,9 @@ class TestValueOnlyPattern:
         parser = LASParser()
         with pytest.warns(UserWarning, match="WRAP=YES"):
             result = parser.parse(content)
-        # WRAP should be reset to NO after warning
-        assert result.version.wrap == "NO"
+        # P-15: single-curve files are exempt from the wrap rejection,
+        # and P-02 keeps the declared WRAP value (no reset).
+        assert result.version.wrap == "YES"
 
     def test_las30_wrap_no_silent(self, caplog) -> None:
         """F2-03: LAS 3.0 WRAP=NO should NOT produce a WRAP=YES warning."""
@@ -2097,17 +2398,18 @@ class TestValueOnlyPattern:
     # --- F-8-003: WRAP=YES trailing-comma regression ---
 
     def test_las30_wrap_yes_multi_curve_trailing_comma_raises(self) -> None:
-        """F-8-003 + F-051: WRAP=YES trailing comma data parsed as non-wrapped.
+        """F-8-003 + F-051 + P-02: WRAP=YES trailing comma data raises.
 
-        When WRAP=YES with 2+ curves and COMMA delimiter, a data line containing
-        a single value plus a trailing comma (e.g. "1670.0,") would produce
-        ["1670.0", ""] → len=2 tokens.  Without the F-7-003 fix stripping
-        trailing empty tokens, len(_tokens) == 1 is False, incorrectly classifying
-        the wrapped data as non-wrapped.
+        When WRAP=YES with 2+ curves and COMMA delimiter, a data line
+        containing a single value plus a trailing comma (e.g. "1670.0,")
+        is a genuinely wrapped depth line.  The F-7-003 trailing-empty
+        strip lets the downstream _las30_data.py wrap detection classify
+        it as wrapped.
 
-        F-051: WRAP=YES in LAS 3.0 now emits a UserWarning and resets WRAP to NO,
-        so the downstream _las30_data.py wrap-detection heuristic no longer fires.
-        The data is parsed as non-wrapped (one value fills DEPT, GR gets NULL).
+        P-02: F-051 previously reset WRAP to NO, which disabled the
+        downstream detection and silently parsed wrapped data as
+        non-wrapped (corruption).  The reset is removed — the declared
+        WRAP value is kept so genuine wrap is detected and rejected.
         """
         content = (
             "~VERSION INFORMATION\n"
@@ -2118,15 +2420,12 @@ class TestValueOnlyPattern:
             " DEPT.M       :  Depth {F}\n"
             " GR.API       :  Gamma Ray {F}\n"
             "~ASCII\n"
-            " 1670.0,\n"  # single value + trailing comma → parsed as non-wrapped
+            " 1670.0,\n"  # single value + trailing comma → genuinely wrapped
         )
         parser = LASParser()
         with pytest.warns(UserWarning, match="WRAP=YES"):
-            result = parser.parse(content)
-        # WRAP should be reset to NO after warning
-        assert result.version.wrap == "NO"
-        # Data parsed in non-wrapped mode: one value assigned to DEPT
-        assert result.logs.get("DEPT") is not None
+            with pytest.raises(LASParseError, match="WRAP=YES"):
+                parser.parse(content)
 
     def test_las30_wrap_yes_multi_curve_full_row_no_raise(self) -> None:
         """F-8-003: WRAP=YES with full multi-curve row does NOT raise.
@@ -3012,8 +3311,8 @@ class TestValidateCrossSectionConsistency:
     def test_parse_s_format_in_logs_raises(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """R-005: String-format curve placed in logs triggers LASDataError
-        during parser finalization (parser.py:743-766).
+        """R-005 + P-11: String-format curve placed in logs triggers
+        LASParseError during parser finalization (parser.py:743-766).
 
         The check at parse() lines 743-766 iterates all las_file.curves
         and verifies format-vs-placement consistency.  A curve with
@@ -3021,6 +3320,10 @@ class TestValidateCrossSectionConsistency:
         IS tested through LASFile.__post_init__ and DataSection.__post_init__
         in test_models.py, but the parser-specific copy at lines 743-766
         had zero coverage.
+
+        P-11: the check previously raised LASDataError which escaped
+        parse() (reader.py only wraps LASParseError).  It is now
+        normalized to LASParseError at the parser boundary.
 
         We inject mismatched state via monkeypatch on _reset() because
         the parser itself always routes data correctly — the check is a
@@ -3032,8 +3335,8 @@ class TestValidateCrossSectionConsistency:
 
         from pylasdev import (
             CurveDefinition,
-            LASDataError,
             LASFile,
+            LASParseError,
             VersionSection,
             WellSection,
         )
@@ -3079,25 +3382,30 @@ class TestValidateCrossSectionConsistency:
             " STEP.M    : 10\n"
             " NULL.     : -999\n"
         )
-        with pytest.raises(LASDataError, match=r"string-format.*logs"):
+        with pytest.raises(LASParseError, match=r"string-format.*logs"):
             parser.parse(content)
 
     def test_parse_numeric_format_in_string_data_raises(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """R-005: Numeric-format curve in string_data triggers LASDataError
-        during parser finalization (parser.py:743-766, second branch).
+        """R-005 + P-11: Numeric-format curve in string_data triggers
+        LASParseError during parser finalization (parser.py:743-766,
+        second branch).
 
         The check raises when a curve with numeric data_format (not S/A)
         appears in string_data.  This complements the S-format-in-logs
         branch tested above.
+
+        P-11: the check previously raised LASDataError which escaped
+        parse() (reader.py only wraps LASParseError).  It is now
+        normalized to LASParseError at the parser boundary.
         """
         import numpy as np
 
         from pylasdev import (
             CurveDefinition,
-            LASDataError,
             LASFile,
+            LASParseError,
             VersionSection,
             WellSection,
         )
@@ -3134,7 +3442,7 @@ class TestValidateCrossSectionConsistency:
             " STEP.M    : 10\n"
             " NULL.     : -999\n"
         )
-        with pytest.raises(LASDataError, match=r"numeric-format.*string_data"):
+        with pytest.raises(LASParseError, match=r"numeric-format.*string_data"):
             parser.parse(content)
 
     # --- R-006: pre-~V section_idx increment coverage ---
@@ -3193,3 +3501,492 @@ class TestValidateCrossSectionConsistency:
             f"Expected current_data_section_idx >= 2 after pre-~V A→A "
             f"transition, got {parser._state.current_data_section_idx}"
         )
+
+
+# ──────────────────────────────────────────────────────────────
+# P-03 (HIGH): Deferred pre-~V data sections separated by a
+# non-A section must not merge (groupby key collision)
+# ──────────────────────────────────────────────────────────────
+
+class TestP03PreVDataSectionsSeparatedByNonA:
+    """P-03: A→W→A pre-~V data sections must NOT merge into one DataSection.
+
+    Prior to the fix, F-040 only incremented the section idx on A→A
+    transitions.  A non-A section (e.g. ~W) between two ~A sections made
+    the W→A transition fail to increment, so both sections shared the
+    same (section_type, section_name, section_idx) key and groupby merged
+    them into ONE DataSection — later sections' data was read against the
+    first section's curve scope (silent corruption).
+    """
+
+    def test_pre_v_a_w_a_sections_do_not_merge(self) -> None:
+        content = """~A
+100.0,50.0
+101.0,51.0
+~WELL INFORMATION
+ NULL.   -999.25 : NULL VALUE
+~A
+200.0,60.0
+201.0,61.0
+~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.data_sections) == 2, (
+            f"Expected 2 DataSections (A→W→A before ~V), got "
+            f"{len(las.data_sections)}"
+        )
+        sec0 = las.data_sections[0]
+        assert list(sec0.data["DEPT"]) == [100.0, 101.0]
+        assert list(sec0.data["DT"]) == [50.0, 51.0]
+        sec1 = las.data_sections[1]
+        assert list(sec1.data["DEPT"]) == [200.0, 201.0]
+        assert list(sec1.data["DT"]) == [60.0, 61.0]
+        # Names must be distinct (N-I-03 replay idx normalization)
+        assert sec0.name != sec1.name
+
+    def test_pre_v_a_c_a_sections_do_not_merge(self) -> None:
+        """P-03: A→C→A also must not merge (any non-A separator)."""
+        content = """~A
+100.0,50.0
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+~A
+200.0,60.0
+~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO   :
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ DT.US/M      : SONIC  {F}
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert len(las.data_sections) == 2, (
+            f"Expected 2 DataSections (A→C→A before ~V), got "
+            f"{len(las.data_sections)}"
+        )
+        assert list(las.data_sections[0].data["DEPT"]) == [100.0]
+        assert list(las.data_sections[1].data["DEPT"]) == [200.0]
+
+
+# ──────────────────────────────────────────────────────────────
+# P-01 (MEDIUM): LAS 1.2 well-format lasio layout branch-2
+# inversion — value-before-colon non-mandatory fields
+# ──────────────────────────────────────────────────────────────
+
+class TestP01WellFormatLasioInversion:
+    """P-01: auto-mode branch-2 must extract the PRE-colon text as the
+    value when pre-colon looks like data (lasio value-before-colon).
+
+    Prior to the fix, branch-2 set actual_value = description (post-colon)
+    despite its comment claiming "lasio format with value before colon",
+    silently inverting value/description for lasio-style files.
+    """
+
+    def test_lasio_digit_value_before_colon(self) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   1000.5 : START DEPTH\n"
+            " STOP.M   500.0  : STOP DEPTH\n"
+            " STEP.M   -0.125 : STEP\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            " DATE.    15/01/2001 : LOG DATE\n"
+            " UWI.     10006170502W500 : UNIQUE WELL ID\n"
+        )
+        parser = LASParser()
+        las = parser.parse(content)
+        # lasio layout: value before colon → value is the pre-colon text
+        assert las.well["DATE"] == "15/01/2001", (
+            f"Expected DATE value '15/01/2001', got {las.well['DATE']!r}"
+        )
+        assert las.well["UWI"] == "10006170502W500", (
+            f"Expected UWI value '10006170502W500', got {las.well['UWI']!r}"
+        )
+        # description preserved on the other side
+        assert las.well.descriptions.get("DATE") == "LOG DATE"
+        assert las.well.descriptions.get("UWI") == "UNIQUE WELL ID"
+
+    def test_cwls_and_lasio_modes_equivalent(self) -> None:
+        """P-01: cwls and lasio modes produce identical extraction for
+        spec-layout files (the parameter is API-compatible; both parse
+        the CWLS label-left/value-right layout the same way)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   1000.5 : START DEPTH\n"
+            " STOP.M   500.0  : STOP DEPTH\n"
+            " STEP.M   -0.125 : STEP\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            " COMP.    COMPANY : Test Oil Company Ltd.\n"
+        )
+        las_cwls = LASParser(well_format="cwls").parse(content)
+        las_lasio = LASParser(well_format="lasio").parse(content)
+        assert las_cwls.well["COMP"] == las_lasio.well["COMP"] == "Test Oil Company Ltd."
+
+
+# ──────────────────────────────────────────────────────────────
+# P-02 (MEDIUM): WRAP=YES LAS 3.0 detection must stay live
+# ──────────────────────────────────────────────────────────────
+
+class TestP02WrapYesDetectionLive:
+    """P-02: the F-051 WRAP reset made genuine-wrap detection dead code.
+
+    With the reset removed, genuinely wrapped LAS 3.0 data (multi-curve,
+    one value per line) is detected and rejected regardless of whether
+    WRAP appears before or after VERS.  Non-wrapped data still parses.
+    """
+
+    def test_vers_before_wrap_genuine_wrap_raises(self) -> None:
+        """VERS-before-WRAP ordering must ALSO raise for wrapped data."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            " DLM.    COMMA : DELIMITING CHARACTER\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth {F}\n"
+            " GR.API       :  Gamma Ray {F}\n"
+            "~ASCII\n"
+            " 1670.0\n"   # genuinely wrapped: depth only, GR on next line
+            " 45.5\n"
+            " 1670.5\n"
+            " 46.0\n"
+        )
+        parser = LASParser()
+        with pytest.warns(UserWarning, match="WRAP=YES"):
+            with pytest.raises(LASParseError, match="WRAP=YES"):
+                parser.parse(content)
+
+    def test_wrap_before_vers_genuine_wrap_raises(self) -> None:
+        """WRAP-before-VERS ordering must raise identically."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " DLM.    COMMA : DELIMITING CHARACTER\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth {F}\n"
+            " GR.API       :  Gamma Ray {F}\n"
+            "~ASCII\n"
+            " 1670.0\n"
+            " 45.5\n"
+            " 1670.5\n"
+            " 46.0\n"
+        )
+        parser = LASParser()
+        with pytest.raises(LASParseError, match="WRAP=YES"):
+            parser.parse(content)
+
+    def test_wrap_yes_non_wrapped_data_still_parses(self) -> None:
+        """WRAP=YES header with full-row (non-wrapped) data still parses."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            " DLM.    COMMA : DELIMITING CHARACTER\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth {F}\n"
+            " GR.API       :  Gamma Ray {F}\n"
+            "~ASCII\n"
+            " 1670.0,45.5\n"
+            " 1670.5,46.0\n"
+        )
+        parser = LASParser()
+        with pytest.warns(UserWarning, match="WRAP=YES"):
+            las = parser.parse(content)
+        assert "DEPT" in las.logs
+        assert "GR" in las.logs
+
+
+# ──────────────────────────────────────────────────────────────
+# P-04 (MEDIUM): DATA_LINE_PATTERN first-colon delimiter
+# ──────────────────────────────────────────────────────────────
+
+class TestP04FirstColonDelimiter:
+    """P-04: descriptions containing ": " must not be split/truncated.
+
+    The regex previously split on the LAST structurally-valid colon,
+    silently truncating descriptions like "Gamma Ray : API".
+    """
+
+    def test_description_with_embedded_colon_preserved(self) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   :\n"
+            " DLM.   COMMA :\n"
+            "~CURVE INFORMATION\n"
+            " GR.API       :  Gamma Ray : API  {F}\n"
+            "~ASCII\n"
+            " 1670.0,45.5\n"
+        )
+        parser = LASParser()
+        las = parser.parse(content)
+        gr = next(c for c in las.curves if c.mnemonic == "GR")
+        assert gr.description == "Gamma Ray : API", (
+            f"Expected description 'Gamma Ray : API', got {gr.description!r}"
+        )
+
+    def test_well_description_with_embedded_colon_preserved(self) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            " WELL.    VESPA-1 : WELL : NAME\n"
+        )
+        parser = LASParser()
+        las = parser.parse(content)
+        assert las.well["WELL"] == "VESPA-1"
+        assert las.well.descriptions.get("WELL") == "WELL : NAME", (
+            f"Expected description 'WELL : NAME', got "
+            f"{las.well.descriptions.get('WELL')!r}"
+        )
+
+
+# ──────────────────────────────────────────────────────────────
+# P-11 (MEDIUM): LASDataError / bare ValueError must not escape
+# parse() — normalized to LASParseError
+# ──────────────────────────────────────────────────────────────
+
+class TestP11NoExceptionEscape:
+    """P-11: parse() must only raise LASParseError at its boundary.
+
+    LASDataError (a ValueError subclass) and bare ValueError raised
+    inside parse() previously escaped the public API because reader.py
+    only wraps LASParseError.
+    """
+
+    def test_negative_format_offset_raises_lasparseerror(self) -> None:
+        """{A:-5} previously raised bare ValueError from ArrayElementInfo."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   :\n"
+            "~CURVE INFORMATION\n"
+            " NMR[1].UNIT : NMR ARRAY {A:-5}\n"
+        )
+        parser = LASParser()
+        with pytest.raises(LASParseError, match="invalid array element info"):
+            parser.parse(content)
+
+
+# ──────────────────────────────────────────────────────────────
+# P-15 (MEDIUM): single-curve WRAP=YES-before-VERS not rejected
+# ──────────────────────────────────────────────────────────────
+
+class TestP15SingleCurveWrapExemption:
+    """P-15: single-curve LAS 3.0 files with WRAP=YES must not be
+    rejected even when WRAP appears before VERS (n_curves<=1 exemption,
+    mirroring data_reader's curve_count<=1 rule)."""
+
+    def test_single_curve_wrap_yes_before_vers_parses(self) -> None:
+        content = """~WELL INFORMATION
+ NULL.   -999.25 : NULL VALUE
+~VERSION INFORMATION
+ WRAP.   YES  :
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ DLM.   COMMA :
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+~ASCII
+ 1670.0
+ 1671.0
+"""
+        parser = LASParser()
+        las = parser.parse(content)
+        assert list(las.logs["DEPT"]) == [1670.0, 1671.0]
+
+
+# ──────────────────────────────────────────────────────────────
+# P-05 (MEDIUM): ~ASCII|CURVE no-space pipe — parser pre-scan
+# ──────────────────────────────────────────────────────────────
+
+class TestP05NoSpacePipeAsciiHeader:
+    """P-05: no-space pipe data header (~ASCII|CURVE) — parser-side
+    pre-scan must recognize the section so data_line_count is correct.
+
+    (The reader-side `_is_ascii_section` / `_detect_actual_wrap` sites
+    are in data_reader.py / _data_section_reader.py — outside G1 scope;
+    reported as a finding for the reader group.)
+    """
+
+    def test_pre_scan_counts_no_space_pipe_ascii(self) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   :\n"
+            " DLM.   COMMA :\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       : DEPTH  {F}\n"
+            " DT.US/M      : SONIC  {F}\n"
+            "~ASCII|CURVE\n"
+            " 100.0,50.0\n"
+            " 101.0,51.0\n"
+        )
+        parser = LASParser()
+        las = parser.parse(content)
+        # Parser-side: the section must be recognized and data parsed
+        assert len(las.data_sections) == 1
+        assert list(las.data_sections[0].data["DEPT"]) == [100.0, 101.0]
+        # Pre-scan count must reflect the ~ASCII|CURVE data lines
+        assert parser.data_line_count == 2, (
+            f"Expected data_line_count 2 for ~ASCII|CURVE, got "
+            f"{parser.data_line_count}"
+        )
+
+
+# ──────────────────────────────────────────────────────────────
+# G2 (N-I-22 / N-I-01 / N-I-04): parser iter-2 new findings
+# ──────────────────────────────────────────────────────────────
+
+class TestNI22UnitCharacterClassWidening:
+    """N-I-22 (HIGH): the parser unit character class (word chars, hyphen,
+    slash only) rejected legitimate common LAS units containing ``%``, ``°``,
+    or ``.`` (porosity ``%``, temperature ``°C``, resistivity ``ohm.m``).
+    Such a curve line failed DATA_LINE_PATTERN entirely, so the whole curve
+    AND its data column were silently dropped on read.  The unit class is
+    now widened to also accept ``%``, ``°``, and ``.``."""
+
+    def test_parse_curve_unit_percent(self) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   100.0 : \n"
+            " STOP.M   200.0 : \n"
+            " STEP.M   1.0 : \n"
+            " NULL.    -999.25 : \n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M      100.0 : DEPTH\n"
+            " PHIT.%      25.5 : POROSITY\n"
+        )
+        las = LASParser().parse(content)
+        assert len(las.curves) == 2, "curve with '%' unit must not be dropped"
+        phit = next(c for c in las.curves if c.mnemonic == "PHIT")
+        assert phit.unit == "%"
+
+    def test_parse_curve_unit_ohm_m(self) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   100.0 : \n"
+            " STOP.M   200.0 : \n"
+            " STEP.M   1.0 : \n"
+            " NULL.    -999.25 : \n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M      1000.0 : DEPTH\n"
+            " RT.ohm.m    15.5 : RESISTIVITY\n"
+        )
+        las = LASParser().parse(content)
+        assert len(las.curves) == 2, "curve with 'ohm.m' unit must not be dropped"
+        rt = next(c for c in las.curves if c.mnemonic == "RT")
+        assert rt.unit == "ohm.m"
+
+    def test_parse_curve_unit_degree_celsius(self) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : LAS 3.0\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   100.0 : \n"
+            " STOP.M   200.0 : \n"
+            " STEP.M   1.0 : \n"
+            " NULL.    -999.25 : \n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M      1000.0 : DEPTH\n"
+            " TEMP.°C     23.5 : TEMPERATURE\n"
+            "~A DEPTH TEMP\n"
+            "1000.0 23.5\n"
+            "1001.0 24.5\n"
+        )
+        las = LASParser().parse(content)
+        temp = next(c for c in las.curves if c.mnemonic == "TEMP")
+        assert temp.unit == "°C"
+        # The data column must also survive (previously dropped with the curve).
+        assert "TEMP" in las.logs, "TEMP data column must not be dropped"
+        assert list(las.logs["TEMP"]) == [23.5, 24.5]
+
+
+class TestNI01MissingVersionGate:
+    """N-I-01 (MEDIUM): parse()'s missing-~V validation was gated on
+    ``content.strip()`` even when ``lines=`` was provided — callers passing
+    ``lines=`` with empty ``content`` silently bypassed the LASParseError and
+    got a misleading "empty content" warning instead.  The gate now checks
+    the effective line list, so both argument paths behave identically."""
+
+    def test_lines_with_real_content_raises_missing_version(self) -> None:
+        lines = [" VERS. 2.0 : CWLS LOG ASCII STANDARD", " STRT.M 100.0 : "]
+        with pytest.raises(LASParseError, match="missing required ~V"):
+            LASParser().parse(content="", lines=lines)
+
+    def test_content_and_lines_equivalent(self) -> None:
+        content = " VERS. 2.0 : CWLS LOG ASCII STANDARD\n STRT.M 100.0 : \n"
+        with pytest.raises(LASParseError, match="missing required ~V"):
+            LASParser().parse(content=content)
+
+    def test_empty_lines_warn_not_raise(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            las = LASParser().parse(content="", lines=[])
+        assert any(
+            "Empty or whitespace-only LAS content" in str(w.message) for w in caught
+        ), "empty source must warn, not raise"
+        assert las.version.vers == "2.0"
+
+
+class TestNI04TypedDataSectionScopeReset:
+    """N-I-04 (MEDIUM): a typed data section (e.g. ~TOPS_DATA) with no
+    matching ``_DEFINITION`` and no ``__MAIN__`` fallback inherited the
+    PREVIOUS section's curve scope (CORE curves for TOPS data — silent
+    mislabel).  The missing else-branch now resets to ALL curves."""
+
+    def test_typed_section_no_definition_gets_all_curves(self) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : LAS 3.0\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   100.0 : \n"
+            " STOP.M   200.0 : \n"
+            " STEP.M   1.0 : \n"
+            " NULL.    -999.25 : \n"
+            "~MUD_DEFINITION\n"
+            " DEPTH.M 100.0 : DEPTH\n"
+            " MUDW.kg/m3 1200.0 : MUD WEIGHT\n"
+            "~CORE_DEFINITION\n"
+            " DEPTH.M 100.0 : DEPTH\n"
+            " CORE.g/cm3 2.5 : CORE DENSITY\n"
+            "~CORE_DATA\n"
+            "100.0 2.5\n"
+            "101.0 2.6\n"
+            "~TOPS_DATA\n"
+            "100.0 1.0\n"
+            "101.0 2.0\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        sections = {ds.name: ds for ds in las.data_sections}
+        # CORE_DATA matched its own CORE_DEFINITION.
+        core_curves = [c.mnemonic for c in sections["CORE_DATA"].section_curves]
+        assert core_curves == ["DEPTH_2", "CORE"], core_curves
+        # TOPS_DATA has no TOPS_DEFINITION and no ~C/__MAIN__ — it must NOT
+        # inherit CORE_DATA's scoped curves; it resets to ALL curves
+        # (including MUDW from the earlier MUD_DEFINITION).
+        tops_curves = [c.mnemonic for c in sections["TOPS_DATA"].section_curves]
+        assert tops_curves == ["DEPTH", "MUDW", "DEPTH_2", "CORE"], tops_curves

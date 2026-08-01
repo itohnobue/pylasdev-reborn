@@ -360,6 +360,16 @@ def _compare_data_sections(
             type(sections1).__name__,
         )
         return False
+    # E-08: Symmetric type check.  Previously only sections1 was checked —
+    # sections2=None raised a bare TypeError on len(), and sections2={}
+    # (a non-list empty container) silently compared equal to [].
+    if not isinstance(sections2, list):
+        logger.warning(
+            "Type mismatch in data_sections: %s vs %s",
+            type(sections1).__name__,
+            type(sections2).__name__,
+        )
+        return False
     if len(sections1) != len(sections2):
         logger.warning(
             "data_sections length mismatch: %d vs %d",
@@ -371,6 +381,16 @@ def _compare_data_sections(
     for i, (ds1, ds2) in enumerate(
         zip(sections1, sections2, strict=False)
     ):
+        # E-08: Per-element type checks.  Previously a non-dict element
+        # (e.g. a str) raised a bare AttributeError on .keys().
+        if not isinstance(ds1, dict) or not isinstance(ds2, dict):
+            logger.warning(
+                "Type mismatch at 'data_sections[%d]': %s vs %s",
+                i,
+                type(ds1).__name__,
+                type(ds2).__name__,
+            )
+            return False
         if set(ds1.keys()) != set(ds2.keys()):
             only_in_first = set(ds1.keys()) - set(ds2.keys())
             only_in_second = set(ds2.keys()) - set(ds1.keys())

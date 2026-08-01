@@ -2477,42 +2477,24 @@ class TestProductionCheckWriterFixes:
         assert "GR.GAPI" in content, "GR from section1 should be in ~CURVE"
         assert "DT.US/M" in content, "DT from section2 should be in ~CURVE"
 
-    # --- F-210 (MEDIUM): colon-escaping for curve unit ---
+    # --- F-210 / M-04: colon-escaping for curve unit ---
 
     def test_curve_unit_colon_escaped(self, tmp_path: Path) -> None:
-        """F-210: Curve unit with ' : ' (colon-space adjacency) is escaped.
+        """F-210/M-04: Curve unit with ' : ' (colon-space adjacency) is rejected.
 
-        The unit appears between mnemonic and description, before the
-        structural colon. A unit containing " : " creates a spurious
-        structural separator that misroutes parser split results.
-        The fix escapes colon-whitespace adjacencies in the unit.
+        F-210 originally documented the writer escaping colon-space
+        adjacencies in the unit (``g/cm3 : grain`` → ``g/cm3 _:_ grain``).
+        M-04 (CONFIRMED) found that escape path insufficient: an escaped
+        colon unit cannot be re-parsed by the parser's unit grammar, so
+        the whole curve + data column is silently dropped on roundtrip.
+        The fix rejects such units at the model layer instead —
+        CurveDefinition construction now raises ValueError.
         """
-        las = LASFile()
-        las.version = VersionSection(vers="2.0")
-        las.well["NULL"] = "-999.25"
-        las.curves_order = ["DEPT", "SPECIAL"]
-        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
-        las.curves.append(
-            CurveDefinition(mnemonic="SPECIAL", unit="g/cm3 : grain", description="Special Density")
-        )
-        las.logs["DEPT"] = np.array([100.0])
-        las.logs["SPECIAL"] = np.array([2.5])
-
-        temp_file = tmp_path / "colon_unit.las"
-        write_las_file(temp_file, las)
-
-        content = temp_file.read_text()
-        curve_section = content.split("~CURVE")[1].split("~A")[0]
-        # The unit "g/cm3 : grain" has " : " (whitespace-colon-space)
-        # which gets escaped by _escape_colons_for_las_value
-        # The raw "g/cm3 : grain" with colon-space adjacency should NOT appear
-        # (it would create a spurious structural colon separator)
-        assert "g/cm3 : grain" not in curve_section, (
-            f"Colon-space in unit should be escaped, got:\n{curve_section}"
-        )
-        # The escaped form should appear (underscore around colon)
-        assert "g/cm3" in curve_section
-        assert "grain" in curve_section
+        with pytest.raises(ValueError, match="invalid unit"):
+            CurveDefinition(
+                mnemonic="SPECIAL", unit="g/cm3 : grain",
+                description="Special Density",
+            )
 
     # --- Quick-fix: early-return path blank line ---
 
@@ -2721,3 +2703,835 @@ class TestProductionCheckWriterFixes:
         assert "CONTINENT" in a_line[0], (
             f"CONTINENT missing from ~A header: {a_line[0]!r}"
         )
+
+
+# ============================================================
+# G7 — Writer Base Fix Regression Tests (W-02, W-04..W-09)
+# ============================================================
+
+class TestG7WriterBaseFixes:
+    """Regression tests for fix group G7 (_writer_base.py).
+
+    Each test FAILS on the pre-fix code and PASSES after the fix.
+    """
+
+    # --- W-02: bare precision specifier must not crash on integral data ---
+
+    def test_write_bare_precision_normalized(self, tmp_path: Path) -> None:
+        """W-02: precision='.5' (bare, no code letter) must not crash.
+
+        Before the fix, format(int(v), '.5') raised ValueError
+        ("Precision not allowed in integer format specifier") for
+        integer-valued data such as depths, so writing any file with a
+        bare precision specifier failed with LASWriteError mid-write.
+        """
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {
+                "STRT": "1000.0",
+                "STOP": "1002.0",
+                "STEP": "1.0",
+                "NULL": "-999.25",
+            },
+            "logs": {"DEPT": np.array([1000.0, 1001.0, 1002.0])},
+            "curves_order": ["DEPT"],
+        }
+        temp_file = tmp_path / "bare_precision.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(temp_file, data, precision=".5")
+
+        reread = read_las_file(str(temp_file))
+        np.testing.assert_array_almost_equal(
+            reread["logs"]["DEPT"], np.array([1000.0, 1001.0, 1002.0])
+        )
+
+    # --- W-04: copy-back warning reflects the actual outcome ---
+
+    def _make_las2_single_section(
+        self, with_top_level_logs: bool
+    ) -> LASFile:
+        """Build a LAS 2.0 file with one DataSection (and optionally
+        pre-populated top-level logs)."""
+        las = LASFile()
+        las.version = VersionSection(vers="2.0", wrap="NO", dlm="SPACE")
+        las.well["STRT"] = "100.0"
+        las.well["STOP"] = "300.0"
+        las.well["STEP"] = "100.0"
+        las.well["NULL"] = "-999.25"
+        if with_top_level_logs:
+            las.curves_order = ["DEPT"]
+            las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+            las.logs["DEPT"] = np.array([1000.0, 2000.0])
+        section = DataSection(
+            name="CURVE",
+            curves_order=["DEPT"],
+            section_curves=[CurveDefinition(mnemonic="DEPT", unit="M")],
+            data={"DEPT": np.array([1.0, 2.0])},
+        )
+        las.data_sections.append(section)
+        return las
+
+    def test_copy_back_warning_when_content_dropped(self, tmp_path: Path) -> None:
+        """W-04: when top-level logs already exist, the section data is
+        dropped and the warning must say so — not claim it 'will be
+        preserved'."""
+        las = self._make_las2_single_section(with_top_level_logs=True)
+
+        temp_file = tmp_path / "w04_dropped.las"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            write_las_file(temp_file, las)
+        messages = [str(w.message) for w in caught]
+        assert any("will NOT be preserved" in m for m in messages), (
+            f"Expected 'will NOT be preserved' warning, got {messages}"
+        )
+        assert not any(
+            "Single-section data will be preserved" in m for m in messages
+        )
+
+    def test_copy_back_warning_when_content_preserved(self, tmp_path: Path) -> None:
+        """W-04: with empty top-level containers the section data is
+        copied back and the warning still claims preservation."""
+        las = self._make_las2_single_section(with_top_level_logs=False)
+
+        temp_file = tmp_path / "w04_preserved.las"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            write_las_file(temp_file, las)
+        messages = [str(w.message) for w in caught]
+        assert any(
+            "Single-section data will be preserved" in m for m in messages
+        ), f"Expected preservation warning, got {messages}"
+
+        reread = read_las_file_as_object(temp_file)
+        np.testing.assert_array_almost_equal(
+            reread.logs["DEPT"], np.array([1.0, 2.0])
+        )
+
+    # --- W-05: ~C must not be empty when data_sections provides curves ---
+
+    def test_single_data_section_emits_curve_definitions(
+        self, tmp_path: Path
+    ) -> None:
+        """W-05: LAS 2.0 with a single data_sections and empty top-level
+        curves must emit curve definitions in ~C, not an empty section.
+
+        Before the fix, ~C was emitted empty while ~A carried the data
+        columns — curve metadata (units/descriptions) was silently lost
+        and the data was discarded on re-read ('no curves are defined').
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="2.0", wrap="NO", dlm="SPACE")
+        las.well["STRT"] = "100.0"
+        las.well["STOP"] = "300.0"
+        las.well["STEP"] = "100.0"
+        las.well["NULL"] = "-999.25"
+
+        section = DataSection(
+            name="CURVE",
+            curves_order=["DEPT", "DT"],
+            section_curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M", description="Depth"),
+                CurveDefinition(mnemonic="DT", unit="US/M", description="Delta-T"),
+            ],
+            data={
+                "DEPT": np.array([100.0, 101.0]),
+                "DT": np.array([50.0, 51.0]),
+            },
+        )
+        las.data_sections.append(section)
+
+        temp_file = tmp_path / "w05_curve_defs.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(temp_file, las)
+
+        content = temp_file.read_text(encoding="utf-8")
+        curve_sec = content.split("~CURVE", 1)[1].split("~", 1)[0]
+        assert "DEPT.M" in curve_sec, (
+            f"~C missing DEPT definition: {curve_sec!r}"
+        )
+        assert "DT.US/M" in curve_sec, (
+            f"~C missing DT definition: {curve_sec!r}"
+        )
+
+        reread = read_las_file_as_object(temp_file)
+        assert [c.mnemonic for c in reread.curves] == ["DEPT", "DT"], (
+            f"Unexpected curves after roundtrip: "
+            f"{[c.mnemonic for c in reread.curves]}"
+        )
+        np.testing.assert_array_almost_equal(
+            reread.logs["DEPT"], np.array([100.0, 101.0])
+        )
+        np.testing.assert_array_almost_equal(
+            reread.logs["DT"], np.array([50.0, 51.0])
+        )
+
+    # --- W-06: guarded containers survive a write ---
+
+    def test_guards_survive_successful_write(self, tmp_path: Path) -> None:
+        """W-06: after a successful write, logs/curves must remain
+        guarded — invalid mutations are still rejected.
+
+        Before the fix, the writers' finally blocks restored plain
+        dict/list snapshots, permanently stripping the guards, so
+        ``logs[123] = ...`` was silently accepted."""
+        las = LASFile()
+        las.version = VersionSection(vers="2.0", wrap="NO", dlm="SPACE")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        temp_file = tmp_path / "w06_guards.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(temp_file, las)
+
+        with pytest.raises(TypeError):
+            las.logs[123] = np.array([1.0])
+        with pytest.raises(TypeError):
+            las.curves.append("not a curve")
+
+    def test_guards_survive_failed_write(self, tmp_path: Path) -> None:
+        """W-06/W-07: after a FAILED write, the model is restored to its
+        pre-write state and the containers remain guarded."""
+        las = LASFile()
+        las.version = VersionSection(vers="2.0", wrap="YES", dlm="SPACE")
+        las.well["STRT"] = "100.0"
+        las.well["STOP"] = "300.0"
+        las.well["STEP"] = "100.0"
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+        # Two data_sections force LASWriteError inside the write pass
+        # (multiple data_sections are only supported for LAS 3.0).
+        las.data_sections.append(
+            DataSection(name="A", curves_order=["DEPT"], data={"DEPT": np.array([1.0])})
+        )
+        las.data_sections.append(
+            DataSection(name="B", curves_order=["DEPT"], data={"DEPT": np.array([2.0])})
+        )
+
+        temp_file = tmp_path / "w06_failed.las"
+        with pytest.raises(LASWriteError):
+            write_las_file(temp_file, las)
+
+        # W-07: wrap restored to the pre-write value on failure.
+        assert las.version.wrap == "YES", (
+            f"wrap leaked to {las.version.wrap!r} after failed write"
+        )
+        # W-06: guards intact after the failed write.
+        with pytest.raises(TypeError):
+            las.logs[123] = np.array([1.0])
+
+    # --- W-08: parameter array_index roundtrip ---
+
+    def test_parameter_array_index_roundtrip(self, tmp_path: Path) -> None:
+        """W-08: a parameter with array_index but a non-bracket mnemonic
+        (RUN, not RUN[1]) must roundtrip with array_index preserved.
+
+        Before the fix, the writer emitted 'RUN' (no bracket) and the
+        parser reconstructs array_index only from bracket mnemonics, so
+        array_index was silently lost (1 → None)."""
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+        las.parameters.append(
+            ParameterEntry(
+                mnemonic="RUN",
+                unit="",
+                value="10",
+                description="Run number",
+                array_index=1,
+            )
+        )
+
+        temp_file = tmp_path / "w08_param_idx.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(temp_file, las)
+
+        content = temp_file.read_text(encoding="utf-8")
+        assert "RUN[1]" in content
+
+        reread = read_las_file_as_object(temp_file)
+        runs = [p for p in reread.parameters if p.mnemonic == "RUN[1]"]
+        assert len(runs) == 1, (
+            f"Expected RUN[1] parameter, got "
+            f"{[p.mnemonic for p in reread.parameters]}"
+        )
+        assert runs[0].array_index == 1
+
+    # --- W-09: curve array_info roundtrip ---
+
+    def test_curve_array_info_roundtrip_without_bracket_mnemonic(
+        self, tmp_path: Path
+    ) -> None:
+        """W-09: a curve with array_info but a non-bracket mnemonic
+        (NMR, not NMR[5]) must roundtrip with array_info preserved and
+        numeric data intact.
+
+        Before the fix, the writer emitted 'NMR' with {A:5}; the parser
+        reconstructs array_info only from bracket mnemonics, so the curve
+        was treated as string-format and its numeric data was
+        reclassified into string_data on re-read."""
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "NMR"]
+        las.curves.append(
+            CurveDefinition(
+                mnemonic="DEPT", unit="M", description="DEPTH", data_format="F"
+            )
+        )
+        las.curves.append(
+            CurveDefinition(
+                mnemonic="NMR",
+                unit="ms",
+                description="NMR Echo",
+                data_format="A",
+                array_info=ArrayElementInfo(
+                    base_name="NMR", index=5, time_offset=0.0
+                ),
+            )
+        )
+        las.logs["DEPT"] = np.array([100.0, 101.0])
+        las.logs["NMR"] = np.array([10.0, 11.0])
+
+        temp_file = tmp_path / "w09_array_info.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(temp_file, las)
+
+        content = temp_file.read_text(encoding="utf-8")
+        assert "NMR[5]" in content
+
+        reread = read_las_file_as_object(temp_file)
+        nmr = [c for c in reread.curves if c.mnemonic == "NMR[5]"]
+        assert len(nmr) == 1, (
+            f"Expected NMR[5] curve, got "
+            f"{[c.mnemonic for c in reread.curves]}"
+        )
+        assert nmr[0].is_array_element
+        assert nmr[0].array_info is not None
+        assert nmr[0].array_info.base_name == "NMR"
+        assert nmr[0].array_info.index == 5
+        # Numeric data must land in logs, NOT string_data.
+        assert "NMR[5]" in reread.logs
+        assert "NMR[5]" not in reread.string_data
+        np.testing.assert_array_almost_equal(
+            reread.logs["NMR[5]"], np.array([10.0, 11.0])
+        )
+
+
+class TestG8FixGroup:
+    """Regression tests for fix group G8 (W-01, N-I-15, N-I-16, N-I-17,
+    N-I-18, N-I-20) — LAS 3.0 writer duplicate-curve emission, per-section
+    curve scoping, 256-char line-limit gaps, string null/NaN guard, and
+    brace-token-in-description format extraction.
+    """
+
+    # --- W-01: duplicate curve emission in ~C ---
+
+    def test_w01_no_duplicate_curve_emission_across_sections(
+        self, tmp_path: Path
+    ) -> None:
+        """W-01: two LOG_DATA sections sharing DEPT emit DEPT once in ~C.
+
+        Before the fix, the first loop extended each section's curves with
+        NO dedup, so DEPT appeared twice in ~C and re-read inflated the
+        curve count (2→4) with phantom null-filled columns.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+
+        section1 = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "GR"],
+            section_curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"),
+                CurveDefinition(mnemonic="GR", unit="GAPI", data_format="F"),
+            ],
+            data={
+                "DEPT": np.array([100.0, 110.0]),
+                "GR": np.array([75.0, 80.0]),
+            },
+        )
+        section2 = DataSection(
+            name="LOG2",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "DT"],
+            section_curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"),
+                CurveDefinition(mnemonic="DT", unit="US/M", data_format="F"),
+            ],
+            data={
+                "DEPT": np.array([200.0, 210.0]),
+                "DT": np.array([50.0, 55.0]),
+            },
+        )
+        las.data_sections.append(section1)
+        las.data_sections.append(section2)
+
+        temp_file = tmp_path / "w01_dedup.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(temp_file, las)
+
+        content = temp_file.read_text(encoding="utf-8")
+        curve_block = content.split("~CURVE INFORMATION", 1)[1].split("~", 1)[0]
+        # DEPT must appear exactly once in the ~C block.
+        assert curve_block.count("DEPT.M") == 1, (
+            f"DEPT.M duplicated in ~C block: {curve_block!r}"
+        )
+
+    def test_w01_core_only_no_top_level_fallback(self, tmp_path: Path) -> None:
+        """W-01 Part 2: CORE-only files must NOT emit top-level curves in ~C.
+
+        A CORE_DATA file with section_curves carries its definitions in the
+        typed ~Core_Definition section; the old top-level fallback duplicated
+        them in ~C and re-read inflated the global curve count (2→4).
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["CORE_DEPTH", "CORE_VAL"]
+        las.curves.append(CurveDefinition(mnemonic="CORE_DEPTH", unit="M"))
+        las.curves.append(CurveDefinition(mnemonic="CORE_VAL", unit=""))
+
+        section = DataSection(
+            name="Core[1]",
+            section_type="CORE_DATA",
+            curves_order=["CORE_DEPTH", "CORE_VAL"],
+            section_curves=[
+                CurveDefinition(mnemonic="CORE_DEPTH", unit="M"),
+                CurveDefinition(mnemonic="CORE_VAL", unit=""),
+            ],
+            data={
+                "CORE_DEPTH": np.array([100.0]),
+                "CORE_VAL": np.array([1.5]),
+            },
+        )
+        las.data_sections.append(section)
+
+        temp_file = tmp_path / "w01_core.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(temp_file, las)
+
+        content = temp_file.read_text(encoding="utf-8")
+        curve_block = content.split("~CURVE INFORMATION", 1)[1].split("~", 1)[0]
+        # The ~C main block must NOT carry the core curves (they live in
+        # ~Core_Definition) — otherwise re-read doubles the curve count.
+        assert "CORE_DEPTH" not in curve_block, (
+            f"Top-level fallback duplicated core curves in ~C: {curve_block!r}"
+        )
+        assert "~Core_Definition" in content
+
+    # --- N-I-15: ~C fallback must warn for section curves absent from top-level ---
+
+    def test_ni15_warns_when_section_curve_absent_from_top_level(
+        self, tmp_path: Path
+    ) -> None:
+        """N-I-15: a LOG_DATA section curve absent from top-level curves
+        triggers a write-time warning instead of silent data loss."""
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+
+        section = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "GR", "RHOB"],  # GR/RHOB have no definitions
+            data={
+                "DEPT": np.array([100.0]),
+                "GR": np.array([75.0]),
+                "RHOB": np.array([2550.0]),
+            },
+        )
+        las.data_sections.append(section)
+
+        temp_file = tmp_path / "ni15_missing.las"
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            write_las_file(temp_file, las)
+            messages = [str(x.message) for x in w]
+        assert any("GR" in m and "no definition" in m for m in messages), (
+            f"Expected warning about GR missing definition, got: {messages}"
+        )
+
+    # --- N-I-16: 256-char line-limit gaps ---
+
+    def test_ni16_las12_column_header_warns(self, tmp_path: Path) -> None:
+        """N-I-16(a): the ~A column-header line is length-checked for LAS 1.2.
+
+        Before the fix the ~A header was appended AFTER _warn_long_header_lines
+        ran, so a 362-char column header produced 0 warnings while data rows
+        warned.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="1.2")
+        las.well["NULL"] = "-999.25"
+        names = [f"C{i:03d}" for i in range(60)]
+        las.curves_order = names
+        for n in names:
+            las.curves.append(CurveDefinition(mnemonic=n, unit="M"))
+            las.logs[n] = np.array([1.0])
+
+        temp_file = tmp_path / "ni16_header.las"
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            write_las_file(temp_file, las)
+            messages = [str(x.message) for x in w]
+        assert any("column-header" in m for m in messages), (
+            f"Expected ~A column-header warning, got: {messages[:5]}"
+        )
+
+    def test_ni16_las20_wrap_no_header_warns(self, tmp_path: Path) -> None:
+        """N-I-16(b): LAS 2.0 WRAP=NO header lines are length-checked.
+
+        Before the fix the header check was gated on is_las12 only, so a
+        LAS 2.0 WRAP=NO file with a 312-char ~W description produced 0
+        warnings despite the CWLS 256-char limit.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="2.0", wrap="NO", dlm="SPACE")
+        las.well["NULL"] = "-999.25"
+        las.well["COMP"] = "X" * 300
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        temp_file = tmp_path / "ni16_las20.las"
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            write_las_file(temp_file, las)
+            messages = [str(x.message) for x in w]
+        assert any("header line exceeds" in m for m in messages), (
+            f"Expected LAS 2.0 WRAP=NO header warning, got: {messages[:5]}"
+        )
+
+    # --- N-I-17: string curve None/NaN guard ---
+
+    def test_ni17_string_none_nan_written_as_sentinel(self, tmp_path: Path) -> None:
+        """N-I-17: None/NaN in string data must not be written as literal
+        "None"/"nan" strings — route to the '-' sentinel like the numeric
+        branch routes non-finite to the null sentinel."""
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "WELLID"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
+        las.curves.append(CurveDefinition(mnemonic="WELLID", unit="", data_format="S"))
+        las.logs["DEPT"] = np.array([100.0, 101.0, 102.0])
+
+        section = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "WELLID"],
+            section_curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"),
+                CurveDefinition(mnemonic="WELLID", unit="", data_format="S"),
+            ],
+            data={"DEPT": np.array([100.0, 101.0, 102.0])},
+            string_data={
+                "WELLID": np.array([None, "A", np.nan], dtype=object),
+            },
+        )
+        las.data_sections.append(section)
+
+        temp_file = tmp_path / "ni17_string_null.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(temp_file, las)
+
+        content = temp_file.read_text(encoding="utf-8")
+        data_part = content.split("~A", 1)[1] if "~A" in content else ""
+        # Literal "None"/"nan" must NOT leak into the data rows.
+        for bad in ("None", "nan"):
+            assert bad not in data_part, (
+                f"Literal {bad!r} leaked into data rows: {data_part!r}"
+            )
+
+    # --- N-I-18: brace-token-in-description ---
+
+    def test_ni18_user_brace_token_before_appended_format(
+        self, tmp_path: Path
+    ) -> None:
+        """N-I-18: a user description containing a format-brace token before
+        the writer-appended format must not mis-extract data_format.
+
+        Parser now prefers the TRAILING (writer-appended) format specifier;
+        previously it took the FIRST match, so user text "{F}" with real
+        data_format="E" roundtripped as data_format="F" (mis-extracted).
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["GR"]
+        las.curves.append(
+            CurveDefinition(
+                mnemonic="GR", unit="API",
+                description="Gamma {F} log", data_format="E",
+            )
+        )
+        las.logs["GR"] = np.array([75.0])
+
+        temp_file = tmp_path / "ni18_brace.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(temp_file, las)
+
+        reread = read_las_file_as_object(temp_file)
+        assert reread.curves[0].data_format == "E", (
+            f"data_format mis-extracted from user brace token: "
+            f"{reread.curves[0].data_format!r}"
+        )
+
+    def test_ni18_non_format_brace_preserved_with_real_format(
+        self, tmp_path: Path
+    ) -> None:
+        """N-I-18: non-format brace text ({Density}) stays in the description
+        while the writer-appended real format is extracted.  Previously the
+        FIRST match ({Density}) failed validation and cleared data_format,
+        losing the real format."""
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["RHOB"]
+        las.curves.append(
+            CurveDefinition(
+                mnemonic="RHOB", unit="G/C3",
+                description="Bulk {Density}", data_format="F",
+            )
+        )
+        las.logs["RHOB"] = np.array([2550.0])
+
+        temp_file = tmp_path / "ni18_density.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(temp_file, las)
+
+        reread = read_las_file_as_object(temp_file)
+        assert reread.curves[0].data_format == "F", (
+            f"real data_format lost: {reread.curves[0].data_format!r}"
+        )
+        assert "{Density}" in reread.curves[0].description, (
+            "user text {Density} lost: "
+            f"{reread.curves[0].description!r}"
+        )
+
+    # --- N-I-20: per-section curve-scope emission ---
+
+    def test_ni20_log_data_per_section_scope_roundtrip(
+        self, tmp_path: Path
+    ) -> None:
+        """N-I-20: LOG_DATA sections with distinct curve sets keep their own
+        scope on re-read — section 2's DT data must NOT land in the GR column.
+
+        Before the fix every LOG_DATA section hardcoded ``| CURVE``, so both
+        sections re-read scoped to the global union and section 2's columns
+        were silently relabeled (DT → GR).
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+
+        section1 = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "GR"],
+            section_curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"),
+                CurveDefinition(mnemonic="GR", unit="GAPI", data_format="F"),
+            ],
+            data={
+                "DEPT": np.array([100.0, 110.0]),
+                "GR": np.array([75.0, 80.0]),
+            },
+        )
+        section2 = DataSection(
+            name="LOG2",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "DT"],
+            section_curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"),
+                CurveDefinition(mnemonic="DT", unit="US/M", data_format="F"),
+            ],
+            data={
+                "DEPT": np.array([200.0, 210.0]),
+                "DT": np.array([50.0, 55.0]),
+            },
+        )
+        las.data_sections.append(section1)
+        las.data_sections.append(section2)
+
+        temp_file = tmp_path / "ni20_scope.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(temp_file, las)
+
+        content = temp_file.read_text(encoding="utf-8")
+        # Each section must pipe to its own per-section Definition, not the
+        # hardcoded ``| CURVE`` that destroyed per-section scope.
+        assert "| Log_Definition" in content, (
+            "Section 1 missing per-section Definition pipe"
+        )
+        assert "| Log_Definition_2" in content, (
+            "Section 2 missing per-section Definition pipe"
+        )
+
+        reread = read_las_file_as_object(temp_file)
+        by_name = {ds.name: ds for ds in reread.data_sections}
+        assert "LOG2" in by_name
+        # LOG2's DT column must hold the original DT values, not be relabeled.
+        dt_vals = by_name["LOG2"].data.get("DT")
+        assert dt_vals is not None
+        np.testing.assert_array_almost_equal(
+            np.asarray(dt_vals, dtype=float), np.array([50.0, 55.0])
+        )
+        gr_vals = by_name["LOG2"].data.get("GR")
+        assert gr_vals is None, (
+            "LOG2 should not have a GR column after per-section scoping"
+        )
+
+    def test_ni20_reread_top_level_curves_deduped(self, tmp_path: Path) -> None:
+        """EXT-03: N-I-20 per-section Definitions must not inflate the
+        top-level curve model on re-read.
+
+        The writer emits a deduped ~C block plus per-section
+        ~Log_Definition sections that RE-DECLARE curves already in ~C
+        (DEPT/GR for LOG, DEPT/DT for LOG2).  The parser registered every
+        Definition curve into the global curves/curves_order with no
+        cross-section dedup — the re-read top-level model inflated 3→7
+        (['DEPT','GR','DT','DEPT','GR','DEPT','DT']).  The final-assembly
+        dedup must collapse it back to the main ~C set while keeping
+        per-section data scoping intact.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+
+        section1 = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "GR"],
+            section_curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"),
+                CurveDefinition(mnemonic="GR", unit="GAPI", data_format="F"),
+            ],
+            data={
+                "DEPT": np.array([100.0, 110.0]),
+                "GR": np.array([75.0, 80.0]),
+            },
+        )
+        section2 = DataSection(
+            name="LOG2",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "DT"],
+            section_curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"),
+                CurveDefinition(mnemonic="DT", unit="US/M", data_format="F"),
+            ],
+            data={
+                "DEPT": np.array([200.0, 210.0]),
+                "DT": np.array([50.0, 55.0]),
+            },
+        )
+        las.data_sections.append(section1)
+        las.data_sections.append(section2)
+
+        temp_file = tmp_path / "ni20_dedup.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(temp_file, las)
+
+        reread = read_las_file_as_object(temp_file)
+        # Top-level curves dedupe to the main ~C set.
+        assert reread.curves_order == ["DEPT", "GR", "DT"], (
+            f"Top-level curves_order inflated: {reread.curves_order}"
+        )
+        assert len(reread.curves) == 3, (
+            f"Top-level curve definitions inflated: {len(reread.curves)}"
+        )
+        # Per-section scoping survives (the N-I-20 data-scoping guarantee).
+        by_name = {ds.name: ds for ds in reread.data_sections}
+        dt_vals = by_name["LOG2"].data.get("DT")
+        assert dt_vals is not None
+        np.testing.assert_array_almost_equal(
+            np.asarray(dt_vals, dtype=float), np.array([50.0, 55.0])
+        )
+        assert by_name["LOG2"].data.get("GR") is None
+
+
+class TestExt04IntegerRoundtripWriter:
+    """EXT-04 convergence: {I} curves with a fractional declared NULL must
+    survive a write→read roundtrip exactly.
+
+    Pre-fix, the writer rounded values above 2^53 through float64
+    (9007199254740993 → '9007199254740992.00000000') and the LAS 1.2/2.0
+    writer dropped the {I} marker, so re-read routed the column as float64
+    and the exact value was permanently lost on both version paths.
+    """
+
+    _VALUE = 9007199254740993  # 2^53 + 1 — not representable in float64
+
+    def _make_las(self, vers: str) -> LASFile:
+        las = LASFile()
+        las.version = VersionSection(vers=vers, wrap="NO", dlm="SPACE")
+        las.well["NULL"] = "-999.25"
+        las.well["STRT"] = "100.0"
+        las.well["STOP"] = "101.0"
+        las.well["STEP"] = "1.0"
+        las.curves_order = ["DEPT", "RUN_NO"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
+        las.curves.append(CurveDefinition(mnemonic="RUN_NO", unit="", data_format="I"))
+        las.logs["DEPT"] = np.array([100.0, 101.0])
+        las.logs["RUN_NO"] = np.array([self._VALUE, -999.25], dtype=object)
+        return las
+
+    @pytest.mark.parametrize("vers", ["2.0", "3.0"])
+    def test_integer_precision_write_read_roundtrip_exact(
+        self, tmp_path: Path, vers: str
+    ) -> None:
+        """Write a {I} curve with fractional NULL, re-read, and assert the
+        >2^53 value survives exactly and the null cell keeps -999.25."""
+        las = self._make_las(vers)
+        out = tmp_path / f"ext04_rt_{vers}.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+
+        content = out.read_text(encoding="utf-8")
+        # The {I} marker must be emitted even on LAS 1.2/2.0 — without it
+        # re-read routes the column as float64 and rounds >2^53 values.
+        assert "{I}" in content, (
+            "'{I}' marker missing from " + vers + " output"
+        )
+        # The >2^53 value must be written as its exact decimal.
+        assert "9007199254740993" in content, (
+            f"written value was rounded: {content!r}"
+        )
+
+        reread = read_las_file_as_object(out)
+        if vers == "3.0":
+            arr = reread.data_sections[0].data["RUN_NO"]
+        else:
+            arr = reread.logs["RUN_NO"]
+        assert int(arr[0]) == self._VALUE, (
+            f"write→read rounded {self._VALUE}: {arr[0]}"
+        )
+        assert arr[1] == -999.25, (
+            "null cell must keep the fractional sentinel"
+        )
+

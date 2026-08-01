@@ -286,3 +286,48 @@ class TestResolveMnemonic:
         assert resolve_mnemonic(uppered, "bk") == "BFV", (
             "bk must resolve to BFV"
         )
+
+
+class TestMnemBaseDualLaterologCollision:
+    """N-I-30: MNEM_BASE maps both LLD and LLS → BK → BFV.  Reading a
+    dual-laterolog file (both curves present) must not crash and the
+    duplicate-rename warning must mention mnem_base resolution (not claim
+    the file simply had repeated names)."""
+
+    def test_reader_rename_warning_mentions_mnem_base(self, tmp_path: Path) -> None:
+        import warnings
+
+        from pylasdev import read_las_file
+
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       :  Depth\n"
+            " LLD.OHMM     :  Laterolog deep\n"
+            " LLS.OHMM     :  Laterolog shallow\n"
+            "~A  DEPT  LLD  LLS\n"
+            "100.0  15.0  16.0\n"
+            "101.0  15.5  16.5\n"
+        )
+        test_file = tmp_path / "dual_laterolog.las"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            data = read_las_file(test_file, mnem_base=MNEM_BASE)
+
+        rename_warns = [
+            str(w.message)
+            for w in rec
+            if "renamed to" in str(w.message)
+        ]
+        # The reader renames the second resolved-BFV curve.
+        assert len(rename_warns) >= 1
+        assert "mnem_base" in rename_warns[0]
+        assert "repeated curve names" in rename_warns[0]
+        # Data survives under the deduplicated names.
+        assert "BFV" in data["logs"]

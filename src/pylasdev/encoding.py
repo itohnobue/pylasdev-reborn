@@ -57,6 +57,27 @@ FALLBACK_ENCODINGS = ["utf-8", "cp1251", "cp866", "cp1252", "latin-1"]
 # Sampling the first _MIN_VALIDATION_CHARS avoids scanning multi-GB files.
 _MIN_VALIDATION_CHARS = 65_536  # Sample first 64K chars/bytes for analysis
 
+# E-07: Cyrillic-detection sample window.  The byte-frequency and run-length
+# detectors below sample only the first _MIN_VALIDATION_CHARS bytes.  A
+# cp1251/cp866 file whose Cyrillic content lands beyond the first 64K (e.g.
+# large ~C/~O sections or long ASCII headers) is therefore invisible to both
+# signals and gets misdecoded as cp1252/latin-1 → silent mojibake of all
+# header strings.  Widening ONLY the Cyrillic detection samples (not the
+# word-char ratio sample, which must stay small for F-88 memory reasons)
+# lets those detectors see Cyrillic text further into the file.
+_CYRILLIC_DETECTION_CHARS = 1_048_576  # Sample first 1 MiB for Cyrillic signals
+
+# E-06: Near-tie margin for the Cyrillic-vs-Western selection.  Byte 0xB9
+# is "№" in cp1251 (not alnum) but "¹" in cp1252 (alnum), so any "№" in
+# the sample gives cp1252 a small but strict ratio advantage (~2.9%) over
+# cp1251.  The ratio-primary sort (load-bearing — see F-24 and the UTF-8
+# preference below) would then select cp1252 and decode the whole file as
+# mojibake.  When the content is judged Cyrillic and the best Western
+# candidate beats the best Cyrillic candidate by only this near-tie margin,
+# prefer the Cyrillic candidate.  Genuine encoding mismatches produce ratio
+# gaps >10%, so this never overrides a clear winner.
+_NEAR_TIE_CYRILLIC_MARGIN = 0.04  # 4% relative ratio gap
+
 
 def _has_cyrillic_text(text: str) -> bool:
     """Check if *text* contains any Cyrillic code points (U+0400-U+04FF)."""
@@ -232,7 +253,9 @@ def _decode_best_quality(
     _RUSSIAN_COMMON_BYTES = frozenset({
         0xE0, 0xE2, 0xE5, 0xE8, 0xEB, 0xED, 0xEE, 0xF0, 0xF1, 0xF2,
     })
-    _raw_sample = raw_bytes[:_MIN_VALIDATION_CHARS]
+    # E-07: Use the widened Cyrillic-detection window so Cyrillic content
+    # beyond the first 64K contributes to the byte-frequency signal.
+    _raw_sample = raw_bytes[:_CYRILLIC_DETECTION_CHARS]
     _russian_byte_count = sum(1 for b in _raw_sample if b in _RUSSIAN_COMMON_BYTES)
     _russian_byte_freq = _russian_byte_count / max(len(_raw_sample), 1)
     _is_cyrillic = _russian_byte_freq >= 0.10
@@ -241,8 +264,9 @@ def _decode_best_quality(
     # Decode with cp1251 (always succeeds) and check for concentrated
     # Cyrillic runs — 3+ consecutive Cyrillic chars strongly indicates
     # genuine Russian content regardless of byte-frequency.
+    # E-07: Use the same widened window for the run-length sample.
     if not _is_cyrillic:
-        _cp1251_sample = raw_bytes[:_MIN_VALIDATION_CHARS].decode(
+        _cp1251_sample = raw_bytes[:_CYRILLIC_DETECTION_CHARS].decode(
             "cp1251", errors="replace"
         )
         if _has_cyrillic_text(_cp1251_sample) and _max_cyrillic_run(_cp1251_sample) >= 3:
@@ -250,6 +274,26 @@ def _decode_best_quality(
     _preferred = _CYRILLIC_ENCS if _is_cyrillic else _WESTERN
     candidates.sort(key=lambda x: (-x[2], 0 if x[0] in _preferred else 1))
     best_enc, _best_sample, best_ratio = candidates[0]
+
+    # E-06: Near-tie Cyrillic preference.  The ratio-primary sort above is
+    # load-bearing (a preference-primary sort regresses UTF-8 Cyrillic), so
+    # we do not reorder candidates.  Instead, when the content is judged
+    # Cyrillic and the winning Western candidate (cp1252/latin-1) beats the
+    # best Cyrillic candidate by only the near-tie margin created by the
+    # "№" (0xB9) per-char advantage, prefer the Cyrillic candidate.  This
+    # leaves every other selection decision untouched.
+    if _is_cyrillic and best_enc in _WESTERN:
+        _best_cyrillic: tuple[str, str, float] | None = None
+        for _cand in candidates:
+            if _cand[0] in _CYRILLIC_ENCS:
+                _best_cyrillic = _cand
+                break
+        if _best_cyrillic is not None:
+            _cyr_enc, _cyr_sample, _cyr_ratio = _best_cyrillic
+            if best_ratio - _cyr_ratio <= _NEAR_TIE_CYRILLIC_MARGIN * best_ratio:
+                best_enc = _cyr_enc
+                _best_sample = _cyr_sample
+                best_ratio = _cyr_ratio
 
     # F-88: After selecting the winning encoding, re-decode the full
     # content from raw_bytes rather than returning the stored sample.

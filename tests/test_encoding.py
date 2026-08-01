@@ -382,3 +382,112 @@ class TestProductionCheckEncodingFix:
         assert len(text) > 0
         # The Russian text characters should be present in the decoded content
         assert "VERSION" in text
+
+
+class TestE06NumeroSignCyrillic:
+    """E-06: cp1251 files containing "№" (0xB9) must not decode as cp1252.
+
+    Byte 0xB9 is "№" in cp1251 (not alnum) but "¹" in cp1252 (alnum), so
+    any "№" in the sample gives cp1252 a small ratio advantage over cp1251.
+    The ratio-primary sort then selects cp1252 → full-file mojibake.  The
+    near-tie Cyrillic preference must override only that small margin.
+    """
+
+    def test_cp1251_with_numero_sign_detected_as_cp1251(
+        self, tmp_path: Path
+    ) -> None:
+        """E-06: a cp1251 Russian file with "№" decodes as cp1251, not cp1252."""
+        russian = "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410 \u2116 123 \u041c\u0415\u0421\u0422\u041e\u0420\u041e\u0416\u0414\u0415\u041d\u0418\u0415 \u041f\u041b\u0410\u0421\u0422 "
+        # "СКВАЖИНА № 123 МЕСТОРОЖДЕНИЕ ПЛАСТ "
+        mixed = ("WELL NAME : " + russian + "\n") * 50
+        test_file = tmp_path / "e06_numero_sign.las"
+        test_file.write_bytes(mixed.encode("cp1251"))
+
+        # Force chardet to fail (returns utf-8 as the fallback) so the
+        # quality-based fallback chain makes the decision.
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            enc, _text = read_with_encoding(test_file)
+        assert enc == "cp1251", (
+            f"E-06: cp1251 file with '№' misdecoded as {enc!r} (mojibake)"
+        )
+
+    def test_utf8_cyrillic_still_detected_after_fix(self, tmp_path: Path) -> None:
+        """E-06: UTF-8 Cyrillic must not regress to cp1251 (fix-regression guard)."""
+        russian = "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410 \u2116 123 \u041c\u0415\u0421\u0422\u041e\u0420\u041e\u0416\u0414\u0415\u041d\u0418\u0415 \u041f\u041b\u0410\u0421\u0422 "
+        mixed = ("WELL NAME : " + russian + "\n") * 50
+        test_file = tmp_path / "e06_utf8_cyrillic.las"
+        test_file.write_bytes(mixed.encode("utf-8"))
+
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="latin-1",
+        ):
+            enc, text = read_with_encoding(test_file)
+        assert enc == "utf-8", (
+            f"E-06: UTF-8 Cyrillic file misdecoded as {enc!r}"
+        )
+        assert "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410" in text
+
+
+class TestE07CyrillicBeyond64K:
+    """E-07: Cyrillic content beyond the first 64K must be detected.
+
+    The byte-frequency and run-length detectors previously sampled only
+    the first 64K bytes, so a cp1251/cp866 file whose Cyrillic text lands
+    beyond 64K (large ~C/~O sections or long ASCII headers) was invisible
+    to both signals → misdecoded as cp1252/latin-1 → silent mojibake.
+    """
+
+    def test_cp1251_cyrillic_beyond_64k_detected(self, tmp_path: Path) -> None:
+        """E-07: cp1251 Cyrillic beyond 64K decodes as cp1251."""
+        russian = "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410 \u0422\u0415\u0421\u0422 \u041c\u0415\u0421\u0422\u041e\u0420\u041e\u0416\u0414\u0415\u041d\u0418\u0415 \u041f\u041b\u0410\u0421\u0422 "
+        # ~70KB ASCII preamble pushes Cyrillic beyond the old 64K window.
+        preamble = ("# " + "X" * 77 + "\n") * 900
+        raw = preamble.encode("ascii") + (russian * 200).encode("cp1251") + b"\n"
+        test_file = tmp_path / "e07_beyond_64k.las"
+        test_file.write_bytes(raw)
+
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            enc, text = read_with_encoding(test_file)
+        assert enc == "cp1251", (
+            f"E-07: Cyrillic beyond 64K misdecoded as {enc!r}"
+        )
+        assert "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410" in text
+
+    def test_cp866_cyrillic_beyond_64k_detected(self, tmp_path: Path) -> None:
+        """E-07: cp866 Cyrillic beyond 64K is no longer misdecoded as latin-1.
+
+        Before the fix the first-64K sampling missed the Cyrillic tail, so
+        _is_cyrillic was False and the file fell to the Western tiebreak
+        (latin-1, raw control chars).  After widening the Cyrillic detection
+        samples, the file is recognized as Cyrillic — the selection must be
+        a Cyrillic encoding, never a Western one.  (Note: when the Cyrillic
+        tail lies beyond the F-88 ratio sample window, cp1251-vs-cp866
+        cannot be distinguished by ratio — both are valid Cyrillic results.)
+        """
+        russian = "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410 \u0422\u0415\u0421\u0422 \u041c\u0415\u0421\u0422\u041e\u0420\u041e\u0416\u0414\u0415\u041d\u0418\u0415 \u041f\u041b\u0410\u0421\u0422 "
+        preamble = ("# " + "X" * 77 + "\n") * 900
+        raw = preamble.encode("ascii") + (russian * 200).encode("cp866") + b"\n"
+        test_file = tmp_path / "e07_beyond_64k_cp866.las"
+        test_file.write_bytes(raw)
+
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            enc, text = read_with_encoding(test_file)
+        assert enc in ("cp1251", "cp866"), (
+            f"E-07: cp866 Cyrillic beyond 64K misdecoded as {enc!r}"
+        )
+        # Pre-fix the file fell to the Western tiebreak (latin-1).  Post-fix
+        # it is recognized as Cyrillic — the decoded text must contain
+        # Cyrillic code points, not raw Western control chars.
+        assert any(0x0400 <= ord(c) <= 0x04FF for c in text), (
+            "E-07: cp866 tail decoded without any Cyrillic characters"
+        )

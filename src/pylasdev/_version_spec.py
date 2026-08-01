@@ -85,11 +85,22 @@ class _LASVersionSpec:
     def mandatory_well_fields(self) -> tuple[str, ...]:
         """Mandatory well-section field mnemonics for the current version.
 
-        LAS 1.2, 2.0, and 3.0 all require STRT, STOP, STEP, NULL.
-        LAS 1.2 additionally requires WELL, LOC, SRVC, UWI (soft-required).
+        LAS 1.2 and 2.0 require the lascheck 10-field set for ~W:
+        STRT, STOP, STEP, NULL, COMP, WELL, FLD, LOC, SRVC, DATE.
+        LAS 3.0 requires the four numeric depth-control fields
+        (STRT, STOP, STEP, NULL).
+
+        M-11: UWI is NOT in lascheck's required set (it is optional when
+        present) — previously LAS 1.2 wrongly required it, producing a
+        false-positive "missing: UWI" warning on common files that carry no
+        UWI.  COMP/FLD/DATE were previously omitted, producing false
+        negatives.
         """
-        if self.is_las12:
-            return ("STRT", "STOP", "STEP", "NULL", "WELL", "LOC", "SRVC", "UWI")
+        if self.is_las12 or self.is_las20:
+            return (
+                "STRT", "STOP", "STEP", "NULL",
+                "COMP", "WELL", "FLD", "LOC", "SRVC", "DATE",
+            )
         return ("STRT", "STOP", "STEP", "NULL")
 
     # --- section structure rules -------------------------------------------
