@@ -34,3 +34,11 @@ parsetab.py
 
 # Test artifacts
 coverage.json
+
+# Agentic workflow (local tooling — not part of the repo)
+.opencode/
+AGENTS.md
+session.md
+opencode.json
+loop-tasks.txt
+loop-tasks-run.sh
