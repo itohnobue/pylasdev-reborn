@@ -1,5 +1,5 @@
 # Knowledge Base
-Last updated: 2026-08-02T16:13:21.562886
+Last updated: 2026-08-02T20:00:07.684819
 
 ## [dis-20260620063206-7fc4ae]
 Category: discovery
@@ -1207,13 +1207,6 @@ Changed: 2026-08-02T05:39:51.323343
 
 Cyrillic detector family: coordination and adjacency-scoping. The Cyrillic-vs-Western decision in encoding.py uses THREE independent detectors (byte-frequency, run-length, №-adjacency) — each has a DISTINCT failure mode, and a detector added to fix one failure can introduce another: M-57 byte-frequency false-positives on accent-dense Western text (realistic ñ-dense cp1252 -> 15.7% > 10% threshold -> whole file misdecoded cp1251, mojibake, zero warnings); M-82 run-length false-positives on Western cp1252 with >=3 consecutive accented bytes (Ñáñez -> decoded as Cyrillic Сбсez); M-81 №-density gap (genuine cp1251 №-rich files fail when № density > ~4% -> misdecoded cp1252; chardet does not rescue, conf 0.03-0.20); F-18 №-confirmation must require 0xB9 ADJACENT to the Cyrillic run, not whole-file membership — a lone Western '¹' (also byte 0xB9 in cp1252) plus any accented run elsewhere flips the file (encoding.py now uses _NUMERO_ADJACENCY_WINDOW). Checklist: every added encoding detector must be tested against the OTHER detectors' known false-positive classes (accent-dense Western, №-dense Cyrillic, multi-consecutive-accent Western); a detector that only ADDS detection (no false-positive guard) will misroute realistic files; per-char byte signatures need positional (adjacency) constraints, not just presence. Extends pat-20260801161435-e13efb; corrects the byte-frequency threshold claim in got-20260802053918-c67976.
 
-## [got-20260802053956-78111c]
-Category: gotcha
-Tags: python, pickle, slots, subclass, list, dict
-Changed: 2026-08-02T05:39:56.164332
-
-__slots__ on list/dict subclasses breaks unpickling: pickle.dumps works but loads raises AttributeError (e.g., _expected_type missing) because the default __reduce__ path for C-level container subclasses cannot restore slot state. In pylasdev-reborn, M-16 (_GuardedList.__slots__ in models.py) and M-48 (_DevColumns.__slots__) both reproduced: dumps OK / loads FAILS; grep __getstate__/__setstate__/__reduce__ -> 0 hits; no pickle tests. _GuardedDict (no __slots__) pickles fine — the asymmetry is the diagnostic giveaway. Every LASFile carries a _GuardedList (curves, params, etc.) and every DevFile a _DevColumns, so the entire object graph is unpicklable. Fix: add __getstate__/__setstate__ (or __reduce__) to any __slots__-using container subclass, or drop __slots__ on container subclasses. Checklist: grep for __slots__ in list/dict subclass definitions; for each, verify pickle roundtrip (dumps then loads) works; add a pickle regression test; check sibling classes for the dumps-OK/loads-fails asymmetry.
-
 ## [pat-20260802053958-275951]
 Category: pattern
 Tags: python, writer, parser, frozenset, order, column-swap, scoping
@@ -1235,13 +1228,6 @@ Changed: 2026-08-02T14:57:47.477148
 
 pylasdev Parser/Models boundary: mnem_base (incl. shipped MNEM_BASE) is OPT-IN on both read_las_file (default None) and LASFile.from_dict (default None) — default paths apply NO mnemonic normalization, so PXM-01/PXM-06 collision bugs (well last-wins, curve alias-first swap GK/GK_2) only trigger when caller passes mnem_base. from_dict curve-collision failure is order-dependent: [GR,GK] alias-first raises LASDataError (curves_order vs curves mismatch via shared _norm_curve_mnem closure state), canonical-first [GK,GR] passes. Well path has raw==resolved re-key branch (models.py:3306-3316); curve paths lack it. Parser VERS normalizes '1,2'->'2.0' but from_dict keeps verbatim -> write_las_file raises LASWriteError.
 
-## [got-20260802161321-d99bca]
-Category: gotcha
-Tags: wrap, data_reader, las
-Changed: 2026-08-02T16:13:21.384783
-
-F-07 wrap depth-line rule needs 'unambiguous' guard: bare 'first line full + any later n==1' misclassifies ragged non-wrapped [3,2,1] as wrapped (breaks H-02 null-fill). Refinement: window[1]==1 OR >=2 one-value rows. Validated 12 shapes.
-
 ## [pat-20260802161321-0c72c1]
 Category: pattern
 Tags: memory-cap, string, data_reader
@@ -1255,4 +1241,60 @@ Tags: dlm, comma, string
 Changed: 2026-08-02T16:13:21.552543
 
 I2-02 embedded-comma-in-string fix: csv.reader quote-awareness REJECTED (F2-015: writer emits raw delimiter.join(), no CSV quotes; quote parsing breaks writer roundtrips). Chose loud warning at _read_normal extra-columns site + count summary.
+
+## [got-20260802195912-698112]
+Category: gotcha
+Tags: wrap, data_reader, las30, curve-count, regression, parser
+Changed: 2026-08-02T19:59:12.039379
+
+F-07 wrap depth-line rule needs curve_count-aware gate: the 2-curve ambiguity (window[1]==1 after a full first row) is NOT unambiguous for curve_count==2 — the arm MUST be gated (curve_count >= 3 and window[1] == 1) or sum(1 for n in window[1:] if n == 1) >= 2, mirrored identically on BOTH wrap-detection paths (data_reader.py:641-644 AND _las30_data.py:364-367). PF-18 (HIGH regression): the s9 fix mirrored the las30 gate onto data_reader — the unconditional window[1]==1 arm misclassified a 2-curve LAS 1.2/2.0 WRAP=NO file with a short middle row (window [2,1,2]) as WRAPPED -> silent data corruption (genuine values discarded/misaligned). This SUPERSEDES the earlier refinement 'window[1]==1 OR >=2 one-value rows' which was curve_count-blind and regressed [2,1,2] nc=2. The >=2-one-value-rows arm alone catches genuine 2-curve wrapped files. Validated 12 shapes. Checklist: every wrap rule arm must be curve_count-aware; two-path parity is verified by comparing the gate expressions verbatim; regression-test the 2-curve WRAP=NO short-middle-row shape on both LAS 1.2 and LAS 2.0 plus string-padding.
+
+## [got-20260802195917-35c9c7]
+Category: gotcha
+Tags: python, pickle, slots, containers, __setitem__, validation, models
+Changed: 2026-08-02T19:59:17.208699
+
+Pickle on guarded containers: EVERY __slots__ container subclass with __setitem__-time validation breaks unpickling (dumps OK / loads AttributeError), because default unpickling restores items through __setitem__ BEFORE the slot is set. _GuardedDict (models.py, __slots__ + unconditional _check_column_array_like at :369) was the last slotted container missing __reduce__; _GuardedList (:565-579), _DevColumns (:5232), _DevColumnOrder (:5409) already had it. PF-09 (MEDIUM regression): adding __setitem__-time validation to a slotted container breaks pickle unless __reduce__/__setstate__ is added in the SAME change — the guard fired before _container_name was restored. Fix: __reduce__ reconstructs via __init__(dict(self)) (re-validates + sets slot), __setstate__ restores the slot. Checklist: any slotted container whose __setitem__ touches an instance slot needs __reduce__/__setstate__; add a pickle roundtrip test that verifies guards still raise post-unpickle; test BOTH non-empty (items restored through __setitem__) and empty containers.
+
+## [pat-20260802195933-a62aa6]
+Category: pattern
+Tags: python, parser, writer, sanitization, escape, roundtrip, symmetry
+Changed: 2026-08-02T19:59:33.551940
+
+Sanitize/desanitize scope symmetry: a desanitize (unescape) step must reverse EXACTLY the escape positions the paired writer emits — no more, no less. PF-02 (MEDIUM regression): the s8 fix made _parse_other run EVERY ~O line through blanket _desanitize_las_value, which unescaped '_~' -> '~' (a data-row escape the ~O writer NEVER emits) and mid-line '_#' (the ~O writer escapes ONLY line-start '#'-prefixed content) — genuine '_~weird line' and mid-line '_#literal_under' silently corrupted on write->read. Fix: scoped _desanitize_other_line (parser.py:612-655) reverses only '_#' at position 0 or preceded exclusively by leading whitespace. Fundamental limitation: a genuine line-start '_#literal_under' is byte-identical to a writer-escaped '#literal_under', so line-start '_#' CANNOT be both preserved and restored — document the achievable scope. Checklist: enumerate the writer's ACTUAL escape positions (grep _sanitize_las_value); the unescape must match them exactly; test genuine content that merely RESEMBLES escapes ('_~', mid-line '_#'); roundtrip both writer-produced escapes AND genuine lookalikes.
+
+## [pat-20260802195938-ae151e]
+Category: pattern
+Tags: python, parser, state-capture, deferral, section-transition, pipe-target
+Changed: 2026-08-02T19:59:38.564668
+
+Deferred-state snapshot completeness: when a parser snapshots state for deferred processing (capture/flush), the snapshot MUST include every attribute the deferred flush path reads — a missing field silently misroutes data. PF-01 (MEDIUM, incomplete PARS-06 fix): _CapturedState (_section_transition.py:62-70) had no pipe-target field; capture_current_state() snapshotted BEFORE classification but _process_consecutive_data restored curve indices + data-section type and NOT _current_pipe_target, so on A->A consecutive data sections the first section's forward '| X_Definition' pipe was never recorded in _deferred_pipe_targets and its replay scoped to __MAIN__ (DEPT/GR) instead of the piped _Definition (RHOB) — silent data mislabeling. Fix: add current_pipe_target to _CapturedState, capture it before classification, swap in/out in _process_consecutive_data like the other fields. Checklist: for every deferred-flush attribute the flush function reads, verify the snapshot struct has a field AND the restore path restores it; grep the flush path for all self._* reads and cross-check against the snapshot struct; A->A consecutive-section tests must exercise the full captured-state contract.
+
+## [pat-20260802195943-aafe5a]
+Category: pattern
+Tags: python, models, metadata, prefix, collision, to_dict, from_dict, roundtrip
+Changed: 2026-08-02T19:59:43.866343
+
+Reserved-prefix metadata vs user columns: when a metadata namespace prefix (e.g. _meta_) is reserved, to_dict AND from_dict must BOTH disambiguate by VALUE SHAPE (str/bytes/list[str]/None = metadata; array = user column), not by key presence alone — and BOTH directions must agree. PF-07 (MEDIUM, incomplete MOD-11 fix): to_dict collision check tested only the bare name (models.py:5827-5842) while from_dict tested f'_meta_{key}' in data (:6049), so a user column literally named _meta_source_file + bare source_file metadata caused LASDataError on roundtrip, and a DOUBLE collision (columns named both source_file AND _meta_source_file) silently OVERWROTE the _meta_source_file user column with the metadata string (data loss). Fix: extract a metadata-SHAPE predicate (_is_dev_metadata_shaped, models.py:172-210); apply it on BOTH sides; to_dict gains a double-collision guard (preserve both user columns, warn, skip metadata). Checklist: reserved-prefix handling must be shape-based, not name-based; every to_dict emission branch must mirror the from_dict classification branch; test the double-collision case (bare + prefixed user columns) — it must warn, not silently overwrite.
+
+## [pat-20260802195949-d76275]
+Category: pattern
+Tags: python, writer, curves_order, column-swap, order-source, case-insensitive, regression
+Changed: 2026-08-02T19:59:49.421096
+
+Metadata emission must use the SAME live order source as data rows: when ~C (metadata) and data rows are emitted from DIFFERENT order sources (cached curves list vs live curves_order), a post-construction mutation silently swaps columns on write->read. PF-22 (MEDIUM, incomplete I2-13 fix): the legacy ~A path emitted ~C from the cached 'curves' list while data rows emitted from live 'curves_order' — post-construction curves_order mutation (I2-13) produced a file whose ~C order disagrees with its data columns, and re-read silently swaps columns, with only a suppressible models warning. PF-21 (MEDIUM, incomplete I2-22): same class on the LAS 3.0 path — case-insensitive lookup missing in writer fallback loops (curves_by_mnem :332, _section_mnems :435) -> false warnings, ~C reorder, duplicate emission. Fix: emit metadata from the same live order structure the data rows use; apply consistent key normalization (e.g. .upper()) in EVERY lookup path the emission uses, not just the primary one. Checklist: identify every order source feeding an emission; they must be the SAME object; apply identical normalization in all fallback/primary lookup loops; mutation-after-construction tests must cover the legacy path, not just LAS 3.0.
+
+## [pat-20260802195954-b51168]
+Category: pattern
+Tags: python, writer, writeback, las30, copy-back, roundtrip, to_dict
+Changed: 2026-08-02T19:59:54.100880
+
+Copy-back/writeback must transfer ALL distinguishing fields, not just identity fields: when a fix propagates a curve/attribute to a top-level structure (writeback), copying only mnemonic+array_info but NOT the stripped description leaks state on roundtrip. PF-19 (MEDIUM, incomplete L30-01 fix): F2-07 writeback (_las30_data.py:891-905) copied mnemonic/array_info but not the stripped description -> to_dict leaked the {A:0} marker and the no-data_sections write path double-emitted '{A:0} {A:0}'. Fix: extend writeback to copy the stripped description (same source the section curve uses). Checklist: when writeback/copy-back copies a curve, enumerate ALL fields the roundtrip (parse->to_dict, write) depends on — identity (mnemonic/array_info) AND descriptive (description, unit, format) fields; test the no-data_sections write path AND parse->to_dict; the marker/format text must not leak into output twice.
+
+## [got-20260802200007-ac0a13]
+Category: gotcha
+Tags: python, dev-reader, thousands-separator, performance, quadratic, dos
+Changed: 2026-08-02T20:00:07.674857
+
+Thousands-separator recombination must be linear single-pass: re-scanning or pair-restarting inside _recombine_thousands_separators makes it O(n^2) on long token rows. I2-18 (CONFIRMED MEDIUM): clean quadratic benchmark 0.10s -> 27.65s @ 16K tokens, ~18min @ 100K — a crafted file is a DoS. Fix: single linear pass with first-run exact-fit (only the FIRST pair that produces the expected column count is merged per the gate), per-pair warnings on subsequent merges. Complements the corruption-family gotcha (got-20260802054001-11a495): the fix must be BOTH correct (multi-separator/signed/headerless/delimiter-aware) AND linear. Checklist: benchmark recombination on >=16K-token rows after any change; avoid nested loops over the token list; the 'first pair only' gate must not degrade into per-pair restarts.
 
