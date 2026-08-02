@@ -61,6 +61,49 @@ def _scalars_equal(a: Any, b: Any) -> bool:
         return False
 
 
+def _allclose_symmetric(
+    arr1: np.ndarray,
+    arr2: np.ndarray,
+    rtol: float,
+    atol: float,
+) -> bool:
+    """Symmetric tolerance comparison of two numeric arrays.
+
+    ``np.allclose`` references the *second* operand for the relative
+    tolerance (``|a - b| <= atol + rtol * |b|``), which makes
+    ``compare_las_dicts(d1, d2)`` disagree with
+    ``compare_las_dicts(d2, d1)`` at the tolerance boundary.  Reference
+    the larger magnitude instead so the result is order-independent:
+
+        |a - b| <= atol + rtol * max(|a|, |b|)
+
+    NaN is treated as equal to NaN and ``inf`` to ``inf`` (with the same
+    sign) — matching ``np.allclose(..., equal_nan=True)`` semantics.
+
+    Integer operands are promoted to float64 before the diff/abs/tol
+    computation (mirroring ``np.isclose``'s own promotion via
+    ``np.result_type(y, 1.)``): native-dtype int64 subtraction/abs wraps
+    in two's complement for large magnitudes (``abs(-2**63)`` stays
+    negative), which would otherwise produce wrong "equal" verdicts for
+    far-apart integer values (F-17).
+    """
+    if arr1.dtype.kind in "iu":
+        arr1 = arr1.astype(np.float64)
+    if arr2.dtype.kind in "iu":
+        arr2 = arr2.astype(np.float64)
+    with np.errstate(invalid="ignore"):
+        # Only positions where BOTH operands are finite participate in
+        # the tolerance check; non-finite positions are matched below.
+        both_finite = np.isfinite(arr1) & np.isfinite(arr2)
+        diff = np.abs(arr1 - arr2)
+        tol = atol + rtol * np.maximum(np.abs(arr1), np.abs(arr2))
+        close = (diff <= tol) & both_finite
+    equal_nan = np.isnan(arr1) & np.isnan(arr2)
+    equal_pos_inf = np.isposinf(arr1) & np.isposinf(arr2)
+    equal_neg_inf = np.isneginf(arr1) & np.isneginf(arr2)
+    return bool(np.all(close | equal_nan | equal_pos_inf | equal_neg_inf))
+
+
 def _compare_arrays(
     arr1: np.ndarray,
     arr2: np.ndarray,
@@ -110,9 +153,7 @@ def _compare_arrays(
         if isinstance(arr2, np.ma.MaskedArray):
             arr2 = arr2.astype(np.float64).filled(np.nan)  # type: ignore[attr-defined]  # MaskedArray.astype preserves mask
         try:
-            if not np.allclose(
-                arr1, arr2, rtol=rtol, atol=atol, equal_nan=True
-            ):
+            if not _allclose_symmetric(arr1, arr2, rtol, atol):
                 logger.warning("Array values mismatch at '%s'", label)
                 return False
         except (ValueError, TypeError):
@@ -280,6 +321,71 @@ def compare_las_dicts(
 # ──────────────────────────────────────────────────────────────
 
 
+def _has_nan(obj: Any) -> bool:
+    """Check if obj or any nested element is NaN or masked.
+
+    Masks are treated as NaN-equivalent because masked values are
+    filled with NaN before comparison (``_compare_arrays``) and then
+    matched via equal_nan=True.
+    """
+    if isinstance(obj, (float, np.floating)):
+        return obj != obj
+    if isinstance(obj, np.ndarray):
+        # Descend into array elements: a size-1 NaN array would otherwise
+        # slip past the guard and be compared by direct equality, where
+        # NaN != NaN makes two identical arrays look UNEQUAL (M-30).
+        if isinstance(obj, np.ma.MaskedArray):
+            mask = obj.mask
+            if mask is not np.ma.nomask and np.any(mask):
+                return True
+        if obj.dtype.kind in "fiu":
+            try:
+                return bool(np.isnan(obj).any())
+            except TypeError:
+                return False
+        return False
+    if isinstance(obj, list):
+        return any(_has_nan(x) for x in obj)
+    if isinstance(obj, dict):
+        return any(_has_nan(v) for v in obj.values())
+    return False
+
+
+def _list_to_numeric_array(lst: list[Any]) -> np.ndarray | None:
+    """Convert a homogeneous numeric list to a float64 ndarray.
+
+    All elements must be real numbers (int/float/np.number/np.bool_),
+    numeric ndarrays, or masked values (filled with NaN).  Returns None
+    for empty lists and lists containing non-numeric elements (strings,
+    dicts, tuples, None, ragged list-of-arrays, ...) so callers fall
+    back to element-wise comparison.
+    """
+    if not lst:
+        return None
+    for item in lst:
+        if isinstance(item, np.ndarray):
+            # MaskedArray IS-A ndarray (including the masked scalar
+            # singleton): masked elements are filled with NaN below;
+            # numeric dtype required either way.
+            if item.dtype.kind not in "fiu":
+                return None
+        elif isinstance(item, (int, float, np.integer, np.floating, np.bool_)):
+            continue
+        else:
+            return None
+    # Fill masked elements with NaN explicitly (avoids numpy's
+    # "converting a masked element to nan" warning and mirrors the
+    # MaskedArray handling in _compare_arrays).
+    cleaned = [
+        np.ma.filled(item, np.nan) if isinstance(item, np.ma.MaskedArray) else item
+        for item in lst
+    ]
+    try:
+        return np.asarray(cleaned, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+
+
 def _compare_lists(
     l1: Any,
     l2: Any,
@@ -289,24 +395,22 @@ def _compare_lists(
 ) -> bool:
     """Compare two lists that may contain numpy arrays.
 
-    Tries direct list equality first.  When numpy arrays inside the list
-    cause ValueError/TypeError (ambiguous truth value), falls back to
-    per-element comparison using ``_coerce_and_compare``.
+    Homogeneous numeric lists are compared with ``np.allclose`` via
+    ``_compare_arrays`` so rtol/atol apply consistently with the ndarray
+    path (M-58) — including size-1 ndarray elements and NaN/masked
+    elements (M-30, M-33).  Other lists fall back to direct equality,
+    routing to per-element comparison when numpy ambiguity or NaN
+    requires it.
     """
+    arr1 = _list_to_numeric_array(l1)
+    arr2 = _list_to_numeric_array(l2)
+    if arr1 is not None and arr2 is not None:
+        return _compare_arrays(arr1, arr2, label, rtol, atol)
+
     try:
         # Check for NaN values before shortcut comparison — NaN != NaN
         # evaluates True without raising ValueError/TypeError, bypassing
         # per-element comparison that correctly handles NaN==NaN.
-        def _has_nan(obj: Any) -> bool:
-            """Check if obj or any nested element is NaN."""
-            if isinstance(obj, (float, np.floating)):
-                return obj != obj
-            if isinstance(obj, list):
-                return any(_has_nan(x) for x in obj)
-            if isinstance(obj, dict):
-                return any(_has_nan(v) for v in obj.values())
-            return False
-
         if _has_nan(l1) or _has_nan(l2):
             raise ValueError  # Route to per-element comparison
         if l1 != l2:

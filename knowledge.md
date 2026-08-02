@@ -1,5 +1,5 @@
 # Knowledge Base
-Last updated: 2026-08-01T16:32:50.003462
+Last updated: 2026-08-02T05:40:01.564507
 
 ## [dis-20260620063206-7fc4ae]
 Category: discovery
@@ -163,13 +163,6 @@ Tags: python, parser, validation, state-machine
 Changed: 2026-07-17T16:46:13.747235
 
 Premature state flag before validation: Setting boolean success flags (`self._version_found = True`) at function entry before any line validation causes silent suppression of error conditions. When a flag is set unconditionally before `_match_data_line` returns, sections containing only garbage/non-matching lines are still marked 'found' — suppressing the 'missing mandatory section' error and producing spurious downstream warnings against incorrect defaults. Fix: move the flag set INSIDE the successful match branch, so it only fires when actual valid data was parsed. In pylasdev-reborn: `_parse_version()` at parser.py:861 set `_version_found = True` before any validation; if all lines in the ~V section failed to match, the flag stayed True, suppressing the real error.
-
-## [got-20260717164618-499710]
-Category: gotcha
-Tags: python, encoding, detection, cyrillic, byte-analysis
-Changed: 2026-07-17T16:46:18.204140
-
-Encoding detection: character-based analysis on decoded samples is unreliable when the decoding itself maps bytes to ambiguous code points. In pylasdev-reborn `_decode_best_quality()`, a `_has_cyrillic` check inspecting `candidates[0][1]` (cp1251-decoded sample) for Cyrillic code points (U+0400-U+04FF) gave false positives for Western European files: cp1251 maps Western accented bytes (0xC0-0xFF) to Cyrillic code points — ANY file with accented Latin characters (e, a, e) produced `_has_cyrillic = True`, causing the tiebreaker to prefer cp1251 and produce Cyrillic mojibake. Fix: byte-frequency analysis on RAW bytes (before decoding). Count frequency of bytes corresponding to the top-10 most common Russian letters in cp1251 (`{0xE0, 0xE2, 0xE5, 0xE8, 0xEB, 0xED, 0xEE, 0xF0, 0xF1, 0xF2}`) — Russian text has 25-57% frequency, Western text 2-5%. A 10% threshold unambiguously separates them. This is independent of any encoding's byte-to-character mapping.
 
 ## [pat-20260717164621-1e2924]
 Category: pattern
@@ -1150,3 +1143,88 @@ Tags: python, performance, hot-path, memory, benchmark
 Changed: 2026-08-01T16:15:19.059999
 
 Per-value hot-path costs in data reading: hoist flag lookups, prefer math module over numpy for Python scalars, pre-allocate numeric columns, and resource guards must count intermediate phases. IT3-F-01: _desanitize_las_value re-runs full import machinery per value via thread-local __getattr__ (1.04-1.07 µs/value; 2.05x end-to-end read slowdown) — cache the flag once per read. IT3-F-02: np.isfinite/np.isnan/np.isinf on Python scalars are 15.3x slower than math.isfinite (semantically identical for Python floats) — swap per-value scalar checks to math module; leave array-vectorized numpy uses. IT3-F-03: _read_wrapped accumulates every value as Python float (~32B/value) then converts at end — 1.80x peak-RSS delta at 3M values; MAX_TOTAL_ELEMENTS counts final arrays only, so the intermediate list phase bypasses the OOM guard's intent — pre-allocate numeric columns or cap the intermediate phase. N-I-26: 9 unbounded str.split() sites in delimiter-detection bypass G-18 token-cap (102.8MB RSS growth on 0.58MB file, 177x amplification) — bound with maxsplit. Checklist: profile per-value loops; grep thread-local/import-machinery lookups in hot loops; math.* for Python scalar checks, np.* only for arrays; pre-allocate arrays; every str.split() bounded. In pylasdev-reborn: IT3-F-01, IT3-F-02, IT3-F-03, N-I-26 — 4 CONFIRMED (measured).
+
+## [got-20260802053918-c67976]
+Category: gotcha
+Tags: python, encoding, detection, cyrillic, byte-analysis
+Changed: 2026-08-02T05:39:18.889349
+
+Encoding detection: character-based analysis on decoded samples is unreliable when the decoding itself maps bytes to ambiguous code points. In pylasdev-reborn _decode_best_quality(), a _has_cyrillic check inspecting candidates[0][1] (cp1251-decoded sample) for Cyrillic code points (U+0400-U+04FF) gave false positives for Western European files: cp1251 maps Western accented bytes (0xC0-0xFF) to Cyrillic code points. Fix: byte-frequency analysis on RAW bytes (before decoding). Count frequency of bytes corresponding to the top-10 most common Russian letters in cp1251 ({0xE0, 0xE2, 0xE5, 0xE8, 0xEB, 0xED, 0xEE, 0xF0, 0xF1, 0xF2}) — Russian text runs 25-57% frequency, typical Western text 2-5%. CORRECTION (2026-08-02, M-57 CONFIRMED): the 10% threshold is a heuristic, NOT a universal separator — accent-dense Western text false-positives: a realistic Spanish/Portuguese cp1252 file (ñ-dense) measures 15.7% > 10% and is misdecoded as cp1251 (mojibake, zero warnings). Do not treat the threshold as unambiguous; pair the byte-frequency detector with the other detectors (run-length, №-adjacency — see the Cyrillic detector-family pattern) and validate against accent-dense Western inputs.
+
+## [pat-20260802053925-61425d]
+Category: pattern
+Tags: python, regression, fix-coordination, structural-fix, hotspot
+Changed: 2026-08-02T05:39:25.152354
+
+Regressing-function structural hardening: when a function is re-fixed for the same defect class (2+ PRIOR_FIX_ATTEMPT findings in the same ~45-line block), leaf patches are the wrong tool — apply a structural fix satisfying the FULL decision contract, not just the current repro. In pylasdev-reborn _is_mnemonic_header_row (data_reader.py:781-853) was re-fixed 3x in ONE session (F-01, F-03, F-19 then M-01/M-02/M-03): each leaf patch fixed one repro shape while sibling shapes stayed broken or a new regression appeared (M-02 string-row drop at the new wrapped call site). The structural fix that ended the cycle: (a) token-count equality — only a full-width row (len(values) == curve_count) can be a header; (b) all-string exclusion — a section with only string curves is never a header; (c) match set = resolved ∪ original_mnemonics (mnem_base-aware); (d) replace drop-with-warning on pre-scan undercount with geometric grow-and-continue (_allocated doubles; whole-container growth via dict.__setitem__ preserving the equal-length invariant). Process requirements: localized pre-fix audit BEFORE the fix pass + second-opinion reviewer on the fix agent (hotspot rule). Checklist: after a function is fixed twice for one defect class, stop patching leaves; enumerate the full contract; fix the root structure; regression-test EVERY previously-broken input class (M-01/M-02/M-03 repro shapes: mnem_base header, wrapped mixed-section, all-string section).
+
+## [pat-20260802053927-4cb0be]
+Category: pattern
+Tags: python, regex, performance, dos-protection, family, pre-fix-audit
+Changed: 2026-08-02T05:39:27.751449
+
+Regex ReDoS families require whole-family hardening: catastrophic-backtracking regexes come in FAMILIES within one module — fixing one pattern's ReDoS leaves sibling patterns with the same backtracking structure quadratic. In pylasdev-reborn, commit 3f18608 fixed DATA_LINE_PATTERN's O(n^3) and added _SAFE_REGEX_LINE_LENGTH but left FORMAT_SPEC_PATTERN (H-04: 22-44s per line at 48KB, 712x amplification, ~61-122h CPU per 500MB file), VALUE_ONLY fallback (M-60), and unescape-colons re.sub (M-61) quadratic — asymmetric-fix regression verified via git show (3f18608 never touched FORMAT_SPEC_PATTERN). The fix required a localized pre-fix audit of the whole regex family + unified hardening (bounded matcher / fast-path scan / line-length guard), landing on all siblings together. Checklist: when fixing a regex ReDoS, grep the module for ALL sibling regexes with the same backtracking structure (optional quantifiers, nested repetition, alternation over long runs); run a pre-fix audit covering every sibling before fixing; fix the family together or add a shared guard; regression-test each pattern with adversarial inputs proving linear time. This is the regex-specific instance of the parallel-code-path omission pattern (pat-20260720071838-171ab7).
+
+## [pat-20260802053933-1c5213]
+Category: pattern
+Tags: workflow, fix-coordination, edit-density, dispatch, process
+Changed: 2026-08-02T05:39:33.391567
+
+Fix-dispatch completeness: when splitting confirmed findings across fix agents (e.g., by edit-density 8-per-file / 12-per-agent caps), a confirmed finding can be silently DROPPED — never assigned to any fix agent. In pylasdev-reborn, M-76 (multi-thousands-separator corruption) was CONFIRMED and on the fix list but absent from ALL 14 fix task prompts (grep 0 hits) — discovered only by post-fix VERIFY (F-02, HIGH as filed: fix-completeness). The edit-density split is a coordination artifact that can lose findings; F-04 (M-38 las30-side) was a second dispatch gap — the 2.0-side fix was dispatched, the 3.0-side implementation never received it. Fix: after assembling fix-agent task prompts, mechanically verify EVERY confirmed finding ID appears in at least one task prompt (grep the prompt corpus for each ID); a finding with 0 hits is a dispatch gap. Cross-file findings need one hit per file-owner agent. Checklist: build the confirmed-finding ID list; grep every fix task prompt for each ID; every ID must have >=1 hit; cross-file findings >=2 hits; re-check after any scope split.
+
+## [pat-20260802053935-9b4b26]
+Category: pattern
+Tags: testing, regression, false-confidence, pre-fix, falsifiability
+Changed: 2026-08-02T05:39:35.727803
+
+Vacuous regression tests: a regression test that passes on PRE-FIX code provides zero regression value — it cannot catch the regression it claims to guard. The s9 test-quality pass found 5 vacuous tests guarding the highest-value fixes (H-04 ReDoS, H-01 scoping) with no effective protection. Five failure modes: (a) WRONG INPUT SHAPE — H-04 test used 100 lines x single '{'+550A (linear on pre-fix) instead of MANY unclosed braces on ONE line (the quadratic trigger, 22s pre-fix); (b) BRANCH ROUTING — H-01 test used pipe-qualified ~LOG_DATA + classic ~C, routing around the changed bare-~LOG_DATA branch; (c) WRONG DATA TYPE — M-32 test used Python lists (exact-equal, symmetric pre-fix) instead of ndarrays (tolerance-asymmetric pre-fix); (d) FALSE CONTRACT — M-76 space test had ZERO separators and asserted recombination the comma-gated code cannot perform; (e) WRONG ASSERTION TARGET — M-04 test asserted section data while the bug corrupted top-level logs, and used fill values == declared NULL so the buggy write path never executed. MECHANICAL GATE: run every new regression test against the PRE-FIX tree; if it passes, it is vacuous — fix input shape/branch/type/target until it fails on pre-fix and passes on post-fix. This is the operational test of the general rule in pat-20260721180622-4f55ad.
+
+## [pat-20260802053941-5ce3d0]
+Category: pattern
+Tags: python, wrap-detection, las30, reader, contract, declared_wrap
+Changed: 2026-08-02T05:39:41.198498
+
+Wrap-detection two-path contract: wrap detection is implemented TWICE — LAS 1.2/2.0 path (data_reader._detect_actual_wrap) and LAS 3.0 path (_las30_data._detect_actual_wrap_las30) — and the two implementations drift, so a wrap fix must land on BOTH. This session: H-02 (2.0 majority-vote misclassifies when ~C declares MORE curves than ~A rows — every line short -> WRAPPED -> half the rows dropped, columns shifted), M-05 (WRAP=NO + genuinely wrapped data misparsed; 3.0 path has no content-based detection while 2.0 parses the same data correctly), M-07 (3.0 COMMA/TAB wrap decision made on FIRST data line only), M-38 (mixed-wrap first-line-full misdetected as non-wrapped, DEPT polluted — warnings fire but misdiagnose), F-04 (3.0 helper short-circuits return False on first-full-line with NO declared_wrap fall-through — dispatch gap), F-05 (H-02 uniform-short-row guard omitted in 3.0 helper -> WRAP=NO short-row files REJECTED with a factually wrong error, pre-fix parsed OK). Coherent contract: majority vote over >=3 lines, curve_count-aware, declared_wrap (WRAP=YES) fall-through in BOTH paths, content-based detection on 3.0 too, warnings that correctly attribute the failure mode (short-row vs misdetection). Fixes must be mirrored across both implementations — dispatching a wrap fix to one path alone is an asymmetric-fix regression. See pat-20260801161344-fc653b for the corroboration core.
+
+## [pat-20260802053943-dd5df5]
+Category: pattern
+Tags: python, container-guard, reconcile, trim, grow, interaction
+Changed: 2026-08-02T05:39:43.175885
+
+Whole-container reconcile vs per-key guards: internal whole-container reconciliation (trimming or growing ALL curve arrays to a common length) must NOT trip per-assignment length guards — it needs an explicit bypass path. In pylasdev-reborn, the F-01 fix's F36 whole-container trim (las_file.logs[curve_name] = arr[:current_line]) tripped the M-43 per-key _check_value_length guard -> spurious crash (HIGH F-01); the FIX-CONV-2 G-04 grow uses dict.__setitem__ whole-container growth to preserve the equal-length invariant, mirroring _GuardedDict.trim_all's bypass (models.py:302-303). Design rule: when a guarded container enforces equal-length via per-key validation, whole-container resize operations (trim/grow/sync-all) bypass per-key guards; per-key mutation stays guarded. The invariant (equal-length) and the guard (per-key) must be separated. Checklist: when adding a per-key length guard, verify internal reconcile paths have a bypass; when adding a reconcile, use the bypass not per-key assignment; document the invariant-vs-guard separation; test both trim (overcount) and grow (undercount) directions.
+
+## [pat-20260802053948-f668cb]
+Category: pattern
+Tags: python, numpy, int64, overflow, comparison, allclose, twos-complement
+Changed: 2026-08-02T05:39:48.203459
+
+int64 subtraction overflow in hand-rolled allclose: np.allclose promotes operands to float64 internally, but hand-rolled symmetric-allclose implementations that diff/abs in native dtype WRAP on int64 overflow (two's complement): [-2**63] vs [0] compares EQUAL (diff wraps to -2**63, abs(-2**63) is still -2**63 -> within rtol) when the values are plainly unequal. F-17 (compare.py _allclose_symmetric): int64 subtraction/abs overflow -> wrong True; -2^63 is a common int64 missing-sentinel and {I} int64 curves are produced by the library's own reader. The M-32 symmetric-allclose fix REINTRODUCED this class (np.allclose's implicit promotion was the only thing masking it before). Fix: promote BOTH operands to float64 (astype(np.float64)) BEFORE diff/abs, matching np.allclose semantics; MaskedArray operands must also be promoted (existing filled(np.nan) path). Checklist: in any comparison computing diff = a - b or abs(a - b) on integer dtypes, promote to float64 first; test with [-2**63] vs [0] and [2**63-1] vs [0]; verify symmetric argument swap gives the same answer; re-check when replacing np.allclose with a hand-rolled implementation.
+
+## [pat-20260802053951-54b7bd]
+Category: pattern
+Tags: python, encoding, cyrillic, detection, mojibake, adjacency, false-positive
+Changed: 2026-08-02T05:39:51.323343
+
+Cyrillic detector family: coordination and adjacency-scoping. The Cyrillic-vs-Western decision in encoding.py uses THREE independent detectors (byte-frequency, run-length, №-adjacency) — each has a DISTINCT failure mode, and a detector added to fix one failure can introduce another: M-57 byte-frequency false-positives on accent-dense Western text (realistic ñ-dense cp1252 -> 15.7% > 10% threshold -> whole file misdecoded cp1251, mojibake, zero warnings); M-82 run-length false-positives on Western cp1252 with >=3 consecutive accented bytes (Ñáñez -> decoded as Cyrillic Сбсez); M-81 №-density gap (genuine cp1251 №-rich files fail when № density > ~4% -> misdecoded cp1252; chardet does not rescue, conf 0.03-0.20); F-18 №-confirmation must require 0xB9 ADJACENT to the Cyrillic run, not whole-file membership — a lone Western '¹' (also byte 0xB9 in cp1252) plus any accented run elsewhere flips the file (encoding.py now uses _NUMERO_ADJACENCY_WINDOW). Checklist: every added encoding detector must be tested against the OTHER detectors' known false-positive classes (accent-dense Western, №-dense Cyrillic, multi-consecutive-accent Western); a detector that only ADDS detection (no false-positive guard) will misroute realistic files; per-char byte signatures need positional (adjacency) constraints, not just presence. Extends pat-20260801161435-e13efb; corrects the byte-frequency threshold claim in got-20260802053918-c67976.
+
+## [got-20260802053956-78111c]
+Category: gotcha
+Tags: python, pickle, slots, subclass, list, dict
+Changed: 2026-08-02T05:39:56.164332
+
+__slots__ on list/dict subclasses breaks unpickling: pickle.dumps works but loads raises AttributeError (e.g., _expected_type missing) because the default __reduce__ path for C-level container subclasses cannot restore slot state. In pylasdev-reborn, M-16 (_GuardedList.__slots__ in models.py) and M-48 (_DevColumns.__slots__) both reproduced: dumps OK / loads FAILS; grep __getstate__/__setstate__/__reduce__ -> 0 hits; no pickle tests. _GuardedDict (no __slots__) pickles fine — the asymmetry is the diagnostic giveaway. Every LASFile carries a _GuardedList (curves, params, etc.) and every DevFile a _DevColumns, so the entire object graph is unpicklable. Fix: add __getstate__/__setstate__ (or __reduce__) to any __slots__-using container subclass, or drop __slots__ on container subclasses. Checklist: grep for __slots__ in list/dict subclass definitions; for each, verify pickle roundtrip (dumps then loads) works; add a pickle regression test; check sibling classes for the dumps-OK/loads-fails asymmetry.
+
+## [pat-20260802053958-275951]
+Category: pattern
+Tags: python, writer, parser, frozenset, order, column-swap, scoping
+Changed: 2026-08-02T05:39:58.691584
+
+Order-insensitive set comparison for order-sensitive output: using set/frozenset equality for scoping or identity decisions when column ORDER is semantically meaningful silently swaps columns. M-66/M-68 (_writer_las30.py): writer compares frozensets of curve names to decide whether a section's curves match the main block — {GR, DEPT} == {DEPT, GR}, so a section with the SAME curve-name set but DIFFERENT column order roundtrips with GR/DEPT data silently SWAPPED, zero corruption warnings. M-83: same dedup region, mnemonic-only key drops the second section's desc/api_code (W-01 compares unit/format only). The parser-side scope resolution (main_curve_end pipe branch, M-67/M-69) must mirror the writer's per-section scoping — H-01's fix did not cover the pipe branch, giving two failure directions (frozen-at-0 -> whole LOG_DATA discarded; unfrozen -> None -> phantom columns). Fix: when output ordering matters (per-section column order, scoping), compare order-sensitive structures (tuples, sequences) or emit explicit per-section definitions — never frozenset/set equality on ordered data. Checklist: grep frozenset/set comparisons in writer/parser scoping and dedup; verify ordering is preserved; test with same-set-different-order sections; dedup keys must include distinguishing attributes (unit/format/desc) not just the name.
+
+## [got-20260802054001-11a495]
+Category: gotcha
+Tags: python, dev-reader, thousands, separator, locale, headerless, signed
+Changed: 2026-08-02T05:40:01.554188
+
+Thousands-separator recombination edge cases: _recombine_thousands_separators (dev_reader.py) has a family of silent-corruption cases beyond the basic 1,234.5: (a) MULTI-SEPARATOR values (>=1e6, 2+ separators) only PARTIALLY recombined — the len(values)==expected+1 gate merges the FIRST pair only, true value destroyed (M-76: 6-token no recombine at all; 5-token MD=1234.0, X=567.8); (b) SIGNED values fail the isdigit gate — '-1,234.5' skips its true pair and a later genuine adjacent pair is merged 600+500->600500, with the warning citing the WRONG pair (M-53); (c) HEADERLESS files never recombined — the gate requires non-empty names, and the M-52 fix's _expected_cols = len(names) if names else len(values)-1 made first headerless rows ALWAYS eligible, merging genuine 2-col headerless comma files into one column (F-07 regression); (d) the gate is DELIMITER-BLIND — semicolon locale-decimal values NaN with a misleading warning while detection says parseable (F-13). Fix: iterate consecutive pairs (not just the first), use a numeric-aware check (try float() not isdigit), gate recombination on unambiguous evidence (delimiter-aware AND not-headerless-first-row), and warn with the ACTUAL merged pair. Checklist: test multi-separator, signed, headerless-comma, and semicolon-locale inputs; a fix must be comma-gated AND header-aware; regression-test the pre-fix corruption shape.
+

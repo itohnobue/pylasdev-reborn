@@ -74,11 +74,9 @@ _DEV_ALIASES: dict[str, str] = {
     # Easting (X) variants
     "UTMX": "X",
     "EW": "X",            # Petrel east-west
-    "DX": "X",            # Petrel X offset
     # Northing (Y) variants
     "UTMY": "Y",
     "NS": "Y",            # Petrel north-south
-    "DY": "Y",            # Petrel Y offset
     # Self-mappings — canonical names must map to themselves
     # so that lowercased canonical names (e.g. "md", "azi") are
     # normalised to uppercase rather than silently preserving the
@@ -89,6 +87,14 @@ _DEV_ALIASES: dict[str, str] = {
     "AZI": "AZI",
     "X": "X",
     "Y": "Y",
+    # M-21: DX/DY are Petrel grid-north OFFSET columns, semantically
+    # distinct from the absolute X/Y coordinates.  They must NOT alias
+    # to X/Y: on real Petrel files (test_data/sample.dev) that fabricated
+    # X_2/Y_2 columns with factually-wrong duplicate warnings ("DX was
+    # never named X") and destroyed the offset-vs-absolute distinction.
+    # Keep them as their own identities.
+    "DX": "DX",           # Petrel X offset (grid-north, distinct from X)
+    "DY": "DY",           # Petrel Y offset (grid-north, distinct from Y)
 }
 
 
@@ -222,6 +228,31 @@ def _is_float_token(token: str) -> bool:
         return False
 
 
+def _is_float_token_comma_decimal(token: str) -> bool:
+    """``_is_float_token`` with comma-decimal locale conversion applied.
+
+    M-54: The whitespace detection path previously checked raw tokens, so a
+    space-delimited comma-decimal first row (``"1,5 2,0 3,0"``) fell through
+    to simple-format detection and was consumed as a fabricated header (first
+    data row lost).  Mirror the semicolon path (V-07) so locale-style tokens
+    are recognised as data in the whitespace path too.
+
+    M-25: A 3-digit comma group (``"1,234"``) is a THOUSANDS separator, not a
+    locale decimal — it is NOT treated as a float here (consistent with
+    :func:`_dev_to_finite_float`'s gating).  Locale decimals in practice use
+    1-2 fractional digits (``"1,00"``/``"1,50"``).
+
+    Args:
+        token: Raw data token (already whitespace-stripped).
+
+    Returns:
+        True when the token parses as a finite float after locale conversion.
+    """
+    if _THOUSANDS_GROUP_RE.match(token) is not None:
+        return False
+    return _is_float_token(_convert_comma_decimal(token))
+
+
 # --- Locale-style number handling (V-07 / V-08) ---
 
 # Comma-decimal locale token: digits with a single comma as the decimal
@@ -230,10 +261,33 @@ def _is_float_token(token: str) -> bool:
 # use a comma for the decimal point.
 _COMMA_DECIMAL_RE = re.compile(r"^([+-]?\d+),(\d+)$")
 
+# Thousands-separator token: digits with a comma followed by EXACTLY three
+# digits (e.g. "1,234", "-12,345").  In space/tab/semicolon-delimited files
+# a 3-digit comma group is a THOUSANDS separator, not a locale decimal —
+# silently converting "1,234" to "1.234" corrupts US-locale files by 1000x
+# (M-25).  Locale decimals in practice use 1-2 fractional digits (V-07
+# documents "1,00"/"1,50"), so the 3-digit group is treated as thousands
+# and left unconverted (with a warning) instead of mis-converted.
+_THOUSANDS_GROUP_RE = re.compile(r"^([+-]?\d+),(\d{3})$")
+
 # Suffix fragment of a thousands-separator number as it appears after
 # comma-splitting a comma-delimited data row: exactly 3 digits followed by
-# an optional decimal/exponent part (e.g. "234.5" from "1,234.5").
-_THOUSANDS_FRAG_RE = re.compile(r"^\d{3}(?:\.\d+)?(?:[eE][+-]?\d+)?$")
+# a decimal or exponent part (e.g. "234.5" from "1,234.5").
+# M-23: The decimal/exponent part is REQUIRED.  A bare 3-digit fragment
+# (e.g. "450" from "100,450") is ambiguous with a genuine extra-column
+# row — both "100" and "450" are plausible standalone column values, so
+# merging them silently corrupts real data.  Only a fragment carrying a
+# fractional/exponent part is an unambiguous thousands continuation.
+_THOUSANDS_FRAG_RE = re.compile(r"^\d{3}(?:\.\d+|[eE][+-]?\d+)$")
+
+# Intermediate group of a thousands-separated number as it appears after
+# comma-splitting a comma-delimited data row: EXACTLY 3 bare digits (e.g.
+# "234" in "1,234,567.8").  M-76: a value with 2+ separators splits into
+# multiple fragments — a prefix, one or more bare 3-digit groups, and a
+# final 3-digit group with a decimal/exponent part.  Only the FINAL group
+# may carry the fractional/exponent part (_THOUSANDS_FRAG_RE); intermediate
+# groups are bare so they are distinguished from genuine extra columns.
+_THOUSANDS_GROUP_BARE_RE = re.compile(r"^\d{3}$")
 
 
 def _convert_comma_decimal(value: str) -> str:
@@ -263,18 +317,83 @@ def _dev_to_finite_float(
     value_str: str,
     null_value: float,
     _failure_counter: list[int] | None = None,
+    _thousands_counter: list[int] | None = None,
+    _comma_as_thousands: bool = True,
 ) -> float:
     """Convert a DEV data token to a finite float.
 
     Thin wrapper around :func:`data_reader._to_finite_float` that first
     applies comma-decimal locale conversion (V-07) so values like
     ``"1,00"`` parse as ``1.00`` instead of NaN.
+
+    M-25: The conversion is gated so a 3-digit comma group (``"1,234"``)
+    is treated as a THOUSANDS separator, not a locale decimal.  In
+    space/tab-delimited files the unconditional conversion previously
+    corrupted US-locale thousands values by 1000x (``1,234`` -> ``1.234``)
+    with zero warnings.  Thousands-style tokens are left unconverted (they
+    will fail :func:`_to_finite_float` and be counted in
+    ``_failure_counter``) and counted in ``_thousands_counter`` so the
+    caller can emit one summary warning per file.
+
+    F-13: The thousands gate is DELIMITER-AWARE.  The semicolon path
+    documents a locale-decimal convention (V-07: ``;`` delimiter + ``,``
+    decimal separator), so a semicolon file whose tokens contain 3-digit
+    comma groups (``"1,234"``) previously became NaN with a misleading
+    thousands warning while the semicolon DETECTION path converted them
+    ungated — an internal detection/parse inconsistency.  Callers pass
+    ``_comma_as_thousands=False`` for semicolon delimiters so 3-digit
+    comma groups convert as locale decimals there, aligning parse with
+    detection.  Space/tab delimiters keep the gate (US thousands are the
+    unambiguous reading) and 1-2 digit V-07 locale decimals
+    (``"1,00"``/``"1,50"``) convert regardless.
     """
+    if _comma_as_thousands and _THOUSANDS_GROUP_RE.match(value_str) is not None:
+        if _thousands_counter is not None:
+            _thousands_counter[0] += 1
+    else:
+        value_str = _convert_comma_decimal(value_str)
     return _to_finite_float(
-        _convert_comma_decimal(value_str),
+        value_str,
         null_value,
         _failure_counter=_failure_counter,
     )
+
+
+def _is_thousands_prefix(token: str) -> bool:
+    """Whether a token is a bare integer thousands prefix, optionally signed.
+
+    ``str.isdigit()`` only accepts 0-9, so a signed value like ``"-1"`` (from
+    ``"-1,234.5"``) was never recombined while a later genuine adjacent pair
+    could be merged in its place — wrong-pair corruption (M-53).
+
+    Args:
+        token: Candidate thousands prefix (e.g. ``"1"``, ``"-1"``, ``"+1"``).
+
+    Returns:
+        True when the token is an integer (possibly signed), False otherwise.
+    """
+    body = token[1:] if token[:1] in "+-" else token
+    return body.isdigit()
+
+
+def _is_valid_thousands_leading_group(token: str) -> bool:
+    """Whether a token is a valid leading group of a thousands-separated number.
+
+    Thousands grouping separates digits into groups of three from the right,
+    so the leading group holds 1-3 digits (``"1"``, ``"12"``, ``"123"``).  A
+    4+ digit leading group before a comma (``"1000"`` in ``"1000,250.5"``) is
+    NOT a valid thousands format — it is a genuine extra column in a
+    multi-column headerless row (F-07).
+
+    Args:
+        token: Candidate leading group (e.g. ``"1"``, ``"-12"``, ``"1000"``).
+
+    Returns:
+        True when the token is an integer of 1-3 digits (optionally signed),
+        False otherwise.
+    """
+    body = token[1:] if token[:1] in "+-" else token
+    return body.isdigit() and len(body) <= 3
 
 
 def _recombine_thousands_separators(
@@ -284,11 +403,35 @@ def _recombine_thousands_separators(
 
     In comma-delimited files a value like ``1,234.5`` is split by the
     delimiter into two tokens (``"1"`` and ``"234.5"``), silently shifting
-    every subsequent column (V-08).  When a row has exactly one extra token
-    beyond the declared column count, consecutive tokens matching the
-    thousands pattern (a short integer prefix + a 3-digit suffix, optionally
-    with a decimal part) are recombined into a single value with the comma
-    removed (``"1,234.5"`` → ``"1234.5"``).
+    every subsequent column (V-08).  When a row has surplus tokens beyond
+    the declared column count, consecutive tokens matching the thousands
+    pattern (a short integer prefix + 3-digit groups with the final one
+    carrying a decimal/exponent part) are recombined into a single value
+    with the commas removed (``"1,234.5"`` → ``"1234.5"``).
+
+    M-23: Recombination fires only when the thousands interpretation is
+    unambiguous.  A bare 3-digit fragment (``"100,450"`` → prefix ``"100"``,
+    fragment ``"450"``) is just as likely to be two real columns in a
+    genuine extra-column row; it is left alone so the existing extra-column
+    handling discards the surplus token instead of silently merging real
+    values.
+
+    M-53: The prefix check accepts an optional sign (``"-1"``, ``"+1"``) via
+    :func:`_is_thousands_prefix`.  The merged value keeps the sign
+    (``"-1" + "234.5"`` → ``"-1234.5"``).  The first-match early return also
+    guarantees that when the true thousands pair is signed, a later genuine
+    adjacent pair is never merged in its place.
+
+    M-76: Values with 2+ thousands separators (``"1,234,567.8"``, e.g. a UTM
+    northing) comma-split into THREE or more fragments and previously only
+    the LAST adjacent pair was merged — the leading fragment became a
+    standalone column and the true value was destroyed.  The gate is relaxed
+    from ``len(values) == expected + 1`` to ``len(values) > expected``, and
+    the ENTIRE consecutive run of thousands fragments (prefix + bare 3-digit
+    groups + final 3-digit group with a decimal/exponent part) is merged so
+    every separator is recombined.  Bare intermediate groups are still only
+    merged when a final decimal/exponent fragment closes the run, preserving
+    M-23's unambiguity rule.
 
     Args:
         values:   Tokens from a comma-delimited data row.
@@ -298,18 +441,32 @@ def _recombine_thousands_separators(
         Tuple of ``(recombined_token_list, original_fragment, merged_value)``
         when a recombination applies, or ``None`` when none does (row already
         matches the expected count, has multiple extra tokens, or contains
-        no thousands pattern).
+        no unambiguous thousands run).
     """
-    if len(values) != expected + 1:
+    if len(values) <= expected:
         return None
     for i in range(len(values) - 1):
-        if values[i].isdigit() and _THOUSANDS_FRAG_RE.match(values[i + 1]):
-            merged = values[i] + values[i + 1]
-            return (
-                [*values[:i], merged, *values[i + 2:]],
-                f"{values[i]},{values[i + 1]}",
-                merged,
-            )
+        if not _is_thousands_prefix(values[i]):
+            continue
+        # Merge the whole consecutive run: prefix + zero or more bare
+        # 3-digit groups + a final 3-digit group carrying a decimal or
+        # exponent part.  Without a closing decimal/exponent fragment the
+        # bare groups are genuine columns, not thousands fragments.
+        merged = values[i]
+        j = i + 1
+        while j < len(values) and _THOUSANDS_GROUP_BARE_RE.match(values[j]):
+            merged += values[j]
+            j += 1
+        if j < len(values) and _THOUSANDS_FRAG_RE.match(values[j]):
+            merged += values[j]
+            j += 1
+        else:
+            continue
+        return (
+            [*values[:i], merged, *values[j:]],
+            ",".join(values[i:j]),
+            merged,
+        )
     return None
 
 
@@ -424,6 +581,46 @@ def _split_delimited_line(
     return [v.strip() for v in tokens[:max_tokens]]
 
 
+def _all_lines_are_data_or_count(
+    lines: list[tuple[int, str]], max_tokens: int
+) -> bool:
+    """M-74/M-75: whether every line before the comma/semicolon-bearing line
+    is headerless DATA or a column-count prefix.
+
+    The comma/semicolon pre-checks must only declare headerless when the
+    first content line is itself data (all-float tokens) or a single-integer
+    column-count prefix.  A text column header (``"MD TVD X Y"``), a Petrel
+    well-header (``"WELL-1 1000.0 2000.0"``), or a DUG title before the
+    comma-bearing DATA line means the file HAS a header — declaring headerless
+    consumes that header as the first data row, destroying every column
+    (M-74: space/tab header + comma FLOAT data → all-NaN) or losing
+    columns/rows (M-75: DUG-A, Petrel space well-header, semicolon header).
+    The I2F-30 count-prefix shapes (``"4\\n1.0,2.0,3.0,4.0\\n"``) still fire:
+    a single-integer pre-line is a count prefix, not a header.
+
+    Args:
+        lines:     Content entries (``(line_index, stripped_content)``)
+                   that precede the first comma/semicolon-bearing line.
+        max_tokens: Token safety cap from data_reader.
+
+    Returns:
+        True only when every pre-line is data or a count prefix.
+    """
+    for _entry in lines:
+        _tokens = _entry[1].split(maxsplit=max_tokens)
+        if len(_tokens) == 1:
+            try:
+                int(_tokens[0])
+            except ValueError:
+                pass
+            else:
+                continue
+        if _tokens and all(_is_float_token(t) for t in _tokens):
+            continue
+        return False
+    return True
+
+
 def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int]:
     """Detect DEV file format from first few content lines.
 
@@ -469,10 +666,35 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
     # line is a column count (e.g. "4\\n1.0,2.0,3.0,4.0") has no comma on
     # line 1, causing the original check to miss the comma and fall through
     # to DUG Pattern A detection, consuming the first data row as a header.
-    _comma_texts = [entry[1] for entry in content_entries[:3] if "," in entry[1]]
-    if _comma_texts:
+    # M-74/M-75: The comma pre-check must only declare headerless when the
+    # FIRST content line is itself data (all-float tokens) or a column-count
+    # prefix (single integer).  When the first comma-bearing line is preceded
+    # by a text header (space/tab header + comma FLOAT data → M-74 total
+    # all-NaN destruction; DUG count + text header, Petrel space well-header,
+    # semicolon header → M-75 column/row loss), declaring headerless consumes
+    # that header as the first data row.  Falling through lets the
+    # whitespace/DUG/Petrel detection examine the header and the F-01
+    # delimiter auto-correction rescue mixed-delimiter files.  The I2F-30
+    # count-prefix shapes ("4\\n1.0,2.0,3.0,4.0\\n") still fire because a
+    # single-integer pre-line is a count prefix, not a header.  Canonical
+    # DUG-B (comma data at content entry index 3, outside this [:3] window)
+    # is untouched.
+    _comma_idx: int | None = None
+    _comma_text: str | None = None
+    for _idx, _entry in enumerate(content_entries[:3]):
+        if "," in _entry[1]:
+            _comma_idx = _idx
+            _comma_text = _entry[1]
+            break
+    if (
+        _comma_text is not None
+        and _comma_idx is not None
+        and (
+            _comma_idx == 0
+            or _all_lines_are_data_or_count(content_entries[:_comma_idx], _max_tokens)
+        )
+    ):
         # Use the first comma-containing line for token analysis.
-        _comma_text = _comma_texts[0]
         comma_tokens = [t.strip() for t in _comma_text.split(",", maxsplit=_max_tokens) if t.strip()]
         if comma_tokens:
             float_tokens = [t for t in comma_tokens if _is_float_token(t)]
@@ -539,29 +761,30 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                             and len(content_entries) >= 3
                         ):
                             try:
-                                dug_count = int(first_line_tokens[0])
+                                int(first_line_tokens[0])
                             except ValueError:
                                 pass
                             else:
-                                if dug_count == len(comma_tokens):
-                                    # N-I-24: count-prefix comma file — skip
-                                    # the count line (("headerless", 1)) so
-                                    # Pass 2 derives columns from the first
-                                    # real data line (matches the whitespace
-                                    # I2F-001/N-I-24 contract).
-                                    return ("headerless", 1)
-                        # Not DUG Pattern A — check second line for matching
-                        # column count (numeric column names like "100,200,300").
-                        if len(content_entries) >= 2:
-                            second_comma_tokens = [
-                                t.strip()
-                                for t in content_entries[1][1].split(",", maxsplit=_max_tokens)
-                                if t.strip()
-                            ]
-                            if len(second_comma_tokens) == len(comma_tokens):
-                                return ("simple", 1)
-                        # No second line or mismatch — ambiguous.
-                        # Treat as headerless data (safer default).
+                                # N-I-24 / M-51: count-prefix comma file — skip
+                                # the count line (("headerless", 1)) so Pass 2
+                                # derives columns from the first real data line
+                                # (matches the whitespace I2F-001/N-I-24
+                                # contract).  The guard fires on count-MISMATCH
+                                # too: a count-prefix file whose declared count
+                                # disagrees with the data token count is still
+                                # headerless; the old mismatch path fell through
+                                # to ("simple", 1) (count becomes header → all
+                                # NaN) or ("headerless", 0) (count becomes data
+                                # → 3 of 4 columns lost).
+                                return ("headerless", 1)
+                        # M-50: V-13 contract — ANY all-integer first row is
+                        # headerless DATA, not integer column headers.  The
+                        # comma path's second-line count-match previously
+                        # returned ("simple", 1), consuming the first station
+                        # ("0,0,45") as fabricated numeric column names; the
+                        # whitespace path (V-13) returns ("headerless", 0) for
+                        # the same input.  Apply the same guard here: every
+                        # non-count-prefix all-integer comma first row is data.
                         return ("headerless", 0)
                     else:
                         # Non-integer float tokens (e.g. "1.5,2.3,3.7")
@@ -580,17 +803,16 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                             and len(content_entries) >= 3
                         ):
                             try:
-                                dug_count = int(first_line_tokens[0])
+                                int(first_line_tokens[0])
                             except ValueError:
                                 pass
                             else:
-                                if dug_count == len(comma_tokens):
-                                    # N-I-24: count-prefix comma file — skip
-                                    # the count line (("headerless", 1)) so
-                                    # Pass 2 derives columns from the first
-                                    # real data line (matches the whitespace
-                                    # I2F-001/N-I-24 contract).
-                                    return ("headerless", 1)
+                                # N-I-24 / M-51: count-prefix comma file — skip
+                                # the count line (("headerless", 1)) so Pass 2
+                                # derives columns from the first real data line.
+                                # Fires on count-MISMATCH too (see the
+                                # all-integer branch above).
+                                return ("headerless", 1)
                         return ("headerless", 0)
                 else:
                     # Single-column all-float comma token — headerless data.
@@ -632,9 +854,26 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
     # treated as headerless.  Comma-decimal tokens (e.g. "1,00") are
     # normalised before the float check so locale-style data is detected
     # as well (V-07 family).
-    _semi_texts = [entry[1] for entry in content_entries[:3] if ";" in entry[1]]
-    if _semi_texts:
-        _semi_text = _semi_texts[0]
+    # M-75: Same ordering guard as the comma pre-check — only declare
+    # headerless when the first content line is data or a count prefix.
+    # A semicolon-bearing DATA line preceded by a text header (e.g.
+    # space header + semicolon data) must fall through so the header is
+    # examined instead of being consumed as the first data row.
+    _semi_idx: int | None = None
+    _semi_text: str | None = None
+    for _idx, _entry in enumerate(content_entries[:3]):
+        if ";" in _entry[1]:
+            _semi_idx = _idx
+            _semi_text = _entry[1]
+            break
+    if (
+        _semi_text is not None
+        and _semi_idx is not None
+        and (
+            _semi_idx == 0
+            or _all_lines_are_data_or_count(content_entries[:_semi_idx], _max_tokens)
+        )
+    ):
         semi_tokens = [
             t.strip()
             for t in _semi_text.split(";", maxsplit=_max_tokens)
@@ -661,7 +900,22 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 second_tokens = content_entries[1][1].split(maxsplit=_max_tokens)
                 # F-ITER2-D3-M05: Primary check — any non-float token in the
                 # second line means it's a header (text column names).
-                if any(not _is_float_token(t) for t in second_tokens):
+                # M-24: EXCEPT when the non-float tokens are known missing-data
+                # sentinels ("na", "null", ...).  A count-prefix headerless file
+                # whose first data row carries a sentinel (e.g.
+                # "4\n1.0 2.0 3.0 na\n...") is DATA with missing values, not a
+                # text column header — returning DUG consumed that row as
+                # fabricated numeric column names.  Mirror the F-021 sentinel
+                # check (below) on the second line: sentinel-only non-float
+                # tokens fall through to the all-float handling (count-match →
+                # headerless, skip the count line).
+                _non_float_second = [
+                    t for t in second_tokens if not _is_float_token(t)
+                ]
+                if _non_float_second and not all(
+                    t.lower().strip() in _DEV_SENTINELS
+                    for t in _non_float_second
+                ):
                     return ("dug", 2)
                 # Secondary heuristic — when ALL second-line tokens parse as
                 # floats (e.g. numeric column names "100 200 300"), check if
@@ -691,11 +945,12 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                     # mirroring the comma I2F-30 count-prefix handling.
                     return ("headerless", 1)
                 # F-DV01: Count-mismatch fallback — when the second line is
-                # all-float but the count doesn't match the first line's
-                # integer, it's STILL DUG format (not headerless) as long as
-                # there are 3+ content entries (i.e. data lines exist beyond
-                # the header).  Without >=3 guard a 2-line file like
-                # "100\\n50.0\\n" is too ambiguous — it stays headerless.
+                # all-float (or sentinel-bearing data per M-24) but the count
+                # doesn't match the first line's integer, the file is
+                # AMBIGUOUS between DUG-with-numeric-header and headerless
+                # data with an off-by-1-2 column-count prefix.  Without >=3
+                # guard a 2-line file like "100\\n50.0\\n" is too ambiguous —
+                # it stays headerless.
                 # F-01: Require len(second_tokens) > 1 to prevent single-column
                 # headerless files (e.g. "100\\n200\\n300\\n") from being
                 # misdetected as DUG format.  A DUG file with only 1 column is
@@ -707,13 +962,45 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 # as DUG.  Genuine DUG count mismatches are typically off by 1-2
                 # tokens; a 33x mismatch means the first line is data, not a count.
                 #
-                # I2F-001: Only fire for genuine count mismatches (count !=
-                # token count).  When count == token count the case above
-                # covers it (fall-through to headerless for all-float).
-                elif len(second_tokens) > 1 and len(content_entries) >= 3 and all(
-                    _is_float_token(t) for t in second_tokens
-                ) and col_count <= len(second_tokens) + 1:
-                    return ("dug", 2)
+                # I2F-001 (M-20): Apply the same data-preserving all-float guard
+                # as the count-match branch above.  The old fallback returned
+                # ("dug", 2) for an all-float second line, consuming the first
+                # data row as numeric column names whenever the count was off
+                # by 1-2 — a headerless count-prefix file like "2\n0 0 45\n..."
+                # lost its first surface station as fabricated "0"/"0_2"/"45"
+                # columns.  The DUG-with-numeric-header shape is structurally
+                # indistinguishable from headerless data, so the data-preserving
+                # default wins: return ("headerless", 1) and let Pass 2 skip the
+                # count line and derive columns from the first REAL data line.
+                # Genuine DUG files have text column headers (handled by the
+                # primary check above).
+                # F-14: The fallback must ALSO fire when the second line is
+                # sentinel-bearing DATA (e.g. "1.0 2.0 na"), not just all-float
+                # lines.  The M-24 sentinel primary check above fell through
+                # for sentinel-only non-float tokens, but this branch's
+                # all-float requirement then rejected the line, so a
+                # count-prefix headerless file with a sentinel in its first
+                # data row fell all the way to the generic headerless path —
+                # the count line became a data row ("4" polluting the data, 3
+                # genuine columns collapsing to 1).  Mirror the comma-path
+                # M-51 fix: a count-prefix file whose declared count disagrees
+                # with the data token count is still a count-prefix headerless
+                # file.  The condition accepts an all-float second line OR one
+                # whose every non-float token is a known missing-data sentinel.
+                elif (
+                    len(second_tokens) > 1
+                    and len(content_entries) >= 3
+                    and col_count <= len(second_tokens) + 1
+                    and (
+                        all(_is_float_token(t) for t in second_tokens)
+                        or all(
+                            t.lower().strip() in _DEV_SENTINELS
+                            for t in second_tokens
+                            if not _is_float_token(t)
+                        )
+                    )
+                ):
+                    return ("headerless", 1)
 
     # Pattern B: multi-word title, integer column count, header.
     #   "Deviation survey for Well-1"   ← descriptive title
@@ -756,7 +1043,12 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
     # has 2+ integer-like tokens, treat as simple format with numeric
     # column names.  Single-column and decimal-token cases remain
     # headerless (too ambiguous for heuristic disambiguation).
-    if first_tokens and all(_is_float_token(t) for t in first_tokens):
+    # M-54: The float checks below apply comma-decimal locale conversion
+    # (_is_float_token_comma_decimal) so a space-delimited comma-decimal
+    # first row ("1,5 2,0 3,0") is recognised as headerless data instead of
+    # falling through to simple format and being consumed as a fabricated
+    # header (first station lost) — consistent with the semicolon path.
+    if first_tokens and all(_is_float_token_comma_decimal(t) for t in first_tokens):
         # Only apply heuristic for multi-column files with integer-like
         # column names.  Decimal tokens (0.00, -20.06, 1.0e2) remain
         # headerless — they look like data, not column names.
@@ -790,13 +1082,15 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
     # Without this check, a line like "100.0 na 200.0 300.0" falls
     # through to simple-format, consuming the first data row as a header.
     if first_tokens:
-        float_tokens = [t for t in first_tokens if _is_float_token(t)]
+        float_tokens = [t for t in first_tokens if _is_float_token_comma_decimal(t)]
         mostly_float = (
             len(float_tokens) >= 2
             and len(float_tokens) >= len(first_tokens) - 1
         )
         if mostly_float:
-            _non_float_tokens = [t for t in first_tokens if not _is_float_token(t)]
+            _non_float_tokens = [
+                t for t in first_tokens if not _is_float_token_comma_decimal(t)
+            ]
             _is_sentinel = all(
                 t.lower().strip() in _DEV_SENTINELS for t in _non_float_tokens
             )
@@ -878,6 +1172,16 @@ def _validate_dev_data(
     # when ``_md_col is None`` so a file whose depth column is naturally
     # named ``MD_2`` is validated instead of triggering the misleading
     # "MD column not found" warning.
+    # M-22: With normalize_aliases=False the depth aliases
+    # (MDKB/MDSS/MDRKB/DEPTH/DPT) survive as-is and previously escaped
+    # negative-MD/NaN-density/monotonicity/repeat checks while ALSO
+    # triggering the false "MD column not found" warning.  They are real
+    # depth columns: the first one found becomes the MD reference column
+    # (also used by the TVD MD-consistency checks), additional ones are
+    # validated as survivors.
+    _MD_FAMILY_BASES = ("MD", "MDKB", "MDSS", "MDRKB", "DEPTH", "DPT")
+    _MD_DEPTH_ALIASES = ("MDKB", "MDSS", "MDRKB", "DEPTH", "DPT")
+
     _md_col = None
     for _cn in dev.columns:
         if _cn.upper() == "MD":
@@ -887,13 +1191,26 @@ def _validate_dev_data(
     _md_survivors: list[str] = []
     for _col_name in dev.column_order:
         _col_upper = _col_name.upper()
-        _suffix = _col_name[len("MD"):]
-        if (
-            _col_upper.startswith("MD")
-            and _suffix.startswith("_")
-            and _suffix[1:].isdigit()
-        ):
-            _md_survivors.append(_col_name)
+        if _col_upper == "MD":
+            continue
+        # Depth alias surviving as-is (normalize_aliases=False).
+        if _col_upper in _MD_DEPTH_ALIASES:
+            if _md_col is None:
+                _md_col = _col_name
+            else:
+                _md_survivors.append(_col_name)
+            continue
+        # _N-suffixed dedup survivor of any MD-family base
+        # (MD_2, DEPTH_2, MDKB_3, ...).
+        for _base in _MD_FAMILY_BASES:
+            _suffix = _col_name[len(_base):]
+            if (
+                _col_upper.startswith(_base)
+                and _suffix.startswith("_")
+                and _suffix[1:].isdigit()
+            ):
+                _md_survivors.append(_col_name)
+                break
 
     def _check_md_column(_md_name: str) -> None:
         """Run the MD-family data-quality checks on one column."""
@@ -1779,6 +2096,10 @@ def read_dev_file_as_object(
     short_row_count: int | None = None  # Track short-row count for summary
     discarded_lines = 0  # Track silently-discarded lines from pre-scan undercount
     _fc: list[int] = [0]  # Count non-trivial float conversion failures
+    # M-25: Count comma-separated THOUSANDS-style tokens (e.g. "1,234") seen
+    # in non-comma-delimited data.  They are not locale decimals and are left
+    # unconverted (→ NaN); one summary warning is emitted at the end.
+    _tc: list[int] = [0]
 
     for line in lines:
         stripped = line.strip()
@@ -1800,23 +2121,42 @@ def read_dev_file_as_object(
         # V-08 (G9): Thousands-separator recombination for comma-delimited
         # data rows.  A value like "1,234.5" is split by the comma delimiter
         # into two tokens ("1" and "234.5"), silently shifting every
-        # subsequent column.  When a row has one extra token beyond the
+        # subsequent column.  When a row has surplus tokens beyond the
         # declared columns and consecutive tokens match the thousands
         # pattern, recombine them (with a warning) before assignment.
-        # Headerless first rows are exempt — they define the column count.
-        if delimiter == "," and names and len(values) > len(names):
-            _recombined = _recombine_thousands_separators(values, len(names))
-            if _recombined is not None:
-                _merged_vals, _original_frag, _merged_value = _recombined
-                warnings.warn(
-                    f"Data value '{_original_frag}' contains a thousands "
-                    f"separator, which is not natively supported in "
-                    f"comma-delimited DEV files; recombined to "
-                    f"'{_merged_value}' for column mapping. Review the "
-                    f"data line if this row has genuine extra columns.",
-                    stacklevel=2,
-                )
-                values = _merged_vals
+        # M-52: The gate previously required non-empty ``names``, so the FIRST
+        # headerless data row — which defines the column count — was never
+        # recombined: "1,234.5" defined 2 columns from its raw split and every
+        # row stayed split with no thousands warning.  For that first row there
+        # is no declared column count, so treat it as having one surplus token
+        # (expected = len(values) - 1): recombination fires only when an
+        # unambiguous digit + 3-digit-fragment pair is present.
+        # F-07: The headerless first-row case must only fire when UNAMBIGUOUS.
+        # A leading group of 4+ digits ("1000" in "1000,250.5") is NOT a valid
+        # thousands grouping (thousands groups are three digits from the
+        # right), so such a row is a genuine multi-column headerless row —
+        # block recombination entirely so its columns stay separate instead of
+        # silently merging 1000,250.5 into 1000250.5.
+        if delimiter == "," and len(values) >= 2:
+            if names:
+                _expected_cols = len(names)
+            else:
+                _expected_cols = len(values) - 1
+                if not _is_valid_thousands_leading_group(values[0]):
+                    _expected_cols = len(values)
+            if len(values) > _expected_cols:
+                _recombined = _recombine_thousands_separators(values, _expected_cols)
+                if _recombined is not None:
+                    _merged_vals, _original_frag, _merged_value = _recombined
+                    warnings.warn(
+                        f"Data value '{_original_frag}' contains a thousands "
+                        f"separator, which is not natively supported in "
+                        f"comma-delimited DEV files; recombined to "
+                        f"'{_merged_value}' for column mapping. Review the "
+                        f"data line if this row has genuine extra columns.",
+                        stacklevel=2,
+                    )
+                    values = _merged_vals
 
         if format_type == "headerless":
             if content_seen <= skip_content_lines:
@@ -1852,7 +2192,7 @@ def read_dev_file_as_object(
                 # Store first data row (G-04 bounds guard).
                 if current_line < data_lines:
                     for k in range(len(names)):
-                        dev.columns[names[k]][current_line] = _dev_to_finite_float(values[k], np.nan, _failure_counter=_fc)
+                        dev.columns[names[k]][current_line] = _dev_to_finite_float(values[k], np.nan, _failure_counter=_fc, _thousands_counter=_tc, _comma_as_thousands=(delimiter != ";"))
                     current_line += 1
                 else:
                     discarded_lines += 1
@@ -1884,7 +2224,7 @@ def read_dev_file_as_object(
                         else:
                             short_row_count += 1
                     for k in range(min(len(values), len(names))):
-                        dev.columns[names[k]][current_line] = _dev_to_finite_float(values[k], np.nan, _failure_counter=_fc)
+                        dev.columns[names[k]][current_line] = _dev_to_finite_float(values[k], np.nan, _failure_counter=_fc, _thousands_counter=_tc, _comma_as_thousands=(delimiter != ";"))
                     current_line += 1
                 else:
                     discarded_lines += 1
@@ -1969,7 +2309,7 @@ def read_dev_file_as_object(
                         else:
                             short_row_count += 1
                     for k in range(min(len(values), len(names))):
-                        dev.columns[names[k]][current_line] = _dev_to_finite_float(values[k], np.nan, _failure_counter=_fc)
+                        dev.columns[names[k]][current_line] = _dev_to_finite_float(values[k], np.nan, _failure_counter=_fc, _thousands_counter=_tc, _comma_as_thousands=(delimiter != ";"))
                     current_line += 1
                 else:
                     discarded_lines += 1
@@ -2056,7 +2396,7 @@ def read_dev_file_as_object(
                         else:
                             short_row_count += 1
                     for k in range(min(len(values), len(names))):
-                        dev.columns[names[k]][current_line] = _dev_to_finite_float(values[k], np.nan, _failure_counter=_fc)
+                        dev.columns[names[k]][current_line] = _dev_to_finite_float(values[k], np.nan, _failure_counter=_fc, _thousands_counter=_tc, _comma_as_thousands=(delimiter != ";"))
                     current_line += 1
                 else:
                     discarded_lines += 1
@@ -2103,6 +2443,22 @@ def read_dev_file_as_object(
             f"{_fc[0]} value(s) could not be converted to finite float "
             f"and were replaced with NaN. This may indicate string data, "
             f"corrupt values, or non-standard formatting.",
+            stacklevel=2,
+        )
+
+    # M-25: Summary warning for comma-separated THOUSANDS-style tokens in
+    # non-comma-delimited data.  "1,234" is a thousands separator, not a
+    # locale decimal — it is left unconverted (NaN above) rather than being
+    # silently mis-read as 1.234.  Locale decimals (V-07) use 1-2 fractional
+    # digits ("1,00", "1,50") and convert normally.
+    if _tc[0] > 0:
+        warnings.warn(
+            f"{_tc[0]} value(s) contain comma-separated thousands "
+            f"separators (e.g. '1,234'), which are not supported in "
+            f"{delimiter!r}-delimited DEV data. These values were not "
+            f"converted and may be NaN. If the file uses a comma as a "
+            f"locale decimal separator, values must use 1-2 fractional "
+            f"digits (e.g. '1,50').",
             stacklevel=2,
         )
 

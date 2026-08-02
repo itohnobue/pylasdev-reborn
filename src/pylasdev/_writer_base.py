@@ -92,8 +92,22 @@ _SECTION_TYPE_TO_DEFINITION_PREFIX: dict[str, str] = {
 
 # ── Module-level utility functions ──────────────────────────────────────
 
-def _sanitize_las_value(value: str) -> str:
-    """Sanitize a string for safe inclusion in LAS output."""
+
+def _sanitize_las_value(value: str, *, preserve_leading_tilde: bool = False) -> str:
+    """Sanitize a string for safe inclusion in LAS output.
+
+    Args:
+        preserve_leading_tilde: If True, a leading ``~`` (and any preceding
+            whitespace) is NOT stripped.  The default strips a line-start
+            ``~[A-Za-z]`` pattern so a value never mimics a LAS section
+            header (``~CURVE``, ``~WELL``...).  That strip is only required
+            for text emitted at the START of an output line.  Values emitted
+            mid-line (well values, parameter values, descriptions,
+            non-first-column data cells) can never be confused with a section
+            header, and stripping them silently corrupts the model value on
+            write→read (M-28).  Pass True for such mid-line content so the
+            value survives roundtrip unchanged.
+    """
     value = (
         value.replace("\r\n", " ")
         .replace("\n", " ")
@@ -105,7 +119,8 @@ def _sanitize_las_value(value: str) -> str:
     value = value.replace("\t", " ")
     value = _CONTROL_CHARS_RE.sub("", value)
     value = _UNICODE_WS_RE.sub(" ", value)
-    value = _LEADING_SECTION_RE.sub(r"\1", value, count=1)
+    if not preserve_leading_tilde:
+        value = _LEADING_SECTION_RE.sub(r"\1", value, count=1)
     if value.startswith("#"):
         value = "_" + value
     elif value and value.lstrip().startswith("#"):
@@ -167,6 +182,17 @@ def _section_type_to_prefix(section_type: str) -> str:
         return known
     if section_type.endswith("_DATA"):
         return _sanitize_las_value(section_type).replace("|", "")
+    # M-84: Bare known section types (e.g. "CORE") are accepted by the
+    # model and by the parser's _SECTION_TYPE_MAP (which maps both "CORE"
+    # and "CORE_DATA" → "CORE_DATA"), but the header prefix map only knows
+    # the *_DATA forms.  Without this fallback a bare "CORE" falls back to
+    # "A" + a misdiagnosing warning, and the re-read section_type silently
+    # becomes LOG_DATA.  Try the canonical *_DATA form so the header stays
+    # roundtrippable (defense-in-depth; the model also normalizes at
+    # construction).
+    _data_form = section_type + "_DATA"
+    if _data_form in _SECTION_TYPE_TO_PREFIX:
+        return _SECTION_TYPE_TO_PREFIX[_data_form]
     import warnings
 
     warnings.warn(
@@ -179,13 +205,48 @@ def _section_type_to_prefix(section_type: str) -> str:
     return "A"
 
 
-def _format_curve_line(curve: CurveDefinition, is_las30: bool) -> str:
-    """Format a single CurveDefinition as a LAS curve line."""
+def _format_curve_line(
+    curve: CurveDefinition,
+    is_las30: bool,
+    string_mnemonics: frozenset[str] | None = None,
+) -> str:
+    """Format a single CurveDefinition as a LAS curve line.
+
+    Args:
+        string_mnemonics: Mnemonics of curves whose DATA lives in a
+            string_data container for the emitted scope.  M-77: a LAS 3.0
+            string curve with an empty (or non-'S') data_format would be
+            emitted WITHOUT the {S} marker — the parser's ONLY string
+            signal — and re-read as numeric, silently destroying the
+            values.  Callers with string_data context pass this set so the
+            writer forces the {S} marker.
+    """
     unit = _sanitize_las_value(curve.unit) if curve.unit else ""
     unit = _escape_colons_for_las_value(unit) if unit else ""
     desc = curve.description if curve.description else ""
 
-    if curve.data_format and (is_las30 or curve.data_format == "I"):
+    is_string_curve = string_mnemonics is not None and curve.mnemonic in string_mnemonics
+    if is_las30 and is_string_curve and (curve.data_format or "").upper() != "S":
+        # M-77: a string-data curve without data_format='S' would be
+        # emitted markerless; the parser classifies columns by the {S}
+        # marker ONLY, so the values are re-read as numeric nulls.  Force
+        # the {S} marker.  When a conflicting non-empty format is declared
+        # the marker swap is a real contract change — warn loudly.
+        if curve.data_format:
+            import warnings
+
+            warnings.warn(
+                f"Curve '{curve.mnemonic}' is placed in string_data but "
+                f"declares data_format={curve.data_format!r} (not 'S').  "
+                f"Emitting the {{S}} marker so the parser recognizes the "
+                f"values as strings; the declared format is not "
+                f"representable for string data.",
+                UserWarning,
+                stacklevel=3,
+            )
+        format_str = "{S}"
+        desc = f"{desc}  {format_str}"
+    elif curve.data_format and (is_las30 or curve.data_format == "I"):
         # EXT-04: the braced {I} marker is emitted for integer-format
         # curves on ALL versions.  LAS 1.2/2.0 have no format-specifier
         # convention, but without the marker a >2^53 {I} value (e.g.
@@ -207,17 +268,59 @@ def _format_curve_line(curve: CurveDefinition, is_las30: bool) -> str:
                     else:
                         format_str += f":{int(offset)}"
                 else:
-                    format_str += f":{offset}"
+                    format_str += f":{_format_offset_plain(offset)}"
         format_str += "}"
         desc = f"{desc}  {format_str}"
+    elif curve.data_format:
+        # M-27: non-LAS-3.0 output cannot represent a non-{I} format
+        # specifier — the metadata is silently dropped on write→read.
+        import warnings
 
-    api_code = _sanitize_las_value(curve.api_code) if curve.api_code else ""
+        warnings.warn(
+            f"Curve '{curve.mnemonic}' data_format "
+            f"{curve.data_format!r} cannot be represented in LAS "
+            f"1.2/2.0 output — it is dropped on write→read roundtrip.",
+            UserWarning,
+            stacklevel=3,
+        )
+    if curve.array_info is not None and not is_las30:
+        # M-27: array_info (and the bracket mnemonic that carries it) is
+        # only emitted for LAS 3.0; on 1.2/2.0 the metadata is silently
+        # dropped on write→read.
+        import warnings
+
+        warnings.warn(
+            f"Curve '{curve.mnemonic}' array_info is not representable "
+            f"in LAS 1.2/2.0 output — it is dropped on write→read "
+            f"roundtrip.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+    api_code = (
+        _sanitize_las_value(curve.api_code, preserve_leading_tilde=True) if curve.api_code else ""
+    )
     api_code = _escape_colons_for_las_value(api_code)
     api = f"  {api_code}" if api_code else ""
-    desc = _sanitize_las_value(desc)
+    desc = _sanitize_las_value(desc, preserve_leading_tilde=True)
     desc = _escape_colons_for_las_value(desc)
 
-    mnemonic = _sanitize_las_value(curve.mnemonic)
+    # M-59: Emit the vendor-standard mnemonic when the model records one.
+    # The reader's mnem_base rename (e.g. LLD→BFV) preserves the original
+    # name in CurveDefinition.original_mnemonic, but the writer previously
+    # emitted curve.mnemonic ONLY — so a read→write roundtrip
+    # permanently canonicalized the colliding vendor name in the output
+    # file (re-read without mnem_base never recovers it).  When
+    # original_mnemonic is set and differs, emit it so the write
+    # reconstructs the vendor-standard name.  Data columns stay
+    # positional, so values remain aligned (verified: the parser routes
+    # data by ~C order, not by the ~A header).
+    _emit_mnem = (
+        curve.original_mnemonic
+        if curve.original_mnemonic and curve.original_mnemonic != curve.mnemonic
+        else curve.mnemonic
+    )
+    mnemonic = _sanitize_las_value(_emit_mnem)
     if (
         is_las30
         and curve.array_info is not None
@@ -259,15 +362,47 @@ def _format_parameter_line(param: ParameterEntry, is_las30: bool) -> str:
         # keeping the description stable), so the roundtrip is
         # deterministic across construction paths.
         desc = f"{desc}  {{{param.data_format}}}"
+    elif param.data_format:
+        # M-27: LAS 1.2/2.0 output cannot represent a braced format
+        # specifier — the metadata is silently dropped on write→read.
+        import warnings
+
+        warnings.warn(
+            f"Parameter '{param.mnemonic}' data_format "
+            f"{param.data_format!r} cannot be represented in LAS "
+            f"1.2/2.0 output — it is dropped on write→read roundtrip.",
+            UserWarning,
+            stacklevel=3,
+        )
 
     if is_las30 and param.zone:
-        zone_str = f" | {param.zone.zone_name}"
+        # M-12: escape literal pipes in the ZONE NAME itself.  A genuine
+        # pipe inside zone_name (e.g. "Zone|X") would otherwise be
+        # re-parsed as the LAST '|' fragment of the zone association —
+        # ZONE_ASSOC_PATTERN's (?<!\\)\| matches any non-escaped pipe, so
+        # "| Zone|X[2]" re-reads zone="X" and leaks "| Zone" into the
+        # description.  Escaping the zone_name pipe keeps it inside the
+        # zone text; the parser unescapes it after extraction.
+        zone_name = _escape_pipes_for_las_value(param.zone.zone_name)
+        zone_str = f" | {zone_name}"
         if param.zone.zone_index is not None:
             zone_str += f"[{param.zone.zone_index}]"
         desc = f"{desc}{zone_str}"
+    elif param.zone:
+        # M-27: LAS 1.2/2.0 output cannot represent a zone association —
+        # the metadata is silently dropped on write→read.
+        import warnings
 
-    value = _sanitize_las_value(param.value)
-    desc = _sanitize_las_value(desc)
+        warnings.warn(
+            f"Parameter '{param.mnemonic}' zone association is not "
+            f"representable in LAS 1.2/2.0 output — it is dropped on "
+            f"write→read roundtrip.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+    value = _sanitize_las_value(param.value, preserve_leading_tilde=True)
+    desc = _sanitize_las_value(desc, preserve_leading_tilde=True)
     value = _escape_colons_for_las_value(value)
     desc = _escape_colons_for_las_value(desc)
 
@@ -321,11 +456,31 @@ def _format_data_rows(
     warned_long = False
     warned_delim_str = False
     warned_empty_str = False
+    warned_tilde_str = False
     for i in range(num_rows):
         row_values: list[str] = []
         for arr, is_string in curve_arrays:
             if arr is None or i >= len(arr):
-                row_values.append(_format_number(null_value, precision, null_value))
+                if is_string:
+                    # M-78: a short (ragged) string curve was padded with
+                    # the NUMERIC null sentinel, which on re-read becomes
+                    # a fabricated "-999.25" STRING value.  Route missing
+                    # string values through the string-branch missing-value
+                    # routing (the '-' sentinel) instead.
+                    if not warned_empty_str:
+                        import warnings
+
+                        warnings.warn(
+                            "Missing string curve value (short array) "
+                            "padded with '-' sentinel — roundtrip "
+                            "fidelity is lost: parser cannot distinguish "
+                            "original '-' from the missing value.",
+                            stacklevel=4,
+                        )
+                        warned_empty_str = True
+                    row_values.append("-")
+                else:
+                    row_values.append(_format_number(null_value, precision, null_value))
             elif is_string:
                 _raw = arr[i]
                 # N-I-17: A None/NaN/Inf value in a string-data array was
@@ -353,7 +508,10 @@ def _format_data_rows(
                     continue
                 raw_val = str(_raw)
                 raw_has_delim = delimiter in raw_val
-                val = _sanitize_las_value(raw_val)
+                # M-28: preserve a leading '~' in string DATA values —
+                # stripping it silently corrupts the model value.  Mid-row
+                # cells can never be confused with a section header.
+                val = _sanitize_las_value(raw_val, preserve_leading_tilde=True)
                 if delimiter == " ":
                     if re.search(r"\s", val):
                         if not warned_delim_str:
@@ -402,6 +560,56 @@ def _format_data_rows(
                         )
                         warned_empty_str = True
                     val = "-"
+                if not row_values and re.match(r"\s*~[A-Za-z]", val):
+                    # M-28: this value lands in the FIRST column, so the
+                    # emitted data row would start with '~'+letter and the
+                    # reader would treat it as a LAS section header (the
+                    # writer's own reader skips such lines) — dropping the
+                    # row and breaking the file structure.  The value is
+                    # preserved everywhere else, but here the leading '~'
+                    # MUST be stripped for the file to stay valid — warn
+                    # loudly that the value was altered.
+                    val = _LEADING_SECTION_RE.sub(r"\1", val, count=1)
+                    if not warned_tilde_str:
+                        import warnings
+
+                        warnings.warn(
+                            "String curve value in the first data column "
+                            "begins with '~' followed by a letter; the "
+                            "emitted row would be misread as a LAS section "
+                            "header on re-read.  The leading '~' was "
+                            "removed, so the written value differs from "
+                            "the model.",
+                            stacklevel=4,
+                        )
+                        warned_tilde_str = True
+                elif not row_values and re.match(r"\s*~", val):
+                    # M-85: value in the FIRST data column starts with '~'
+                    # + NON-letter (e.g. '~3D', '~.', bare '~').  The
+                    # M-28 guard above only matches '~'+letter; these
+                    # survive _sanitize_las_value, so the emitted data row
+                    # would BEGIN with '~' — and the parser/reader skip
+                    # '~'-prefixed lines as section-header noise
+                    # (parser.py F-83 / _data_section_reader.py), silently
+                    # dropping the ENTIRE row to `other` with zero
+                    # warnings.  Escape the leading '~' as '_~' (mirroring
+                    # the existing '#'-prefix escape) so the line never
+                    # starts with '~'; the parser's
+                    # _desanitize_las_value restores '_~' → '~' on re-read.
+                    val = "_" + val.lstrip()
+                    if not warned_tilde_str:
+                        import warnings
+
+                        warnings.warn(
+                            "String curve value in the first data column "
+                            "begins with '~' followed by a non-letter; the "
+                            "emitted row would be misread as a LAS section "
+                            "header and silently dropped on re-read.  The "
+                            "leading '~' was escaped as '_~' (restored on "
+                            "re-read) to keep the row in the file.",
+                            stacklevel=4,
+                        )
+                        warned_tilde_str = True
                 row_values.append(val)
             else:
                 val = arr[i]
@@ -489,6 +697,65 @@ def _format_fixed_precision(value: float, precision: str) -> str:
 
     result = format(value, f".{decimal_places}f")
     return result
+
+
+# F-15: The parser's FORMAT_SPEC_PATTERN offset group is bounded at 64
+# characters ([-\d.]{0,64}, parser.py) to keep the ReDoS-bounded quantifier
+# linear.  The writer must never emit an offset field longer than that or
+# the whole {A:N} spec fails to parse (the M-56 defect class).  '0.' +
+# decimal_places fits in 64 chars up to 62 decimals; use 61 to leave room
+# for a leading '-' sign on negative offsets.
+_MAX_OFFSET_FIXED_DECIMALS: int = 61
+
+
+def _format_offset_plain(offset: float) -> str:
+    """Format a float WITHOUT scientific notation for ``{A:N}`` offsets.
+
+    M-56: Python's default ``str()`` formats values in (0, 1e-4) as
+    scientific notation (``9e-05``), which the parser's FORMAT_SPEC_PATTERN
+    offset group ``[-\\d.]*`` cannot parse — the entire ``{A:N}`` spec is
+    then treated as description text, losing data_format and time_offset.
+    Values >= 1e-4 already format as fixed-point (str() has no exponent),
+    so only the scientific case is rewritten.
+
+    F-08: the fixed-point rewrite preserves ALL significant digits of the
+    offset (counted from the shortest-repr mantissa), using the same
+    magnitude-aware formula as ``_format_fixed_precision`` — the earlier
+    ``-magnitude + 2`` heuristic produced only ~2-3 significant digits for
+    offsets in (0, 1e-4) (1.2345e-05 → '0.0000123', 0.36% error).
+
+    F-15: the emitted field is CLAMPED to ``_MAX_OFFSET_FIXED_DECIMALS`` so
+    it never exceeds the parser's 64-character offset-group cap.  Offsets
+    too small to represent exactly within the cap are rounded and a LOUD
+    warning is emitted — data_format and the {A:N} spec survive the
+    roundtrip (unlike the pre-fix >32-char fields which failed to parse and
+    leaked the literal spec into the description).
+    """
+    s = str(offset)
+    if "e" not in s.lower():
+        return s
+    if offset == 0:
+        return "0"
+    # Significant digits in the shortest repr — the minimum needed to
+    # round-trip the float64 exactly.
+    mantissa = s.split("e")[0]
+    sig_digits = len(mantissa.replace(".", "").replace("-", ""))
+    magnitude = math.floor(math.log10(abs(offset)))
+    decimal_places = sig_digits + max(0, (-magnitude) - 1)
+    if decimal_places > _MAX_OFFSET_FIXED_DECIMALS:
+        import warnings
+
+        warnings.warn(
+            f"time_offset {offset!r} cannot be represented exactly in the "
+            f"{{A:N}} offset field (needs {decimal_places} decimal places, "
+            f"capped at {_MAX_OFFSET_FIXED_DECIMALS} to stay within the "
+            f"parser's 64-character offset group).  The emitted value is "
+            f"rounded and may not round-trip exactly.",
+            UserWarning,
+            stacklevel=3,
+        )
+        decimal_places = _MAX_OFFSET_FIXED_DECIMALS
+    return format(offset, f".{decimal_places}f")
 
 
 def _warn_long_header_lines(lines: list[str], max_length: int) -> None:
@@ -639,6 +906,8 @@ class _WriterBase:
 
         for issue in self._las_file.validate(complete=True):
             warnings.warn(issue, stacklevel=2)
+        if self._spec.is_las30:
+            self._warn_string_curves_without_s_marker()
         lines: list[str] = []
         lines.extend(self._write_version_section())
         lines.extend(self._write_well_section())
@@ -706,8 +975,13 @@ class _WriterBase:
             value = self._las_file.well.entries[key]
             unit = _sanitize_las_value(self._las_file.well.units.get(key, ""))
             unit_dot = f".{unit}" if unit else "."
-            val = _sanitize_las_value(value)
-            desc = _sanitize_las_value(self._las_file.well.descriptions.get(key, ""))
+            # M-28: well values/descriptions are emitted mid-line (never at
+            # line start) so a leading '~' must be preserved, not stripped.
+            val = _sanitize_las_value(value, preserve_leading_tilde=True)
+            desc = _sanitize_las_value(
+                self._las_file.well.descriptions.get(key, ""),
+                preserve_leading_tilde=True,
+            )
             val = _escape_colons_for_las_value(val)
             desc = _escape_colons_for_las_value(desc)
             desc_str = f"  {desc}" if desc else ""
@@ -738,7 +1012,18 @@ class _WriterBase:
             curves = self._las_file.data_sections[0].section_curves
 
         for curve in curves:
-            lines.append(_format_curve_line(curve, self._spec.is_las30))
+            # M-77: pass the string_data mnemonic set so a string curve
+            # without data_format='S' still gets the {S} marker.  On
+            # 1.2/2.0 the is_las30 gate inside _format_curve_line keeps
+            # the marker off (string curves are lossy there by design and
+            # validate(complete=True) already warns).
+            lines.append(
+                _format_curve_line(
+                    curve,
+                    self._spec.is_las30,
+                    frozenset(self._las_file.string_data.keys()),
+                )
+            )
 
         lines.append("")
         return lines
@@ -770,6 +1055,73 @@ class _WriterBase:
 
     def _write_ascii_sections(self) -> list[str]:
         raise NotImplementedError
+
+    def _warn_string_curves_without_s_marker(self) -> None:
+        """M-77: warn when a LAS 3.0 string curve lacks the {S} marker.
+
+        The parser classifies a column as string ONLY from the {S} marker
+        in its ~C/Definition line.  A string-data curve with an empty (or
+        non-'S') data_format is emitted markerless and its values are
+        re-read as numeric nulls — silent destruction.  This check covers
+        BOTH the top-level (no data_sections) and per-section paths from
+        the base template ``write()``; callers that pass string_data
+        context into ``_format_curve_line`` also emit {S} directly.
+
+        F-09: the M-77 {S}-forcing branch in ``_format_curve_line`` emits
+        the {S} marker for any string-data curve whose mnemonic is in the
+        string_mnemonics set passed for its emitted scope — the main ~C
+        block passes the UNION of every scope's string_data keys and
+        per-section Definitions pass the section's own keys.  When the
+        curve IS in that set the values round-trip intact, so warning
+        here would misdiagnose the exact scenario the fix prevents.
+        Only warn when the marker is genuinely absent for the emitted
+        scope (the curve's mnemonic is NOT in the union string_mnemonics
+        set) — i.e. string data would actually be lost.
+        """
+        import warnings
+
+        las_file = self._las_file
+        top_curves = {c.mnemonic: c for c in las_file.curves or []}
+        warned: set[str] = set()
+        # Union of EVERY string_data mnemonic across all scopes — the set
+        # the main ~C block passes to _format_curve_line
+        # (_Las30Writer._all_string_mnemonics), which is a superset of
+        # every per-section Definition set.  Membership here means {S} is
+        # forced at emission.
+        emitted_str_mnems: set[str] = set(las_file.string_data or {})
+        for ds in las_file.data_sections:
+            emitted_str_mnems.update(ds.string_data or {})
+
+        def _warn_for(curve: CurveDefinition, mnem: str) -> None:
+            if (curve.data_format or "").upper() == "S" or mnem in warned:
+                return
+            if curve.mnemonic in emitted_str_mnems:
+                # F-09: {S} is forced via string_mnemonics — no loss.
+                return
+            warnings.warn(
+                f"LAS 3.0 string curve '{mnem}' has "
+                f"data_format={(curve.data_format or '')!r} (not 'S').  "
+                f"Without the {{S}} marker the parser reads this column "
+                f"as numeric and the string values are lost on "
+                f"write→read roundtrip.",
+                UserWarning,
+                stacklevel=2,
+            )
+            warned.add(mnem)
+
+        # Top-level string_data scope (no-data_sections path).
+        for mnem in las_file.string_data or {}:
+            cd = top_curves.get(mnem)
+            if cd is not None:
+                _warn_for(cd, mnem)
+        # Per-section scopes — definitions may live in the section itself
+        # or fall back to the top-level curves list.
+        for ds in las_file.data_sections:
+            sec_curves = {c.mnemonic: c for c in ds.section_curves or []}
+            for mnem in ds.string_data or {}:
+                cd = sec_curves.get(mnem) or top_curves.get(mnem)
+                if cd is not None:
+                    _warn_for(cd, mnem)
 
     # ── Shared helpers for version-specific writers ──────────────────
 
@@ -851,8 +1203,7 @@ class _WriterBase:
             if self._las_file.curves_order and (self._las_file.logs or self._las_file.string_data):
                 _log_keys = set(self._las_file.logs.keys()) if self._las_file.logs else set()
                 _str_keys = (
-                    set(self._las_file.string_data.keys()) if self._las_file.string_data
-                    else set()
+                    set(self._las_file.string_data.keys()) if self._las_file.string_data else set()
                 )
                 _order_set = set(self._las_file.curves_order)
                 _uncovered = _order_set - _log_keys - _str_keys
@@ -868,7 +1219,8 @@ class _WriterBase:
         # Path C: Legacy single data section (~A)
         curve_names = self._las_file.curves_order
         if curve_names and not any(
-            name in self._las_file.logs or name in self._las_file.string_data for name in curve_names
+            name in self._las_file.logs or name in self._las_file.string_data
+            for name in curve_names
         ):
             warnings.warn(
                 f"curves_order contains {len(curve_names)} curve(s) "
@@ -876,8 +1228,29 @@ class _WriterBase:
                 f"No data will be emitted.",
                 stacklevel=3,
             )
-        if any(name in self._las_file.logs or name in self._las_file.string_data for name in curve_names):
-            header_line = "~A  " + "  ".join(_sanitize_las_value(name) for name in curve_names)
+        if any(
+            name in self._las_file.logs or name in self._las_file.string_data
+            for name in curve_names
+        ):
+            # M-59: Keep the ~A column-header line consistent with the
+            # ~C curve lines.  The ~C section now emits
+            # CurveDefinition.original_mnemonic (the vendor-standard name)
+            # when it differs from curve.mnemonic; the ~A header must use
+            # the SAME emitted names or an external parser sees a
+            # column-header/curve mismatch (pylasdev routes data
+            # positionally by ~C order, so its own roundtrip is
+            # unaffected — this is for file-level consistency).
+            _by_mnem = {c.mnemonic: c for c in self._las_file.curves or []}
+
+            def _header_name(name: str) -> str:
+                c = _by_mnem.get(name)
+                if c is not None and c.original_mnemonic and c.original_mnemonic != c.mnemonic:
+                    return c.original_mnemonic
+                return name
+
+            header_line = "~A  " + "  ".join(
+                _sanitize_las_value(_header_name(name)) for name in curve_names
+            )
             # N-I-16: The ~A column-header line is appended AFTER the
             # header-section length check in `write()` (which runs before
             # `_write_ascii_sections`), so it was NEVER length-checked for
@@ -914,6 +1287,7 @@ class _WriterBase:
 
 
 # ── Public API: write_las_file ──────────────────────────────────────────
+
 
 def write_las_file(
     file_path: str | Path,
@@ -972,20 +1346,21 @@ def write_las_file(
     try:
         file_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        raise LASWriteError(
-            f"Cannot create output directory {file_path.parent}: {e}"
-        ) from e
+        raise LASWriteError(f"Cannot create output directory {file_path.parent}: {e}") from e
 
     # Version dispatch: choose the correct writer class.
     spec = _LASVersionSpec(las_file.version.vers)
     if spec.is_las12:
         from ._writer_las12 import _Las12Writer
+
         writer: _WriterBase = _Las12Writer(las_file, precision)
     elif spec.is_las20:
         from ._writer_las20 import _Las20Writer
+
         writer = _Las20Writer(las_file, precision)
     elif spec.is_las30:
         from ._writer_las30 import _Las30Writer
+
         writer = _Las30Writer(las_file, precision)
     else:
         raise LASWriteError(
@@ -1001,11 +1376,9 @@ def write_las_file(
 
         try:
             target_dir = str(file_path.parent)
-            fd, tmp_path = tempfile.mkstemp(
-                dir=target_dir, prefix=".tmp_", suffix=file_path.name
-            )
+            fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=".tmp_", suffix=file_path.name)
             try:
-                with os.fdopen(fd, 'w', encoding=encoding, newline='') as f:
+                with os.fdopen(fd, "w", encoding=encoding, newline="") as f:
                     f.write(content)
                 os.replace(tmp_path, file_path)
             except Exception:

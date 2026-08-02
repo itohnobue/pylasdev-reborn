@@ -3692,15 +3692,41 @@ class TestG5ParameterDataFormatAlignment:
         assert las.parameters[0].data_format == "F"
 
     def test_writer_emits_braced_multi_char(self, tmp_path) -> None:
-        """Direct-constructed multi-char data_format is emitted braced."""
+        """M-11: Direct construction now matches from_dict — multi-char
+        data_format is cleared with a warning, never emitted braced.
+
+        Pre-fix, direct construction preserved ``DD/MM/YYYY`` and the
+        writer emitted ``{DD/MM/YYYY}`` which the parser could not re-read
+        (data_format cleared, description polluted with literal braces).
+        After the N-I-21 parity fix, ParameterEntry construction clears
+        multi-char metadata templates (``DD/MM/YYYY`` → ``""``) and
+        truncates extended Fortran codes (``F8.3`` → ``F``) — identical
+        to the from_dict path.
+        """
         from pylasdev import read_las_file_as_object, write_las_file
 
-        pe = ParameterEntry(
-            mnemonic="DATE",
-            value="2024-01-01",
-            description="Log date",
-            data_format="DD/MM/YYYY",
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            pe = ParameterEntry(
+                mnemonic="DATE",
+                value="2024-01-01",
+                description="Log date",
+                data_format="DD/MM/YYYY",
+            )
+        # The multi-char template is cleared at construction with a warning.
+        assert pe.data_format == ""
+        assert any(
+            "multi-character data_format" in str(w.message) for w in rec
+        ), f"expected clear warning, got: {[str(w.message) for w in rec]}"
+        # Extended Fortran codes truncate to their single-letter base.
+        pe_ext = ParameterEntry(
+            mnemonic="DEPTH",
+            value="1.0",
+            description="Depth",
+            data_format="F8.3",
         )
+        assert pe_ext.data_format == "F"
+
         las = LASFile(
             version=VersionSection(vers="3.0"),
             curves_order=["DEPT"],
@@ -3709,14 +3735,17 @@ class TestG5ParameterDataFormatAlignment:
             parameters=[pe],
         )
         out = tmp_path / "param_fmt.las"
-        write_las_file(str(out), las)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(str(out), las)
         text = out.read_text(encoding="utf-8")
-        assert "{DD/MM/YYYY}" in text
-        # Re-read is stable: data_format cleared by the parser, description
-        # keeps the braced text — no per-roundtrip duplication.
+        # No braced multi-char template is emitted (it was cleared).
+        assert "{DD/MM/YYYY}" not in text
+        # Re-read is stable: data_format stays cleared, description keeps
+        # only the original text — no per-roundtrip duplication.
         back = read_las_file_as_object(str(out))
         assert back.parameters[0].data_format == ""
-        assert "{DD/MM/YYYY}" in back.parameters[0].description
+        assert back.parameters[0].description == "Log date"
 
 
 class TestG5MnemBaseResolutionCollision:

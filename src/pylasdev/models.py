@@ -78,6 +78,27 @@ _MNEMONIC_PATTERN = re.compile(r"^[\w\-]+(\[\d+\])?$")
 # ``[\w\-/]*`` here would regress N-I-22 at the model layer.
 _UNIT_PATTERN = re.compile(r"^[\w\-/.%°]*$")
 
+# M-84: Map bare LAS 3.0 section-type keywords (the parser's
+# _SECTION_TYPE_MAP bare forms) to their canonical *_DATA form.  The
+# parser accepts both "CORE" and "CORE_DATA" (mapping both to
+# "CORE_DATA"), so a model constructed with the bare form must be
+# normalized or the writer's _section_type_to_prefix cannot emit a
+# roundtrippable header (it falls back to "A" and the re-read
+# section_type silently becomes LOG_DATA).
+_BARE_SECTION_TYPE_TO_DATA: dict[str, str] = {
+    "CORE": "CORE_DATA",
+    "DRILLING": "DRILLING_DATA",
+    "FORMATION": "FORMATION_DATA",
+    "INCLINOMETRY": "INCLINOMETRY_DATA",
+    "LOG": "LOG_DATA",
+    "MUD": "MUD_DATA",
+    "PERFORATIONS": "PERFORATIONS_DATA",
+    "RISK": "RISK_DATA",
+    "STRUCTURE": "STRUCTURE_DATA",
+    "TEST": "TEST_DATA",
+    "TOPS": "TOPS_DATA",
+}
+
 
 def _coerce_numpy_scalar(value: Any) -> Any:
     """Convert numpy scalar types to Python scalar types (M-06).
@@ -96,6 +117,49 @@ def _coerce_numpy_scalar(value: Any) -> Any:
     if isinstance(value, np.floating):
         return float(value)
     return value
+
+
+def _data_is_integral(arr: Any) -> bool:
+    """Return True when every element of *arr* is an integral value (M-14).
+
+    ``np.int64`` coercion silently truncates fractional values (1.5 → 1)
+    and converts NaN → 0 (dangerous: NaN is the standard missing-data
+    marker).  Before coercing ``{I}``-format data to int64, verify that
+    no element would be altered by the cast: integer/uint/bool dtypes
+    are always safe; float/complex dtypes must be finite and equal to
+    their floor; object dtypes are checked per element (exact Python
+    ints are safe, float sentinels like -999.25 and NaN are not).
+    Non-numeric dtypes (str, bytes, ...) are treated as non-integral so
+    they route to the object-dtype branch rather than crashing.
+    """
+    try:
+        _arr = np.asarray(arr)
+    except (ValueError, TypeError):
+        return False
+    if _arr.dtype.kind in "iub":
+        return True
+    if _arr.dtype.kind in "fc":
+        if not np.all(np.isfinite(_arr)):
+            return False
+        return bool(np.all(_arr == np.floor(_arr)))
+    if _arr.dtype.kind == "O":
+        for _v in _arr.flat:
+            if isinstance(_v, (int, np.integer, bool)):
+                continue
+            if isinstance(_v, (float, np.floating)):
+                if not math.isfinite(_v) or float(_v) != math.floor(float(_v)):
+                    return False
+                continue
+            # Unrecognised scalar — only integral if float-convertible
+            # to an exact integer.
+            try:
+                _f = float(_v)
+            except (ValueError, TypeError):
+                return False
+            if not math.isfinite(_f) or _f != math.floor(_f):
+                return False
+        return True
+    return False
 
 
 class _GuardedDict(dict[str, Any]):
@@ -134,8 +198,46 @@ class _GuardedDict(dict[str, Any]):
                 f"got {type(key).__name__}"
             )
 
+    @staticmethod
+    def _value_len(value: Any) -> int:
+        """Row-count of a stored value.
+
+        0-d numpy arrays and scalars have no ``len()`` — treat them as
+        single-element values, matching the construction-time convention in
+        DataSection.__post_init__ (M-18 guard).
+        """
+        if isinstance(value, np.ndarray) and value.ndim == 0:
+            return 1
+        try:
+            return len(value)
+        except TypeError:
+            return 1
+
+    def _check_value_length(self, value: Any) -> None:
+        """M-43: enforce equal row counts across all values.
+
+        Construction-time checks (DataSection.__post_init__ / LASFile
+        validate) enforce length consistency, but post-construction
+        mutation of a SINGLE key previously bypassed them — a wrong-length
+        assignment passed silently and the writer padded the shorter array
+        with null_value (-999.25), corrupting data on write→read.  Catch
+        the mismatch here with a clean error, mirroring
+        ``_DevColumns.__setitem__``.
+        """
+        if self:
+            _existing = self._value_len(next(iter(self.values())))
+            _new = self._value_len(value)
+            if _new != _existing:
+                raise ValueError(
+                    f"{self._container_name}: inconsistent lengths — "
+                    f"existing values have length {_existing}, new value "
+                    f"has length {_new}.  All values in a data container "
+                    f"must have the same row count."
+                )
+
     def __setitem__(self, key: Any, value: Any) -> None:
         self._validate_key(key)
+        self._check_value_length(value)
         super().__setitem__(key, value)
 
     def update(self, *args: Any, **kwargs: Any) -> None:
@@ -143,18 +245,62 @@ class _GuardedDict(dict[str, Any]):
         _update_items = dict(*args, **kwargs)
         for _k in _update_items:
             self._validate_key(_k)
+        # M-43: the value-side length guard is also bypassed by update.
+        for _v in _update_items.values():
+            self._check_value_length(_v)
         super().update(_update_items)
 
     def setdefault(self, key: Any, default: Any = None) -> Any:
         # M-01: dict.setdefault bypasses __setitem__.
         self._validate_key(key)
+        # M-43: value-side length guard (only when the key is actually
+        # inserted — an existing key returns the stored value untouched).
+        if key not in self:
+            self._check_value_length(default)
         return super().setdefault(key, default)
 
     def __ior__(self, other: Any) -> _GuardedDict:  # type: ignore[misc,override]
         # M-01: dict.__ior__ bypasses __setitem__.
-        for _k in other:
+        _other = dict(other)
+        for _k in _other:
             self._validate_key(_k)
-        return super().__ior__(other)
+        # M-43: value-side length guard is also bypassed by |=.
+        for _v in _other.values():
+            self._check_value_length(_v)
+        return super().__ior__(_other)
+
+    def trim_all(self, length: int) -> None:
+        """Trim every stored value to *length* rows (whole-container reconcile).
+
+        The F36 read-path reconciliation trims ALL values to the actual
+        data-line count when the pre-scan over-counted (standalone
+        mnemonic header rows in ~A, section-detection divergence).
+        Per-key ``__setitem__`` reassignment cannot express this: the
+        FIRST key would be compared against still-untrimmed siblings and
+        rejected by the M-43 length guard even though the final state is
+        fully consistent (F-01).  This method performs the whole-container
+        trim first, then validates the equal-length invariant ONCE —
+        legitimate internal reconciliation succeeds while genuinely
+        inconsistent containers still raise.
+        """
+        if not self:
+            return
+        _trimmed: dict[str, Any] = {}
+        for _key, _value in dict.items(self):
+            if self._value_len(_value) > length:
+                _trimmed[_key] = _value[:length]
+            else:
+                _trimmed[_key] = _value
+        _lengths = {self._value_len(_v) for _v in _trimmed.values()}
+        if len(_lengths) > 1:
+            raise ValueError(
+                f"{self._container_name}: inconsistent lengths — trimming "
+                f"to {length} rows leaves values of differing lengths "
+                f"{sorted(_lengths)}.  All values in a data container must "
+                f"have the same row count."
+            )
+        for _key, _value in _trimmed.items():
+            dict.__setitem__(self, _key, _value)
 
 
 class _GuardedList(list[Any]):
@@ -211,24 +357,54 @@ class _GuardedList(list[Any]):
         super().insert(index, item)
 
     def extend(self, items: Iterable[Any]) -> None:
-        for item in items:
+        # M-10: Materialize the iterable BEFORE validating.  A one-shot
+        # iterable (generator) would be consumed by the validation loop
+        # and then mutated by list.extend with the exhausted iterator —
+        # silent data loss (`las.curves.extend(gen)` → []).
+        _items = list(items)
+        for item in _items:
             self._validate_item(item)
-        super().extend(items)
+        super().extend(_items)
 
     def __setitem__(self, index: Any, item: Any) -> None:
         if isinstance(index, slice):
             # M-02: slice assignment passes an iterable of items, not a
             # single item.  Validate each element of the assigned slice.
-            for _item in item:
+            # M-10: materialize first — same one-shot-iterable trap as
+            # extend (a generator consumed by the validation loop would
+            # empty the slice assignment).
+            _items = list(item)
+            for _item in _items:
                 self._validate_item(_item)
+            item = _items
         else:
             self._validate_item(item)
         super().__setitem__(index, item)
 
     def __iadd__(self, other: Iterable[Any]) -> _GuardedList:  # type: ignore[misc]
-        for item in other:
+        # M-10: Materialize before validation — same one-shot-iterable
+        # trap as extend (list.__iadd__ would mutate the exhausted
+        # iterator, silently appending nothing).
+        _other = list(other)
+        for item in _other:
             self._validate_item(item)
-        return super().__iadd__(other)
+        return super().__iadd__(_other)
+
+    def __reduce__(self) -> Any:
+        # M-16: list subclasses with __slots__ do not unpickle by
+        # default — reconstruction bypasses __init__ so _expected_type
+        # is unset when the item-restoration path calls _validate_item,
+        # raising AttributeError.  Reconstruct through __init__ (which
+        # validates the items) and restore the slot state explicitly via
+        # __setstate__.
+        return (
+            self.__class__,
+            (list(self),),
+            (self._container_name, self._expected_type),
+        )
+
+    def __setstate__(self, state: Any) -> None:
+        self._container_name, self._expected_type = state
 
 
 def _create_parameter_entry(param_dict: dict[str, Any]) -> ParameterEntry:
@@ -502,18 +678,34 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
     # The parser raises LASParseError for missing VERS (parser.py:406-409).
     # from_dict previously silently defaulted to "2.0" via _safe_str(),
     # manufacturing version metadata on roundtrip gaps.
+    # M-73: The check fired only when the "version" key was PRESENT but VERS
+    # was missing inside it.  When the entire "version" key was absent,
+    # data.get("version") returned None, isinstance(None, dict) was False,
+    # the check was skipped, and from_dict silently defaulted to LAS 2.0 —
+    # while the parser raises LASParseError for equivalent input (content
+    # without a ~V section, parser.py:697-701).  Fire the presence check for
+    # BOTH states so the two APIs stay consistent.
     version = data.get("version")
-    if isinstance(version, dict):
-        if "VERS" not in version:
-            raise ValueError(
-                "Missing required VERS field in version section. "
-                "VERS must be present (e.g. '1.2', '2.0', '3.0')."
-            )
-        # H-04: Validate VERS value against known LAS versions.
-        # M-04: VERS warning removed from here — duplicate of
-        # VersionSection.__post_init__ (line 577).  The post_init
-        # check covers all construction paths (direct, parser,
-        # from_dict) as the single authoritative source.
+    if version is None:
+        raise ValueError(
+            "Missing required 'version' section.  "
+            "'version' must be present with a 'VERS' key "
+            "(e.g. '1.2', '2.0', '3.0')."
+        )
+    if not isinstance(version, dict):
+        raise TypeError(
+            f"version: expected dict, got {type(version).__name__}"
+        )
+    if "VERS" not in version:
+        raise ValueError(
+            "Missing required VERS field in version section. "
+            "VERS must be present (e.g. '1.2', '2.0', '3.0')."
+        )
+    # H-04: Validate VERS value against known LAS versions.
+    # M-04: VERS warning removed from here — duplicate of
+    # VersionSection.__post_init__ (line 577).  The post_init
+    # check covers all construction paths (direct, parser,
+    # from_dict) as the single authoritative source.
 
     # --- F-018: DLM validation ---
     if isinstance(version, dict):
@@ -1350,6 +1542,50 @@ class CurveDefinition:
                 f"CurveDefinition: array_info must be ArrayElementInfo "
                 f"or None, got {type(self.array_info).__name__}"
             )
+        # M-17: Cross-check bracket-notation mnemonic against
+        # array_info.base_name (same check the from_dict path applies at
+        # lines ~3042-3052).  A mismatched array_info silently corrupts
+        # output on write — the writer rebuilds the mnemonic from
+        # array_info.index (W-09) and _las30_data groups array curves by
+        # base_name, so a mismatched element is validated under a group
+        # it will not belong to after re-parse.  Warn (mirroring
+        # from_dict) rather than raise.
+        if self.array_info is not None and "[" in self.mnemonic:
+            _mnem_base = self.mnemonic.split("[", 1)[0]
+            if _mnem_base != self.array_info.base_name:
+                warnings.warn(
+                    f"CurveDefinition: mnemonic {self.mnemonic!r} uses "
+                    f"array notation but array_info.base_name is "
+                    f"{self.array_info.base_name!r}.  Cross-check "
+                    f"mismatch may indicate malformed input.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        # M-86: Reject the AMBIGUOUS state — bracketed mnemonic +
+        # data_format="A" + array_info=None.  Per _detect_string_curves,
+        # data_format="A" WITHOUT array_info is a STRING curve (the model
+        # accepts it), but the writer emits "NMR[1]  : desc {A}" and the
+        # parser UNCONDITIONALLY fabricates ArrayElementInfo from any
+        # bracketed mnemonic — reclassifying the curve to NUMERIC on
+        # re-read and silently destroying the string data (numeric-looking
+        # values fully silent; non-numeric → generic conversion warning).
+        # The writer emits IDENTICAL output with/without array_info
+        # (ambiguous signal), so the file cannot distinguish a genuine
+        # numeric array (array_info set) from a string curve.  Reject the
+        # ambiguous state loudly: a numeric array must set array_info; a
+        # string curve must use data_format="S" (which the parser
+        # classifies string regardless of array_info) or a non-bracket
+        # mnemonic.
+        if "[" in self.mnemonic and (self.data_format or "").upper() == "A" and self.array_info is None:
+            raise ValueError(
+                f"CurveDefinition: mnemonic {self.mnemonic!r} with "
+                f"data_format='A' but no array_info is ambiguous and "
+                f"cannot roundtrip.  The parser fabricates a phantom "
+                f"ArrayElementInfo for bracketed mnemonics, reclassifying "
+                f"this string curve to numeric on re-read and destroying "
+                f"its data.  Set array_info (numeric array) or use "
+                f"data_format='S' (string curve)."
+            )
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -1437,6 +1673,52 @@ class ParameterZone:
                 f"ParameterZone: zone_index must be >= 0, "
                 f"got {self.zone_index!r}"
             )
+        # M-12/M-65/L-124: Validate zone_name against the parser's zone
+        # grammar so a zone association survives write→read roundtrip.
+        # - A pipe ('|') in zone_name is escaped by the writer (\|) and
+        #   unescaped by the parser, so it roundtrips — but warn loudly
+        #   that it is non-standard.
+        # - Characters outside the roundtrip grammar (colon, semicolon,
+        #   dot, slash, brackets, etc.) previously made the ENTIRE
+        #   '| Zone[N]' association unparseable on re-read: the zone was
+        #   silently dropped and the raw '| Zone[N]' text leaked into the
+        #   parameter description.  The parser's zone grammar is now
+        #   tolerant of the M-65 punctuation class ([:;./] + escaped
+        #   pipes), so those roundtrip; warn loudly for characters that
+        #   STILL cannot roundtrip (brackets '['/']' conflict with the
+        #   zone index notation, and any other stray punctuation).
+        # - Trailing whitespace (L-124) breaks the '$'-anchored zone
+        #   pattern; normalize it away with a warning.
+        if isinstance(self.zone_name, str):
+            _normalized = self.zone_name.strip()
+            if _normalized != self.zone_name:
+                warnings.warn(
+                    f"ParameterZone: zone_name {self.zone_name!r} has "
+                    f"leading/trailing whitespace.  Normalizing to "
+                    f"{_normalized!r} so the zone association "
+                    f"roundtrips.",
+                    stacklevel=2,
+                )
+                self.zone_name = _normalized
+            if "|" in self.zone_name:
+                warnings.warn(
+                    f"ParameterZone: zone_name {self.zone_name!r} contains "
+                    f"a pipe ('|').  The writer escapes it and the parser "
+                    f"restores it, so the zone roundtrips, but a pipe in a "
+                    f"zone name is non-standard.",
+                    stacklevel=2,
+                )
+            _non_roundtrip = re.findall(r"[^A-Za-z0-9_\-.:;/ ]", self.zone_name)
+            if _non_roundtrip:
+                warnings.warn(
+                    f"ParameterZone: zone_name {self.zone_name!r} contains "
+                    f"characters {sorted(set(_non_roundtrip))} that the "
+                    f"LAS 3.0 zone grammar cannot roundtrip (brackets "
+                    f"'['/']' conflict with the zone index notation).  "
+                    f"The zone association may not survive a "
+                    f"write→read roundtrip.",
+                    stacklevel=2,
+                )
         # Run warning-producing checks via validate().
         for issue in self.validate(complete=False):
             warnings.warn(issue, stacklevel=2)
@@ -1549,14 +1831,33 @@ class ParameterEntry:
                 f"characters, '-', '/', '.', '%', and '°' (matching the "
                 f"parser's unit grammar)."
             )
-        # F-M-009: Validate data_format when provided, mirroring
+        # F-M-009 / M-11: Validate data_format when provided, mirroring
         # CurveDefinition.__post_init__ (lines 619-624) and the
-        # from_dict parameter path (lines 125-137).  Only validate
-        # single-character values — multi-character strings like
-        # "DD/MM/YYYY" are metadata descriptors, not LAS format
-        # specifiers.  Single-character non-format values like "X"
-        # would be propagated as {X} format specifiers and produce
-        # corrupted LAS output.
+        # from_dict parameter path (_create_parameter_entry, lines
+        # 338-352).  Single-character values are validated against the
+        # valid set; multi-character strings like "DD/MM/YYYY" are
+        # metadata descriptors, not LAS format specifiers.  The writer
+        # emits any non-empty data_format braced ({DD/MM/YYYY}), which
+        # re-parses to data_format='' with the brace text polluting the
+        # description — so direct construction must apply the SAME
+        # normalization as from_dict: truncate Fortran-style extended
+        # codes (F8.3 → F) and warn-and-clear other multi-char values,
+        # keeping roundtrips deterministic across construction paths.
+        if self.data_format and len(self.data_format) > 1:
+            if _EXTENDED_FORMAT_SPEC_RE.match(self.data_format):
+                self.data_format = self.data_format[0]
+            else:
+                warnings.warn(
+                    f"Ignoring multi-character data_format "
+                    f"'{self.data_format}' for parameter "
+                    f"'{self.mnemonic}'.  "
+                    f"Only single-letter LAS format codes or "
+                    f"Fortran-style extended codes are valid; "
+                    f"clearing to empty string.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self.data_format = ""
         if (self.data_format
                 and len(self.data_format) == 1
                 and self.data_format not in _VALID_DATA_FORMATS):
@@ -1577,6 +1878,38 @@ class ParameterEntry:
                 f"ParameterEntry.array_index must be int or None, "
                 f"got {type(self.array_index).__name__}"
             )
+        # M-41: Reject negative array_index.  The writer emits ``RUN[-1]``
+        # (W-08 guard only checks "[" not in mnemonic) but the parser's
+        # mnemonic grammar (``[\w\-]+(?:\[\d+\])?``) cannot match a
+        # negative index — the parameter line is skipped and the parameter
+        # silently vanishes on write→read.  Sibling fields
+        # (ArrayElementInfo.index, ParameterZone.zone_index) reject
+        # negatives; ParameterEntry was the only field without the guard.
+        if self.array_index is not None and self.array_index < 0:
+            raise ValueError(
+                f"ParameterEntry.array_index must be >= 0, "
+                f"got {self.array_index!r}"
+            )
+        # M-42: Cross-check bracket-notation mnemonic against array_index
+        # (parameter twin of M-17's CurveDefinition check).  A parameter
+        # like ``RUN[3]`` with array_index=5 is accepted, the writer's
+        # ``"[" not in mnemonic`` guard skips the W-08 bracket append and
+        # emits ``RUN[3]``, and re-parse reconstructs array_index=3 — a
+        # silent field divergence.  Warn (mirroring from_dict's F-17 curve
+        # warning) rather than raise, so internally-consistent pairs
+        # (bracket == array_index) and non-bracket mnemonics stay silent.
+        if "[" in self.mnemonic and self.array_index is not None:
+            _mnem_index = self.mnemonic.split("[", 1)[1].rstrip("]")
+            if _mnem_index.isdigit() and int(_mnem_index) != self.array_index:
+                warnings.warn(
+                    f"ParameterEntry: mnemonic {self.mnemonic!r} uses "
+                    f"array notation with index {_mnem_index} but "
+                    f"array_index is {self.array_index!r}.  The writer "
+                    f"emits the mnemonic's bracket index; the array_index "
+                    f"field will diverge on re-parse.",
+                    UserWarning,
+                    stacklevel=2,
+                )
         # F-005: Validate zone type (ParameterZone | None).
         if self.zone is not None and not isinstance(self.zone, ParameterZone):
             raise TypeError(
@@ -1860,6 +2193,19 @@ class DataSection:
             else:
                 self.section_type = _stripped
 
+        # M-84: Normalize bare known section types to their canonical
+        # *_DATA form.  The parser's _SECTION_TYPE_MAP accepts both
+        # "CORE" and "CORE_DATA" (mapping both to "CORE_DATA"), and a
+        # from_dict/direct model may carry the bare form.  The writer's
+        # _section_type_to_prefix only recognizes the *_DATA-suffixed
+        # forms; a bare "CORE" falls back to "A" with a warning and the
+        # re-read section_type silently becomes LOG_DATA.  Normalize at
+        # the model so the roundtrip preserves the declared type.
+        if self.section_type:
+            _bare = _BARE_SECTION_TYPE_TO_DATA.get(self.section_type)
+            if _bare is not None and _bare != self.section_type:
+                self.section_type = _bare
+
         # data keys ⊆ curves_order
         data_keys = set(self.data.keys())
         orphaned_data = data_keys - curve_set
@@ -2007,6 +2353,17 @@ class DataSection:
         # F-008: Wrap data/string_data with guarded dicts to catch
         # invalid mutations post-construction.  __post_init__ already
         # validated the contents; the guards prevent future corruption.
+        # M-15: Direct construction must not alias the caller's arrays —
+        # _GuardedDict wraps via a shallow dict(*args), so array values
+        # would remain SHARED with the caller (np.shares_memory True) and
+        # caller-side mutation would corrupt internal data.  Deepcopy the
+        # mutable input first (N-I-11 pattern — the same fix
+        # LASFile.__post_init__ applies to logs/string_data).  from_dict
+        # builds private arrays from already-deepcopied input, so it
+        # skips this via _from_dict=True.
+        if not self._from_dict:
+            self.data = copy.deepcopy(self.data)
+            self.string_data = copy.deepcopy(self.string_data)
         self.data = _GuardedDict(self.data, _container_name="DataSection.data")
         self.string_data = _GuardedDict(
             self.string_data, _container_name="DataSection.string_data"
@@ -2129,6 +2486,27 @@ class LASFile:
                 self.logs = copy.deepcopy(self.logs)
             if self.string_data:
                 self.string_data = copy.deepcopy(self.string_data)
+            # M-15: Direct construction must not alias the caller's
+            # DataSection objects (nor the caller's data_sections list).
+            # ``LASFile(data_sections=[ds])`` previously stored the
+            # caller's object BY REFERENCE — caller mutation of the
+            # DataSection (ds.name, ds.data[...]) propagated into the
+            # model.  Deepcopy the whole container (N-I-11 pattern).
+            # from_dict builds private DataSection instances and skips
+            # this via _from_dict=True.
+            # M-19: The deepcopy must run even for an EMPTY list.  The
+            # previous ``if self.data_sections:`` gate left an empty
+            # caller list aliased — a later caller ``append()`` mutated
+            # the model's data_sections and bypassed the __post_init__
+            # validation (duplicate-name dedup, per-section sweeps,
+            # continuity) that ran at construction time.
+            self.data_sections = copy.deepcopy(self.data_sections)
+            # M-19: curves_order is ALSO stored by reference (adversarial
+            # finding: ``lf.curves_order is order`` → True; caller append
+            # propagates, bypassing the same __post_init__ validation).
+            # Strings are immutable so the deepcopy is cheap — it only
+            # detaches the container.
+            self.curves_order = copy.deepcopy(self.curves_order)
 
         # F-13: Validate curves_order element types for direct construction.
         # from_dict validates per-element types at lines 2100-2111;
@@ -2332,11 +2710,24 @@ class LASFile:
             _seen_ds: set[str] = set()
             for _ds_name in _ds_names:
                 if _ds_name in _seen_ds:
-                    raise LASDataError(
-                        f"LASFile: duplicate data section name "
-                        f"{_ds_name!r}.  Data section names must "
-                        f"be unique."
-                    )
+                    # M-34: from_dict must tolerate duplicate section names.
+                    # The parser ACCEPTS them (parser.py:842-844 reports
+                    # validate() issues via logger.warning only), so the
+                    # library's own parse→to_dict→from_dict roundtrip
+                    # previously failed with LASDataError on a file the
+                    # parser accepted.  from_dict re-runs __post_init__
+                    # (I2F-13) with _from_dict=True — skip the raise on
+                    # that path and let the validate(complete=True) call
+                    # that from_dict ALWAYS performs right after report the
+                    # duplicate as a warning (single warning, no data loss).
+                    # Direct construction (_from_dict=False) still raises —
+                    # that is the documented F-14 contract.
+                    if not self._from_dict:
+                        raise LASDataError(
+                            f"LASFile: duplicate data section name "
+                            f"{_ds_name!r}.  Data section names must "
+                            f"be unique."
+                        )
                 _seen_ds.add(_ds_name)
             _all_section_curve_names: set[str] = set()
             for _ds in self.data_sections:
@@ -2877,6 +3268,82 @@ class LASFile:
                 _resolved_curve_names[resolved] = _raw_key
                 return resolved
 
+            # M-44: Resolution-collision-aware WELL-name normalization
+            # (twin of _norm_curve_mnem above for the well section).
+            # The well/well_units/well_descriptions loops previously used
+            # the bare _norm_mnem, so two distinct raw mnemonics resolving
+            # to the same canonical (e.g. "LLD"→"BFV" AND "LLS"→"BFV" in
+            # the shipped MNEM_BASE) silently last-won — one entry was
+            # dropped with ZERO warnings, while the parser path warns
+            # (parser.py:1908-1915) and the curve path uses
+            # _norm_curve_mnem.  Keep the ORIGINAL mnemonic for the
+            # colliding entry (preserving data) and warn, matching N-I-30.
+            # Separate resolved-name state: well entries and curves are
+            # distinct namespaces that legitimately share canonical names
+            # (e.g. a "DEPT" well entry and a "DEPT" curve).
+            _resolved_well_names: dict[str, str] = {}
+            _warned_well_collisions: set[tuple[str, str]] = set()
+
+            def _norm_well_mnem(raw: str, entries: dict[str, str], /) -> str:
+                """Normalize a well mnemonic, preserving ALL values on
+                resolution collisions (F-10: TRUE data preservation).
+
+                *entries* is the destination dict (``las_file.well.entries``,
+                ``well.units``, or ``well.descriptions``).  When the
+                canonical key itself collides with a previously-stored alias
+                (e.g. ``{"LLD": "100", "BFV": "200"}`` with ``LLD→BFV``),
+                the M-44 collision branch previously returned ``raw ==
+                resolved`` and the caller's assignment last-won — the alias
+                value was silently dropped while the warning claimed
+                preservation.  Here the alias's stored value is first
+                re-keyed to its ORIGINAL mnemonic, so BOTH values survive
+                and the warning describes what actually happens.
+                """
+                resolved = _norm_mnem(raw)
+                _raw_key = raw.upper()
+                _prev_raw = _resolved_well_names.get(resolved)
+                if _prev_raw is not None and _prev_raw != _raw_key:
+                    if raw == resolved:
+                        # The canonical key collides with a stored alias:
+                        # move the alias's value back under its original
+                        # mnemonic so the caller's store of the canonical
+                        # value below cannot overwrite it.  Guarded so a
+                        # container where the alias was never stored (shared
+                        # _resolved_well_names state across the well /
+                        # well_units / well_descriptions loops) is untouched.
+                        if resolved in entries:
+                            entries[_prev_raw] = entries[resolved]
+                            del entries[resolved]
+                    # Warn once per (raw, resolved) pair.
+                    if (_raw_key, resolved) not in _warned_well_collisions:
+                        _warned_well_collisions.add((_raw_key, resolved))
+                        if raw == resolved:
+                            warnings.warn(
+                                f"from_dict: well mnemonic '{raw}' resolves "
+                                f"to '{resolved}' via mnem_base, but "
+                                f"'{resolved}' is already used by well entry "
+                                f"'{_prev_raw}'.  Preserving both: the value "
+                                f"for '{_prev_raw}' is re-keyed to its "
+                                f"original mnemonic and '{raw}' is stored "
+                                f"under '{resolved}'.",
+                                UserWarning,
+                                stacklevel=2,
+                            )
+                        else:
+                            warnings.warn(
+                                f"from_dict: well mnemonic '{raw}' resolves "
+                                f"to '{resolved}' via mnem_base, but "
+                                f"'{resolved}' is already used by well entry "
+                                f"'{_prev_raw}'.  Keeping original mnemonic "
+                                f"'{raw}' to preserve well entry identity.",
+                                UserWarning,
+                                stacklevel=2,
+                            )
+                    _resolved_well_names[_raw_key] = _raw_key
+                    return resolved if raw == resolved else raw
+                _resolved_well_names[resolved] = _raw_key
+                return resolved
+
             las_file = cls()
 
             version = _resolve_dict_entry(data, "version", dict, dict)
@@ -2901,7 +3368,13 @@ class LASFile:
                     )
                 # F-058: Normalize well entry keys through mnem_base,
                 # matching the parser's behaviour (parser.py:1932-1938).
-                _norm_key = _norm_mnem(key)
+                # M-44: collision-aware — two raw mnemonics resolving to
+                # the same canonical keep the original and warn instead of
+                # silently dropping one entry.  F-10: the destination dict
+                # is passed so an alias+canonical pair in the same input
+                # preserves BOTH values (the alias is re-keyed to its
+                # original mnemonic).
+                _norm_key = _norm_well_mnem(key, las_file.well.entries)
                 las_file.well[_norm_key] = _safe_str(value)
             # Restore well units if present (from v1.7+ roundtrip data)
             well_units = _resolve_dict_entry(data, "well_units", dict, dict)
@@ -2916,7 +3389,11 @@ class LASFile:
                         f"Well unit dict key must be str, "
                         f"got {type(key).__name__}: {key!r}"
                     )
-                _norm_key = _norm_mnem(key)
+                # M-44: collision-aware well_units normalization (same
+                # N-I-30 pattern as the well entries loop above).  F-10:
+                # pass the destination dict so alias+canonical pairs in
+                # the same input preserve BOTH unit values.
+                _norm_key = _norm_well_mnem(key, las_file.well.units)
                 las_file.well.units[_norm_key] = _safe_str(unit)
 
             # Restore well descriptions if present (from v1.8+ roundtrip data)
@@ -2932,7 +3409,11 @@ class LASFile:
                         f"Well description dict key must be str, "
                         f"got {type(key).__name__}: {key!r}"
                     )
-                _norm_key = _norm_mnem(key)
+                # M-44: collision-aware well_descriptions normalization
+                # (same N-I-30 pattern as the well entries loop above).
+                # F-10: pass the destination dict so alias+canonical pairs
+                # in the same input preserve BOTH description values.
+                _norm_key = _norm_well_mnem(key, las_file.well.descriptions)
                 las_file.well.descriptions[_norm_key] = _safe_str(desc)
 
             curves_order = data.get("curves_order", [])
@@ -3350,7 +3831,51 @@ class LASFile:
                         )
                     try:
                         k = _norm_curve_mnem(k)
-                        ds_data[k] = np.atleast_1d(np.array(v, dtype=np.float64))
+                        # H-03: Per-section {I} branch — mirror the
+                        # top-level logs path (L-03, ~line 3877).  The
+                        # unconditional float64 coercion here destroyed
+                        # {I} integer precision above 2^53 on the
+                        # parse→to_dict→from_dict roundtrip
+                        # (9007199254740993 → 9007199254740992.0,
+                        # silent); efe7181 fixed the top-level sibling
+                        # but missed this per-section site
+                        # (asymmetric-fix regression).  Key on the
+                        # per-section curve's data_format and the
+                        # integrality of the declared NULL sentinel,
+                        # exactly like the top-level path.  The M-14
+                        # integrality guard (below) also prevents the
+                        # int64 branch from silently truncating
+                        # fractional/NaN data in per-section {I} curves.
+                        _fmt = next(
+                            (
+                                sc.data_format
+                                for sc in ds_section_curves
+                                if sc.mnemonic == k
+                            ),
+                            "",
+                        )
+                        _declared_null = las_file.well.get("NULL")
+                        _null_ok = True
+                        if _declared_null is not None:
+                            try:
+                                _null_ok = float(_declared_null).is_integer()
+                            except (ValueError, TypeError):
+                                _null_ok = False
+                        if _fmt == "I" and _null_ok and _data_is_integral(v):
+                            ds_data[k] = np.atleast_1d(
+                                np.array(v, dtype=np.int64)
+                            )
+                        elif _fmt == "I":
+                            # EXT-04: fractional declared NULL or
+                            # non-integral data — preserve exact values
+                            # in an object array (never truncate).
+                            ds_data[k] = np.atleast_1d(
+                                np.array(v, dtype=object)
+                            )
+                        else:
+                            ds_data[k] = np.atleast_1d(
+                                np.array(v, dtype=np.float64)
+                            )
                     except (ValueError, TypeError, MemoryError, OverflowError) as e:
                         ds_name = ds_dict.get("name", "<unknown>")
                         raise ValueError(
@@ -3763,7 +4288,7 @@ class LASFile:
                             _null_ok = float(_declared_null).is_integer()
                         except (ValueError, TypeError):
                             _null_ok = False
-                    if _fmt == "I" and _null_ok:
+                    if _fmt == "I" and _null_ok and _data_is_integral(arr):
                         las_file.logs[name] = np.atleast_1d(
                             np.array(arr, dtype=np.int64)
                         )
@@ -3773,6 +4298,13 @@ class LASFile:
                         # values, float sentinel for null cells).  Coercing
                         # to float64 would silently round {I} values above
                         # 2^53 (e.g. 9007199254740993 → 9007199254740992.0).
+                        # M-14: also reached when the NULL is integral but
+                        # the DATA is non-integral (fractional values would
+                        # be silently truncated to int64, and NaN would be
+                        # converted to 0 — NaN is the standard missing-data
+                        # marker, so it must never become a real zero).
+                        # Routing to object dtype preserves every value
+                        # exactly instead of silently altering it.
                         las_file.logs[name] = np.atleast_1d(
                             np.array(arr, dtype=object)
                         )
@@ -4100,11 +4632,220 @@ class _DevColumns(dict[str, NDArray[np.float64]]):
         del self[key]
         return _value
 
+    def popitem(self) -> tuple[str, NDArray[np.float64]]:
+        # M-18: dict.popitem (C-level) bypasses __delitem__, so it popped
+        # the last column WITHOUT removing it from column_order — the
+        # stale order made to_dict/from_dict raise LASDataError.  Route
+        # through __delitem__ (same pattern as pop above) so column_order
+        # stays in sync.  LIFO semantics match dict.popitem.
+        if not self:
+            raise KeyError("popitem(): dictionary is empty")
+        _key = next(reversed(self))
+        _value = self[_key]
+        del self[_key]
+        return _key, _value
+
     def clear(self) -> None:
         # Clear column_order with the dict — a desynced column_order that
         # still names removed columns breaks the to_dict/from_dict contract.
         super().clear()
         self._dev.column_order.clear()
+
+    def __ior__(self, other: Any) -> _DevColumns:  # type: ignore[misc,override]
+        # M-13: dict.__ior__ (|=) bypasses the Python __setitem__
+        # override, so it previously skipped str-key validation, float64
+        # coercion, length consistency, MAX_DATA_LINES, AND column_order
+        # sync — wrong-length/int-key inserts were silently accepted and
+        # the to_dict/from_dict roundtrip raised LASDataError.  Route
+        # through update() (which routes through __setitem__) so every
+        # guard applies.
+        self.update(other)
+        return self
+
+    def __reduce__(self) -> Any:
+        # M-48: dict subclasses with __slots__ do not unpickle by default —
+        # reconstruction bypasses __init__, so the _dev slot is never set
+        # and any access raises AttributeError (reproduced on DevFile AND
+        # bare _DevColumns).  Reconstruct through __init__ (which re-binds
+        # _dev) with the dict content.  Exact sibling of the Round-1 M-16
+        # _GuardedList fix above.
+        return (
+            self.__class__,
+            (self._dev, dict(self)),
+        )
+
+
+class _DevColumnOrder(list[str]):
+    """Validating list for DevFile.column_order.
+
+    M-46: column_order was an unguarded plain list.  Direct mutation
+    (``dev.column_order.append("GHOST")``) desynced order from columns and
+    broke the to_dict→from_dict roundtrip with LASDataError, and construction
+    stored the caller's list BY REFERENCE (caller mutation — including a
+    silent ``reverse()`` reorder — corrupted the model with zero warnings).
+    The guarded list validates item type, rejects duplicates, routes every
+    ADD through the same column-existence invariant ``_DevColumns`` maintains
+    (column_order may only reference existing columns), and routes REMOVE/
+    pop/clear through the same invariant (an entry may not be removed while
+    its column still exists — use ``del dev.columns[k]`` instead), so order
+    and columns cannot desync via mutation.
+    """
+
+    __slots__ = ('_dev',)
+
+    def __init__(self, dev: DevFile, values: Iterable[str] = ()) -> None:
+        self._dev = dev
+        # Materialize FIRST (a one-shot iterable would be consumed by the
+        # validation loop and then re-iterated empty by list.__init__).
+        # list(values) also guarantees the stored list is a fresh object —
+        # the caller's list is never stored by reference.
+        _items = list(values)
+        for _item in _items:
+            self._validate_item(_item)
+        # F-12: wholesale (re)assignment through this constructor must
+        # validate the same invariants __post_init__ enforces for the
+        # construction-time pair — duplicates and column existence.  The
+        # __setattr__ intercept re-wraps every ``dev.column_order = [...]``
+        # here, and __post_init__ never re-runs post-construction, so
+        # ``['GHOST']``/``['MD','MD']`` were previously accepted and
+        # silently desynced order from columns.  LASDataError (a ValueError
+        # subclass) matches the __post_init__ E-F-026 contract.  Column
+        # existence is enforced only once columns are populated — empty
+        # columns are allowed for incremental population (the __post_init__
+        # ``if not self.columns: return`` design).
+        if _items:
+            from .exceptions import LASDataError
+
+            _seen: set[str] = set()
+            # getattr: during unpickling (_DevColumnOrder.__reduce__ →
+            # __init__) the _dev backref may be a partially-restored
+            # DevFile whose ``columns`` attribute is not set yet — the
+            # pickled snapshot was validated when it was created, so the
+            # existence check can only run when columns is available.
+            _columns = getattr(dev, "columns", None)
+            for _item in _items:
+                if _item in _seen:
+                    raise LASDataError(
+                        f"DevFile: column_order contains duplicate "
+                        f"entries: {_item}.  Each column may only "
+                        f"appear once."
+                    )
+                _seen.add(_item)
+                if _columns and _item not in _columns:
+                    raise LASDataError(
+                        f"DevFile: column_order entry '{_item}' is not "
+                        f"a column in dev.columns.  column_order may "
+                        f"only reference existing columns."
+                    )
+        super().__init__(_items)
+
+    def _validate_item(self, item: Any) -> None:
+        if not isinstance(item, str):
+            raise TypeError(
+                f"DevFile column_order entries must be str, "
+                f"got {type(item).__name__}"
+            )
+
+    def _check_add(self, item: Any) -> None:
+        self._validate_item(item)
+        if item in self:
+            raise ValueError(
+                f"DevFile: column_order already contains '{item}'.  "
+                f"Each column may only appear once."
+            )
+        if item not in self._dev.columns:
+            raise ValueError(
+                f"DevFile: column_order entry '{item}' is not a "
+                f"column in dev.columns.  column_order may only "
+                f"reference existing columns."
+            )
+
+    def _check_remove(self, item: Any) -> None:
+        if item in self._dev.columns:
+            raise ValueError(
+                f"DevFile: cannot remove column '{item}' from "
+                f"column_order while it still exists in columns.  "
+                f"Use 'del dev.columns[{item!r}]' to remove a column."
+            )
+
+    def append(self, item: Any) -> None:
+        self._check_add(item)
+        super().append(item)
+
+    def insert(self, index: SupportsIndex, item: Any) -> None:
+        self._check_add(item)
+        super().insert(index, item)
+
+    def extend(self, items: Iterable[Any]) -> None:
+        _items = list(items)
+        for _item in _items:
+            self._check_add(_item)
+        super().extend(_items)
+
+    def __iadd__(self, other: Any) -> _DevColumnOrder:  # type: ignore[misc,override]
+        _other = list(other)
+        for _item in _other:
+            self._check_add(_item)
+        return super().__iadd__(_other)
+
+    def __setitem__(self, index: Any, item: Any) -> None:
+        if isinstance(index, slice):
+            _old = list(self[index])
+            _items = list(item)
+            # F-11: slice assignment REPLACES/REMOVES the entries in
+            # *index* — a shrinking/empty slice (e.g. ``[1:2] = []``)
+            # previously deleted entries without the remove-side desync
+            # guard, silently desyncing order from columns.  Route every
+            # entry being dropped (not re-inserted by the new items)
+            # through _check_remove — an entry may not be removed while
+            # its column still exists — mirroring remove/pop/__delitem__
+            # and the add-side _check_add below.
+            for _old_item in _old:
+                if _old_item not in _items:
+                    self._check_remove(_old_item)
+            for _it in _items:
+                self._check_add(_it)
+            item = _items
+        else:
+            self._check_add(item)
+        super().__setitem__(index, item)
+
+    def remove(self, value: Any) -> None:
+        self._check_remove(value)
+        super().remove(value)
+
+    def pop(self, index: Any = -1) -> Any:
+        # list.pop's IndexError/ValueError semantics are preserved by
+        # delegating the actual removal to super().
+        _value = self[index]
+        self._check_remove(_value)
+        return super().pop(index)
+
+    def __delitem__(self, index: Any) -> None:
+        _value = self[index]
+        self._check_remove(_value)
+        super().__delitem__(index)
+
+    def clear(self) -> None:
+        # Clearing the order is only consistent while columns is also
+        # empty (_DevColumns.clear() empties the dict BEFORE clearing the
+        # order).  A non-empty columns dict with an empty order breaks the
+        # to_dict→from_dict roundtrip (LASDataError).
+        if self._dev.columns:
+            raise ValueError(
+                f"DevFile: cannot clear column_order while "
+                f"columns still contains {sorted(self._dev.columns)}.  "
+                f"Use 'dev.columns.clear()' to remove all columns."
+            )
+        super().clear()
+
+    def __reduce__(self) -> Any:
+        # M-48 twin: list subclass with __slots__ — reconstruct through
+        # __init__ so _dev is re-bound on unpickle.
+        return (
+            self.__class__,
+            (self._dev, list(self)),
+        )
 
 
 @dataclass(eq=False)
@@ -4122,6 +4863,115 @@ class DevFile:
     # population.  Consistent with LASFile._from_dict and
     # DataSection._from_dict.
     _from_dict: bool = field(default=False, repr=False)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """M-45/M-46/M-49: Guarded assignment for ``columns`` and
+        ``column_order``.
+
+        Post-construction ``dev.columns = <plain dict>`` wholesale
+        reassignment previously replaced the ``_DevColumns`` wrapper with
+        a plain dict — dropping EVERY guard (str-key validation, float64
+        coercion, length consistency, MAX_DATA_LINES, column_order sync).
+        Wrong-length columns were silently accepted, ``to_dict`` emitted a
+        desynced model, and ``DevFile.from_dict`` raised LASDataError
+        (validate() even crashed with a raw IndexError on the desynced
+        state).  ``dev.columns.copy()`` hit the same bypass.
+
+        M-49: passing a pre-wrapped ``_DevColumns`` (the natural copy idiom
+        ``DevFile(columns=old_dev.columns, ...)``) previously passed through
+        BY REFERENCE — ``dev2.columns is dev1.columns``, the ``_dev`` backref
+        still pointed at dev1, and mutation through dev2 corrupted dev1 while
+        leaving dev2's column_order stale (roundtrip LASDataError).  The
+        content is now deep-copied and re-wrapped bound to THIS DevFile.
+
+        M-46: ``column_order`` is now wrapped in ``_DevColumnOrder`` (deepcopy
+        + re-wrap on every assignment), so caller lists are never stored by
+        reference and post-construction mutation cannot desync order→columns.
+
+        Intercept ALL ``columns``/``column_order`` assignments (including the
+        dataclass ``__init__`` path) and re-wrap through the same validation
+        ``__post_init__`` applies, so reassignment can never bypass the
+        guards.
+        """
+        if name != "columns":
+            if name == "column_order":
+                # M-46: Deepcopy + re-wrap through _DevColumnOrder.  For an
+                # already-wrapped input (e.g. dev2.column_order =
+                # dev1.column_order), copy the CONTENT only — deepcopying the
+                # wrapper itself would copy its _dev backref (the wrong
+                # DevFile).  list[str] is immutable-element, so the
+                # materialized copy in _DevColumnOrder.__init__ makes the
+                # storage private.
+                if isinstance(value, _DevColumnOrder):
+                    value = list(value)
+                super().__setattr__(
+                    name,
+                    _DevColumnOrder(self, copy.deepcopy(value)),
+                )
+                return
+            super().__setattr__(name, value)
+            return
+        # N-I-11: Direct assignment must not alias the caller's dict or its
+        # arrays — deepcopy makes the storage private, and coercing list
+        # values to ndarray (matching _DevColumns.__setitem__) makes
+        # downstream validate() safe.
+        if not isinstance(value, dict):
+            raise TypeError(
+                f"DevFile: columns must be a dict, "
+                f"got {type(value).__name__}"
+            )
+        if isinstance(value, _DevColumns):
+            # M-49: Content-only copy — dict(value) drops the _dev backref
+            # so deepcopy does not also copy the SOURCE DevFile; the copy is
+            # re-wrapped bound to this DevFile below.
+            _cols = copy.deepcopy(dict(value))
+        else:
+            _cols = copy.deepcopy(value)
+        _coerced: dict[str, NDArray[np.float64]] = {}
+        for _k, _v in _cols.items():
+            if not isinstance(_k, str):
+                raise TypeError(
+                    f"DevFile column keys must be str, "
+                    f"got {type(_k).__name__}"
+                )
+            _coerced[_k] = np.atleast_1d(np.asarray(_v, dtype=np.float64))
+        # Length consistency + MAX_DATA_LINES on the assigned set (mirrors
+        # _DevColumns.__setitem__ and __post_init__).  LASDataError matches
+        # the exception __post_init__ raises for the same whole-dict
+        # checks (E-F-026 contract); it IS a ValueError subclass, so
+        # callers catching ValueError still capture these errors.
+        from .exceptions import LASDataError
+        if len(_coerced) > 1:
+            _lens = {
+                _k: (1 if isinstance(_a, np.ndarray) and _a.ndim == 0
+                     else len(_a))
+                for _k, _a in _coerced.items()
+            }
+            if len(set(_lens.values())) > 1:
+                raise LASDataError(
+                    f"DevFile: columns have inconsistent array lengths: "
+                    f"{_lens}"
+                )
+        from .data_reader import MAX_DATA_LINES
+        for _k, _a in _coerced.items():
+            if len(_a) > MAX_DATA_LINES:
+                raise LASDataError(
+                    f"DevFile: column '{_k}' length ({len(_a)}) "
+                    f"exceeds maximum allowed ({MAX_DATA_LINES})"
+                )
+        super().__setattr__(name, _DevColumns(self, _coerced))
+        # Sync column_order to the reassigned key set: preserve existing
+        # order for surviving keys, drop removed keys, append new keys in
+        # insertion order.  During __init__ column_order is not yet set
+        # (declared after columns) — __post_init__ validates the initial
+        # pair instead.
+        _order = self.__dict__.get("column_order")
+        if _order is not None:
+            _new_keys = list(_coerced.keys())
+            if set(_order) != set(_new_keys):
+                _kept = [k for k in _order if k in _coerced]
+                _added = [k for k in _new_keys if k not in _order]
+                self.column_order = _kept + _added
 
     def validate(self, complete: bool = False) -> list[str]:
         """Validate DEV file data integrity.
@@ -4302,6 +5152,17 @@ class DevFile:
                 for _k, _v in _cols.items()
             }
             self.columns = _DevColumns(self, _cols)
+
+        # M-46: Direct construction must not alias the caller's
+        # column_order list — caller-side mutation (append, or a silent
+        # reverse() reorder) previously corrupted the model with zero
+        # warnings.  Deepcopy and wrap through _DevColumnOrder (str-only,
+        # no duplicates, entries must reference existing columns).
+        # Idempotent: the __setattr__ intercept already wraps every
+        # assignment — this defensive branch covers direct __dict__
+        # manipulation (same pattern as the columns wrap above).
+        if not isinstance(self.column_order, _DevColumnOrder):
+            self.column_order = copy.deepcopy(self.column_order)
 
         if not self.columns:
             return
@@ -4550,20 +5411,38 @@ class DevFile:
                                     "got bytes.  Decode to str first: "
                                     "value.decode('utf-8')"
                                 )
-                            dev.column_order = [value]
                             # F2-31: Normalize column_order entries to match
                             # normalized column names in dev.columns.
                             if normalize_aliases:
+                                # I2F-011: map entries back to the actual
+                                # case-sensitive column keys BEFORE storing
+                                # so _DevColumnOrder's existence check passes
+                                # for metadata-collision columns (e.g. column
+                                # 'source_file' vs normalized 'SOURCE_FILE').
+                                _col_order = [_normalize_dev_column(value)]
+                                _actual_keys = {k.upper(): k for k in dev.columns}
                                 dev.column_order = [
-                                    _normalize_dev_column(c)
-                                    for c in dev.column_order
+                                    _actual_keys.get(c.upper(), c)
+                                    for c in _col_order
                                 ]
+                            else:
+                                dev.column_order = [value]
                         else:
                             _col_order = list(value)
                             # F2-31: Normalize column_order entries.
                             if normalize_aliases:
                                 _col_order = [
                                     _normalize_dev_column(c)
+                                    for c in _col_order
+                                ]
+                                # I2F-011: map entries back to the actual
+                                # case-sensitive column keys BEFORE storing
+                                # so _DevColumnOrder's existence check passes
+                                # for metadata-collision columns (e.g. column
+                                # 'source_file' vs normalized 'SOURCE_FILE').
+                                _actual_keys = {k.upper(): k for k in dev.columns}
+                                _col_order = [
+                                    _actual_keys.get(c.upper(), c)
                                     for c in _col_order
                                 ]
                             if len(_col_order) >= MAX_CURVES:
@@ -4614,20 +5493,38 @@ class DevFile:
                                     "got bytes.  Decode to str first: "
                                     "value.decode('utf-8')"
                                 )
-                            dev.column_order = [value]
                             # F2-31: Normalize column_order entries to match
                             # normalized column names in dev.columns.
                             if normalize_aliases:
+                                # I2F-011: map entries back to the actual
+                                # case-sensitive column keys BEFORE storing
+                                # so _DevColumnOrder's existence check passes
+                                # for metadata-collision columns (e.g. column
+                                # 'source_file' vs normalized 'SOURCE_FILE').
+                                _col_order = [_normalize_dev_column(value)]
+                                _actual_keys = {k.upper(): k for k in dev.columns}
                                 dev.column_order = [
-                                    _normalize_dev_column(c)
-                                    for c in dev.column_order
+                                    _actual_keys.get(c.upper(), c)
+                                    for c in _col_order
                                 ]
+                            else:
+                                dev.column_order = [value]
                         else:
                             _col_order = list(value)
                             # F2-31: Normalize column_order entries.
                             if normalize_aliases:
                                 _col_order = [
                                     _normalize_dev_column(c)
+                                    for c in _col_order
+                                ]
+                                # I2F-011: map entries back to the actual
+                                # case-sensitive column keys BEFORE storing
+                                # so _DevColumnOrder's existence check passes
+                                # for metadata-collision columns (e.g. column
+                                # 'source_file' vs normalized 'SOURCE_FILE').
+                                _actual_keys = {k.upper(): k for k in dev.columns}
+                                _col_order = [
+                                    _actual_keys.get(c.upper(), c)
                                     for c in _col_order
                                 ]
                             if len(_col_order) >= MAX_CURVES:

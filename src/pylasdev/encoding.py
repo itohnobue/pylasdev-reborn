@@ -10,6 +10,7 @@ Geoscience files commonly use:
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from .exceptions import LASEncodingError
@@ -57,54 +58,130 @@ FALLBACK_ENCODINGS = ["utf-8", "cp1251", "cp866", "cp1252", "latin-1"]
 # Sampling the first _MIN_VALIDATION_CHARS avoids scanning multi-GB files.
 _MIN_VALIDATION_CHARS = 65_536  # Sample first 64K chars/bytes for analysis
 
-# E-07: Cyrillic-detection sample window.  The byte-frequency and run-length
-# detectors below sample only the first _MIN_VALIDATION_CHARS bytes.  A
-# cp1251/cp866 file whose Cyrillic content lands beyond the first 64K (e.g.
-# large ~C/~O sections or long ASCII headers) is therefore invisible to both
-# signals and gets misdecoded as cp1252/latin-1 → silent mojibake of all
-# header strings.  Widening ONLY the Cyrillic detection samples (not the
-# word-char ratio sample, which must stay small for F-88 memory reasons)
-# lets those detectors see Cyrillic text further into the file.
-_CYRILLIC_DETECTION_CHARS = 1_048_576  # Sample first 1 MiB for Cyrillic signals
-
-# E-06: Near-tie margin for the Cyrillic-vs-Western selection.  Byte 0xB9
-# is "№" in cp1251 (not alnum) but "¹" in cp1252 (alnum), so any "№" in
-# the sample gives cp1252 a small but strict ratio advantage (~2.9%) over
-# cp1251.  The ratio-primary sort (load-bearing — see F-24 and the UTF-8
-# preference below) would then select cp1252 and decode the whole file as
-# mojibake.  When the content is judged Cyrillic and the best Western
-# candidate beats the best Cyrillic candidate by only this near-tie margin,
-# prefer the Cyrillic candidate.  Genuine encoding mismatches produce ratio
-# gaps >10%, so this never overrides a clear winner.
+# E-06 + M-81: Near-tie margin for the Cyrillic-vs-Western selection.  Byte
+# 0xB9 is "№" in cp1251 (not alnum) but "¹" in cp1252 (alnum), so any "№"
+# in the sample gives cp1252 a small but strict ratio advantage (~2.9%)
+# over cp1251.  The ratio-primary sort (load-bearing — see F-24 and the
+# UTF-8 preference below) would then select cp1252 and decode the whole
+# file as mojibake.  When the content is judged Cyrillic and the best
+# Western candidate beats the best Cyrillic candidate by only this
+# near-tie margin, prefer the Cyrillic candidate.  Genuine encoding
+# mismatches produce ratio gaps >10%, so this never overrides a clear
+# winner.  (M-81: the exact № contribution is subtracted from the gap in
+# _decode_best_quality, so the margin no longer needs to bound №-density.)
 _NEAR_TIE_CYRILLIC_MARGIN = 0.04  # 4% relative ratio gap
 
+# M-31: Cyrillic detection scans the WHOLE file — there is deliberately no
+# fixed sample window.  A fixed window (64K, widened to 1 MiB by E-07) left
+# files whose Cyrillic content starts beyond the window (large ASCII
+# headers, large numeric ~A blocks before string curves) invisible to the
+# detector, so they were misdecoded as cp1252/latin-1 → silent mojibake of
+# all header strings.  The whole-file scan is cheap: the byte-class regexes
+# below run at C speed and _has_confirmed_cyrillic_run() early-exits at the
+# first qualifying run.  (F-88's word-char ratio sample stays bounded at
+# _MIN_VALIDATION_CHARS — only the Cyrillic detector scans the whole file.)
 
-def _has_cyrillic_text(text: str) -> bool:
-    """Check if *text* contains any Cyrillic code points (U+0400-U+04FF)."""
-    for ch in text:
-        cp = ord(ch)
-        if 0x0400 <= cp <= 0x04FF:
+# M-57/M-82: A "Cyrillic byte" is a byte that decodes to a Cyrillic code
+# point (U+0400-U+04FF) under cp1251.  Bytes 0xC0-0xFF are ambiguous — under
+# cp1252 they are accented Latin letters — so 3 such bytes in a row
+# ("Ñáñez" → "Сбс") is NOT a reliable Cyrillic signal (M-82).  A run is  # noqa: RUF003
+# confirmed as genuine Cyrillic when it is _CYRILLIC_RUN_CONFIRM+ bytes long
+# (real words are 4+ Cyrillic letters; 4+ consecutive cp1252 accents are
+# essentially nonexistent), OR when it contains a "strong" byte — a byte
+# that is Cyrillic under cp1251 but NOT an alnum letter under cp1252
+# (control chars/symbols that Western text cannot plausibly contain).  The
+# strong-byte rule also catches cp866-encoded Cyrillic, which maps to
+# 0x80-0x9F under cp1251 (runs of 3, e.g. "ЋђЋ").  A 3-byte run is also
+# confirmed when a "№" marker (0xB9) is ADJACENT to it: № is a Russian
+# typographic convention (well names "СКВ №1", "ПЛАСТ №2"), and genuine  # noqa: RUF003
+# cp1251-encoded № is the raw byte 0xB9, so the rule fires only on
+# single-byte Cyrillic files (M-81; UTF-8-encoded "№" is 0xE2 0x84 0x96).
+# F-18: the №-confirmation is scoped to a small window AROUND the run —
+# the 0xB9 byte must be within _NUMERO_ADJACENCY_WINDOW bytes before the
+# run start or after the run end.  It must NOT be a whole-file membership
+# test: a lone Western "¹" (also byte 0xB9 in cp1252) in a footnote
+# hundreds of KB away from an accented run ("Ñáñez") would otherwise flip
+# a genuine cp1252 file to cp1251 → mojibake (M-82 defect class re-opened).
+# Byte-frequency alone (F-24) is NOT used: its common-letter byte set is
+# byte-identical to common cp1252 accents, so ñ-dense Spanish/Portuguese
+# text exceeds any realistic frequency threshold (M-57); run confirmation
+# subsumes it (any file dense enough to exceed a frequency threshold
+# contains 4+ char words).
+_CYRILLIC_RUN_CONFIRM = 4
+_STRONG_RUN_MIN = 3
+# F-18: adjacency window for the "№" (0xB9) confirmation rule — a genuine
+# "СКВ №1" places the marker within 1-3 bytes of the run (space/punctuation  # noqa: RUF003
+# + 0xB9), so 8 bytes on either side comfortably covers real-world labels
+# while keeping a far-away footnote marker out of scope.
+_NUMERO_ADJACENCY_WINDOW = 8
+
+
+def _build_cyrillic_run_regexes() -> tuple[re.Pattern[bytes], re.Pattern[bytes], re.Pattern[bytes]]:
+    """Build the C-speed byte regexes used by :func:`_has_confirmed_cyrillic_run`.
+
+    Returns:
+        (runs of ``_CYRILLIC_RUN_CONFIRM``+ Cyrillic bytes,
+         runs of 3+ Cyrillic bytes,
+         runs of Cyrillic bytes containing at least one strong byte).
+    """
+    cyrillic_bytes = bytes(
+        b
+        for b in range(0x80, 0x100)
+        if 0x0400 <= ord(bytes([b]).decode("cp1251", errors="replace")) <= 0x04FF
+    )
+    strong_bytes = bytes(
+        b
+        for b in cyrillic_bytes
+        if not bytes([b]).decode("cp1252", errors="replace").isalnum()
+    )
+    cyrillic_class = b"[" + cyrillic_bytes + b"]"
+    strong_class = b"[" + strong_bytes + b"]"
+    return (
+        re.compile(
+            cyrillic_class + b"{" + str(_CYRILLIC_RUN_CONFIRM).encode("ascii") + b",}"
+        ),
+        re.compile(cyrillic_class + b"{3,}"),
+        re.compile(cyrillic_class + b"*" + strong_class + cyrillic_class + b"*"),
+    )
+
+
+_CYRILLIC_RUN_GE_RE, _CYRILLIC_RUN_3_RE, _STRONG_CYRILLIC_RUN_RE = (
+    _build_cyrillic_run_regexes()
+)
+
+
+def _has_confirmed_cyrillic_run(data: bytes) -> bool:
+    """Return True if *data* contains a run of bytes confirming Cyrillic text.
+
+    A run of ``_CYRILLIC_RUN_CONFIRM`` or more consecutive Cyrillic bytes, a
+    run of 3+ such bytes together with a "№" marker (0xB9) ADJACENT to the
+    run (within ``_NUMERO_ADJACENCY_WINDOW`` bytes of it — see the module
+    constants, F-18), or a run of ``_STRONG_RUN_MIN`` or more that contains a
+    strong Cyrillic byte (a byte that is Cyrillic under cp1251 but not an
+    alnum letter under cp1252), strongly indicates genuine cp1251/cp866
+    content — see the module constants for the rationale
+    (M-31/M-57/M-81/M-82/F-18).
+    """
+    if _CYRILLIC_RUN_GE_RE.search(data):
+        return True
+    # F-18: The №-confirmation rule is ADJACENCY-scoped, not whole-file.
+    # The previous `b"\xb9" in data and _CYRILLIC_RUN_3_RE.search(data)`
+    # fired when the 0xB9 byte and the 3-byte run were anywhere in the
+    # file (probes: 700KB/1MB/10MB apart all fired), so a genuine cp1252
+    # Western file with a single "¹" (0xB9 in cp1252) plus an accented
+    # run ("Ñáñez") was flipped to cp1251 → mojibake with zero warnings.
+    # Only a 0xB9 within a small window of the run itself confirms the
+    # Russian "№" convention.
+    if b"\xb9" in data:
+        for match in _CYRILLIC_RUN_3_RE.finditer(data):
+            window_start = max(0, match.start() - _NUMERO_ADJACENCY_WINDOW)
+            window_end = min(len(data), match.end() + _NUMERO_ADJACENCY_WINDOW)
+            if b"\xb9" in data[window_start:window_end]:
+                return True
+    for match in _STRONG_CYRILLIC_RUN_RE.finditer(data):
+        if len(match.group()) >= _STRONG_RUN_MIN:
             return True
     return False
-
-
-def _max_cyrillic_run(text: str) -> int:
-    """Return the length of the longest consecutive run of Cyrillic characters.
-
-    A run length >= 3 is a strong signal that the encoding is genuinely
-    Cyrillic rather than accidental byte-frequency matches.
-    """
-    max_run = 0
-    current_run = 0
-    for ch in text:
-        cp = ord(ch)
-        if 0x0400 <= cp <= 0x04FF:
-            current_run += 1
-            if current_run > max_run:
-                max_run = current_run
-        else:
-            current_run = 0
-    return max_run
 
 
 def detect_encoding(file_path: Path) -> str:
@@ -228,49 +305,17 @@ def _decode_best_quality(
     # (the default with chardet 7.x), candidates[0] is always cp1251,
     # which maps Western accented bytes to Cyrillic code points
     # (e.g. 0xE9 = é → U+0439 = й), producing false positives for
-    # Western European files and causing mojibake.
-    #
-    # Robust approach: byte-frequency analysis on the raw bytes.
-    # The top-10 most common Russian letters (о, е, а, и, н, т, с,  # noqa: RUF003
-    # р, в, л) collectively account for ~35 % of Russian text.  In  # noqa: RUF003
-    # cp1251 these map to the byte set {0xE0, 0xE2, 0xE5, 0xE8,
-    # 0xEB, 0xED, 0xEE, 0xF0, 0xF1, 0xF2}.  In cp1252 Western
-    # European text those same bytes map to infrequent accented
-    # letters (à, â, å, è, ë, í, î, ð, ñ, ò) at only 2-5 %
-    # combined frequency.  A threshold of 10 % provides a wide
-    # safety margin — Russian files score 25-40 %, Western files
-    # score 2-5 %.
-    #
-    # For cp866-encoded Russian, the most common letters (а-п) map  # noqa: RUF003
-    # to 0xA0-0xAF, which overlaps less with our cp1251-targeted
-    # set.  However cp866 is the secondary Cyrillic encoding in
-    # the FALLBACK_ENCODINGS list and already wins the ratio
-    # comparison against its cp1251-decoded mojibake — the
-    # tiebreaker is only needed when ratios are equal, which
-    # primarily occurs between cp1251 and cp1252.
+    # Western European files and causing mojibake.  The later
+    # byte-frequency approach (F-24) was also unreliable: its top-10
+    # common-Russian-byte set is byte-identical to common cp1252
+    # accents, so ñ-dense Spanish/Portuguese text false-positives
+    # (M-57).  The current detector is _has_confirmed_cyrillic_run()
+    # over the whole file (M-31): runs of 4+ Cyrillic bytes, or runs of
+    # 3+ containing a "strong" byte, confirm genuine Cyrillic — see the
+    # module constants (M-57/M-82).  This subsumes both prior signals.
     _CYRILLIC_ENCS = frozenset({"cp1251", "cp866"})
     _WESTERN = frozenset({"cp1252", "latin-1"})
-    _RUSSIAN_COMMON_BYTES = frozenset({
-        0xE0, 0xE2, 0xE5, 0xE8, 0xEB, 0xED, 0xEE, 0xF0, 0xF1, 0xF2,
-    })
-    # E-07: Use the widened Cyrillic-detection window so Cyrillic content
-    # beyond the first 64K contributes to the byte-frequency signal.
-    _raw_sample = raw_bytes[:_CYRILLIC_DETECTION_CHARS]
-    _russian_byte_count = sum(1 for b in _raw_sample if b in _RUSSIAN_COMMON_BYTES)
-    _russian_byte_freq = _russian_byte_count / max(len(_raw_sample), 1)
-    _is_cyrillic = _russian_byte_freq >= 0.10
-    # F-129+F-132: Run-length analysis catches cp1251 files with large
-    # ASCII headers that dilute byte-frequency below the 10% threshold.
-    # Decode with cp1251 (always succeeds) and check for concentrated
-    # Cyrillic runs — 3+ consecutive Cyrillic chars strongly indicates
-    # genuine Russian content regardless of byte-frequency.
-    # E-07: Use the same widened window for the run-length sample.
-    if not _is_cyrillic:
-        _cp1251_sample = raw_bytes[:_CYRILLIC_DETECTION_CHARS].decode(
-            "cp1251", errors="replace"
-        )
-        if _has_cyrillic_text(_cp1251_sample) and _max_cyrillic_run(_cp1251_sample) >= 3:
-            _is_cyrillic = True
+    _is_cyrillic = _has_confirmed_cyrillic_run(raw_bytes)
     _preferred = _CYRILLIC_ENCS if _is_cyrillic else _WESTERN
     candidates.sort(key=lambda x: (-x[2], 0 if x[0] in _preferred else 1))
     best_enc, _best_sample, best_ratio = candidates[0]
@@ -290,7 +335,20 @@ def _decode_best_quality(
                 break
         if _best_cyrillic is not None:
             _cyr_enc, _cyr_sample, _cyr_ratio = _best_cyrillic
-            if best_ratio - _cyr_ratio <= _NEAR_TIE_CYRILLIC_MARGIN * best_ratio:
+            # M-81: 0xB9 decodes to "№" (non-alnum) under cp1251 but "¹"
+            # (alnum) under cp1252, so every № in the sample inflates the
+            # Western ratio by exactly K/N (K = 0xB9 count in the ratio
+            # window).  The fixed margin covers only ~4% №-density; at
+            # higher density the rescue fails and genuine cp1251 files
+            # misdecode as cp1252.  Subtract the № artifact from the ratio
+            # gap before comparing to the margin, so any №-density is
+            # handled without weakening the margin for other gaps.
+            _ratio_window = raw_bytes[:_MIN_VALIDATION_CHARS]
+            _numero_artifact = _ratio_window.count(0xB9) / max(len(_ratio_window), 1)
+            if (
+                best_ratio - _cyr_ratio - _numero_artifact
+                <= _NEAR_TIE_CYRILLIC_MARGIN * best_ratio
+            ):
                 best_enc = _cyr_enc
                 _best_sample = _cyr_sample
                 best_ratio = _cyr_ratio

@@ -11,6 +11,7 @@ All state that was previously on ``self`` is passed through an
 
 from __future__ import annotations
 
+import re
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -28,7 +29,7 @@ from .data_reader import (
     _to_integer_value,
 )
 from .exceptions import LASDataError, LASParseError
-from .models import CurveDefinition, DataSection
+from .models import ArrayElementInfo, CurveDefinition, DataSection
 
 
 @dataclass
@@ -172,6 +173,26 @@ def _deduplicate_curves(
 # cells are re-filled with the declared NULL once the well section is parsed.
 _NULL_FILL_CELLS_ATTR = "_pylasdev_null_fill_cells"
 _NULL_FILL_SENTINEL_ATTR = "_pylasdev_null_fill_sentinel"
+# M-04: Private attribute marking the DataSection whose arrays were copied
+# into the top-level ``las_file.logs`` view (the first LOG_DATA section at
+# fill time).  ``_reconcile_null_sentinels`` only writes fill cells back
+# into the logs view of the SAME section — writing another section's
+# fill-cell row into ``las_file.logs`` would clobber genuine values of a
+# DIFFERENT section (e.g. a CORE_DATA section's null fill overwriting the
+# LOG_DATA section's real GR value).
+_NULL_LOGS_OWNER_ATTR = "_pylasdev_logs_owner"
+
+# M-63: Python-object accumulation caps.  ``MAX_TOTAL_ELEMENTS`` guards
+# numpy array allocation at ~8 B/element (~8 GB intent), but ``fill_cells``
+# tuples (~100 B each) and per-row string objects (~50-100 B each) bypass
+# that accounting — a file that passes the element guard can amplify to
+# ~100 GB of Python objects (measured ~96-103 B/fill-cell tuple; the
+# guard's own comment says ~8 B/element).  Cap the tracked counts at a
+# fraction of the element budget so Python-object memory stays within the
+# same order as the guard's intent.  When a cap is exceeded the file is
+# malformed/crafted — reject like the other MAX_* guards.
+_MAX_FILL_CELLS = _data_reader.MAX_TOTAL_ELEMENTS // 12
+_MAX_STRING_VALUES = _data_reader.MAX_TOTAL_ELEMENTS // 12
 
 
 def _reconcile_null_sentinels(las_file: LASFile) -> None:
@@ -205,6 +226,12 @@ def _reconcile_null_sentinels(las_file: LASFile) -> None:
             continue
         sentinel = getattr(data_section, _NULL_FILL_SENTINEL_ATTR, None)
         if sentinel is None or sentinel == declared_null:
+            # M-71: No re-fill is needed (cells already carry the declared
+            # NULL, or no sentinel was recorded), but the tracking list
+            # MUST still be released — the previous ``continue`` bypassed
+            # the clear below, permanently retaining the (row, col) list
+            # on the returned LASFile.
+            setattr(data_section, _NULL_FILL_CELLS_ATTR, [])
             continue
         for row, col in fill_cells:
             if col >= len(data_section.curves_order):
@@ -213,11 +240,17 @@ def _reconcile_null_sentinels(las_file: LASFile) -> None:
             arr = data_section.data.get(mnemonic)
             if arr is not None and row < len(arr):
                 arr[row] = declared_null
-                # Keep the top-level logs convenience view in sync — it is
-                # a defensive copy of the same arrays made at fill time.
-                log_arr = las_file.logs.get(mnemonic)
-                if log_arr is not None and row < len(log_arr):
-                    log_arr[row] = declared_null
+                # M-04: Keep the top-level logs convenience view in sync
+                # ONLY when this section owns it.  ``las_file.logs`` is a
+                # defensive copy of the FIRST LOG_DATA section's arrays
+                # made at fill time; a DIFFERENT section's fill-cell row
+                # must never be written into another section's logs array
+                # (an earlier CORE_DATA section's null fill would clobber
+                # the LOG_DATA section's genuine value).
+                if getattr(data_section, _NULL_LOGS_OWNER_ATTR, False):
+                    log_arr = las_file.logs.get(mnemonic)
+                    if log_arr is not None and row < len(log_arr):
+                        log_arr[row] = declared_null
         setattr(data_section, _NULL_FILL_CELLS_ATTR, [])
         warnings.warn(
             f"Data section '{data_section.name or 'ASCII'}': null-value "
@@ -227,6 +260,284 @@ def _reconcile_null_sentinels(las_file: LASFile) -> None:
             UserWarning,
             stacklevel=3,
         )
+
+
+def _detect_actual_wrap_las30(
+    data_lines: list[str],
+    n_curves: int,
+    delimiter: str,
+    declared_wrap: str | None,
+) -> bool:
+    """Detect actual wrap from the section's collected data lines.
+
+    M-05/M-07: The LAS 3.0 path must apply the SAME content-based wrap
+    detection as ``data_reader._detect_actual_wrap`` (F-H01) — running
+    regardless of the declared WRAP header, and using the hardened 4-line
+    majority vote instead of deciding on the first data line only.  The
+    declared WRAP header may be wrong: mislabeled Petrel exports claim
+    WRAP=YES with non-wrapped data, and WRAP=NO/absent files can contain
+    genuinely wrapped data (which would otherwise be silently misparsed
+    with a DEPT-shift).
+
+    A line is "full" (non-wrapped evidence) when it carries the complete
+    row (``len >= curve_count``) for every delimiter — trailing empties
+    are stripped, so a wrapped depth line is exactly 1 value and a
+    wrapped continuation line carries ``curve_count-1`` values, both
+    partial evidence.  Decision (mirrors data_reader):
+
+    - First line full → non-wrapped immediately (a wrapped first line is
+      always a depth line with exactly 1 value).
+    - Otherwise, if >= 2 full lines among the first 4 → non-wrapped
+      (sparse leading rows then full rows).
+    - If >= 3 partial lines among the first 4 → wrapped.
+    - Ties fall back to the declared WRAP header, then to wrapped
+      (conservative).
+
+    Args:
+        data_lines: Collected ASCII data lines for the current section
+            (may include comment and blank lines, which are skipped).
+        n_curves: Number of curves declared for the section.
+        delimiter: Data column delimiter character.
+        declared_wrap: Declared WRAP header value ("YES"/"NO"), or None.
+
+    Returns:
+        True when the data is genuinely wrapped.
+    """
+    window: list[int] = []
+    for line in data_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        # Lazy import mirrors the existing `from .parser import ...`
+        # pattern inside process_ascii_data: _data_section_reader imports
+        # data_reader at module level, so a top-level import here would
+        # create a cycle through data_reader.
+        from ._data_section_reader import _split_data_line
+
+        values = _split_data_line(stripped, delimiter)
+        window.append(len(values))
+        if len(window) >= 4:
+            break
+
+    if not window:
+        # No data lines — nothing to classify as wrapped.
+        return False
+
+    def _is_full(n: int) -> bool:
+        return n >= n_curves
+
+    # First line full → non-wrapped (wrapped first line is always depth).
+    # M-38 (las30 side): BUT a WRAP=YES header with a COMPLETE first row
+    # can still be a genuine mixed-wrap file (per-row line-width wrapping):
+    # first row complete, continuation lines wrapped.  The first-line-full
+    # rule serves the COMMON mislabeled case (WRAP=YES but data is fully
+    # non-wrapped — all lines full).  When the header declares WRAP=YES
+    # and later window lines are partial (continuation/depth evidence),
+    # fall through to the majority vote below instead of short-circuiting
+    # to non-wrapped.  For LAS 3.0 (no wrapped reader) the majority vote
+    # classifies such a file as wrapped → the caller raises the loud
+    # "LAS 3.0 WRAP=YES is not supported" LASParseError instead of
+    # silently misparsing.
+    if _is_full(window[0]):
+        if declared_wrap is not None and declared_wrap.upper() == "YES":
+            if len(window) > 1 and any(not _is_full(n) for n in window[1:]):
+                pass  # fall through to the majority vote below
+            else:
+                return False
+        else:
+            return False
+
+    full_count = sum(1 for n in window if _is_full(n))
+    partial_count = len(window) - full_count
+
+    # H-02 (las30 side): curve-count mismatch guard.  When ~C declares
+    # MORE curves than ~A rows contain (e.g. 3 curves declared but every
+    # row carries 2 values), every line is "partial" and the majority vote
+    # below would classify the file as WRAPPED — routing a WRAP=NO file to
+    # the loud (but factually wrong) "LAS 3.0 WRAP=YES is not supported"
+    # rejection.  A genuine wrapped file's line lengths VARY (depth lines
+    # carry exactly 1 value and continuation lines curve_count-1); a
+    # uniform short length L (1 < L < curve_count) across the whole
+    # window, with NO 1-value depth line, is a column-count mismatch —
+    # treat as non-wrapped so the graceful short-row null-fill preserves
+    # the data (mirrors data_reader.py:622-628).
+    if (
+        len(window) >= 2
+        and full_count == 0
+        and len(set(window)) == 1
+        and 1 < window[0] < n_curves
+    ):
+        return False
+
+    # Two full rows among the first 4 → definitively non-wrapped.
+    if full_count >= 2:
+        return False
+    # At least 3 partial rows and fewer than 2 full → wrapped.
+    if partial_count >= 3:
+        return True
+    # Ambiguous window (e.g. 2-2 or 1-1): use the declared header as the
+    # tiebreak, else default to wrapped (conservative).
+    if declared_wrap is not None:
+        return declared_wrap.upper() == "YES"
+    return True
+
+
+# M-08: LAS 3.0 spec-form array channels are written with REPEATED PLAIN
+# mnemonics plus a per-element ``{A:N}`` format code, e.g.::
+#
+#     NMR .ms : NMR Echo Array {A:0}
+#     NMR .ms : NMR Echo Array {A:5}
+#
+# The parser only builds ``array_info`` from BRACKET mnemonics
+# (``NMR[1]``/``NMR[2]`` — see parser.py ARRAY_MNEMONIC_PATTERN); the
+# spec-form above arrives as duplicate plain mnemonics with
+# ``data_format="A"`` and ``array_info=None``.  The old code deduplicated
+# them (NMR/NMR_2) and routed them as STRING curves, discarding the array
+# structure and spacing metadata.  Detect the repeated-plain-mnemonic
+# pattern and synthesize ``array_info`` so the channel routes to numeric
+# arrays exactly like bracket-notation.
+_SPEC_FORM_ARRAY_RE = re.compile(r"\{A:(?P<offset>[-\d.]*)\}")
+
+
+def _spec_form_group_data_is_numeric(
+    data_lines: list[str] | None,
+    delimiter: str | None,
+    indices: list[int],
+) -> bool:
+    """Return True when every value in the group's columns is numeric.
+
+    F-06: Confirms a repeated-plain-mnemonic A-format group is a genuine
+    spec-form array channel.  The parser strips the ``{A:N}`` marker from
+    curve descriptions (parser.py:2502-2504) before this layer runs, so
+    the marker is unobservable here — a repeated plain mnemonic with
+    ``data_format="A"`` is ambiguous between a spec-form array channel and
+    duplicate STRING curves.  The DATA is the only unambiguous
+    discriminator: array channels carry numeric values, duplicate STRING
+    curves carry non-numeric values (e.g. two ``LITH ... {A}`` entries
+    holding "SAND SHALE").  A group whose columns contain ANY non-numeric
+    value is a string curve and must NOT be reclassified (pre-fix
+    behavior: deduplicate as STRING curves, values preserved).
+
+    Numeric compatibility mirrors the fill loop's ``_to_finite_float``:
+    empty/missing tokens are null-compatible (not string evidence).
+
+    Args:
+        data_lines: Collected ASCII data lines for the section, or None.
+        delimiter: Data column delimiter character, or None.
+        indices: Curve positions (columns) of the candidate group.
+
+    Returns:
+        True only when the group is unambiguously numeric.
+    """
+    if not data_lines or delimiter is None:
+        return False
+    from ._data_section_reader import _split_data_line
+
+    _failure_counter = [0]
+    for line in data_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        values = _split_data_line(stripped, delimiter)
+        for col in indices:
+            if col >= len(values):
+                # Short row — the cell is null-filled downstream (null for
+                # numeric curves), which is not string evidence.
+                continue
+            _before = _failure_counter[0]
+            # null_value argument is irrelevant to the counter: only the
+            # parse success/failure of the token is being probed.
+            _to_finite_float(values[col], 0.0, _failure_counter=_failure_counter)
+            if _failure_counter[0] > _before:
+                return False
+    return True
+
+
+def _build_spec_form_array_info(
+    section_curves: list[CurveDefinition],
+    data_lines: list[str] | None = None,
+    delimiter: str | None = None,
+) -> list[CurveDefinition]:
+    """Detect spec-form array channels and attach ``array_info`` (M-08).
+
+    A group of 2+ curves with the SAME plain mnemonic, ``data_format``
+    ``"A"``, and no ``array_info`` is a LAS 3.0 spec-form array channel.
+    Each member is rewritten with a bracket mnemonic (``NMR[1]``,
+    ``NMR[2]``, ...) and an ``ArrayElementInfo`` carrying the sequential
+    index and the ``{A:N}`` time offset from the description (when the
+    parser preserved it — see the parser-side coordination note).
+
+    F-06: Synthesis only fires when the group is confirmed as a GENUINE
+    array channel — its data must be unambiguously numeric (see
+    :func:`_spec_form_group_data_is_numeric`).  Duplicate A-format STRING
+    curves (e.g. two ``LITH ... {A}`` entries) are left untouched so the
+    caller's dedup preserves them as STRING curves with values intact.
+
+    Returns a NEW list; the caller's list is not mutated.
+    """
+    # Group consecutive runs of identical plain mnemonics.  LAS 3.0 array
+    # elements are contiguous (array_info validation enforces positional
+    # contiguity), so only a consecutive run is treated as a channel.
+    groups: list[tuple[str, list[int]]] = []
+    current_base: str | None = None
+    current_indices: list[int] = []
+    for i, curve in enumerate(section_curves):
+        if (
+            curve.array_info is not None
+            or (curve.data_format or "").upper() != "A"
+            or "[" in curve.mnemonic
+        ):
+            if current_base is not None:
+                groups.append((current_base, current_indices))
+                current_base = None
+                current_indices = []
+            continue
+        base = curve.mnemonic.upper()
+        if base == current_base:
+            current_indices.append(i)
+        else:
+            if current_base is not None:
+                groups.append((current_base, current_indices))
+            current_base = base
+            current_indices = [i]
+    if current_base is not None:
+        groups.append((current_base, current_indices))
+
+    if not any(len(indices) >= 2 for _, indices in groups):
+        return section_curves
+
+    result = list(section_curves)
+    for base, indices in groups:
+        if len(indices) < 2:
+            continue
+        # F-06: Only synthesize GENUINE array channels.  A repeated plain
+        # mnemonic with data_format "A" is ambiguous (marker stripped by
+        # parser); numeric data confirms the array channel, non-numeric
+        # data means duplicate STRING curves whose values must be
+        # preserved (pre-fix behavior).
+        if not _spec_form_group_data_is_numeric(data_lines, delimiter, indices):
+            continue
+        for pos, curve_idx in enumerate(indices, start=1):
+            curve = result[curve_idx]
+            offset: float | None = None
+            match = _SPEC_FORM_ARRAY_RE.search(curve.description or "")
+            if match and match.group("offset"):
+                try:
+                    offset = float(match.group("offset"))
+                except ValueError:
+                    offset = None
+            result[curve_idx] = CurveDefinition(
+                mnemonic=f"{base}[{pos}]",
+                unit=curve.unit,
+                api_code=curve.api_code,
+                description=curve.description,
+                original_mnemonic=curve.original_mnemonic or curve.mnemonic,
+                data_format=curve.data_format,
+                array_info=ArrayElementInfo(
+                    base_name=base, index=pos, time_offset=offset,
+                ),
+            )
+    return result
 
 
 def process_ascii_data(ctx: AsciiDataContext) -> None:
@@ -273,64 +584,36 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
     if not ctx.ascii_data_lines:
         return
 
-    # F-M-004: LAS 3.0 WRAP=YES check — detect actual wrap from data
-    # lines before rejecting.  Files with WRAP=YES in the header but
-    # non-wrapped data (one full row per line) should parse normally.
-    # The heuristic mirrors _detect_actual_wrap in data_reader.py.
+    # F-M-004 / M-05 / M-07: LAS 3.0 WRAP detection — content-based,
+    # unconditional (mirroring data_reader F-H01).  The declared WRAP
+    # header may be wrong (mislabeled Petrel exports claim WRAP=YES with
+    # non-wrapped data, or WRAP=NO files contain genuinely wrapped data).
+    # The previous code gated detection on the declared WRAP header and
+    # decided COMMA/TAB on the FIRST data line only — WRAP=NO/absent
+    # files with genuinely wrapped data were silently misparsed (DEPT
+    # shift) and sparse-first-row files were falsely rejected.  Use the
+    # same hardened 4-line majority vote as data_reader._detect_actual_wrap.
     # P-15: Single-curve files (n_curves <= 1) are exempt — like
     # data_reader's curve_count<=1 rule, they cannot distinguish wrap
     # mode and are treated as non-wrapped (previously always rejected).
-    # N-I-05: Use second-line corroboration for the SPACE delimiter
-    # (mirroring data_reader F-M16) so a valid WRAP=YES file with a
-    # sparse first row is not falsely rejected.
-    if ctx.las_file.version.wrap.upper() == "YES":
-        if ctx.section_curve_end_idx is not None:
-            n_curves = len(ctx.las_file.curves[ctx.section_curve_start_idx : ctx.section_curve_end_idx])
-        else:
-            n_curves = len(ctx.las_file.curves[ctx.section_curve_start_idx :])
-        actual_wrap = True
-        if n_curves <= 1:
-            # P-15: single-curve files cannot distinguish wrap mode.
-            actual_wrap = False
-        else:
-            delimiter = ctx.las_file.version.delimiter_char
-            _first_wrap: bool | None = None
-            for line in ctx.ascii_data_lines:
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    continue
-                if delimiter == " ":
-                    _sparse = len(stripped.split(maxsplit=_resolve_max_tokens_per_line())) < n_curves
-                    if _first_wrap is None:
-                        _first_wrap = _sparse
-                        if not _first_wrap:
-                            actual_wrap = False
-                            break
-                        # Sparse first line — corroborate with second.
-                        continue
-                    # Second data line: F-M16 corroboration.
-                    actual_wrap = _sparse
-                    break
-                else:
-                    _tokens = stripped.split(delimiter, maxsplit=_resolve_max_tokens_per_line())
-                    # F8M-02: Strip trailing empty strings before wrap check.
-                    # Trailing delimiters (e.g. "100.0,") produce empty fields that
-                    # inflate len(tokens), causing false-negative wrap detection:
-                    # len(["100.0", ""]) = 2 → incorrectly detected as non-wrapped.
-                    # Strip only TRAILING empties — middle empty fields represent
-                    # legitimate sparse data values that must be preserved.
-                    while _tokens and _tokens[-1] == "":
-                        _tokens.pop()
-                    # Non-space delimiter: the depth-line heuristic is
-                    # definitive (matches data_reader._detect_actual_wrap).
-                    actual_wrap = len(_tokens) == 1
-                    break
-        if actual_wrap:
-            raise LASParseError(
-                "LAS 3.0 WRAP=YES is not supported by pylasdev.  "
-                "Convert the file to unwrapped format (one line per "
-                "depth step) before parsing, or set WRAP to NO."
-            )
+    if ctx.section_curve_end_idx is not None:
+        n_curves = len(ctx.las_file.curves[ctx.section_curve_start_idx : ctx.section_curve_end_idx])
+    else:
+        n_curves = len(ctx.las_file.curves[ctx.section_curve_start_idx :])
+    actual_wrap = False
+    if n_curves > 1:
+        actual_wrap = _detect_actual_wrap_las30(
+            ctx.ascii_data_lines,
+            n_curves,
+            ctx.las_file.version.delimiter_char,
+            ctx.las_file.version.wrap,
+        )
+    if actual_wrap:
+        raise LASParseError(
+            "LAS 3.0 WRAP=YES is not supported by pylasdev.  "
+            "Convert the file to unwrapped format (one line per "
+            "depth step) before parsing, or set WRAP to NO."
+        )
 
     # Get delimiter character
     delimiter = ctx.las_file.version.delimiter_char
@@ -352,6 +635,21 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
         )
     else:
         section_curves = list(ctx.las_file.curves[ctx.section_curve_start_idx :])
+    # M-08: Detect LAS 3.0 spec-form array channels (repeated plain
+    # mnemonics + {A:N} format codes) BEFORE deduplication.  These arrive
+    # as duplicate plain-mnemonic A-format curves with array_info=None and
+    # were previously deduplicated into STRING curves, discarding the array
+    # structure and spacing metadata.  Synthesize array_info (bracket
+    # mnemonics + base_name/index/offset) so the channel routes to numeric
+    # arrays exactly like bracket-notation.
+    # F-06: Pass the section's data lines so synthesis only fires when the
+    # group's data is confirmed numeric — duplicate A-format STRING curves
+    # (non-numeric data) are left as strings, preserving their values.
+    section_curves = _build_spec_form_array_info(
+        section_curves,
+        data_lines=ctx.ascii_data_lines,
+        delimiter=delimiter,
+    )
     if not section_curves:
         # F32: Warn when data is present but no curves are defined
         # for this section, then return early.
@@ -546,6 +844,15 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
             ctx.las_file.curves[global_idx].original_mnemonic = curve.original_mnemonic
         ctx.las_file.curves[global_idx].mnemonic = curve.mnemonic
         ctx.las_file.curves_order[global_idx] = deduped_order[i]
+        # M-08: Propagate array_info synthesized for spec-form array
+        # channels to the GLOBAL curve definitions.  The parser builds
+        # array_info for bracket mnemonics directly; spec-form channels
+        # get array_info here, and the LASFile-level format-vs-placement
+        # validation requires the global curve to be an array element
+        # (data_format "A" + array_info) before its numeric data may live
+        # in logs.
+        if curve.array_info is not None:
+            ctx.las_file.curves[global_idx].array_info = curve.array_info
 
     # Use ``>`` for consistency with data_reader.py and models.py which use ``>``
     # throughout all MAX_DATA_LINES guards (accepts files at exactly MAX_DATA_LINES).
@@ -588,7 +895,18 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
     # sentinel is integral — int64 would truncate a fractional NULL (e.g.
     # -999.25 → -999), silently corrupting null cells, so the int64 branch
     # is gated on null integrality (same rule as data_reader).
-    _null_is_integral = float(null_value).is_integer()
+    # M-62 (coordination): the int64 branch must ALSO check int64
+    # representability.  A huge integral sentinel (>= 2^63, e.g. NULL 1e19)
+    # passes ``float(x).is_integer()`` but int64 assignment of
+    # ``int(null_value)`` (short-row/conversion-failure fills at line ~950)
+    # raises OverflowError that escapes the LASParseError-only boundary.
+    # Route such sentinels to the object-dtype path (EXT-04) which holds
+    # arbitrary Python ints exactly — mirroring the data_reader agent's
+    # M-62 fix (_INT64_MIN/_INT64_MAX).
+    _null_is_integral = (
+        float(null_value).is_integer()
+        and _data_reader._INT64_MIN <= int(null_value) <= _data_reader._INT64_MAX
+    )
     string_data_lists: dict[int, list[str]] = {}
     for i, curve in enumerate(section_curves):
         if string_curves.get(i, False):
@@ -636,6 +954,33 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
     # well's declared NULL.  Genuine data values are never tracked.
     track_fill = not well_known
     fill_cells: list[tuple[int, int]] = []  # (row_idx, col_idx) null fills
+
+    # M-63: Bound the Python-object tracking/accumulation structures.
+    # fill_cells tuples (~100 B each) and string values (~50-100 B each)
+    # amplify beyond MAX_TOTAL_ELEMENTS' ~8 B/element accounting — a
+    # crafted file can pass the element guard while allocating ~100 GB of
+    # Python objects.  Reject once a cap is exceeded (same philosophy as
+    # the other MAX_* guards).
+    def _check_fill_cell_cap() -> None:
+        if len(fill_cells) >= _MAX_FILL_CELLS:
+            raise LASParseError(
+                f"Data section '{ctx.current_section_name or 'ASCII'}': "
+                f"tracked null-fill cells exceed maximum allowed "
+                f"({_MAX_FILL_CELLS}). The file may be malformed or corrupt."
+            )
+
+    _string_value_count = 0
+
+    def _check_string_cap() -> None:
+        nonlocal _string_value_count
+        if _string_value_count >= _MAX_STRING_VALUES:
+            raise LASParseError(
+                f"Data section '{ctx.current_section_name or 'ASCII'}': "
+                f"string curve values exceed maximum allowed "
+                f"({_MAX_STRING_VALUES}). The file may be malformed or corrupt."
+            )
+        _string_value_count += 1
+
     for line in ctx.ascii_data_lines:
         # Skip comment lines and blank/whitespace-only lines.
         # F-32: EMPTY_PATTERN was defined at module level but never
@@ -695,6 +1040,7 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
             else:
                 values.append(str(null_value))
                 if track_fill:
+                    _check_fill_cell_cap()
                     fill_cells.append((idx, _pad_idx))
 
         for i in range(num_curves):
@@ -746,6 +1092,7 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
                         stacklevel=2,
                     )
                 string_data_lists[i].append(val_str)
+                _check_string_cap()
             elif integer_curves.get(i, False):
                 # L-03/EXT-04: {I} curve — parse via int() to preserve
                 # exactness above 2^53 (float() would round).  With a
@@ -757,6 +1104,7 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
                     _null_as_float=not _null_is_integral,
                 )
                 if track_fill and (_fc[0] > _fc_before or not val_str):
+                    _check_fill_cell_cap()
                     fill_cells.append((idx, i))
                 arr = numeric_arrays[i]
                 if arr is None:
@@ -773,6 +1121,7 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
                     # replaced with the default null sentinel.  Empty
                     # tokens return null_value without incrementing the
                     # failure counter, so they need an explicit check.
+                    _check_fill_cell_cap()
                     fill_cells.append((idx, i))
                 arr = numeric_arrays[i]
                 if arr is None:
@@ -840,17 +1189,33 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
                 ctx.las_file.logs[curve.mnemonic] = (
                     data_section.data[curve.mnemonic].copy()
                 )
+        # M-04: Record which section's arrays were copied into the
+        # top-level logs view so _reconcile_null_sentinels only writes
+        # fill cells back into the SAME section's logs arrays (the gate
+        # above ensures this is the first LOG_DATA section).
+        setattr(data_section, _NULL_LOGS_OWNER_ATTR, True)
 
     # Convert string data lists to numpy arrays
     for i, curve in enumerate(section_curves):
         if i in string_data_lists:
             string_arr = np.array(string_data_lists[i], dtype=object)
             data_section.string_data[curve.mnemonic] = string_arr
-            if is_log_data and not ctx.las_file.string_data:
+
+    # M-09: Copy ALL string curves of the first LOG_DATA section to the
+    # top-level string_data view.  The gate must be OUTSIDE the per-curve
+    # loop (like the numeric twin at the logs population above): the
+    # previous gate inside the loop stopped after the FIRST string curve
+    # (``not ctx.las_file.string_data`` becomes False once any key exists),
+    # silently dropping every later string curve from the top-level view.
+    if is_log_data and not ctx.las_file.string_data:
+        for i, curve in enumerate(section_curves):
+            if i in string_data_lists:
                 # F2-014: Defensive copy — prevents shared-reference
                 # mutation between LASFile.string_data and
                 # DataSection.string_data.
-                ctx.las_file.string_data[curve.mnemonic] = string_arr.copy()
+                ctx.las_file.string_data[curve.mnemonic] = (
+                    data_section.string_data[curve.mnemonic].copy()
+                )
 
     # N-I-31: Attach the tracked fill cells to the section so a later
     # process_ascii_data call (once ~Well is known) can re-fill them

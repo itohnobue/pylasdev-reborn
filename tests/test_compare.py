@@ -1208,21 +1208,23 @@ class TestMaskedArrayComparison:
         ) is False
 
     def test_0d_masked_true_vs_masked_true(self) -> None:
-        """Two 0-d MaskedArrays both with mask=True are considered unequal.
+        """Two 0-d MaskedArrays both with mask=True are considered equal.
 
-        np.ma.masked == np.ma.masked returns np.ma.masked (not True/False),
-        causing the scalar fallthrough to treat them as a mismatch.  This is
-        the current behavior — the comparison layer does not treat two
-        masked values as equal.
+        M-33 fix: masked invalid values are unified to NaN-equivalent in
+        the list path, so two masked values compare equal (True) — the
+        same answer the dict/data_sections/nested paths already produced.
+        Pre-fix, ``np.ma.masked == np.ma.masked`` returned np.ma.masked
+        (not True/False) and the scalar fallthrough treated them as a
+        mismatch — the list path alone disagreed with every other path.
         """
         ma1 = np.ma.array(42.0, mask=True)
         ma2 = np.ma.array(99.0, mask=True)
         assert np.ma.is_masked(ma1), "Precondition: ma1 should be masked"
         assert np.ma.is_masked(ma2), "Precondition: ma2 should be masked"
-        # Both become np.ma.masked → but masked == masked != True
+        # Both become NaN-equivalent after the masked→NaN unification.
         assert _compare_lists(
             [ma1], [ma2], "test", 1e-7, 0.0
-        ) is False
+        ) is True
 
     def test_0d_masked_vs_regular_scalar_mask_preserved(self) -> None:
         """0-d MaskedArray mask is preserved through nesting in lists."""

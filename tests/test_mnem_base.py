@@ -289,10 +289,11 @@ class TestResolveMnemonic:
 
 
 class TestMnemBaseDualLaterologCollision:
-    """N-I-30: MNEM_BASE maps both LLD and LLS → BK → BFV.  Reading a
+    """N-I-30/M-36: MNEM_BASE maps both LLD and LLS → BK → BFV.  Reading a
     dual-laterolog file (both curves present) must not crash and the
-    duplicate-rename warning must mention mnem_base resolution (not claim
-    the file simply had repeated names)."""
+    collision warning must mention mnem_base resolution AND document the
+    collision avoidance — the colliding curve keeps its ORIGINAL mnemonic
+    (no duplicate BFV, identity preserved)."""
 
     def test_reader_rename_warning_mentions_mnem_base(self, tmp_path: Path) -> None:
         import warnings
@@ -320,14 +321,23 @@ class TestMnemBaseDualLaterologCollision:
             warnings.simplefilter("always")
             data = read_las_file(test_file, mnem_base=MNEM_BASE)
 
-        rename_warns = [
+        # M-36 collision avoidance: the second colliding curve (LLS) keeps
+        # its ORIGINAL mnemonic instead of being renamed to a duplicate
+        # BFV — the warning documents the preservation.
+        keep_warns = [
             str(w.message)
             for w in rec
-            if "renamed to" in str(w.message)
+            if "Keeping the original mnemonic" in str(w.message)
         ]
-        # The reader renames the second resolved-BFV curve.
-        assert len(rename_warns) >= 1
-        assert "mnem_base" in rename_warns[0]
-        assert "repeated curve names" in rename_warns[0]
-        # Data survives under the deduplicated names.
+        assert len(keep_warns) >= 1, (
+            "Expected 'Keeping the original mnemonic' collision warning, "
+            f"got: {[str(w.message) for w in rec]}"
+        )
+        assert "LLS" in keep_warns[0]
+        # The warning still references mnem_base resolution.
+        assert "mnem_base" in keep_warns[0]
+        # No duplicate BFV is created — LLD normalizes to BFV, LLS survives
+        # under its original name.
+        assert data["curves_order"] == ["DEPT", "BFV", "LLS"]
+        # Data survives under the normalized names.
         assert "BFV" in data["logs"]

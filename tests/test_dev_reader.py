@@ -1259,16 +1259,20 @@ class TestExplicitDelimiterParameter:
 
     # --- F-10: F-DV01 count-mismatch fallback test coverage ---
     def test_dv01_count_mismatch_fallback(self, tmp_path: Path) -> None:
-        """F-10: F-DV01 count-mismatch fallback (dev_reader.py:215-218).
+        """F-10/M-20: F-DV01 count-mismatch fallback (dev_reader.py).
 
         Trigger: first line is a single integer (col_count), second line
         has all-float tokens with a DIFFERENT count than col_count, and
-        3+ content entries exist.  This activates the fallback which
-        treats the second line as a DUG header with numeric column names.
+        3+ content entries exist.
+
+        M-20 fix: the count-mismatch fallback is now data-preserving.
+        The count line is skipped and ALL data rows — including the first
+        — are kept as data with generated col_N names.  The pre-fix
+        behavior consumed the first data row as numeric column names,
+        losing one station and fabricating numeric headers.
         """
         # col_count=3 but second line has 4 float tokens (mismatch)
-        # 3+ content entries → fallback activates, returns ("dug", 2)
-        # Second line becomes header: columns ["1.0", "2.0", "3.0", "4.0"]
+        # 3+ content entries → fallback activates
         content = (
             "3\n"
             "1.0 2.0 3.0 4.0\n"
@@ -1279,25 +1283,31 @@ class TestExplicitDelimiterParameter:
         test_file.write_text(content, encoding="utf-8")
 
         data = read_dev_file(test_file)
-        # Detected as DUG with numeric column names
-        assert "1.0" in data
-        assert "2.0" in data
-        assert "3.0" in data
-        assert "4.0" in data
-        assert len(data["1.0"]) == 2  # 2 data rows
-        assert data["1.0"][0] == 100.0
-        assert data["1.0"][1] == 500.0
-        assert data["2.0"][0] == 200.0
-        assert data["3.0"][0] == 300.0
-        assert data["4.0"][0] == 400.0
+        # Data-preserving contract: no fabricated numeric column names —
+        # the first data row is preserved as data under generated col_N
+        # names (M-20).
+        assert "1.0" not in data
+        assert "col_0" in data
+        assert "col_1" in data
+        assert "col_2" in data
+        assert "col_3" in data
+        # col_0 = [first-row 1.0, 100.0, 500.0] — all 3 rows preserved
+        assert len(data["col_0"]) == 3
+        assert data["col_0"][0] == 1.0
+        assert data["col_0"][1] == 100.0
+        assert data["col_0"][2] == 500.0
+        assert data["col_1"][0] == 2.0
+        assert data["col_2"][0] == 3.0
+        assert data["col_3"][0] == 4.0
 
     # --- F-10 variant: F-DV01 with 2.0e1-style float tokens ---
     def test_dv01_fallback_with_scientific_notation_headers(self, tmp_path: Path) -> None:
-        """F-10: F-DV01 fallback with scientific-notation numeric header tokens.
+        """F-10/M-20: F-DV01 fallback with scientific-notation float tokens.
 
-        Verifies the fallback works when second-line tokens use scientific
-        notation (e.g. 1.0e2).  The _is_float_token() function handles
-        e/E/d/D notation.
+        M-20 fix: the count-mismatch fallback is data-preserving.  The
+        first data row's scientific-notation tokens (1.0e2, 2.0E-1,
+        3.14159) are parsed as DATA values, not fabricated numeric column
+        names — no row is lost, no numeric header is created.
         """
         content = (
             "2\n"
@@ -1309,15 +1319,19 @@ class TestExplicitDelimiterParameter:
         test_file.write_text(content, encoding="utf-8")
 
         data = read_dev_file(test_file)
-        # col_count=2, 3 tokens on second line, all float → fallback
-        # Column names are normalized (uppercased via _normalize_column_name)
-        assert "1.0E2" in data
-        assert "2.0E-1" in data
-        assert "3.14159" in data
-        assert len(data["1.0E2"]) == 2
-        assert data["1.0E2"][0] == 100.0
-        assert data["2.0E-1"][0] == 200.0
-        assert data["3.14159"][0] == 300.0
+        # No fabricated numeric column names — first row is data.
+        assert "1.0E2" not in data
+        assert "col_0" in data
+        assert "col_1" in data
+        assert "col_2" in data
+        # col_0 = [1.0e2, 100.0, 400.0] — all 3 rows preserved
+        assert len(data["col_0"]) == 3
+        assert data["col_0"][0] == 100.0  # 1.0e2 parsed as data
+        assert data["col_0"][1] == 100.0
+        assert data["col_0"][2] == 400.0
+        assert data["col_1"][0] == 0.2  # 2.0E-1 parsed as data
+        assert data["col_1"][1] == 200.0
+        assert data["col_2"][0] == 3.14159
 
 
 class TestEmptyColumnNames:

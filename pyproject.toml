@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pylasdev"
-version = "2.0.1"
+version = "2.0.2"
 description = "Python library for reading and writing LAS (Log ASCII Standard) and DEV (deviation) well log files"
 readme = "README.md"
 license = {text = "BSD-3-Clause"}

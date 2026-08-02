@@ -11,11 +11,12 @@ import logging
 import math
 import warnings
 from types import ModuleType
+from typing import cast
 
 import numpy as np
 
 from .exceptions import LASParseError
-from .models import LASFile, WellSection
+from .models import LASFile, WellSection, _GuardedDict
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,16 @@ MAX_TOTAL_ELEMENTS = 1_000_000_000
 # Previously was ``= MAX_CURVES`` (import-time snapshot), which caused the
 # documented "Overridable" behavior to break when MAX_CURVES is overridden.
 MAX_TOKENS_PER_LINE: int | None = None
+
+# M-06/M-62: int64 representability bounds for {I} integer curves.  The
+# int64 storage branch must reject values (data values OR the null
+# sentinel) outside this range — numpy int64 array assignment of a larger
+# Python int raises OverflowError, which would escape the reader's
+# LASParseError-only boundary.  Huge integral sentinels (>= 2^63) route
+# to the object-dtype path instead; huge data values are replaced with
+# the null sentinel and counted as conversion failures.
+_INT64_MIN = int(np.iinfo(np.int64).min)
+_INT64_MAX = int(np.iinfo(np.int64).max)
 
 
 def _resolve_max_tokens_per_line() -> int:
@@ -265,9 +276,23 @@ def _to_integer_value(
     try:
         # int() preserves exactness for plain integer tokens.  This is the
         # common {I} case and the whole point of the dtype branch.
-        return int(value_str)
+        result = int(value_str)
     except ValueError:
-        pass
+        result = None
+    if result is not None:
+        # M-06: On the int64 storage path (integral NULL), a parsed value
+        # beyond int64 range cannot be assigned to the int64 array —
+        # numpy raises OverflowError, which would escape the reader's
+        # LASParseError-only boundary.  Route to the null sentinel and
+        # count as a conversion failure (the existing summary warning
+        # fires) instead of letting the raw exception escape.  The object
+        # dtype path (fractional NULL) holds arbitrary Python ints, so no
+        # bound applies there.
+        if not _null_as_float and not (_INT64_MIN <= result <= _INT64_MAX):
+            if _failure_counter is not None:
+                _failure_counter[0] += 1
+            return int(null_value)
+        return result
     # Fall back to D-notation / float parsing for non-plain tokens.  Only
     # accept the result when it is exactly integral — fractional values in
     # an integer column are conversion failures (null), never truncated.
@@ -285,7 +310,14 @@ def _to_integer_value(
         if _failure_counter is not None:
             _failure_counter[0] += 1
         return null_value if _null_as_float else int(null_value)
-    return int(val)
+    # M-06: bound the float-fallback result on the int64 storage path too
+    # (e.g. "9.2e18" parsed via float() then int() can exceed int64 max).
+    result = int(val)
+    if not _null_as_float and not (_INT64_MIN <= result <= _INT64_MAX):
+        if _failure_counter is not None:
+            _failure_counter[0] += 1
+        return int(null_value)
+    return result
 
 
 def _to_finite_float(
@@ -556,11 +588,45 @@ def _detect_actual_wrap(
         return n >= curve_count
 
     # First line full → non-wrapped (wrapped first line is always depth).
+    # M-38: BUT a WRAP=YES header with a COMPLETE first row can still be a
+    # genuine mixed-wrap file (per-row line-width wrapping): first row
+    # complete, continuation lines wrapped.  The first-line-full rule
+    # serves the COMMON mislabeled case (WRAP=YES but data is fully
+    # non-wrapped — all lines full).  When the header declares WRAP=YES
+    # and later window lines are partial (continuation/depth evidence),
+    # fall through to the majority vote instead of short-circuiting to
+    # non-wrapped.
     if _is_full(window[0]):
-        return False
+        if declared_wrap is not None and declared_wrap.upper() == "YES":
+            if len(window) > 1 and any(not _is_full(n) for n in window[1:]):
+                pass  # fall through to the majority vote below
+            else:
+                return False
+        else:
+            return False
 
     full_count = sum(1 for n in window if _is_full(n))
     partial_count = len(window) - full_count
+
+    # H-02: curve-count mismatch guard.  When ~C declares MORE curves than
+    # ~A rows contain (e.g. 3 curves declared but every row carries 2
+    # values), every line is "partial" and the majority vote below would
+    # classify the file as WRAPPED — routing it to _read_wrapped, which
+    # shifts every non-depth column and silently drops ~half the rows.
+    # A genuine wrapped file's line lengths VARY: depth lines carry exactly
+    # 1 value and continuation lines carry curve_count-1.  A uniform short
+    # length L (1 < L < curve_count) across the whole window, with NO
+    # 1-value depth line, is a column-count mismatch — treat as
+    # non-wrapped so _read_normal's graceful short-row null-fill preserves
+    # the data.  (Requires >=2 lines: a single short row is too ambiguous
+    # to override the declared header tiebreak.)
+    if (
+        len(window) >= 2
+        and full_count == 0
+        and len(set(window)) == 1
+        and 1 < window[0] < curve_count
+    ):
+        return False
 
     # Two full rows among the first 4 → definitively non-wrapped (D-01
     # trailing-comma first row, D-02 two sparse rows, then full rows).
@@ -712,6 +778,75 @@ def _rename_duplicate_curve(
         las_file.curves[idx].mnemonic = new_name
 
 
+def _mnemonic_header_declared(las_file: LASFile) -> set[str]:
+    """Build the mnemonic-header match set once per read.
+
+    The set contains the RESOLVED curve mnemonics (``curves_order``) plus
+    each curve's ``original_mnemonic`` — mnem_base-normalized curves keep
+    their vendor name (e.g. ``LLD``→``BFV`` with ``original_mnemonic="LLD"``),
+    so a header row written in raw vendor mnemonics is still recognized.
+    Mirrors ``parser._is_standalone_mnemonic_header`` (parser.py:3004-3008).
+
+    Must be called AFTER ``_deduplicate_curves`` so ``_2``-suffix renames
+    and their ``original_mnemonic`` values are in place.
+    """
+    declared = {name.upper() for name in las_file.curves_order}
+    for idx, curve in enumerate(las_file.curves):
+        if idx >= len(las_file.curves_order):
+            break
+        if curve.original_mnemonic:
+            declared.add(curve.original_mnemonic.upper())
+    return declared
+
+
+def _is_mnemonic_header_row(
+    values: list[str],
+    las_file: LASFile,
+    curve_count: int,
+    string_curve_indices: set[int],
+    *,
+    declared: set[str] | None = None,
+) -> bool:
+    """M-37/FIX-CONV-2: True when *values* are exactly the declared curve mnemonics.
+
+    LAS 2.0 places curve mnemonics ON the ~A line, but some real-world
+    files emit them as a standalone header row immediately after ~A
+    (e.g. ``~A\\nDEPT GR\\n1000.0 50.0\\n...``).  Such a row is a column
+    header, not a data row: consuming it creates a phantom all-null first
+    row and shifts every subsequent value by one column.
+
+    Detection mirrors the LAS 3.0 gold standard
+    ``parser._is_standalone_mnemonic_header`` (parser.py:2991-3009) for the
+    LAS 1.2/2.0 whole-file scope, with three clauses:
+
+    1. **Token-count equality** (parser.py:2991 analog): ``len(values)``
+       must equal ``curve_count``.  A wrapped-mode continuation row carries
+       fewer tokens and can never be a full header signature — without this,
+       a string value that coincides with a curve mnemonic (e.g. ``LITH``)
+       would be wrongly skipped as a header (M-02).
+    2. **All-string exclusion** (parser.py:3002 analog): when every curve in
+       the section is a string curve, every data value is a string, so a
+       mnemonic-coincident value is indistinguishable from a header row by
+       content alone — string data rows are never dropped (M-03, F-19).
+    3. **Match set = resolved + original mnemonics**: every token must match
+       a resolved curve mnemonic or a curve's ``original_mnemonic``
+       (parser.py:3004-3008 analog), so mnem_base-normalized header rows
+       written in raw vendor mnemonics are recognized (M-01).
+
+    *declared* is the precomputed match set from :func:`_mnemonic_header_declared`;
+    when omitted it is built on demand.  Callers on the hot path hoist it.
+    """
+    if not values:
+        return False
+    if len(values) != curve_count:
+        return False
+    if len(string_curve_indices) == curve_count:
+        return False
+    if declared is None:
+        declared = _mnemonic_header_declared(las_file)
+    return all(token.upper() in declared for token in values)
+
+
 def _read_normal(
     lines: list[str],
     las_file: LASFile,
@@ -750,13 +885,26 @@ def _read_normal(
     # (when the null sentinel is integral) and parsed via int() so values
     # above 2^53 are not silently rounded by float().
     _integer_curve_indices: set[int] = _detect_integer_curves(las_file)
+    # FIX-CONV-2: Hoist the mnemonic-header match set (resolved + original
+    # mnemonics) once per read — building it per data row would make the
+    # hot loop O(rows x curves) for set construction.
+    _mnemonic_declared = _mnemonic_header_declared(las_file)
 
     # L-03: The null sentinel must be known BEFORE allocation to decide the
     # dtype.  int64 allocation would truncate a fractional null sentinel
     # (e.g. -999.25 → -999), silently corrupting every null cell — so the
     # int64 branch is only taken when the declared NULL is integral.
+    # M-62: the int64 branch must ALSO check int64 representability.  A
+    # huge integral sentinel (>= 2^63, e.g. NULL 1e19) passes
+    # ``float(x).is_integer()`` but int64 assignment of ``int(null_value)``
+    # (failure fills at :900) raises OverflowError that escapes the
+    # LASParseError-only boundary.  Route such sentinels to the object
+    # dtype path (EXT-04) which holds arbitrary Python ints exactly.
     null_value = _get_null_value(las_file.well)
-    _null_is_integral = float(null_value).is_integer()
+    _null_is_integral = (
+        float(null_value).is_integer()
+        and _INT64_MIN <= int(null_value) <= _INT64_MAX
+    )
 
     # Pre-allocate arrays — string curves go to string_data, numeric to logs.
     # C-505: Ensure curvenames that appear in both string_curve_indices and
@@ -790,6 +938,12 @@ def _read_normal(
             )
             _numeric_curve_indices.append(i)
 
+    # FIX-CONV-2: data_line_count is a pre-allocation hint, never a
+    # correctness bound.  _allocated tracks the actual array capacity
+    # (starts at the pre-scan estimate, grows geometrically on undercount);
+    # data_line_count keeps its original meaning for the overcount warning.
+    _allocated = data_line_count
+
     # Pre-extract numeric arrays for fast inner-loop access.
     # String array access is direct via las_file.string_data since we
     # cannot mix dtypes in a homogeneous list.
@@ -810,11 +964,22 @@ def _read_normal(
     # counted silently; a summary is logged at the end of the section.
     extra_col_count: int | None = None  # Track extra-column count for summary
     short_row_count: int | None = None  # F-11: Track short-row count for summary
-    discarded_lines = 0  # Track silently-discarded lines from pre-scan undercount
 
     for stripped in _iter_ascii_data_lines(lines):
         # Split using DLM-aware split (shared utility).
         values = _split_data_line(stripped, delimiter)
+
+        # M-37: Skip a standalone mnemonic header row (e.g. "~A\nDEPT GR\n"
+        # before the numeric rows).  LAS 2.0 places mnemonics on the ~A
+        # line, but a common real-world variant emits them as a separate
+        # first row.  Consuming it as a data row produced a phantom
+        # all-null first row and shifted every value by one column.  Skip
+        # it so it is not counted as a data row.
+        if _is_mnemonic_header_row(
+            values, las_file, curve_count, _string_curve_indices,
+            declared=_mnemonic_declared,
+        ):
+            continue
 
         # Warn about extra columns being silently discarded.
         # F-I2-XPD-03: First occurrence logs full context; subsequent
@@ -851,13 +1016,47 @@ def _read_normal(
             else:
                 short_row_count += 1
 
-        # G-04: Bounds guard — skip writes when current_line exceeds
-        # pre-allocated array size.  This can happen when _pre_scan
-        # undercounts data lines (e.g., due to section-header detection
-        # mismatch — G-05).  Mirroring _read_wrapped guards at lines ~490.
-        if current_line >= data_line_count:
-            discarded_lines += 1
-            continue
+        # G-04 (FIX-CONV-2): data_line_count is a pre-allocation hint, never
+        # a correctness bound.  When the pre-scan undercounts data lines
+        # (rows the pre-scan skips but the reader keeps — short all-mnemonic
+        # rows, all-string coincident rows), grow the arrays geometrically
+        # (mirroring _read_wrapped._append_value) instead of silently
+        # dropping the last data row.  A bounded re-allocation preserves the
+        # MAX_TOTAL_ELEMENTS guard's memory-exhaustion intent.
+        if current_line >= _allocated:
+            _new_capacity = max(_allocated * 2, current_line + 1)
+            if curve_count * _new_capacity > MAX_TOTAL_ELEMENTS:
+                raise LASParseError(
+                    f"Total allocation ({curve_count} curves x {_new_capacity} "
+                    f"lines = {curve_count * _new_capacity} elements) exceeds "
+                    f"maximum allowed ({MAX_TOTAL_ELEMENTS}). "
+                    f"The file may be malformed or corrupt."
+                )
+            for curve_name in las_file.curves_order:
+                if curve_name in las_file.logs:
+                    _old_arr = las_file.logs[curve_name]
+                    _new_arr = np.zeros(_new_capacity, dtype=_old_arr.dtype)
+                    _new_arr[:_old_arr.shape[0]] = _old_arr
+                    # Whole-container growth: EVERY curve array is resized to
+                    # the same _new_capacity, so the M-43 equal-length
+                    # invariant holds after the pass.  Bypass the per-key
+                    # __setitem__ guard during the transition, mirroring
+                    # _GuardedDict.trim_all's own dict.__setitem__ pattern
+                    # (models.py:302-303) for whole-container reconciliation.
+                    dict.__setitem__(las_file.logs, curve_name, _new_arr)
+                if curve_name in las_file.string_data:
+                    _old_str = las_file.string_data[curve_name]
+                    _new_str = np.full(_new_capacity, "", dtype=object)
+                    _new_str[:_old_str.shape[0]] = _old_str
+                    dict.__setitem__(las_file.string_data, curve_name, _new_str)
+            _allocated = _new_capacity
+            # Rebuild the pre-extracted numeric references — they now point
+            # at the old (too-small) arrays.
+            curve_arrays = [
+                las_file.logs[name]
+                for name in las_file.curves_order
+                if name in las_file.logs
+            ]
 
         for i in range(min(len(values), curve_count)):
             if i in _string_curve_indices:
@@ -903,21 +1102,13 @@ def _read_normal(
 
         current_line += 1
 
-    # Warn when pre-scan undercounted data lines, causing data discard.
-    if discarded_lines > 0:
-        warnings.warn(
-            f"Pre-scan undercount: {discarded_lines} data line(s) discarded because the "
-            f"actual data exceeds the {data_line_count} lines declared by the pre-scan. "
-            f"Las file data may be truncated.",
-            UserWarning,
-            stacklevel=2,
-        )
-
     # F-024: Warn when pre-scan overcounted data lines (fewer actual data
-    # lines in the ~A section than declared).  Unlike the undercount case
-    # (data loss), this preserves data but indicates a pre-scan discrepancy
-    # — e.g. a multi-section file where _pre_scan counts lines across all
-    # sections but _read_normal only consumes those in the first ~A section.
+    # lines in the ~A section than declared).  Unlike an undercount (which
+    # the G-04 grow branch now absorbs without data loss), this preserves
+    # data but indicates a pre-scan discrepancy — e.g. a multi-section file
+    # where _pre_scan counts lines across all sections but _read_normal
+    # only consumes those in the first ~A section.  Uses the ORIGINAL
+    # pre-scan count, never the grown capacity.
     if current_line < data_line_count:
         warnings.warn(
             f"Pre-scan overcount: declared {data_line_count} data lines but only {current_line} actual "
@@ -949,28 +1140,37 @@ def _read_normal(
             stacklevel=2,
         )
 
-    # F36: Trim arrays when ~A section ended early (fewer data lines than
-    # declared). Pre-allocated np.zeros tail would otherwise expose 0.0
+    # F36: Trim arrays when ~A section ended early (fewer data rows than
+    # allocated). Pre-allocated np.zeros tail would otherwise expose 0.0
     # values that differ from null_value, corrupting downstream analysis.
     # Fill the tail with null_value before slicing to ensure consistency
     # even when pre-scan over-counts relative to _read_normal's actual
-    # line consumption.
+    # line consumption.  FIX-CONV-2: the condition is the ACTUAL allocated
+    # capacity (_allocated), which covers both the pre-scan overcount case
+    # and the slack left by geometric growth on undercount.
     # F-WXP-01: Also trim string_data arrays for string-curve columns.
-    if current_line < data_line_count:
-        # Trim numeric arrays (float64)
+    # FIX-CONV-1 (F-01): route the trim through _GuardedDict.trim_all —
+    # per-key ``las_file.logs[curve_name] = arr[:current_line]``
+    # reassignment tripped the M-43 length guard: the FIRST key is
+    # compared against still-untrimmed siblings and rejected even though
+    # the final trimmed state is fully consistent.  ``trim_all`` performs
+    # the whole-container trim and validates the invariant once.
+    if current_line < _allocated:
+        # Fill numeric tails with null_value (float64) — trim_all then
+        # slices every value to current_line rows.
         for curve_name in las_file.curves_order:
             if curve_name in las_file.logs:
                 arr = las_file.logs[curve_name]
                 if current_line < len(arr):
                     arr[current_line:] = null_value
-                las_file.logs[curve_name] = arr[:current_line]
-        # Trim string arrays (str_)
+        cast(_GuardedDict, las_file.logs).trim_all(current_line)
+        # Fill string tails with "" (str_) before the whole-container trim.
         for curve_name in las_file.curves_order:
             if curve_name in las_file.string_data:
                 arr_str = las_file.string_data[curve_name]
                 if current_line < len(arr_str):
                     arr_str[current_line:] = ""
-                las_file.string_data[curve_name] = arr_str[:current_line]
+        cast(_GuardedDict, las_file.string_data).trim_all(current_line)
 
 
 def _read_wrapped(
@@ -1057,6 +1257,8 @@ def _read_wrapped(
     _string_curve_map: dict[int, str] = {
         _idx: las_file.curves_order[_idx] for _idx in _string_curve_indices
     }
+    # FIX-CONV-2: Hoist the mnemonic-header match set once per read.
+    _mnemonic_declared = _mnemonic_header_declared(las_file)
     # F-R-03: Accumulate string values into lists (same pattern as
     # data_lists).  Pad/trim and convert to np.array at the end.
     _string_lists: dict[str, list[str]] = {
@@ -1067,9 +1269,16 @@ def _read_wrapped(
     # sentinel BEFORE allocation — the int64 dtype branch is only taken
     # when the declared NULL is integral (int64 would truncate a
     # fractional sentinel like -999.25, corrupting every null cell).
+    # M-62: the int64 branch must ALSO check int64 representability — a
+    # huge integral sentinel (>= 2^63) passes is_integer() but int64
+    # assignment of int(null_value) (pad at :1382) raises OverflowError.
+    # Route to the object dtype path instead.
     _integer_curve_indices: set[int] = _detect_integer_curves(las_file)
     null_value = _get_null_value(las_file.well)
-    _null_is_integral = float(null_value).is_integer()
+    _null_is_integral = (
+        float(null_value).is_integer()
+        and _INT64_MIN <= int(null_value) <= _INT64_MAX
+    )
     _fc: list[int] = [0]  # F-PXR-03: count non-trivial conversion failures
 
     # IT3-F-03: Pre-allocate numeric columns instead of accumulating every
@@ -1119,6 +1328,19 @@ def _read_wrapped(
         # Split using DLM-aware split (shared utility).
         values = _split_data_line(stripped, delimiter)
 
+        # F-03 (FIX-CONV-1): M-37's standalone-mnemonic-header skip must
+        # apply in wrapped mode too.  A header row (e.g. "~A\nDEPT GR\n"
+        # before the wrapped depth/continuation rows) is a column header,
+        # not data — consuming it produced a phantom null first row and
+        # shifted every value by one column.  The M-38 WRAP=YES
+        # fall-through routes such files into the wrapped path, so the
+        # skip is required here (not just in _read_normal).
+        if _is_mnemonic_header_row(
+            values, las_file, curve_count, _string_curve_indices,
+            declared=_mnemonic_declared,
+        ):
+            continue
+
         if depth_line:
             # Depth line: single value = depth for this step.
             # Reset the extra-values flag at each depth step boundary
@@ -1126,6 +1348,50 @@ def _read_wrapped(
             # the pathological-misalignment check for this step.
             depth_had_extra = False
             if not values:
+                continue
+            if len(values) == curve_count and total_elements == 0:
+                # M-38: The FIRST data line carries EXACTLY curve_count
+                # values — a COMPLETE row (a mixed-wrap file: first row
+                # written unwrapped, continuation lines wrapped, e.g.
+                # per-row line-width wrapping).  Consume it as a full step
+                # instead of warning + discarding the "extra" values,
+                # which previously shifted every later depth into a curve
+                # column (silent column/depth corruption).  Restricted to
+                # the first line: a complete-value depth line MID-file is
+                # anomalous junk (documented warn+discard behavior —
+                # test_wrapped_depth_line_extra_values).
+                for _ci, _v in enumerate(values):
+                    if _ci in _string_curve_indices:
+                        _string_lists[_string_curve_map[_ci]].append(
+                            _desanitize_las_value(_v, _desanitize_enabled)
+                        )
+                    elif _ci in _integer_curve_indices:
+                        _append_value(
+                            _ci,
+                            _to_integer_value(
+                                _desanitize_las_value(_v, _desanitize_enabled),
+                                null_value, _fc,
+                                _null_as_float=not _null_is_integral,
+                            ),
+                        )
+                    else:
+                        _append_value(
+                            _ci,
+                            _to_finite_float(
+                                _desanitize_las_value(_v, _desanitize_enabled),
+                                null_value, _fc,
+                            ),
+                        )
+                    total_elements += 1
+                    if total_elements > MAX_TOTAL_ELEMENTS:
+                        raise LASParseError(
+                            f"Total elements ({total_elements}) exceeds maximum allowed "
+                            f"({MAX_TOTAL_ELEMENTS}) in wrapped mode. "
+                            f"The file may be malformed or corrupt."
+                        )
+                # Step complete — next line starts a fresh depth step.
+                depth_line = True
+                counter = 0
                 continue
             if len(values) > 1:
                 warnings.warn(
@@ -1352,6 +1618,34 @@ def _read_wrapped(
             f"step missing one or more values.",
             stacklevel=2,
         )
+    # M-72: The modulo check above is blind to a mid-file under-fill whose
+    # total stays a multiple of curve_count (aligned total).  In that case
+    # every depth step "completes" from the reader's perspective, but the
+    # missing value caused the reader to consume the next depth line as a
+    # data value — permanently shifting a data value into the depth column
+    # (and a depth value into the last curve column) with ZERO diagnostics.
+    # Verify the depth column is actually depth-aligned: a genuine depth
+    # log is monotonic (non-decreasing OR non-increasing).  A non-monotonic
+    # depth column signals the shift.  Advisory warning — not an error.
+    if (
+        curve_count > 0
+        and total_elements % curve_count == 0
+        and 0 in data_arrays
+        and data_fill[0] >= 2
+        and np.issubdtype(data_arrays[0].dtype, np.number)
+    ):
+        _depth_vals = data_arrays[0][:data_fill[0]]
+        _diffs = np.diff(_depth_vals)
+        if not (np.all(_diffs >= 0) or np.all(_diffs <= 0)):
+            warnings.warn(
+                f"Wrapped mode: data section consumed {total_elements} values "
+                f"(a multiple of the curve count {curve_count}) but the depth "
+                f"column is not monotonic — a depth step appears to be "
+                f"under-filled mid-file; DEPTH and curve values may be "
+                f"misaligned.  Check the source file for a step missing one "
+                f"or more values.",
+                stacklevel=2,
+            )
 
     # Compute actual number of depth steps from float curves only.
     # String curve indices have empty data_lists entries — skip them.

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
+
+import numpy as np
 
 from ._writer_base import (
     _SECTION_TYPE_TO_DEFINITION_PREFIX,
@@ -14,7 +17,115 @@ from ._writer_base import (
     _WriterBase,
 )
 from .data_reader import _get_null_value
-from .models import CurveDefinition, LASFile, ParameterEntry
+from .models import CurveDefinition, DataSection, LASFile, ParameterEntry
+
+
+def _emitted_mnemonic(curve: CurveDefinition) -> str:
+    """The mnemonic as written to the ~C / Definition line.
+
+    Mirrors the emission logic in ``_format_curve_line``:
+    - M-59 (F-16): when ``curve.original_mnemonic`` is set and differs
+      from ``curve.mnemonic``, ``_format_curve_line`` emits the
+      VENDOR-standard original name (reconstructing e.g. ``LLD`` from the
+      reader-renamed ``BFV``).  The dedup/identity keys MUST use the same
+      emitted name, or two curves that collide in the output (LLD + BFV
+      with original_mnemonic='LLD') are seen as DISTINCT by dedup and BOTH
+      are emitted — duplicate LLD lines in ~C, structurally invalid file,
+      silent BFV identity loss on re-read (M-64 dedup-key divergence).
+    - W-09: a curve with ``array_info`` but no ``[N]`` in its mnemonic is
+      emitted with the bracket form (``NMR`` + index=1 → ``NMR[1]``).
+      Using the EMITTED mnemonic for dedup/scoping keeps directly-
+      constructed models (base mnemonic + array_info) consistent with
+      parsed models (bracket mnemonic) — without it, NMR[1]/NMR[2]
+      collide (M-64).
+    """
+    mnemonic = (
+        curve.original_mnemonic
+        if curve.original_mnemonic and curve.original_mnemonic != curve.mnemonic
+        else curve.mnemonic
+    )
+    if curve.array_info is not None and "[" not in mnemonic:
+        mnemonic = f"{mnemonic}[{curve.array_info.index}]"
+    return mnemonic
+
+
+def _curve_identity(curve: CurveDefinition) -> tuple[Any, ...]:
+    """Composite identity used for cross-section dedup/scoping comparisons.
+
+    Includes the EMITTED mnemonic, unit, data format, and array index so
+    that:
+    - a second section with the same mnemonic but a different
+      unit/format is recognized as a DIFFERENT scope (M-26),
+    - array curves NMR[1]/NMR[2] do not collide (M-64),
+    - column ORDER is significant (M-66).
+    description/api_code are deliberately EXCLUDED — differences there
+    are preserved via the W-01 richer-definition merge, not by forcing a
+    per-section Definition (M-83).
+    """
+    return (
+        _emitted_mnemonic(curve),
+        curve.unit or "",
+        curve.data_format or "",
+        curve.array_info.index if curve.array_info is not None else None,
+    )
+
+
+def _definition_signature(curve: CurveDefinition) -> tuple[Any, ...]:
+    """Full per-curve signature used to dedup per-section Definition blocks.
+
+    Unlike ``_curve_identity`` this INCLUDES description/api_code (two
+    sections with identical scoping but different metadata must get
+    separate Definition blocks) and the array index + time_offset (M-64:
+    the previous signature omitted ``array_info.index`` so NMR[1]/NMR[2]
+    collapsed to one Definition).
+    """
+    return (
+        _emitted_mnemonic(curve),
+        curve.unit or "",
+        curve.description or "",
+        curve.data_format or "",
+        curve.api_code or "",
+        curve.array_info.index if curve.array_info is not None else None,
+        curve.array_info.time_offset if curve.array_info is not None else None,
+    )
+
+
+def _arrays_equal(a: Any, b: Any) -> bool:
+    """Value equality for M-80 covered-key comparison.
+
+    NaN is treated as equal (a parser roundtrip writes NaN positions
+    through the null sentinel and reads them back identically, so NaN
+    does not indicate a value conflict).
+    """
+    if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+        if a.dtype.kind in "fc" and b.dtype.kind in "fc":
+            return bool(np.array_equal(a, b, equal_nan=True))
+        return bool(np.array_equal(a, b))
+    return bool(a == b)
+
+
+def _dedup_by_emitted_mnemonic(curves: list[CurveDefinition]) -> list[CurveDefinition]:
+    """Dedup a curve list by the EMITTED mnemonic (first definition wins).
+
+    F-16 (M-59 ↔ M-64): ``_format_curve_line`` emits
+    ``original_mnemonic`` when it differs from ``curve.mnemonic``, so two
+    distinct curves can emit the SAME name (e.g. a real ``LLD`` and a
+    ``BFV`` with ``original_mnemonic='LLD'``).  The main ~C block's dedup
+    loop keys on ``_emitted_mnemonic``; the LOG_DATA scoping comparison
+    must use the SAME (deduped) curve set or a section whose curves
+    collide on the emitted name would get a per-section Definition that
+    re-emits the duplicate (structurally invalid file).  First definition
+    wins, mirroring the ~C block's W-01 dedup.
+    """
+    seen: set[str] = set()
+    deduped: list[CurveDefinition] = []
+    for curve in curves:
+        emitted = _emitted_mnemonic(curve)
+        if emitted in seen:
+            continue
+        seen.add(emitted)
+        deduped.append(curve)
+    return deduped
 
 
 class _Las30Writer(_WriterBase):
@@ -31,10 +142,30 @@ class _Las30Writer(_WriterBase):
     def __init__(self, las_file: LASFile, precision: str) -> None:
         super().__init__(las_file, precision)
         # N-I-20: Set by _write_curve_section — the main ~C block's curve
-        # set.  Used by _write_ascii_las30 to decide whether a LOG_DATA
-        # section pipes ``| CURVE`` (matches the main block) or gets a
-        # per-section Definition (distinct curve set).
-        self._main_curve_mnemonics: frozenset[str] = frozenset()
+        # definitions, IN ORDER.  Used by _write_ascii_las30 to decide
+        # whether a LOG_DATA section pipes ``| CURVE`` (matches the main
+        # block, same definitions AND same column order) or gets a
+        # per-section Definition (distinct curve set / identity / order —
+        # M-26/M-64/M-66/M-68).
+        self._main_curves: list[CurveDefinition] = []
+
+    def _all_string_mnemonics(self) -> frozenset[str]:
+        """Union of EVERY string_data mnemonic across all scopes.
+
+        M-77: the parser classifies a column as string ONLY from the {S}
+        marker in its ~C/Definition line.  A string curve with an empty
+        (or non-'S') data_format is emitted markerless and its values are
+        re-read as numeric nulls.  The main ~C block emits the curve
+        definitions that data sections inherit (via ``| CURVE``), so a
+        curve whose DATA lives in string_data in ANY scope must get the
+        {S} marker here.  Per-section Definitions use the section's own
+        string_data keys instead.
+        """
+        mnems = set(self._las_file.string_data.keys()) if self._las_file.string_data else set()
+        for ds in self._las_file.data_sections:
+            if ds.string_data:
+                mnems.update(ds.string_data.keys())
+        return frozenset(mnems)
 
     # ── Version section ──────────────────────────────────────────────
 
@@ -98,36 +229,51 @@ class _Las30Writer(_WriterBase):
             # sharing a mnemonic (e.g. DEPT in section 1 and section 2)
             # therefore emitted DEPT twice in ~C, and on re-read the
             # parser inflated the curve count (2→4) and null-filled the
-            # phantom columns.  Dedup by mnemonic here so the shared
-            # definition is emitted once.
+            # phantom columns.  Dedup by EMITTED mnemonic here so the
+            # shared definition is emitted once — and so array curves
+            # NMR[1]/NMR[2] (same base mnemonic, different array_info
+            # index) do NOT collide (M-64).
             for ds in self._las_file.data_sections:
                 if (ds.section_type or "LOG_DATA").upper() == "LOG_DATA":
                     if ds.section_curves:
                         for curve in ds.section_curves:
-                            if curve.mnemonic not in emitted_mnems:
-                                emitted_mnems.add(curve.mnemonic)
+                            _emitted = _emitted_mnemonic(curve)
+                            if _emitted not in emitted_mnems:
+                                emitted_mnems.add(_emitted)
                                 curves_to_emit.append(curve)
                             else:
                                 # W-01: dedup-by-mnemonic silently drops a
                                 # SECOND section's DIFFERING definition
                                 # (e.g. DEPT.M in A1 vs DEPT.FT in A2) — the
                                 # ~C shows one unit for both sections.  Warn
-                                # on unit/format mismatch so the drop is
-                                # visible instead of silent.
-                                for emitted in curves_to_emit:
-                                    if emitted.mnemonic == curve.mnemonic:
+                                # on unit/format/index mismatch so the drop is
+                                # visible instead of silent (M-26/M-64), and
+                                # on desc/api_code mismatch, preserving the
+                                # richer definition (M-83).
+                                for _i, emitted in enumerate(curves_to_emit):
+                                    if _emitted_mnemonic(emitted) == _emitted:
                                         _emitted_unit = emitted.unit or ""
                                         _curve_unit = curve.unit or ""
+                                        _emitted_fmt = emitted.data_format or ""
+                                        _curve_fmt = curve.data_format or ""
+                                        _emitted_idx = (
+                                            emitted.array_info.index
+                                            if emitted.array_info else None
+                                        )
+                                        _curve_idx = (
+                                            curve.array_info.index
+                                            if curve.array_info else None
+                                        )
                                         if (
                                             _emitted_unit != _curve_unit
-                                            or (emitted.data_format or "")
-                                            != (curve.data_format or "")
+                                            or _emitted_fmt != _curve_fmt
+                                            or _emitted_idx != _curve_idx
                                         ):
                                             import warnings
 
                                             warnings.warn(
                                                 f"Duplicate curve mnemonic "
-                                                f"'{curve.mnemonic}' in LAS 3.0 "
+                                                f"'{_emitted}' in LAS 3.0 "
                                                 f"data sections has a differing "
                                                 f"definition (unit "
                                                 f"{_emitted_unit!r} vs "
@@ -138,8 +284,51 @@ class _Las30Writer(_WriterBase):
                                                 UserWarning,
                                                 stacklevel=3,
                                             )
+                                        # M-83: desc/api_code differences are
+                                        # metadata-only; keep the RICHER
+                                        # definition (non-empty description /
+                                        # api_code wins over empty) in ~C and
+                                        # warn so the drop is visible.
+                                        _desc_changed = (
+                                            (emitted.description or "")
+                                            != (curve.description or "")
+                                        )
+                                        _api_changed = (
+                                            (emitted.api_code or "")
+                                            != (curve.api_code or "")
+                                        )
+                                        if _desc_changed or _api_changed:
+                                            import warnings
+
+                                            warnings.warn(
+                                                f"Duplicate curve mnemonic "
+                                                f"'{_emitted}' in LAS 3.0 "
+                                                f"data sections has a differing "
+                                                f"description/api_code.  "
+                                                f"Keeping the richer definition "
+                                                f"in ~C; the second section's "
+                                                f"metadata is not re-emitted.",
+                                                UserWarning,
+                                                stacklevel=3,
+                                            )
+                                            if (
+                                                not emitted.description
+                                                and curve.description
+                                            ):
+                                                curves_to_emit[_i] = replace(
+                                                    emitted,
+                                                    description=curve.description,
+                                                )
+                                            if not emitted.api_code and curve.api_code:
+                                                curves_to_emit[_i] = replace(
+                                                    curves_to_emit[_i],
+                                                    api_code=curve.api_code,
+                                                )
                                         break
-            curves_by_mnem = {c.mnemonic: c for c in self._las_file.curves}
+            curves_by_mnem: dict[str, CurveDefinition] = {}
+            for _c in self._las_file.curves:
+                curves_by_mnem.setdefault(_c.mnemonic, _c)
+                curves_by_mnem.setdefault(_emitted_mnemonic(_c), _c)
             # N-I-15: the fallback loop was gated on LOG_DATA only, so a
             # non-LOG_DATA section (e.g. CORE_DATA) with curves_order+data
             # but empty section_curves never entered ~C at all — the
@@ -151,10 +340,13 @@ class _Las30Writer(_WriterBase):
             for ds in self._las_file.data_sections:
                 if not ds.section_curves and ds.curves_order:
                     for mnem in ds.curves_order:
-                        if mnem not in emitted_mnems:
+                        _emitted = _emitted_mnemonic(
+                            curves_by_mnem[mnem]
+                        ) if mnem in curves_by_mnem else mnem
+                        if _emitted not in emitted_mnems:
                             curve_def = curves_by_mnem.get(mnem)
                             if curve_def is not None:
-                                emitted_mnems.add(mnem)
+                                emitted_mnems.add(_emitted)
                                 curves_to_emit.append(curve_def)
                             else:
                                 # N-I-15: the section curve is absent from
@@ -199,27 +391,78 @@ class _Las30Writer(_WriterBase):
                         UserWarning,
                         stacklevel=3,
                     )
-                self._main_curve_mnemonics = frozenset()
+                self._main_curves = []
                 lines.append("")
                 return lines
-            # N-I-20: Record the main ~C block's curve set so the ASCII
-            # writer can decide per-section pipe targets.  A LOG_DATA
-            # section whose curves exactly match the main block pipes
-            # ``| CURVE``; a section with a DIFFERENT curve set gets a
+
+            # M-79: Preserve top-level curve DEFINITIONS that no data
+            # section references (metadata-only curves — e.g. a TEMP
+            # definition with unit/description but no data anywhere).
+            # Previously these were silently dropped from ~C whenever any
+            # data_section contributed curves, permanently losing their
+            # metadata on re-read.  Add them to the main block with a
+            # warning (they carry no data, but the definition survives).
+            # Skip when curves_in_definitions — the CORE-only fallback
+            # already emits the full top-level list there.
+            if not curves_in_definitions and self._las_file.curves:
+                _section_mnems: set[str] = set()
+                for ds in self._las_file.data_sections:
+                    if ds.section_curves:
+                        _section_mnems.update(
+                            _emitted_mnemonic(c) for c in ds.section_curves
+                        )
+                    _section_mnems.update(ds.curves_order)
+                _top_data_mnems = (
+                    set(self._las_file.logs.keys())
+                    | set(self._las_file.string_data.keys())
+                )
+                for curve in self._las_file.curves:
+                    _emitted = _emitted_mnemonic(curve)
+                    if _emitted in emitted_mnems:
+                        continue
+                    if _emitted in _section_mnems or curve.mnemonic in _section_mnems:
+                        continue
+                    if _emitted in _top_data_mnems or curve.mnemonic in _top_data_mnems:
+                        # Has data at the top level (e.g. orphaned logs) —
+                        # handled by the covered/orphan warnings, not here.
+                        continue
+                    # Definition-only: no data in any section and no
+                    # top-level data either.  Emit the definition so its
+                    # metadata survives; warn that it has no data.
+                    emitted_mnems.add(_emitted)
+                    curves_to_emit.append(curve)
+                    import warnings
+
+                    warnings.warn(
+                        f"Top-level curve '{curve.mnemonic}' has a "
+                        f"definition but no data in any data section "
+                        f"or in top-level logs/string_data.  Its "
+                        f"metadata is written to ~C so it survives "
+                        f"re-read; no data rows are emitted for it.",
+                        UserWarning,
+                        stacklevel=3,
+                    )
+
+            # N-I-20: Record the main ~C block's curves (ordered) so the
+            # ASCII writer can decide per-section pipe targets.  A LOG_DATA
+            # section whose curves exactly match the main block (same
+            # identities in the same ORDER) pipes ``| CURVE``; a section
+            # with a DIFFERENT curve set, identity, or column order gets a
             # per-section Definition section + pipe so its own scope
-            # survives re-read (the hardcoded ``| CURVE`` re-scoped every
-            # section to the global union, mislabeling columns).
-            self._main_curve_mnemonics = frozenset(
-                c.mnemonic for c in curves_to_emit
-            )
+            # survives re-read (M-26/M-64/M-66/M-68).
+            self._main_curves = list(curves_to_emit)
+            _all_str = self._all_string_mnemonics()
             for curve in curves_to_emit:
-                lines.append(_format_curve_line(curve, self._spec.is_las30))
+                lines.append(_format_curve_line(curve, self._spec.is_las30, _all_str))
         else:
-            self._main_curve_mnemonics = frozenset(
-                c.mnemonic for c in self._las_file.curves
+            self._main_curves = list(self._las_file.curves)
+            _top_str = (
+                frozenset(self._las_file.string_data.keys())
+                if self._las_file.string_data
+                else frozenset()
             )
             for curve in self._las_file.curves:
-                lines.append(_format_curve_line(curve, self._spec.is_las30))
+                lines.append(_format_curve_line(curve, self._spec.is_las30, _top_str))
 
         lines.append("")
         return lines
@@ -319,6 +562,33 @@ class _Las30Writer(_WriterBase):
 
         return lines
 
+    def _effective_section_curves(
+        self, section: DataSection
+    ) -> list[CurveDefinition] | None:
+        """Resolve the curves that define a section's column scope.
+
+        Prefers ``section.section_curves`` (the authoritative per-section
+        definitions).  When ``section_curves`` is empty but ``curves_order``
+        is set (a documented-valid LAS 3.0 pattern — the section inherits
+        definitions from the top-level curve list), resolves each mnemonic
+        from the top-level curves so the scoping comparison and per-section
+        Definition still run (M-68).  Returns None when no curves can be
+        resolved.
+
+        """
+        if section.section_curves:
+            return list(section.section_curves)
+        if section.curves_order:
+            by_mnem = {c.mnemonic: c for c in self._las_file.curves}
+            resolved: list[CurveDefinition] = []
+            for mnem in section.curves_order:
+                cdef = by_mnem.get(mnem)
+                if cdef is not None:
+                    resolved.append(cdef)
+            if resolved:
+                return resolved
+        return None
+
     def _write_ascii_las30(
         self,
         null_value: float,
@@ -329,14 +599,62 @@ class _Las30Writer(_WriterBase):
         """LAS 3.0 multi-section typed data path (Path B of original _write_ascii_sections)."""
         lines: list[str] = []
 
-        # Orphaned logs/string_data warning.
+        # Covered / orphaned top-level logs/string_data warnings.
         if self._las_file.logs or self._las_file.string_data:
-            _ds_covered: set[str] = set()
+            _ds_covered: dict[str, list[Any]] = {}
             for _ds in self._las_file.data_sections:
-                _ds_covered.update(_ds.data.keys())
-                _ds_covered.update(_ds.string_data.keys())
+                for _k, _v_num in _ds.data.items():
+                    _ds_covered.setdefault(_k, []).append(_v_num)
+                for _k, _v_str in _ds.string_data.items():
+                    _ds_covered.setdefault(_k, []).append(_v_str)
+            # M-80: Parity with LAS 2.0 W-04 — a top-level logs/string_data
+            # value whose key IS covered by a data_section is silently
+            # dropped (the section's value wins).  Warn when the dropped
+            # top-level value matches NO data_section's value (actual data
+            # loss — the value survives nowhere in the output).  Matching
+            # values (e.g. a parser roundtrip where the top-level view and
+            # a section hold the same data, or a section that re-states the
+            # top-level value) produce no warning — nothing is lost.
+            if self._las_file.logs:
+                _covered_conflicts = [
+                    _k for _k, _top_v in self._las_file.logs.items()
+                    if _k in _ds_covered
+                    and not any(
+                        _arrays_equal(_top_v, _sec_v)
+                        for _sec_v in _ds_covered[_k]
+                    )
+                ]
+                if _covered_conflicts:
+                    import warnings as _w3
+                    _w3.warn(
+                        f"Top-level logs value(s) {sorted(_covered_conflicts)} "
+                        f"are also present in a data_section with a DIFFERENT "
+                        f"value.  The LAS 3.0 writer path only writes data "
+                        f"from data_sections; the top-level values for these "
+                        f"curves will NOT appear in the output file.",
+                        stacklevel=3,
+                    )
+            if self._las_file.string_data:
+                _str_conflicts = [
+                    _k for _k, _top_v in self._las_file.string_data.items()
+                    if _k in _ds_covered
+                    and not any(
+                        _arrays_equal(_top_v, _sec_v)
+                        for _sec_v in _ds_covered[_k]
+                    )
+                ]
+                if _str_conflicts:
+                    import warnings as _w4
+                    _w4.warn(
+                        f"Top-level string_data value(s) {sorted(_str_conflicts)} "
+                        f"are also present in a data_section with a DIFFERENT "
+                        f"value.  The LAS 3.0 writer path only writes data "
+                        f"from data_sections; the top-level values for these "
+                        f"curves will NOT appear in the output file.",
+                        stacklevel=3,
+                    )
             _orphaned_logs = (
-                set(self._las_file.logs.keys()) - _ds_covered
+                set(self._las_file.logs.keys()) - set(_ds_covered.keys())
                 if self._las_file.logs else set()
             )
             if _orphaned_logs:
@@ -349,7 +667,7 @@ class _Las30Writer(_WriterBase):
                     stacklevel=3,
                 )
             _orphaned_string_data = (
-                set(self._las_file.string_data.keys()) - _ds_covered
+                set(self._las_file.string_data.keys()) - set(_ds_covered.keys())
                 if self._las_file.string_data else set()
             )
             if _orphaned_string_data:
@@ -362,7 +680,7 @@ class _Las30Writer(_WriterBase):
                     stacklevel=3,
                 )
 
-        emitted_defs: dict[str, dict[tuple[tuple[str, str, str, str, str, float | None], ...], str]] = {}
+        emitted_defs: dict[str, dict[tuple[Any, ...], str]] = {}
         for section in self._las_file.data_sections:
             sec_type = (section.section_type or "LOG_DATA").upper()
             section_prefix = _section_type_to_prefix(sec_type)
@@ -375,9 +693,17 @@ class _Las30Writer(_WriterBase):
             # Definition prefix for sections that need per-section curve
             # scoping.  Non-LOG_DATA sections always emit a Definition
             # (dedup by signature) so their curves survive re-read.
-            # LOG_DATA sections get one ONLY when their curve set differs
-            # from the main ~C block — otherwise ``| CURVE`` scopes them
-            # to the main block correctly (N-I-20).
+            # LOG_DATA sections get one ONLY when their curve set/identity/
+            # ORDER differs from the main ~C block — otherwise ``| CURVE``
+            # scopes them to the main block correctly (N-I-20).  The
+            # comparison is ORDER-SENSITIVE and identity-based
+            # (mnemonic+unit+format+index), NOT a frozenset of mnemonics —
+            # a frozenset comparison silently swapped columns when a
+            # section had the same curve-name set but a different column
+            # order (M-66) and missed unit/format/index differences
+            # (M-26/M-64).  When ``section_curves`` is empty but
+            # ``curves_order`` is set, the effective curves are derived so
+            # the comparison still runs (M-68).
             def_prefix: str | None = None
             if sec_type != "LOG_DATA":
                 def_prefix = _SECTION_TYPE_TO_DEFINITION_PREFIX.get(sec_type)
@@ -397,43 +723,60 @@ class _Las30Writer(_WriterBase):
                         )
                         st = _sanitize_las_value(sec_type)
                         def_prefix = st.title().replace("_", "")
-            elif section.section_curves:
-                section_mnems = frozenset(
-                    c.mnemonic for c in section.section_curves
-                )
-                if section_mnems != self._main_curve_mnemonics:
-                    # N-I-20: distinct curve set — emit a per-section
-                    # Definition and pipe to it.  The hardcoded ``| CURVE``
-                    # re-scoped EVERY LOG_DATA section to the global union
-                    # on re-read, silently relabeling columns (e.g. DT
-                    # landing in GR) for sections with their own scope.
-                    def_prefix = "Log"
+            elif sec_type == "LOG_DATA":
+                _sec_curves = self._effective_section_curves(section)
+                if _sec_curves is not None:
+                    # F-16: the scoping comparison must use the same
+                    # (EMITTED-mnemonic-deduped) curve set as the main ~C
+                    # block's dedup loop.  Two curves that emit the same
+                    # name (LLD + BFV with original_mnemonic='LLD') were
+                    # already deduped in ~C — the section's raw set would
+                    # differ from the main block and force a per-section
+                    # Definition that re-emits the duplicate (structurally
+                    # invalid, silently renamed on re-read).  Compare the
+                    # deduped set so such sections pipe ``| CURVE`` to the
+                    # clean main block instead.
+                    _sec_deduped = _dedup_by_emitted_mnemonic(_sec_curves)
+                    _sec_identity = tuple(_curve_identity(c) for c in _sec_deduped)
+                    _main_identity = tuple(_curve_identity(c) for c in self._main_curves)
+                    if _sec_identity != _main_identity:
+                        # N-I-20: distinct curve set/identity/order — emit a
+                        # per-section Definition and pipe to it.  The
+                        # hardcoded ``| CURVE`` re-scoped EVERY LOG_DATA
+                        # section to the global union on re-read, silently
+                        # relabeling columns (e.g. DT landing in GR) for
+                        # sections with their own scope.
+                        def_prefix = "Log"
 
             # Emit per-section Definition section (dedup by curve signature).
             pipe_def_name: str | None = None
-            if def_prefix and section.section_curves:
-                sig = tuple(
-                    (curve.mnemonic, curve.unit or "", curve.description or "", curve.data_format or "",
-                     curve.api_code or "",
-                     curve.array_info.time_offset if curve.array_info else None)
-                    for curve in section.section_curves
-                )
-                if def_prefix not in emitted_defs:
-                    emitted_defs[def_prefix] = {}
-                sig_map = emitted_defs[def_prefix]
-                if sig not in sig_map:
-                    emit_idx = len(sig_map) + 1
-                    def_section_name = (
-                        f"{def_prefix}_Definition"
-                        if emit_idx == 1
-                        else f"{def_prefix}_Definition_{emit_idx}"
+            if def_prefix:
+                sec_curves = self._effective_section_curves(section)
+                if sec_curves:
+                    sig = tuple(
+                        _definition_signature(curve) for curve in sec_curves
                     )
-                    sig_map[sig] = def_section_name
-                    lines.append(f"~{def_section_name}")
-                    for curve in section.section_curves:
-                        lines.append(_format_curve_line(curve, self._spec.is_las30))
-                    lines.append("")
-                pipe_def_name = sig_map[sig]
+                    if def_prefix not in emitted_defs:
+                        emitted_defs[def_prefix] = {}
+                    sig_map = emitted_defs[def_prefix]
+                    if sig not in sig_map:
+                        emit_idx = len(sig_map) + 1
+                        def_section_name = (
+                            f"{def_prefix}_Definition"
+                            if emit_idx == 1
+                            else f"{def_prefix}_Definition_{emit_idx}"
+                        )
+                        sig_map[sig] = def_section_name
+                        lines.append(f"~{def_section_name}")
+                        _sec_str = (
+                            frozenset(section.string_data.keys())
+                            if section.string_data
+                            else frozenset()
+                        )
+                        for curve in sec_curves:
+                            lines.append(_format_curve_line(curve, self._spec.is_las30, _sec_str))
+                        lines.append("")
+                    pipe_def_name = sig_map[sig]
 
             # Data section header with pipe notation.
             if sec_type == "LOG_DATA":

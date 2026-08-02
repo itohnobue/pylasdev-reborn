@@ -5,6 +5,25 @@ All notable changes to pylasdev will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.2] — 2026-08-02
+
+### Production Check
+
+A second full production-check audit (3 discovery iterations + 2 convergence passes)
+fixed **85 verified defects** across the source tree, with ~150 new regression tests. The regression suite
+now passes 1231 tests (0 failures, 1 skipped) at 86.07% coverage; ruff and mypy are clean.
+
+### Fixed
+
+- **Parser**: three-segment version normalization (`1.2.0` → `1.2`, `2.0.1` → `2.0`) and VERS re-entry
+  guards hardened; section/header edge cases closed
+- **Data reader**: wrap-mode and curve-count handling hardened; integer-precision and under-fill paths fixed
+- **DEV reader**: format detection (DUG/Petrel/headerless) and MD dedup-survivor validation hardened
+- **Models**: mutation-entry validation completed; `from_dict` roundtrip and numpy-scalar acceptance fixed
+- **Writer**: duplicate-curve emission scoped per section; mutation guards and precision preservation restored
+- **Encoding/comparison**: encoding fallback and compare guards hardened
+- **ReDoS/security hardening**: regex/parsing hot paths bounded against pathological inputs
+
 ## [2.0.1] — 2026-08-01
 
 ### Production Check
