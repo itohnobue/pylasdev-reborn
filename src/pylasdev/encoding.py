@@ -115,6 +115,17 @@ _STRONG_RUN_MIN = 3
 # while keeping a far-away footnote marker out of scope.
 _NUMERO_ADJACENCY_WINDOW = 8
 
+# ENC-02: Windows-1252 smart-punctuation byte class (0x91-0x97: ' " " – — …).  # noqa: RUF003
+# These bytes decode to Cyrillic ALPHANUMERICS under cp866 (e.g. 0x96 → 'Ц'),
+# inflating cp866's word-char ratio above a genuine Western page whenever the
+# file contains typographic punctuation — the root of the Western→cp866 flip.
+_SMART_PUNCT_BYTES = bytes((0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97))
+
+# ENC-02 (a): material-margin for the detected-encoding priority.  Real
+# encoding mismatches produce ratio gaps >10%; a <5% gap is within the
+# near-tie band and the high-confidence chardet answer should be honored.
+_DETECTED_ENCODING_MARGIN = 0.05
+
 
 def _build_cyrillic_run_regexes() -> tuple[re.Pattern[bytes], re.Pattern[bytes], re.Pattern[bytes]]:
     """Build the C-speed byte regexes used by :func:`_has_confirmed_cyrillic_run`.
@@ -130,24 +141,42 @@ def _build_cyrillic_run_regexes() -> tuple[re.Pattern[bytes], re.Pattern[bytes],
         if 0x0400 <= ord(bytes([b]).decode("cp1251", errors="replace")) <= 0x04FF
     )
     strong_bytes = bytes(
-        b
-        for b in cyrillic_bytes
-        if not bytes([b]).decode("cp1252", errors="replace").isalnum()
+        b for b in cyrillic_bytes if not bytes([b]).decode("cp1252", errors="replace").isalnum()
     )
     cyrillic_class = b"[" + cyrillic_bytes + b"]"
     strong_class = b"[" + strong_bytes + b"]"
     return (
-        re.compile(
-            cyrillic_class + b"{" + str(_CYRILLIC_RUN_CONFIRM).encode("ascii") + b",}"
-        ),
+        re.compile(cyrillic_class + b"{" + str(_CYRILLIC_RUN_CONFIRM).encode("ascii") + b",}"),
         re.compile(cyrillic_class + b"{3,}"),
         re.compile(cyrillic_class + b"*" + strong_class + cyrillic_class + b"*"),
     )
 
 
-_CYRILLIC_RUN_GE_RE, _CYRILLIC_RUN_3_RE, _STRONG_CYRILLIC_RUN_RE = (
-    _build_cyrillic_run_regexes()
-)
+_CYRILLIC_RUN_GE_RE, _CYRILLIC_RUN_3_RE, _STRONG_CYRILLIC_RUN_RE = _build_cyrillic_run_regexes()
+
+
+def _window_has_numero_prefix(window: bytes) -> bool:
+    """Return True if *window* contains a 0xB9 byte that is a Cyrillic "№".
+
+    Byte 0xB9 is "№" in cp1251 but "¹" (superscript one) in cp1252 — a
+    Western footnote "¹" adjacent to an accented run ("Nota¹ Ñáñez") must
+    NOT confirm Cyrillic (ENC-01).  The Russian typographic convention
+    always places a NUMBER after the № (well labels like "№1", "№ 2"), so
+    a 0xB9 counts as "№" only when followed — after optional whitespace —
+    by an ASCII digit.  A Western "¹" is an ordinal/footnote marker, not a
+    "№ <number>" prefix, so the digit-follow constraint disambiguates.
+    """
+    idx = 0
+    while True:
+        idx = window.find(0xB9, idx)
+        if idx == -1:
+            return False
+        nxt = idx + 1
+        while nxt < len(window) and window[nxt] in (0x20, 0x09):  # space/tab
+            nxt += 1
+        if nxt < len(window) and 0x30 <= window[nxt] <= 0x39:
+            return True
+        idx += 1
 
 
 def _has_confirmed_cyrillic_run(data: bytes) -> bool:
@@ -172,11 +201,13 @@ def _has_confirmed_cyrillic_run(data: bytes) -> bool:
     # run ("Ñáñez") was flipped to cp1251 → mojibake with zero warnings.
     # Only a 0xB9 within a small window of the run itself confirms the
     # Russian "№" convention.
+    # ENC-01: even ADJACENT, a Western "¹" must not confirm Cyrillic —
+    # the marker counts only when followed by a digit ("СКВ №1").  # noqa: RUF003
     if b"\xb9" in data:
         for match in _CYRILLIC_RUN_3_RE.finditer(data):
             window_start = max(0, match.start() - _NUMERO_ADJACENCY_WINDOW)
             window_end = min(len(data), match.end() + _NUMERO_ADJACENCY_WINDOW)
-            if b"\xb9" in data[window_start:window_end]:
+            if _window_has_numero_prefix(data[window_start:window_end]):
                 return True
     for match in _STRONG_CYRILLIC_RUN_RE.finditer(data):
         if len(match.group()) >= _STRONG_RUN_MIN:
@@ -234,11 +265,26 @@ def _detect_encoding_from_bytes(raw_data: bytes) -> str:
     return "utf-8"
 
 
+def _detect_confidence_from_bytes(raw_data: bytes) -> float:
+    """Return chardet's confidence for the sample (0.0 when unavailable).
+
+    ``_detect_encoding_from_bytes`` discards the confidence after applying
+    the >0.7 gate.  The detected-encoding priority (ENC-02) needs the raw
+    confidence value to decide whether a high-confidence detection should
+    override the ratio sort, so this helper re-reads it from chardet.
+    """
+    if HAS_CHARDET:
+        result = chardet.detect(raw_data[:50_000])
+        return result["confidence"] or 0.0
+    return 0.0
+
+
 def _decode_best_quality(
     raw_bytes: bytes,
     file_path: Path,
     detected: str,
     encodings: list[str],
+    detected_confidence: float = 0.0,
 ) -> tuple[str, str]:
     """Decode raw_bytes using the best-quality encoding from *encodings*.
 
@@ -257,6 +303,10 @@ def _decode_best_quality(
             when detection failed).  Tried first if not already in
             *encodings*.
         encodings: Encoding names to try.
+        detected_confidence: chardet's raw confidence for the detection
+            (0.0 when unavailable or below the >0.7 gate).  ENC-02:
+            a high-confidence statistical detection is honored over the
+            crude word-char ratio unless beaten by a material margin.
 
     Returns:
         Tuple of (selected_encoding, decoded_content).
@@ -320,6 +370,29 @@ def _decode_best_quality(
     candidates.sort(key=lambda x: (-x[2], 0 if x[0] in _preferred else 1))
     best_enc, _best_sample, best_ratio = candidates[0]
 
+    # ENC-02 (a): Detected-encoding priority.  The ratio-primary sort
+    # (F-24) overrides even a perfect high-confidence chardet answer
+    # (ADV-H1-2 verified: detected='cp1252' passed directly still
+    # selected cp866).  When chardet reports high confidence (>0.7 — the
+    # same gate as _detect_encoding_from_bytes) AND the detected encoding
+    # actually decodes (is a candidate — the decode-success filter that
+    # protects against chardet's wrong "utf-8" answer), honor it unless
+    # another candidate beats it by a MATERIAL margin: real encoding
+    # mismatches produce ratio gaps >10%, so a <5% gap is within the
+    # detection's statistical noise.
+    if detected_confidence > 0.7 and best_enc != detected:
+        _detected_candidate: tuple[str, str, float] | None = None
+        for _cand in candidates:
+            if _cand[0] == detected:
+                _detected_candidate = _cand
+                break
+        if _detected_candidate is not None:
+            _detected_ratio = _detected_candidate[2]
+            if best_ratio - _detected_ratio < _DETECTED_ENCODING_MARGIN:
+                best_enc = _detected_candidate[0]
+                _best_sample = _detected_candidate[1]
+                best_ratio = _detected_ratio
+
     # E-06: Near-tie Cyrillic preference.  The ratio-primary sort above is
     # load-bearing (a preference-primary sort regresses UTF-8 Cyrillic), so
     # we do not reorder candidates.  Instead, when the content is judged
@@ -345,13 +418,41 @@ def _decode_best_quality(
             # handled without weakening the margin for other gaps.
             _ratio_window = raw_bytes[:_MIN_VALIDATION_CHARS]
             _numero_artifact = _ratio_window.count(0xB9) / max(len(_ratio_window), 1)
-            if (
-                best_ratio - _cyr_ratio - _numero_artifact
-                <= _NEAR_TIE_CYRILLIC_MARGIN * best_ratio
-            ):
+            if best_ratio - _cyr_ratio - _numero_artifact <= _NEAR_TIE_CYRILLIC_MARGIN * best_ratio:
                 best_enc = _cyr_enc
                 _best_sample = _cyr_sample
                 best_ratio = _cyr_ratio
+
+    # ENC-02 (b): Western near-tie rescue — the symmetric completion of
+    # E-06.  When the content is judged NON-Cyrillic and the winning
+    # candidate is NOT a Western encoding, a genuine Western file with
+    # Windows-1252 smart punctuation (0x91-0x97) is being misdecoded:
+    # those bytes are Cyrillic alphanumerics under cp866 (e.g. 0x96 →
+    # 'Ц') but punctuation under cp1252/latin-1, so cp866's word-char
+    # ratio is inflated above the correct Western page.  Prefer the best
+    # Western candidate when the ratio gap — minus the smart-punct
+    # artifact (each such byte inflates the non-Western ratio by exactly
+    # K/N) — is within the near-tie margin, mirroring the M-81 №-artifact
+    # subtraction.
+    if not _is_cyrillic and best_enc not in _WESTERN:
+        _best_western: tuple[str, str, float] | None = None
+        for _cand in candidates:
+            if _cand[0] in _WESTERN:
+                _best_western = _cand
+                break
+        if _best_western is not None:
+            _west_enc, _west_sample, _west_ratio = _best_western
+            _ratio_window = raw_bytes[:_MIN_VALIDATION_CHARS]
+            _smart_punct_artifact = sum(_ratio_window.count(b) for b in _SMART_PUNCT_BYTES) / max(
+                len(_ratio_window), 1
+            )
+            if (
+                best_ratio - _west_ratio - _smart_punct_artifact
+                <= _NEAR_TIE_CYRILLIC_MARGIN * best_ratio
+            ):
+                best_enc = _west_enc
+                _best_sample = _west_sample
+                best_ratio = _west_ratio
 
     # F-88: After selecting the winning encoding, re-decode the full
     # content from raw_bytes rather than returning the stored sample.
@@ -432,9 +533,7 @@ def read_with_encoding(
     # F-95: Guard against negative or zero max_file_size which would
     # silently bypass the resource exhaustion check below.
     elif max_file_size <= 0:
-        raise ValueError(
-            f"max_file_size must be positive or None, got {max_file_size}"
-        )
+        raise ValueError(f"max_file_size must be positive or None, got {max_file_size}")
 
     file_size = file_path.stat().st_size
     if file_size > max_file_size:
@@ -482,8 +581,7 @@ def read_with_encoding(
             return _bom_enc, content.lstrip("\ufeff")
         except (UnicodeDecodeError, LookupError) as e:
             raise LASEncodingError(
-                f"Failed to decode {file_path} with encoding"
-                f" '{_bom_enc}': {e}"
+                f"Failed to decode {file_path} with encoding '{_bom_enc}': {e}"
             ) from e
 
     if encoding is not None:
@@ -502,6 +600,11 @@ def read_with_encoding(
 
     # Try auto-detection from the already-read bytes
     detected = _detect_encoding_from_bytes(raw_bytes[:50_000])
+    # ENC-02 (a): re-read the raw chardet confidence so a high-confidence
+    # detection can be honored over the ratio sort (the name-only path
+    # discards it).  When chardet is unavailable or low-confidence this
+    # returns 0.0 and the priority never fires.
+    detected_confidence = _detect_confidence_from_bytes(raw_bytes[:50_000])
 
     # F-ITER2-D4b-M09: Use quality-based selection instead of first-wins
     # fallback chain.  Single-byte Cyrillic encodings (cp1251, cp866) both
@@ -509,4 +612,10 @@ def read_with_encoding(
     # By comparing word-character ratios across all candidates, we select
     # the encoding that produces the most plausible text (highest proportion
     # of alphanumeric characters — real LAS files have ~50-80%).
-    return _decode_best_quality(raw_bytes, file_path, detected, FALLBACK_ENCODINGS)
+    return _decode_best_quality(
+        raw_bytes,
+        file_path,
+        detected,
+        FALLBACK_ENCODINGS,
+        detected_confidence=detected_confidence,
+    )

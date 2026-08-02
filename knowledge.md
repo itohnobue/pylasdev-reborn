@@ -1,5 +1,5 @@
 # Knowledge Base
-Last updated: 2026-08-02T05:40:01.564507
+Last updated: 2026-08-02T16:13:21.562886
 
 ## [dis-20260620063206-7fc4ae]
 Category: discovery
@@ -1227,4 +1227,32 @@ Tags: python, dev-reader, thousands, separator, locale, headerless, signed
 Changed: 2026-08-02T05:40:01.554188
 
 Thousands-separator recombination edge cases: _recombine_thousands_separators (dev_reader.py) has a family of silent-corruption cases beyond the basic 1,234.5: (a) MULTI-SEPARATOR values (>=1e6, 2+ separators) only PARTIALLY recombined — the len(values)==expected+1 gate merges the FIRST pair only, true value destroyed (M-76: 6-token no recombine at all; 5-token MD=1234.0, X=567.8); (b) SIGNED values fail the isdigit gate — '-1,234.5' skips its true pair and a later genuine adjacent pair is merged 600+500->600500, with the warning citing the WRONG pair (M-53); (c) HEADERLESS files never recombined — the gate requires non-empty names, and the M-52 fix's _expected_cols = len(names) if names else len(values)-1 made first headerless rows ALWAYS eligible, merging genuine 2-col headerless comma files into one column (F-07 regression); (d) the gate is DELIMITER-BLIND — semicolon locale-decimal values NaN with a misleading warning while detection says parseable (F-13). Fix: iterate consecutive pairs (not just the first), use a numeric-aware check (try float() not isdigit), gate recombination on unambiguous evidence (delimiter-aware AND not-headerless-first-row), and warn with the ACTUAL merged pair. Checklist: test multi-separator, signed, headerless-comma, and semicolon-locale inputs; a fix must be comma-gated AND header-aware; regression-test the pre-fix corruption shape.
+
+## [got-20260802145747-ca3ff7]
+Category: gotcha
+Tags: pylasdev, parser, models, mnem_base, pxm, gotcha
+Changed: 2026-08-02T14:57:47.477148
+
+pylasdev Parser/Models boundary: mnem_base (incl. shipped MNEM_BASE) is OPT-IN on both read_las_file (default None) and LASFile.from_dict (default None) — default paths apply NO mnemonic normalization, so PXM-01/PXM-06 collision bugs (well last-wins, curve alias-first swap GK/GK_2) only trigger when caller passes mnem_base. from_dict curve-collision failure is order-dependent: [GR,GK] alias-first raises LASDataError (curves_order vs curves mismatch via shared _norm_curve_mnem closure state), canonical-first [GK,GR] passes. Well path has raw==resolved re-key branch (models.py:3306-3316); curve paths lack it. Parser VERS normalizes '1,2'->'2.0' but from_dict keeps verbatim -> write_las_file raises LASWriteError.
+
+## [got-20260802161321-d99bca]
+Category: gotcha
+Tags: wrap, data_reader, las
+Changed: 2026-08-02T16:13:21.384783
+
+F-07 wrap depth-line rule needs 'unambiguous' guard: bare 'first line full + any later n==1' misclassifies ragged non-wrapped [3,2,1] as wrapped (breaks H-02 null-fill). Refinement: window[1]==1 OR >=2 one-value rows. Validated 12 shapes.
+
+## [pat-20260802161321-0c72c1]
+Category: pattern
+Tags: memory-cap, string, data_reader
+Changed: 2026-08-02T16:13:21.471050
+
+DR-05 string-object cap: MAX_TOTAL_ELEMENTS accounts 8B/element but Python str objects cost 50-100B; LAS 1.2/2.0 paths now have MAX_STRING_VALUES = MAX_TOTAL_ELEMENTS // 12 mirroring _las30_data._MAX_STRING_VALUES, enforced at _read_normal store + 3 _read_wrapped append sites with >=cap-raise semantics.
+
+## [dec-20260802161321-285958]
+Category: decision
+Tags: dlm, comma, string
+Changed: 2026-08-02T16:13:21.552543
+
+I2-02 embedded-comma-in-string fix: csv.reader quote-awareness REJECTED (F2-015: writer emits raw delimiter.join(), no CSV quotes; quote parsing breaks writer roundtrips). Chose loud warning at _read_normal extra-columns site + count summary.
 

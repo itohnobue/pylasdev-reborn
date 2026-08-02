@@ -48,9 +48,7 @@ _CONTROL_CHARS_RE = re.compile(
 # space, not silently deleted.  These are layout/presentation characters
 # (non-breaking space, en/em quads, thin spaces, ideographic space) that
 # act as visual word separators.
-_UNICODE_WS_RE = re.compile(
-    r"[\u00A0\u2000-\u200A\u202F\u205F\u3000]"
-)
+_UNICODE_WS_RE = re.compile(r"[\u00A0\u2000-\u200A\u202F\u205F\u3000]")
 
 # Previous pattern ^~([A-Za-z]) only matched a leading tilde.
 # Values like "\t~Version" or "  ~Curve" bypassed section-header
@@ -125,7 +123,7 @@ def _sanitize_las_value(value: str, *, preserve_leading_tilde: bool = False) -> 
         value = "_" + value
     elif value and value.lstrip().startswith("#"):
         stripped = value.lstrip()
-        leading = value[:len(value) - len(stripped)]
+        leading = value[: len(value) - len(stripped)]
         value = leading + "_" + stripped
     return value
 
@@ -205,10 +203,103 @@ def _section_type_to_prefix(section_type: str) -> str:
     return "A"
 
 
+def _emitted_mnemonic(curve: CurveDefinition) -> str:
+    """The mnemonic as written to the ~C / Definition line.
+
+    Mirrors the emission logic in ``_format_curve_line``:
+    - M-59 (F-16): when ``curve.original_mnemonic`` is set and differs
+      from ``curve.mnemonic``, ``_format_curve_line`` emits the
+      VENDOR-standard original name (reconstructing e.g. ``LLD`` from the
+      reader-renamed ``BFV``).  The dedup/identity keys MUST use the same
+      emitted name, or two curves that collide in the output (LLD + BFV
+      with original_mnemonic='LLD') are seen as DISTINCT by dedup and BOTH
+      are emitted — duplicate LLD lines in ~C, structurally invalid file,
+      silent BFV identity loss on re-read (M-64 dedup-key divergence).
+    - W-09: a curve with ``array_info`` but no ``[N]`` in its mnemonic is
+      emitted with the bracket form (``NMR`` + index=1 → ``NMR[1]``).
+      Using the EMITTED mnemonic for dedup/scoping keeps directly-
+      constructed models (base mnemonic + array_info) consistent with
+      parsed models (bracket mnemonic) — without it, NMR[1]/NMR[2]
+      collide (M-64).
+    """
+    mnemonic = (
+        curve.original_mnemonic
+        if curve.original_mnemonic and curve.original_mnemonic != curve.mnemonic
+        else curve.mnemonic
+    )
+    if curve.array_info is not None and "[" not in mnemonic:
+        mnemonic = f"{mnemonic}[{curve.array_info.index}]"
+    return mnemonic
+
+
+def _dedup_by_emitted_mnemonic(curves: list[CurveDefinition]) -> list[CurveDefinition]:
+    """Dedup a curve list by the EMITTED mnemonic (first definition wins).
+
+    F-16 (M-59 ↔ M-64): ``_format_curve_line`` emits
+    ``original_mnemonic`` when it differs from ``curve.mnemonic``, so two
+    distinct curves can emit the SAME name (e.g. a real ``LLD`` and a
+    ``BFV`` with ``original_mnemonic='LLD'``).  The main ~C block's dedup
+    loop keys on ``_emitted_mnemonic``; the LOG_DATA scoping comparison
+    must use the SAME (deduped) curve set or a section whose curves
+    collide on the emitted name would get a per-section Definition that
+    re-emits the duplicate (structurally invalid file).  First definition
+    wins, mirroring the ~C block's W-01 dedup.
+    """
+    seen: set[str] = set()
+    deduped: list[CurveDefinition] = []
+    for curve in curves:
+        emitted = _emitted_mnemonic(curve)
+        if emitted in seen:
+            continue
+        seen.add(emitted)
+        deduped.append(curve)
+    return deduped
+
+
+def _emission_plan(
+    curves: list[CurveDefinition],
+) -> tuple[list[tuple[CurveDefinition, str | None]], list[CurveDefinition]]:
+    """Compute collision-free emission names for a ~C / Definition block.
+
+    W-10/M-59: two distinct ``CurveDefinition`` objects can emit the same
+    name — a reader-renamed duplicate (``IK_2`` with
+    ``original_mnemonic='IK'`` alongside a real ``IK``), a mnem_base
+    vendor-rename collision (``LLD`` + ``BFV`` with
+    ``original_mnemonic='LLD'``), or genuine duplicate mnemonics
+    (``DEPT(M)``/``DEPT(FT)``).  The first occurrence emits normally.
+    A later curve whose M-59 reconstruction would collide falls back to
+    its OWN mnemonic when that is free (preserving the distinct column
+    and keeping the write→read roundtrip stable); when the own mnemonic
+    is ALSO taken the definition is a metadata-only duplicate and is
+    dropped (returned in ``dropped`` for the caller to warn about).
+
+    Returns ``(pairs, dropped)`` where ``pairs`` is an ordered list of
+    ``(curve, mnemonic_override)`` — ``mnemonic_override`` is ``None``
+    for a normal M-59 emission and ``curve.mnemonic`` for a collision
+    fallback — and ``dropped`` lists the metadata-only duplicates.
+    """
+    seen: set[str] = set()
+    pairs: list[tuple[CurveDefinition, str | None]] = []
+    dropped: list[CurveDefinition] = []
+    for curve in curves:
+        candidate = _emitted_mnemonic(curve)
+        if candidate in seen:
+            if curve.mnemonic not in seen:
+                pairs.append((curve, curve.mnemonic))
+                seen.add(curve.mnemonic)
+            else:
+                dropped.append(curve)
+            continue
+        seen.add(candidate)
+        pairs.append((curve, None))
+    return pairs, dropped
+
+
 def _format_curve_line(
     curve: CurveDefinition,
     is_las30: bool,
     string_mnemonics: frozenset[str] | None = None,
+    mnemonic_override: str | None = None,
 ) -> str:
     """Format a single CurveDefinition as a LAS curve line.
 
@@ -220,6 +311,14 @@ def _format_curve_line(
             signal — and re-read as numeric, silently destroying the
             values.  Callers with string_data context pass this set so the
             writer forces the {S} marker.
+        mnemonic_override: When set, emit THIS mnemonic instead of the
+            M-59 original_mnemonic reconstruction.  W-10: a
+            reader-renamed duplicate (IK_2 with original_mnemonic='IK')
+            or a mnem_base vendor-rename (BFV with original_mnemonic='LLD')
+            would otherwise emit a name already taken by another curve in
+            the same block, producing duplicate ~C/Definition lines.  The
+            collision-free emission plan falls back to the curve's own
+            mnemonic to keep the block valid and the roundtrip stable.
     """
     unit = _sanitize_las_value(curve.unit) if curve.unit else ""
     unit = _escape_colons_for_las_value(unit) if unit else ""
@@ -256,7 +355,11 @@ def _format_curve_line(
         # unmarked on LAS 1.2/2.0 to preserve existing output (string
         # curves are lossy on LAS 2.0 by design — see M-29).
         format_str = f"{{{curve.data_format}"
-        if curve.data_format == "A" and curve.array_info and curve.array_info.time_offset is not None:
+        if (
+            curve.data_format == "A"
+            and curve.array_info
+            and curve.array_info.time_offset is not None
+        ):
             offset = curve.array_info.time_offset
             if math.isfinite(offset):
                 if offset == int(offset):
@@ -316,16 +419,16 @@ def _format_curve_line(
     # positional, so values remain aligned (verified: the parser routes
     # data by ~C order, not by the ~A header).
     _emit_mnem = (
-        curve.original_mnemonic
-        if curve.original_mnemonic and curve.original_mnemonic != curve.mnemonic
-        else curve.mnemonic
+        mnemonic_override
+        if mnemonic_override is not None
+        else (
+            curve.original_mnemonic
+            if curve.original_mnemonic and curve.original_mnemonic != curve.mnemonic
+            else curve.mnemonic
+        )
     )
     mnemonic = _sanitize_las_value(_emit_mnem)
-    if (
-        is_las30
-        and curve.array_info is not None
-        and "[" not in mnemonic
-    ):
+    if is_las30 and curve.array_info is not None and "[" not in mnemonic:
         # W-09: The parser reconstructs CurveDefinition.array_info ONLY
         # from bracket mnemonics (ARRAY_MNEMONIC_PATTERN).  A curve whose
         # mnemonic lacks "[N]" loses its array_info on roundtrip — an
@@ -407,11 +510,7 @@ def _format_parameter_line(param: ParameterEntry, is_las30: bool) -> str:
     desc = _escape_colons_for_las_value(desc)
 
     mnemonic = _sanitize_las_value(param.mnemonic)
-    if (
-        is_las30
-        and param.array_index is not None
-        and "[" not in mnemonic
-    ):
+    if is_las30 and param.array_index is not None and "[" not in mnemonic:
         # W-08: The parser reconstructs ParameterEntry.array_index ONLY
         # from bracket mnemonics (ARRAY_MNEMONIC_PATTERN).  A parameter
         # whose mnemonic lacks "[N]" loses its array_index on roundtrip
@@ -490,8 +589,7 @@ def _format_data_rows(
                 # branch had no guard.  Route missing values to the same
                 # '-' sentinel used for empty strings.
                 if _raw is None or (
-                    isinstance(_raw, (float, np.floating))
-                    and not math.isfinite(_raw)
+                    isinstance(_raw, (float, np.floating)) and not math.isfinite(_raw)
                 ):
                     if not warned_empty_str:
                         import warnings
@@ -683,7 +781,16 @@ def _format_null_sentinel(null_value: float, user_precision: str) -> str:
 
 
 def _format_fixed_precision(value: float, precision: str) -> str:
-    """Convert a value to fixed-point notation with magnitude-aware precision."""
+    """Convert a value to fixed-point notation with magnitude-aware precision.
+
+    W-01: a value whose first significant digit lands BEYOND the
+    100-decimal cap (e.g. ``1e-150`` with a default ``.8g`` precision)
+    would be silently zeroed by the fixed-point rewrite —
+    ``format(1e-150, '.100f')`` == ``'0.000...0'`` — destroying the value
+    on write→read.  When the capped fixed-point width cannot reach the
+    first significant digit, fall back to scientific notation (readers
+    parse ``e`` notation via ``float()``) so the value survives.
+    """
     m = re.match(r"\.(\d+)", precision)
     sig_digits = min(int(m.group(1)), 100) if m else 8
 
@@ -694,6 +801,13 @@ def _format_fixed_precision(value: float, precision: str) -> str:
     decimal_places = sig_digits + max(0, (-magnitude) - 1)
     decimal_places = min(decimal_places, 100)
     decimal_places = max(decimal_places, sig_digits)
+
+    # W-01: the first significant digit sits at decimal position
+    # (-magnitude).  When the capped fixed-point width cannot reach it the
+    # output would be all zeros — silently losing the value.  Emit
+    # scientific notation instead, preserving all significant digits.
+    if decimal_places < -magnitude:
+        return format(value, f".{sig_digits}e")
 
     result = format(value, f".{decimal_places}f")
     return result
@@ -789,6 +903,7 @@ def _warn_long_header_lines(lines: list[str], max_length: int) -> None:
 
 # ── _WriterMutationGuard ────────────────────────────────────────────────
 
+
 class _WriterMutationGuard:
     """Context manager that runs deferred validation after write.
 
@@ -816,9 +931,7 @@ class _WriterMutationGuard:
         self._saved_curves_order = (
             list(las_file.curves_order) if las_file.curves_order is not None else None
         )
-        self._saved_curves = (
-            list(las_file.curves) if las_file.curves is not None else None
-        )
+        self._saved_curves = list(las_file.curves) if las_file.curves is not None else None
 
     def __enter__(self) -> _WriterMutationGuard:
         return self
@@ -845,12 +958,8 @@ class _WriterMutationGuard:
         """
         las_file = self._las_file
         if las_file.logs is not None and not isinstance(las_file.logs, _GuardedDict):
-            las_file.logs = _GuardedDict(
-                las_file.logs, _container_name="LASFile.logs"
-            )
-        if las_file.string_data is not None and not isinstance(
-            las_file.string_data, _GuardedDict
-        ):
+            las_file.logs = _GuardedDict(las_file.logs, _container_name="LASFile.logs")
+        if las_file.string_data is not None and not isinstance(las_file.string_data, _GuardedDict):
             las_file.string_data = _GuardedDict(
                 las_file.string_data, _container_name="LASFile.string_data"
             )
@@ -885,6 +994,7 @@ class _WriterMutationGuard:
 
 # ── _WriterBase ─────────────────────────────────────────────────────────
 
+
 class _WriterBase:
     """Abstract base class for version-specific LAS writers.
 
@@ -908,26 +1018,53 @@ class _WriterBase:
             warnings.warn(issue, stacklevel=2)
         if self._spec.is_las30:
             self._warn_string_curves_without_s_marker()
-        lines: list[str] = []
-        lines.extend(self._write_version_section())
-        lines.extend(self._write_well_section())
-        lines.extend(self._write_curve_section())
-        lines.extend(self._write_parameter_section())
-        lines.extend(self._write_other_section())
-        # N-I-16: The header-line length check was gated on `is_las12` only,
-        # so LAS 2.0 WRAP=NO header lines (also subject to the CWLS 256-char
-        # limit per `line_length_limit_for_wrap`) were never checked.  Use
-        # the effective wrap — the writers ALWAYS emit non-wrapped output
-        # (WRAP=YES is overridden to NO), so the effective limit for LAS
-        # 1.2/2.0 output is always 256, matching the data-row check.
-        effective_wrap = (self._las_file.version.wrap or "NO").upper()
-        if effective_wrap == "YES":
-            effective_wrap = "NO"
-        header_limit = self._spec.line_length_limit_for_wrap(effective_wrap)
-        if header_limit is not None:
-            _warn_long_header_lines(lines, header_limit)
-        lines.extend(self._write_ascii_sections())
-        return "\n".join(lines) + "\n"
+
+        # PF-22 (I2-13 completion): the legacy ~A data pass emits its
+        # columns from the LIVE curves_order while ~C historically emitted
+        # from the `curves` list's cached order.  A post-construction
+        # curves_order mutation therefore desynced the ~C column order
+        # from the data rows — the written file re-read with silently
+        # swapped columns and no writer-side signal (the models-side
+        # validate warning is suppressible).  For the legacy emission
+        # paths (LAS 1.2/2.0 always; LAS 3.0 only when it falls back to
+        # ~A without data_sections — the data_sections path already emits
+        # in live order per I2-13 and is driven by section_curves, not
+        # this list) temporarily point `curves` at the live-ordered list
+        # so EVERY ~C emitter (base AND the LAS 3.0 no-data_sections
+        # override) agrees with the data rows at write time.  The model is
+        # restored afterwards — the write does not silently reorder the
+        # user's curves list.
+        _original_curves = self._las_file.curves
+        _reordered_curves: list[CurveDefinition] | None = None
+        if not self._spec.is_las30 or not self._las_file.data_sections:
+            _reordered_curves = self._curves_in_live_order()
+            if _reordered_curves is not None:
+                self._las_file.curves = _reordered_curves
+
+        try:
+            lines: list[str] = []
+            lines.extend(self._write_version_section())
+            lines.extend(self._write_well_section())
+            lines.extend(self._write_curve_section())
+            lines.extend(self._write_parameter_section())
+            lines.extend(self._write_other_section())
+            # N-I-16: The header-line length check was gated on `is_las12` only,
+            # so LAS 2.0 WRAP=NO header lines (also subject to the CWLS 256-char
+            # limit per `line_length_limit_for_wrap`) were never checked.  Use
+            # the effective wrap — the writers ALWAYS emit non-wrapped output
+            # (WRAP=YES is overridden to NO), so the effective limit for LAS
+            # 1.2/2.0 output is always 256, matching the data-row check.
+            effective_wrap = (self._las_file.version.wrap or "NO").upper()
+            if effective_wrap == "YES":
+                effective_wrap = "NO"
+            header_limit = self._spec.line_length_limit_for_wrap(effective_wrap)
+            if header_limit is not None:
+                _warn_long_header_lines(lines, header_limit)
+            lines.extend(self._write_ascii_sections())
+            return "\n".join(lines) + "\n"
+        finally:
+            if _reordered_curves is not None:
+                self._las_file.curves = _original_curves
 
     # ── Section writers (overridable) ───────────────────────────────
 
@@ -1011,6 +1148,55 @@ class _WriterBase:
             # output and the data is discarded on re-read.
             curves = self._las_file.data_sections[0].section_curves
 
+        # PF-22 (I2-13 completion): the ~A data pass emits from the LIVE
+        # curves_order.  When the ~C definitions come from a single-
+        # section copy-back (W-05 above, top-level curves empty), that
+        # live order is the top-level curves_order when set, else the
+        # section's curves_order (Path A copies it to the top level during
+        # the ASCII pass).  Keep ~C consistent with it so a post-
+        # construction curves_order mutation (top-level or section) cannot
+        # swap columns on write→read.
+        if curves is not self._las_file.curves:
+            _live = self._curves_in_live_order(
+                curves,
+                order=(
+                    self._las_file.curves_order
+                    if self._las_file.curves_order
+                    else self._las_file.data_sections[0].curves_order
+                ),
+            )
+            if _live is not None:
+                curves = _live
+
+        if not self._spec.is_las30:
+            # W-10: dedup duplicate EMITTED mnemonics in the ~C block,
+            # mirroring the LAS 3.0 path.  Two distinct CurveDefinitions
+            # can emit the same name (duplicate mnemonics like DEPT(M) /
+            # DEPT(FT), or a vendor rename via original_mnemonic).  The
+            # parser renames the second duplicate on re-read (DEPT →
+            # DEPT_2), silently altering the model identity.  A curve
+            # whose M-59 reconstruction would collide falls back to its
+            # OWN mnemonic (preserving distinct columns like a
+            # reader-renamed IK_2); only a metadata-only duplicate (own
+            # mnemonic also taken) is dropped — warn so the drop is
+            # visible.
+            _curve_pairs, _dropped = _emission_plan(curves)
+            for _curve in _dropped:
+                import warnings
+
+                warnings.warn(
+                    f"Duplicate curve mnemonic '{_emitted_mnemonic(_curve)}' "
+                    f"in ~C.  Keeping the first definition; the second "
+                    f"curve's metadata is not re-emitted (a re-read would "
+                    f"rename it and silently alter the model identity).",
+                    UserWarning,
+                    stacklevel=3,
+                )
+            curves = [c for c, _ in _curve_pairs]
+            _overrides = {id(c): o for c, o in _curve_pairs}
+        else:
+            _overrides = {}
+
         for curve in curves:
             # M-77: pass the string_data mnemonic set so a string curve
             # without data_format='S' still gets the {S} marker.  On
@@ -1022,6 +1208,7 @@ class _WriterBase:
                     curve,
                     self._spec.is_las30,
                     frozenset(self._las_file.string_data.keys()),
+                    mnemonic_override=_overrides.get(id(curve)),
                 )
             )
 
@@ -1041,12 +1228,52 @@ class _WriterBase:
         return lines
 
     def _write_other_section(self) -> list[str]:
-        """Write ~O Other section — LAS 1.2/2.0 (emit)."""
+        """Write ~O Other section — LAS 1.2/2.0 (emit).
+
+        W-08: ~O content is free-form text, but the two transformations
+        below alter the model value on write→read, so they are reported:
+        - a line starting with ``~[A-Za-z]`` has its leading ``~``
+          stripped — otherwise the parser misreads the line as a NEW
+          section header, terminating the ~O block and misrouting the
+          remaining lines;
+        - tab characters are replaced with spaces (``_sanitize_las_value``
+          treats a tab as layout whitespace).
+        ``#``-prefixed lines KEEP the ``_#`` escape: the parser's
+        COMMENT_PATTERN drops raw ``#`` lines before the ~O accumulator
+        sees them, so an unescaped ``#comment`` is lost on re-read.  The
+        reverse ``_#`` → ``#`` restore on the ~O READ path is a parser
+        concern (see W-08 coordination note in the fix report).
+        """
         lines: list[str] = []
         if not self._las_file.other or not self._las_file.other.strip():
             return lines
         lines.append("~OTHER")
+        warned_tilde = False
+        warned_tab = False
         for line in self._las_file.other.splitlines():
+            if not warned_tilde and _LEADING_SECTION_RE.match(line):
+                import warnings
+
+                warnings.warn(
+                    "~Other line starts with '~' followed by a letter; "
+                    "the leading '~' is stripped so the line is not "
+                    "misread as a new LAS section header on re-read.  "
+                    "The written content differs from the model value.",
+                    UserWarning,
+                    stacklevel=3,
+                )
+                warned_tilde = True
+            if not warned_tab and "\t" in line:
+                import warnings
+
+                warnings.warn(
+                    "~Other line contains tab characters; tabs are "
+                    "replaced with spaces when written.  The written "
+                    "content differs from the model value.",
+                    UserWarning,
+                    stacklevel=3,
+                )
+                warned_tab = True
             sanitized = _sanitize_las_value(line)
             if sanitized.strip():
                 lines.append(sanitized)
@@ -1125,6 +1352,68 @@ class _WriterBase:
 
     # ── Shared helpers for version-specific writers ──────────────────
 
+    def _curves_in_live_order(
+        self,
+        curves: list[CurveDefinition] | None = None,
+        order: list[str] | None = None,
+    ) -> list[CurveDefinition] | None:
+        """Resolve a curve list into the LIVE ``curves_order`` order.
+
+        PF-22 (I2-13 completion): the legacy ~A data pass emits its
+        column header and data rows from the LIVE ``curves_order`` while
+        ~C historically emitted from the ``curves`` list's cached order.
+        A post-construction ``curves_order`` mutation (reorder/insert/
+        reverse) therefore desynced the ~C column order from the data
+        rows — the written file re-read with silently swapped columns and
+        no writer-side signal (the models-side validate warning is
+        suppressible).  Callers that need ~C to agree with the data rows
+        resolve the emission source through this helper.
+
+        ``curves`` defaults to ``self._las_file.curves``; ``order``
+        defaults to ``self._las_file.curves_order`` (the W-05 copy-back
+        path passes the section's ``curves_order`` — that is the order the
+        ~A pass will use via Path A copy-back).
+
+        Mnemonic resolution is case-insensitive (I2-22), matching the
+        LAS 3.0 section paths.  Curves absent from ``order`` are appended
+        at the end so metadata-only definitions still survive ~C.  An
+        entry in ``order`` with no resolvable definition is skipped (the
+        ~A data pass handles unresolvable columns separately).  Dedup uses
+        object IDENTITY — distinct-but-equal definitions (e.g. duplicate
+        mnemonics like I2-20's two ``LLD`` curves) are preserved so the
+        downstream emission-dedup (``_emission_plan``) still emits its
+        duplicate warning instead of silently dropping one here.
+
+        Returns the reordered list, or None when no reorder is needed
+        (empty source/order, or the source already matches the live
+        order) — callers then keep their existing emission path so
+        aligned models are untouched.
+        """
+        source = self._las_file.curves if curves is None else curves
+        live_order = self._las_file.curves_order if order is None else order
+        if not source or not live_order:
+            return None
+        by_mnem: dict[str, CurveDefinition] = {}
+        for c in source:
+            by_mnem.setdefault(c.mnemonic, c)
+            by_mnem.setdefault(c.mnemonic.upper(), c)
+        resolved: list[CurveDefinition] = []
+        seen_ids: set[int] = set()
+        for mnem in live_order:
+            cdef = by_mnem.get(mnem) or by_mnem.get(mnem.upper())
+            if cdef is not None and id(cdef) not in seen_ids:
+                seen_ids.add(id(cdef))
+                resolved.append(cdef)
+        for c in source:
+            if id(c) not in seen_ids:
+                seen_ids.add(id(c))
+                resolved.append(c)
+        if len(resolved) == len(source) and all(
+            a is b for a, b in zip(resolved, source, strict=True)
+        ):
+            return None
+        return resolved
+
     def _write_ascii_legacy(self, delimiter: str, check_line_limit: bool) -> list[str]:
         """Legacy ~A data path for LAS 1.2/2.0.
 
@@ -1181,11 +1470,16 @@ class _WriterBase:
             if not self._las_file.curves and _ds.section_curves:
                 self._las_file.curves = list(_ds.section_curves)
 
-            if (self._las_file.curves_order and _ds.curves_order
-                    and (self._las_file.logs or self._las_file.string_data)):
+            if (
+                self._las_file.curves_order
+                and _ds.curves_order
+                and (self._las_file.logs or self._las_file.string_data)
+            ):
                 existing = set(self._las_file.curves_order)
                 for k in _ds.curves_order:
-                    if (k in self._las_file.logs or k in self._las_file.string_data) and k not in existing:
+                    if (
+                        k in self._las_file.logs or k in self._las_file.string_data
+                    ) and k not in existing:
                         self._las_file.curves_order.append(k)
 
             if (
@@ -1242,15 +1536,42 @@ class _WriterBase:
             # unaffected — this is for file-level consistency).
             _by_mnem = {c.mnemonic: c for c in self._las_file.curves or []}
 
+            # W-10: mirror the ~C emission's collision-free naming.  A
+            # reader-renamed duplicate (IK_2 with original_mnemonic='IK')
+            # falls back to its OWN mnemonic so the ~A header stays
+            # collision-free and matches the ~C block.
+            _header_seen: set[str] = set()
+
             def _header_name(name: str) -> str:
                 c = _by_mnem.get(name)
-                if c is not None and c.original_mnemonic and c.original_mnemonic != c.mnemonic:
-                    return c.original_mnemonic
-                return name
+                candidate = (
+                    c.original_mnemonic
+                    if c is not None and c.original_mnemonic and c.original_mnemonic != c.mnemonic
+                    else name
+                )
+                if candidate in _header_seen and c is not None:
+                    candidate = c.mnemonic
+                _header_seen.add(candidate)
+                return candidate
 
-            header_line = "~A  " + "  ".join(
-                _sanitize_las_value(_header_name(name)) for name in curve_names
-            )
+            # W-10: two DISTINCT data columns that emit the same mnemonic
+            # even after the collision fallback (two curves with the same
+            # own mnemonic) would produce duplicate ~A header names — on
+            # re-read the parser renames the duplicate (LLD_2) and the
+            # model identity is silently altered.  The legacy single-block
+            # format cannot represent duplicate columns: fail loudly.
+            _header_names = [_header_name(name) for name in curve_names]
+            if len(set(_header_names)) != len(_header_names):
+                _dups = sorted({n for n in _header_names if _header_names.count(n) > 1})
+                raise LASWriteError(
+                    f"curves_order contains curve(s) that would emit "
+                    f"duplicate column name(s) {_dups} in the ~A header. "
+                    f"LAS 1.2/2.0 cannot represent duplicate columns — "
+                    f"re-read would silently rename them and alter the "
+                    f"model identity."
+                )
+
+            header_line = "~A  " + "  ".join(_sanitize_las_value(n) for n in _header_names)
             # N-I-16: The ~A column-header line is appended AFTER the
             # header-section length check in `write()` (which runs before
             # `_write_ascii_sections`), so it was NEVER length-checked for

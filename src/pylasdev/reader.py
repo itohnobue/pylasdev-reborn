@@ -15,7 +15,7 @@ from typing import Any
 
 from .data_reader import read_ascii_data
 from .encoding import read_with_encoding
-from .exceptions import LASEncodingError, LASParseError, LASReadError
+from .exceptions import LASParseError, LASReadError
 from .models import LASFile
 from .parser import LASParser
 
@@ -73,6 +73,8 @@ def read_las_file(
     Raises:
         LASReadError: If file cannot be found, is not a regular file, or
             exceeds max_file_size.
+        LASEncodingError: If the file content cannot be decoded with the
+            detected or explicitly requested encoding.
         LASParseError: If file content cannot be parsed (e.g. missing
             required ~V section).
         MemoryError: If the system runs out of memory during
@@ -131,6 +133,8 @@ def read_las_file_as_object(
     Raises:
         LASReadError: If file cannot be found, is not a regular file, or
             exceeds max_file_size.
+        LASEncodingError: If the file content cannot be decoded with the
+            detected or explicitly requested encoding.
         LASParseError: If file content cannot be parsed (e.g. missing
             required ~V section).
 
@@ -149,7 +153,15 @@ def read_las_file_as_object(
         detected_encoding, content = read_with_encoding(file_path, encoding, max_file_size)
     except OSError as e:
         raise LASReadError(f"Cannot read file (I/O error): {file_path}") from e
-    except (ValueError, LookupError, LASEncodingError) as e:
+    except ValueError as e:
+        # ENC-03: max_file_size violations surface as ValueError from
+        # read_with_encoding (encoding.py:441-444); re-raise as LASReadError
+        # per the documented reader contract (README error section).
+        # LookupError is intentionally NOT in this tuple — encoding.py wraps
+        # invalid codec names into LASEncodingError (F-94), so it is
+        # unreachable here; LASEncodingError itself propagates untouched so
+        # callers get the accurate decoding message instead of a misleading
+        # "size exceeded" LASReadError (ENC-03).
         raise LASReadError(
             f"Cannot read file (size exceeded or invalid parameter): {file_path}"
         ) from e
@@ -207,8 +219,7 @@ def read_las_file_as_object(
     # For LAS 1.2/2.0, use the dedicated data reader
     if not las_file.is_las30:
         try:
-            read_ascii_data(lines, las_file, parser.data_line_count,
-                            desanitize=desanitize)
+            read_ascii_data(lines, las_file, parser.data_line_count, desanitize=desanitize)
         except LASParseError as e:
             raise LASParseError(f"Error reading {file_path}: {e}") from e
 

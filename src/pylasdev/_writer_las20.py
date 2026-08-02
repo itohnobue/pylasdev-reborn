@@ -72,9 +72,9 @@ class _Las20Writer(_WriterBase):
         if _actual_wrap == "YES":
             self._las_file.version.wrap = "NO"
 
-        check_line_limit = self._spec.line_length_limit_for_wrap(
-            self._las_file.version.wrap
-        ) is not None
+        check_line_limit = (
+            self._spec.line_length_limit_for_wrap(self._las_file.version.wrap) is not None
+        )
 
         try:
             lines.extend(self._write_ascii_legacy(delimiter, check_line_limit))

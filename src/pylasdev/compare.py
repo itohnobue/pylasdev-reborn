@@ -26,26 +26,18 @@ def _scalars_equal(a: Any, b: Any) -> bool:
     # ValueError ("ambiguous truth value") on bool(a == b).
     if isinstance(a, np.ndarray):
         if a.size == 0:
-            logger.warning(
-                "Empty ndarray in scalar comparison; treating as unequal."
-            )
+            logger.warning("Empty ndarray in scalar comparison; treating as unequal.")
             return False
         if a.size > 1:
-            logger.warning(
-                "Multi-element ndarray in scalar comparison; treating as unequal."
-            )
+            logger.warning("Multi-element ndarray in scalar comparison; treating as unequal.")
             return False
         a = a.item()
     if isinstance(b, np.ndarray):
         if b.size == 0:
-            logger.warning(
-                "Empty ndarray in scalar comparison; treating as unequal."
-            )
+            logger.warning("Empty ndarray in scalar comparison; treating as unequal.")
             return False
         if b.size > 1:
-            logger.warning(
-                "Multi-element ndarray in scalar comparison; treating as unequal."
-            )
+            logger.warning("Multi-element ndarray in scalar comparison; treating as unequal.")
             return False
         b = b.item()
     if isinstance(a, (float, np.floating)) and isinstance(b, (float, np.floating)):
@@ -171,9 +163,7 @@ def _compare_arrays(
 # ──────────────────────────────────────────────────────────────
 
 
-def _coerce_and_compare(
-    a: Any, b: Any, label: str, rtol: float, atol: float
-) -> bool:
+def _coerce_and_compare(a: Any, b: Any, label: str, rtol: float, atol: float) -> bool:
     """Compare two values with tolerance-aware dispatch.
 
     Handles numpy arrays, lists, dicts, and scalars at any nesting depth.
@@ -221,18 +211,12 @@ def _coerce_and_compare(
             only_a = set(a.keys()) - set(b.keys())
             only_b = set(b.keys()) - set(a.keys())
             if only_a:
-                logger.warning(
-                    "Keys only in first dict at '%s': %s", label, only_a
-                )
+                logger.warning("Keys only in first dict at '%s': %s", label, only_a)
             if only_b:
-                logger.warning(
-                    "Keys only in second dict at '%s': %s", label, only_b
-                )
+                logger.warning("Keys only in second dict at '%s': %s", label, only_b)
             return False
         for k in a:
-            if not _coerce_and_compare(
-                a[k], b[k], f"{label}.{k}", rtol, atol
-            ):
+            if not _coerce_and_compare(a[k], b[k], f"{label}.{k}", rtol, atol):
                 return False
         return True
 
@@ -377,8 +361,7 @@ def _list_to_numeric_array(lst: list[Any]) -> np.ndarray | None:
     # "converting a masked element to nan" warning and mirrors the
     # MaskedArray handling in _compare_arrays).
     cleaned = [
-        np.ma.filled(item, np.nan) if isinstance(item, np.ma.MaskedArray) else item
-        for item in lst
+        np.ma.filled(item, np.nan) if isinstance(item, np.ma.MaskedArray) else item for item in lst
     ]
     try:
         return np.asarray(cleaned, dtype=np.float64)
@@ -414,9 +397,7 @@ def _compare_lists(
         if _has_nan(l1) or _has_nan(l2):
             raise ValueError  # Route to per-element comparison
         if l1 != l2:
-            logger.warning(
-                "List mismatch at '%s': %r vs %r", label, l1, l2
-            )
+            logger.warning("List mismatch at '%s': %r vs %r", label, l1, l2)
             return False
     except (ValueError, TypeError):
         if not isinstance(l1, list):
@@ -436,9 +417,7 @@ def _compare_lists(
             return False
         for idx, (a, b) in enumerate(zip(l1, l2, strict=False)):
             try:
-                if not _coerce_and_compare(
-                    a, b, f"{label}[{idx}]", rtol, atol
-                ):
+                if not _coerce_and_compare(a, b, f"{label}[{idx}]", rtol, atol):
                     return False
             except (ValueError, TypeError):
                 return False
@@ -482,9 +461,7 @@ def _compare_data_sections(
         )
         return False
 
-    for i, (ds1, ds2) in enumerate(
-        zip(sections1, sections2, strict=False)
-    ):
+    for i, (ds1, ds2) in enumerate(zip(sections1, sections2, strict=False)):
         # E-08: Per-element type checks.  Previously a non-dict element
         # (e.g. a str) raised a bare AttributeError on .keys().
         if not isinstance(ds1, dict) or not isinstance(ds2, dict):
@@ -513,9 +490,7 @@ def _compare_data_sections(
             return False
 
         for k in ds2:
-            if not _coerce_and_compare(
-                ds1[k], ds2[k], f"data_sections[{i}].{k}", rtol, atol
-            ):
+            if not _coerce_and_compare(ds1[k], ds2[k], f"data_sections[{i}].{k}", rtol, atol):
                 return False
 
     return True

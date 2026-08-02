@@ -165,9 +165,7 @@ class TestReadLASFile:
             "were likely converted to null_value by _to_finite_float"
         )
         lith_values = data["string_data"]["LITH"]
-        assert len(lith_values) == 2, (
-            f"Expected 2 LITH values, got {len(lith_values)}"
-        )
+        assert len(lith_values) == 2, f"Expected 2 LITH values, got {len(lith_values)}"
         np.testing.assert_array_equal(
             lith_values,
             np.array(["Sandstone", "Shale"], dtype=np.str_),
@@ -175,15 +173,12 @@ class TestReadLASFile:
 
         # String curve should NOT be in float logs
         assert "LITH" not in data["logs"], (
-            "String curve 'LITH' found in logs (float) — should only "
-            "be in string_data"
+            "String curve 'LITH' found in logs (float) — should only be in string_data"
         )
 
     # --- F-H-006: string curve multi-char value preservation ---
 
-    def test_string_curve_multi_char_values_preserved(
-        self, tmp_path: Path
-    ) -> None:
+    def test_string_curve_multi_char_values_preserved(self, tmp_path: Path) -> None:
         """F-H-006: String curve values > 1 char are preserved in string_data.
 
         Before the fix at data_reader.py:634, string curve arrays were
@@ -215,13 +210,9 @@ class TestReadLASFile:
         data = read_las_file(test_file)
 
         # String curve must be in string_data
-        assert "LITH" in data["string_data"], (
-            "String curve 'LITH' missing from string_data"
-        )
+        assert "LITH" in data["string_data"], "String curve 'LITH' missing from string_data"
         lith_values = data["string_data"]["LITH"]
-        assert len(lith_values) == 3, (
-            f"Expected 3 LITH values, got {len(lith_values)}"
-        )
+        assert len(lith_values) == 3, f"Expected 3 LITH values, got {len(lith_values)}"
         np.testing.assert_array_equal(
             lith_values,
             np.array(["Sandstone", "Limestone", "Dolomite"]),
@@ -2165,11 +2156,7 @@ class TestMaxTokensPerLineGuard:
         """MAX_TOKENS_PER_LINE capped in DEV reader (dev_reader.py:719)."""
         from unittest import mock
 
-        content = (
-            "MD TVD X Y Z\n"
-            "0.0 0.0 100.0 200.0 300.0\n"
-            "100.0 99.0 101.0 201.0 301.0\n"
-        )
+        content = "MD TVD X Y Z\n0.0 0.0 100.0 200.0 300.0\n100.0 99.0 101.0 201.0 301.0\n"
         test_file = tmp_path / "token_cap_dev.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -2303,6 +2290,7 @@ class TestMaxLimitsAtLimit:
 # Production Check Regression Tests
 # ============================================================
 
+
 class TestProductionCheckReaderFixes:
     """Regression tests for production check fixes in data_reader.py and reader.py."""
 
@@ -2381,9 +2369,7 @@ class TestProductionCheckReaderFixes:
 
     # --- E-F-018 (HIGH): depth_line state machine corruption regression test ---
 
-    def test_wrapped_depth_line_state_machine_non_pathological_ef018(
-        self, tmp_path: Path
-    ) -> None:
+    def test_wrapped_depth_line_state_machine_non_pathological_ef018(self, tmp_path: Path) -> None:
         """E-F-018: Regression test — non-pathological recovery now hard-fails.
 
         When a depth line has extra values (depth_had_extra=True) and the next
@@ -2465,9 +2451,7 @@ class TestProductionCheckReaderFixes:
         # F-088: _DESANITIZE_ENABLED is now unified in parser.py.
         assert _parser_mod._DESANITIZE_ENABLED is True
         result = dr_mod._desanitize_las_value("_#test_value")
-        assert result == "#test_value", (
-            f"Expected '#test_value' after desanitize, got {result!r}"
-        )
+        assert result == "#test_value", f"Expected '#test_value' after desanitize, got {result!r}"
 
     # --- E-04 (MEDIUM): thread-local _DESANITIZE_ENABLED never reset ---
 
@@ -2525,15 +2509,20 @@ class TestProductionCheckReaderFixes:
             read_las_file_as_object(test_file)
         assert _parser_mod._DESANITIZE_ENABLED is prior
 
-    # --- F-219 (MEDIUM): LASEncodingError propagation ---
+    # --- F-219 / ENC-03: LASEncodingError propagation ---
 
-    def test_encoding_error_wrapped_as_las_read_error(self, tmp_path: Path) -> None:
-        """F-219: LASEncodingError is wrapped as LASReadError in reader.
+    def test_encoding_error_propagates_as_las_encoding_error(self, tmp_path: Path) -> None:
+        """F-219/ENC-03: a genuine decoding failure propagates as
+        LASEncodingError with an accurate message.
 
-        The docstring was corrected: LASEncodingError is NOT propagated
-        directly. Instead it's caught and re-raised as LASReadError at
-        reader.py:142. Callers receive LASReadError, not LASEncodingError.
+        F-219 previously pinned LASEncodingError → LASReadError.  ENC-03
+        corrected that contract: read_with_encoding raises LASEncodingError
+        with the file path and codec cause, and reader.py must NOT relabel
+        it as a misleading 'size exceeded' LASReadError.  Callers now
+        receive LASEncodingError, matching read_with_encoding's contract.
         """
+        from pylasdev.exceptions import LASEncodingError
+
         content = b"\xff\xfe\x00\x01"  # Invalid encoding bytes
         test_file = tmp_path / "bad_encoding.las"
         test_file.write_bytes(content)
@@ -2543,7 +2532,7 @@ class TestProductionCheckReaderFixes:
 
         with mock.patch("pylasdev.encoding.FALLBACK_ENCODINGS", []):
             with mock.patch("pylasdev.encoding.HAS_CHARDET", False):
-                with pytest.raises(LASReadError, match="Cannot read file"):
+                with pytest.raises(LASEncodingError, match="Failed to decode"):
                     read_las_file(test_file)
 
 
@@ -2585,8 +2574,7 @@ class TestG6DataReaderFixes:
         data = read_las_file(test_file)
 
         assert len(data["logs"]["DEPT"]) == 4, (
-            f"Expected 4 rows, got {len(data['logs']['DEPT'])} — file was "
-            f"misdetected as wrapped"
+            f"Expected 4 rows, got {len(data['logs']['DEPT'])} — file was misdetected as wrapped"
         )
         np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 101.0, 102.0, 103.0])
         np.testing.assert_allclose(data["logs"]["GR"], [-999.25, 75.0, 76.0, 77.0])
@@ -2641,8 +2629,7 @@ class TestG6DataReaderFixes:
         test_file.write_text(content, encoding="utf-8")
         data = read_las_file(test_file)
         assert len(data["logs"]["DEPT"]) == 5, (
-            f"Expected 5 rows, got {len(data['logs']['DEPT'])} — file was "
-            f"misdetected as wrapped"
+            f"Expected 5 rows, got {len(data['logs']['DEPT'])} — file was misdetected as wrapped"
         )
         np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 101.0, 102.0, 103.0, 104.0])
 
@@ -2683,9 +2670,7 @@ class TestG6DataReaderFixes:
 
     # --- EXT-01 (regression): wrapped COMMA/TAB >=3 curves ---
 
-    def test_ext01_wrapped_comma_three_curves_parses_wrapped(
-        self, tmp_path: Path
-    ) -> None:
+    def test_ext01_wrapped_comma_three_curves_parses_wrapped(self, tmp_path: Path) -> None:
         """EXT-01: a genuine WRAP=YES COMMA file with 3 curves (depth line
         alone, data lines carrying curve_count-1 = 2 values) must be
         detected as wrapped.
@@ -2728,9 +2713,7 @@ class TestG6DataReaderFixes:
         np.testing.assert_allclose(data["logs"]["C1"], [1.0, 3.0, 5.0])
         np.testing.assert_allclose(data["logs"]["C2"], [2.0, 4.0, 6.0])
 
-    def test_ext01_wrapped_tab_four_curves_parses_wrapped(
-        self, tmp_path: Path
-    ) -> None:
+    def test_ext01_wrapped_tab_four_curves_parses_wrapped(self, tmp_path: Path) -> None:
         """EXT-01: same misdetection with TAB delimiter and 4 curves
         (data lines carry curve_count-1 = 3 values)."""
         content = (
@@ -2765,9 +2748,7 @@ class TestG6DataReaderFixes:
         np.testing.assert_allclose(data["logs"]["C2"], [2.0, 5.0])
         np.testing.assert_allclose(data["logs"]["C3"], [3.0, 6.0])
 
-    def test_ext01_sparse_first_row_comma_still_non_wrapped(
-        self, tmp_path: Path
-    ) -> None:
+    def test_ext01_sparse_first_row_comma_still_non_wrapped(self, tmp_path: Path) -> None:
         """EXT-01 guard: the D-01 sparse-first-row COMMA file must STILL be
         detected non-wrapped after the curve_count-aware "full" predicate
         (a wrapped continuation line carrying curve_count-1 values must not
@@ -2887,19 +2868,21 @@ class TestG6DataReaderFixes:
         (roundtrip precision preservation)."""
         from pylasdev.models import LASFile
 
-        las = LASFile.from_dict({
-            "version": {"VERS": "2.0", "WRAP": "NO"},
-            "well": {"NULL": "-999"},
-            "curves": [
-                {"mnemonic": "DEPT", "unit": "M", "data_format": "F"},
-                {"mnemonic": "RUN_NO", "data_format": "I"},
-            ],
-            "curves_order": ["DEPT", "RUN_NO"],
-            "logs": {
-                "DEPT": np.array([100.0, 101.0]),
-                "RUN_NO": np.array([9007199254740993, 9007199254740994]),
-            },
-        })
+        las = LASFile.from_dict(
+            {
+                "version": {"VERS": "2.0", "WRAP": "NO"},
+                "well": {"NULL": "-999"},
+                "curves": [
+                    {"mnemonic": "DEPT", "unit": "M", "data_format": "F"},
+                    {"mnemonic": "RUN_NO", "data_format": "I"},
+                ],
+                "curves_order": ["DEPT", "RUN_NO"],
+                "logs": {
+                    "DEPT": np.array([100.0, 101.0]),
+                    "RUN_NO": np.array([9007199254740993, 9007199254740994]),
+                },
+            }
+        )
         assert las.logs["RUN_NO"].dtype == np.int64
         assert las.logs["RUN_NO"][0] == 9007199254740993
 
@@ -2912,28 +2895,28 @@ class TestG6DataReaderFixes:
         is preserved so to_dict → from_dict keeps >2^53 precision."""
         from pylasdev.models import LASFile
 
-        las = LASFile.from_dict({
-            "version": {"VERS": "2.0", "WRAP": "NO"},
-            "well": {"NULL": "-999.25"},
-            "curves": [
-                {"mnemonic": "DEPT", "unit": "M", "data_format": "F"},
-                {"mnemonic": "RUN_NO", "data_format": "I"},
-            ],
-            "curves_order": ["DEPT", "RUN_NO"],
-            "logs": {
-                "DEPT": np.array([100.0, 101.0]),
-                "RUN_NO": np.array([5, -999.25]),
-            },
-        })
+        las = LASFile.from_dict(
+            {
+                "version": {"VERS": "2.0", "WRAP": "NO"},
+                "well": {"NULL": "-999.25"},
+                "curves": [
+                    {"mnemonic": "DEPT", "unit": "M", "data_format": "F"},
+                    {"mnemonic": "RUN_NO", "data_format": "I"},
+                ],
+                "curves_order": ["DEPT", "RUN_NO"],
+                "logs": {
+                    "DEPT": np.array([100.0, 101.0]),
+                    "RUN_NO": np.array([5, -999.25]),
+                },
+            }
+        )
         assert las.logs["RUN_NO"].dtype == np.object_, (
             f"Expected object dtype, got {las.logs['RUN_NO'].dtype}"
         )
         assert las.logs["RUN_NO"][0] == 5
         assert las.logs["RUN_NO"][1] == -999.25
 
-    def test_ext04_integer_precision_fractional_null_las20(
-        self, tmp_path: Path
-    ) -> None:
+    def test_ext04_integer_precision_fractional_null_las20(self, tmp_path: Path) -> None:
         """EXT-04: {I} curve value 9007199254740993 (2^53+1) survives
         exactly on the LAS 1.2/2.0 path with the default/fractional NULL
         -999.25 (pre-fix it rounded to 9007199254740992.0 float64)."""
@@ -2956,13 +2939,9 @@ class TestG6DataReaderFixes:
         assert int(data["logs"]["RUN_NO"][0]) == 9007199254740993, (
             f"Precision lost: {data['logs']['RUN_NO'][0]}"
         )
-        assert data["logs"]["RUN_NO"][1] == -999.25, (
-            "null cell must keep the fractional sentinel"
-        )
+        assert data["logs"]["RUN_NO"][1] == -999.25, "null cell must keep the fractional sentinel"
 
-    def test_ext04_integer_precision_fractional_null_las30(
-        self, tmp_path: Path
-    ) -> None:
+    def test_ext04_integer_precision_fractional_null_las30(self, tmp_path: Path) -> None:
         """EXT-04: same exactness guarantee on the LAS 3.0 path with the
         default/fractional NULL -999.25."""
         content = (
@@ -2983,16 +2962,10 @@ class TestG6DataReaderFixes:
         test_file.write_text(content, encoding="utf-8")
         las = read_las_file_as_object(test_file)
         run_no = las.data_sections[0].data["RUN_NO"]
-        assert int(run_no[0]) == 9007199254740993, (
-            f"Precision lost: {run_no[0]}"
-        )
-        assert run_no[1] == -999.25, (
-            "null cell must keep the fractional sentinel"
-        )
+        assert int(run_no[0]) == 9007199254740993, f"Precision lost: {run_no[0]}"
+        assert run_no[1] == -999.25, "null cell must keep the fractional sentinel"
 
-    def test_ext04_fractional_null_no_spurious_dtype_validate_issue(
-        self, tmp_path: Path
-    ) -> None:
+    def test_ext04_fractional_null_no_spurious_dtype_validate_issue(self, tmp_path: Path) -> None:
         """EXT-04 convergence: parsing a valid LAS 3.0 file with an {I}
         curve and a fractional declared NULL must NOT produce a spurious
         non-numeric-dtype validation issue.
@@ -3063,9 +3036,9 @@ class TestG6DataReaderFixes:
             warnings.simplefilter("always")
             read_las_file(test_file)
             messages = [str(x.message) for x in w]
-        assert any(
-            "under-filled" in m or "not accounted for" in m for m in messages
-        ), f"No under-fill warning emitted. Got: {messages[-3:]}"
+        assert any("under-filled" in m or "not accounted for" in m for m in messages), (
+            f"No under-fill warning emitted. Got: {messages[-3:]}"
+        )
 
     # --- IT3-F-01 (MEDIUM): desanitize flag hoist ---
 
@@ -3201,6 +3174,7 @@ class TestG6DataReaderFixes:
 # section-boundary classification).
 # ──────────────────────────────────────────────────────────────
 
+
 class TestP16ReaderUnrecognizedSection:
     """P-16: `_iter_ascii_data_lines` must STOP reading data when it
     encounters an unrecognized ~section header (break, not
@@ -3297,6 +3271,7 @@ class TestP16ReaderUnrecognizedSection:
 # header (~ASCII|CURVE) must be recognized by the reader.
 # ──────────────────────────────────────────────────────────────
 
+
 class TestP05ReaderNoSpacePipeAscii:
     """P-05: `_is_ascii_section` (and data_reader's section-word
     detection) must strip the `| <target>` pipe suffix so a LAS 1.2/2.0
@@ -3322,8 +3297,7 @@ class TestP05ReaderNoSpacePipeAscii:
         test_file.write_text(content, encoding="utf-8")
         data = read_las_file(test_file)
         assert len(data["logs"]["DEPT"]) == 2, (
-            "~ASCII|CURVE header must produce data rows — got "
-            f"{len(data['logs']['DEPT'])}"
+            f"~ASCII|CURVE header must produce data rows — got {len(data['logs']['DEPT'])}"
         )
         np.testing.assert_allclose(data["logs"]["DEPT"], [10.0, 11.0])
         np.testing.assert_allclose(data["logs"]["GR"], [50.0, 51.0])
@@ -3352,6 +3326,7 @@ class TestP05ReaderNoSpacePipeAscii:
 # M-11 (MEDIUM): mandatory_well_fields aligned with lascheck —
 # UWI removed (optional), COMP/FLD/DATE added (required).
 # ──────────────────────────────────────────────────────────────
+
 
 class TestM11MandatoryWellFields:
     """M-11: `_LASVersionSpec.mandatory_well_fields` must match lascheck's
@@ -3386,24 +3361,32 @@ class TestM11MandatoryWellFields:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             parser.parse(content)
-            mandatory_warnings = [
-                x for x in w if "missing mandatory well field" in str(x.message)
-            ]
+            mandatory_warnings = [x for x in w if "missing mandatory well field" in str(x.message)]
             assert len(mandatory_warnings) == 0, (
                 f"Expected no mandatory well field warnings, got: "
                 f"{[str(x.message) for x in mandatory_warnings]}"
             )
             uwi_warnings = [
-                x for x in w if "UWI" in str(x.message)
-                and "missing mandatory well field" in str(x.message)
+                x
+                for x in w
+                if "UWI" in str(x.message) and "missing mandatory well field" in str(x.message)
             ]
             assert len(uwi_warnings) == 0, (
                 "UWI is optional per lascheck — must not warn when absent"
             )
 
     def test_las12_missing_comp_fld_date_warns(self) -> None:
-        """LAS 1.2 missing COMP/FLD/DATE DOES warn (M-11 false-negative
-        fix) — even when UWI is present."""
+        """LAS 1.2 missing COMP/FLD/DATE does NOT warn (I2-07).
+
+        I2-07 corrected the LAS 1.2 mandatory-field set: lascheck's
+        10-field set is a LAS 2.0-era requirement (lascheck documents
+        "supports checking against LAS 2.0 standard only"), and
+        frackoptima/GERDA require only the four numeric fields
+        (STRT, STOP, STEP, NULL) for LAS 1.2.  COMP/FLD/DATE are NOT
+        mandatory for 1.2, so a 1.2 file carrying the 4 numeric fields
+        (plus optional extras) must produce zero mandatory-field
+        warnings — even when UWI is present.
+        """
         content = (
             "~VERSION INFORMATION\n"
             " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
@@ -3427,12 +3410,61 @@ class TestM11MandatoryWellFields:
             warnings.simplefilter("always")
             parser.parse(content)
             mandatory_warnings = [
-                str(x.message) for x in w
-                if "missing mandatory well field" in str(x.message)
+                str(x.message) for x in w if "missing mandatory well field" in str(x.message)
             ]
-            assert any("COMP" in t for t in mandatory_warnings), mandatory_warnings
-            assert any("FLD" in t for t in mandatory_warnings), mandatory_warnings
-            assert any("DATE" in t for t in mandatory_warnings), mandatory_warnings
+            # I2-07: COMP/FLD/DATE are 2.0-era mandatory fields, NOT 1.2.
+            assert len(mandatory_warnings) == 0, (
+                f"LAS 1.2 with the 4 numeric fields must not warn about "
+                f"COMP/FLD/DATE (I2-07); got: {mandatory_warnings}"
+            )
             assert not any("UWI" in t for t in mandatory_warnings), (
                 f"UWI must not be reported as missing: {mandatory_warnings}"
             )
+
+
+# ──────────────────────────────────────────────────────────────
+# ENC-03 (reader, MEDIUM): max_file_size ValueError conversion +
+# LASEncodingError mislabeling.  README.md:346-360 documented ValueError
+# (catch separately) but code raises LASReadError — the README was the
+# sole outlier (code+docstrings+tests agree on LASReadError) and has been
+# corrected.  A genuine LASEncodingError must also NOT be swallowed under
+# a misleading "size exceeded" message: it propagates as LASEncodingError.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestENC03SizeLimitErrorContract:
+    """ENC-03: size-limit failures raise LASReadError (documented
+    contract); genuine encoding failures raise LASEncodingError with an
+    accurate message — never a misleading 'size exceeded' LASReadError."""
+
+    def test_max_file_size_raises_las_read_error(self, tmp_path: Path) -> None:
+        """read_las_file(max_file_size=1) raises LASReadError (asserting
+        the actual behavior — the README now documents LASReadError, not
+        ValueError)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~A  DEPT\n"
+            "100.0\n"
+        )
+        test_file = tmp_path / "enc03_size.las"
+        test_file.write_text(content, encoding="utf-8")
+        with pytest.raises(LASReadError, match="Cannot read file"):
+            read_las_file(test_file, max_file_size=1)
+
+    def test_genuine_decode_failure_raises_las_encoding_error(self, tmp_path: Path) -> None:
+        """A genuine decoding failure (explicit encoding that cannot decode
+        the bytes) raises LASEncodingError with an accurate message — NOT a
+        misleading 'size exceeded or invalid parameter' LASReadError."""
+        from pylasdev.exceptions import LASEncodingError
+
+        test_file = tmp_path / "enc03_bad_encoding.las"
+        # CP1252 bytes are invalid UTF-8, so forcing utf-8 must fail to decode.
+        test_file.write_bytes("Caf\u00e9 r\u00e9sum\u00e9".encode("cp1252"))
+        with pytest.raises(LASEncodingError, match="Failed to decode"):
+            read_las_file(test_file, encoding="utf-8")

@@ -720,6 +720,7 @@ class TestProductionCheckCompareFix:
 # M-01 Regression: list-of-arrays dispatch branches
 # ──────────────────────────────────────────────────────────────
 
+
 class TestF01HListOfArraysNestedDict:
     """F-01-H: Regression tests for isinstance(val2[in_key], list) branch
     in compare_las_dicts (compare.py:168-189).
@@ -1060,101 +1061,126 @@ class TestCompareListsDirect:
 
     def test_identical_list_of_arrays(self) -> None:
         """Lists containing identical numpy arrays match."""
-        assert _compare_lists(
-            [np.array([1.0, 2.0]), np.array([3.0, 4.0])],
-            [np.array([1.0, 2.0]), np.array([3.0, 4.0])],
-            "test",
-            1e-7,
-            0.0,
-        ) is True
+        assert (
+            _compare_lists(
+                [np.array([1.0, 2.0]), np.array([3.0, 4.0])],
+                [np.array([1.0, 2.0]), np.array([3.0, 4.0])],
+                "test",
+                1e-7,
+                0.0,
+            )
+            is True
+        )
 
     def test_different_arrays_in_list(self) -> None:
         """Lists containing different numpy arrays return False."""
-        assert _compare_lists(
-            [np.array([1.0, 2.0]), np.array([3.0, 4.0])],
-            [np.array([1.0, 2.0]), np.array([3.0, 5.0])],
-            "test",
-            1e-7,
-            0.0,
-        ) is False
+        assert (
+            _compare_lists(
+                [np.array([1.0, 2.0]), np.array([3.0, 4.0])],
+                [np.array([1.0, 2.0]), np.array([3.0, 5.0])],
+                "test",
+                1e-7,
+                0.0,
+            )
+            is False
+        )
 
     def test_nested_list_of_arrays(self) -> None:
         """Nested lists containing numpy arrays match correctly."""
         # _compare_lists dispatches per-element via _compare_values
         # which handles ndarray elements via _compare_arrays
-        assert _compare_lists(
-            [np.array([1.0, 2.0])],
-            [np.array([1.0, 2.0])],
-            "test",
-            1e-7,
-            0.0,
-        ) is True
+        assert (
+            _compare_lists(
+                [np.array([1.0, 2.0])],
+                [np.array([1.0, 2.0])],
+                "test",
+                1e-7,
+                0.0,
+            )
+            is True
+        )
 
     def test_nested_list_of_arrays_mismatch(self) -> None:
         """Nested lists with different arrays return False."""
-        assert _compare_lists(
-            [np.array([1.0, 2.0])],
-            [np.array([9.0, 10.0])],
-            "test",
-            1e-7,
-            0.0,
-        ) is False
+        assert (
+            _compare_lists(
+                [np.array([1.0, 2.0])],
+                [np.array([9.0, 10.0])],
+                "test",
+                1e-7,
+                0.0,
+            )
+            is False
+        )
 
     def test_list_of_arrays_within_tolerance(self) -> None:
         """List of arrays matches within floating-point tolerance."""
-        assert _compare_lists(
-            [np.array([1.0, 2.0])],
-            [np.array([1.0, 2.0 + 1e-12])],
-            "test",
-            1e-7,
-            0.0,
-        ) is True
+        assert (
+            _compare_lists(
+                [np.array([1.0, 2.0])],
+                [np.array([1.0, 2.0 + 1e-12])],
+                "test",
+                1e-7,
+                0.0,
+            )
+            is True
+        )
 
     def test_list_scalar_elements(self) -> None:
         """Lists of scalars match via _compare_values fallthrough."""
-        assert _compare_lists(
-            ["a", "b", "c"],
-            ["a", "b", "c"],
-            "test",
-            1e-7,
-            0.0,
-        ) is True
+        assert (
+            _compare_lists(
+                ["a", "b", "c"],
+                ["a", "b", "c"],
+                "test",
+                1e-7,
+                0.0,
+            )
+            is True
+        )
 
     def test_list_scalar_elements_mismatch(self) -> None:
         """Lists of scalars with different values return False."""
-        assert _compare_lists(
-            ["a", "b", "c"],
-            ["a", "x", "c"],
-            "test",
-            1e-7,
-            0.0,
-        ) is False
+        assert (
+            _compare_lists(
+                ["a", "b", "c"],
+                ["a", "x", "c"],
+                "test",
+                1e-7,
+                0.0,
+            )
+            is False
+        )
 
     def test_list_with_nan_values(self) -> None:
         """Lists containing NaN float values match when identical."""
-        assert _compare_lists(
-            [np.nan, 2.0],
-            [np.nan, 2.0],
-            "test",
-            1e-7,
-            0.0,
-        ) is True
+        assert (
+            _compare_lists(
+                [np.nan, 2.0],
+                [np.nan, 2.0],
+                "test",
+                1e-7,
+                0.0,
+            )
+            is True
+        )
 
     def test_mixed_types_in_list(self) -> None:
         """Lists with mixed scalar types match."""
-        assert _compare_lists(
-            [1, "hello", 3.14],
-            [1, "hello", 3.14],
-            "test",
-            1e-7,
-            0.0,
-        ) is True
+        assert (
+            _compare_lists(
+                [1, "hello", 3.14],
+                [1, "hello", 3.14],
+                "test",
+                1e-7,
+                0.0,
+            )
+            is True
+        )
 
     def test_empty_vs_nonempty_list(self) -> None:
         """Empty list vs non-empty list returns False."""
-        assert _compare_lists(
-            [], [np.array([1.0])], "test", 1e-7, 0.0
-        ) is False
+        assert _compare_lists([], [np.array([1.0])], "test", 1e-7, 0.0) is False
 
     def test_large_list_of_arrays(self) -> None:
         """Larger lists of arrays with many elements match."""
@@ -1177,9 +1203,7 @@ class TestMaskedArrayComparison:
         ma_val = np.ma.array(42.0)
         assert not np.ma.is_masked(ma_val), "Precondition: mask should be False"
         # Single-element list triggers _coerce_and_compare per element
-        assert _compare_lists(
-            [ma_val], [42.0], "test", 1e-7, 0.0
-        ) is True
+        assert _compare_lists([ma_val], [42.0], "test", 1e-7, 0.0) is True
 
     def test_0d_masked_true_vs_regular_scalar(self) -> None:
         """0-d MaskedArray with mask=True vs regular scalar returns False.
@@ -1189,23 +1213,17 @@ class TestMaskedArrayComparison:
         """
         ma_val = np.ma.array(42.0, mask=True)
         assert np.ma.is_masked(ma_val), "Precondition: mask should be True"
-        assert _compare_lists(
-            [ma_val], [42.0], "test", 1e-7, 0.0
-        ) is False
+        assert _compare_lists([ma_val], [42.0], "test", 1e-7, 0.0) is False
 
     def test_0d_masked_vs_same_masked(self) -> None:
         """0-d MaskedArray vs same 0-d MaskedArray matches."""
         ma_val = np.ma.array(3.14)
-        assert _compare_lists(
-            [ma_val], [np.ma.array(3.14)], "test", 1e-7, 0.0
-        ) is True
+        assert _compare_lists([ma_val], [np.ma.array(3.14)], "test", 1e-7, 0.0) is True
 
     def test_0d_masked_vs_different_masked(self) -> None:
         """0-d MaskedArray vs different value 0-d MaskedArray returns False."""
         ma_val = np.ma.array(3.14)
-        assert _compare_lists(
-            [ma_val], [np.ma.array(2.72)], "test", 1e-7, 0.0
-        ) is False
+        assert _compare_lists([ma_val], [np.ma.array(2.72)], "test", 1e-7, 0.0) is False
 
     def test_0d_masked_true_vs_masked_true(self) -> None:
         """Two 0-d MaskedArrays both with mask=True are considered equal.
@@ -1222,26 +1240,25 @@ class TestMaskedArrayComparison:
         assert np.ma.is_masked(ma1), "Precondition: ma1 should be masked"
         assert np.ma.is_masked(ma2), "Precondition: ma2 should be masked"
         # Both become NaN-equivalent after the masked→NaN unification.
-        assert _compare_lists(
-            [ma1], [ma2], "test", 1e-7, 0.0
-        ) is True
+        assert _compare_lists([ma1], [ma2], "test", 1e-7, 0.0) is True
 
     def test_0d_masked_vs_regular_scalar_mask_preserved(self) -> None:
         """0-d MaskedArray mask is preserved through nesting in lists."""
         # Two-element list with masked and non-masked values
         ma_masked = np.ma.array(42.0, mask=True)
         ma_normal = np.ma.array(3.14)
-        assert _compare_lists(
-            [ma_normal, ma_masked], [np.ma.array(3.14), ma_masked], "test", 1e-7, 0.0
-        ) is True
+        assert (
+            _compare_lists(
+                [ma_normal, ma_masked], [np.ma.array(3.14), ma_masked], "test", 1e-7, 0.0
+            )
+            is True
+        )
 
     def test_0d_regular_ndarray_scalar_vs_scalar(self) -> None:
         """0-d regular ndarray vs Python scalar — .item() path still works."""
         arr = np.array(42.0)  # 0-d ndarray, NOT MaskedArray
         assert not isinstance(arr, np.ma.MaskedArray)
-        assert _compare_lists(
-            [arr], [42.0], "test", 1e-7, 0.0
-        ) is True
+        assert _compare_lists([arr], [42.0], "test", 1e-7, 0.0) is True
 
 
 class TestE08DataSectionsSymmetricGuards:
@@ -1256,9 +1273,7 @@ class TestE08DataSectionsSymmetricGuards:
 
     def test_sections2_none_returns_false(self) -> None:
         """E-08: sections2=None returns False instead of raising TypeError."""
-        assert compare_las_dicts(
-            {"data_sections": []}, {"data_sections": None}
-        ) is False
+        assert compare_las_dicts({"data_sections": []}, {"data_sections": None}) is False
 
     def test_sections2_dict_vs_list_returns_false(self) -> None:
         """E-08: sections2={} vs sections1=[] returns False, not True.
@@ -1266,33 +1281,29 @@ class TestE08DataSectionsSymmetricGuards:
         The empty-container silent FALSE-EQUAL: [] == {} previously
         returned True because both had length 0 and the loop never ran.
         """
-        assert compare_las_dicts(
-            {"data_sections": []}, {"data_sections": {}}
-        ) is False
+        assert compare_las_dicts({"data_sections": []}, {"data_sections": {}}) is False
 
     def test_sections2_tuple_returns_false(self) -> None:
         """E-08: sections2=() vs sections1=[] returns False, not True."""
-        assert compare_las_dicts(
-            {"data_sections": []}, {"data_sections": ()}
-        ) is False
+        assert compare_las_dicts({"data_sections": []}, {"data_sections": ()}) is False
 
     def test_sections2_string_returns_false(self) -> None:
         """E-08: sections2='' vs sections1=[] returns False, not True."""
-        assert compare_las_dicts(
-            {"data_sections": []}, {"data_sections": ""}
-        ) is False
+        assert compare_las_dicts({"data_sections": []}, {"data_sections": ""}) is False
 
     def test_non_dict_element_returns_false(self) -> None:
         """E-08: non-dict element returns False instead of AttributeError."""
-        assert compare_las_dicts(
-            {"data_sections": [{"a": 1}]}, {"data_sections": ["notadict"]}
-        ) is False
+        assert (
+            compare_las_dicts({"data_sections": [{"a": 1}]}, {"data_sections": ["notadict"]})
+            is False
+        )
 
     def test_non_dict_first_element_returns_false(self) -> None:
         """E-08: non-dict element in sections1 also returns False."""
-        assert compare_las_dicts(
-            {"data_sections": ["notadict"]}, {"data_sections": [{"a": 1}]}
-        ) is False
+        assert (
+            compare_las_dicts({"data_sections": ["notadict"]}, {"data_sections": [{"a": 1}]})
+            is False
+        )
 
     def test_matching_sections_still_equal(self) -> None:
         """E-08: well-formed matching data_sections still compare equal."""

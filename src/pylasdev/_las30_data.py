@@ -121,9 +121,7 @@ def _deduplicate_curves(
                 unit=curve.unit,
                 api_code=curve.api_code,
                 description=curve.description,
-                original_mnemonic=name
-                if not curve.original_mnemonic
-                else curve.original_mnemonic,
+                original_mnemonic=name if not curve.original_mnemonic else curve.original_mnemonic,
                 data_format=curve.data_format,
                 array_info=curve.array_info,
             )
@@ -147,9 +145,7 @@ def _deduplicate_curves(
                 unit=curve.unit,
                 api_code=curve.api_code,
                 description=curve.description,
-                original_mnemonic=name
-                if not curve.original_mnemonic
-                else curve.original_mnemonic,
+                original_mnemonic=name if not curve.original_mnemonic else curve.original_mnemonic,
                 data_format=curve.data_format,
                 array_info=curve.array_info,
             )
@@ -326,6 +322,45 @@ def _detect_actual_wrap_las30(
     def _is_full(n: int) -> bool:
         return n >= n_curves
 
+    # F-07 (I2-03/I2-04, mirrored from data_reader._detect_actual_wrap):
+    # depth-line evidence rule.  A genuine wrapped file ALWAYS has depth
+    # lines (rows with exactly 1 value); a non-wrapped file essentially
+    # never has a mid-window 1-value row (a mnemonic-header masquerade IS
+    # wrapped evidence, DR-01a).  When any later window line carries
+    # exactly 1 value:
+    #   - declared WRAP=YES → wrapped (I2-04: [3,3,1,1] — two full
+    #     leading rows no longer beat the declaration + depth evidence)
+    #   - first line full AND the depth evidence is unambiguous → wrapped
+    #     (DR-01 / I2-03: mixed-wrap / mnemonic-header masquerade
+    #     [3,1,1] / [3,1,2,1] with WRAP=NO or absent — content outranks a
+    #     NO header).  "Unambiguous" = a 1-value row immediately after
+    #     the full first row, OR at least two 1-value rows in the window.
+    #     A single trailing 1-value row after short rows ([3,2,1]) is a
+    #     ragged non-wrapped row and must stay non-wrapped (graceful
+    #     short-row null-fill) — do NOT classify it wrapped.
+    #     REFINEMENT vs data_reader (L30-I2-03, contract divergence fixed
+    #     here): for n_curves == 2 a 1-value row is AMBIGUOUS — a wrapped
+    #     continuation line also carries curve_count-1 == 1 value, so a
+    #     single 1-value row right after the full first row ([2,1,2], a
+    #     string-padding file where the second row has one missing
+    #     column) must NOT be treated as unambiguous depth evidence.  The
+    #     ≥2-one-value-rows arm still catches genuine 2-curve wrapped
+    #     files ([2,1,1,1] mixed-wrap: depth + continuation pairs).
+    #     For n_curves >= 3 a 1-value row can ONLY be a depth line
+    #     (continuations carry >= 2 values) → the window[1]==1 arm is
+    #     unambiguous there.  The data_reader twin mirrors this n_curves
+    #     >= 3 gate (data_reader.py:641-644), and the 2-curve short-row
+    #     shape is covered by TestPF18DataReaderTwoCurveWrapGate.
+    # Otherwise fall through to the existing rules unchanged.
+    depth_later = len(window) > 1 and any(n == 1 for n in window[1:])
+    if depth_later:
+        if declared_wrap is not None and declared_wrap.upper() == "YES":
+            return True
+        if _is_full(window[0]) and (
+            (n_curves >= 3 and window[1] == 1) or sum(1 for n in window[1:] if n == 1) >= 2
+        ):
+            return True
+
     # First line full → non-wrapped (wrapped first line is always depth).
     # M-38 (las30 side): BUT a WRAP=YES header with a COMPLETE first row
     # can still be a genuine mixed-wrap file (per-row line-width wrapping):
@@ -361,12 +396,7 @@ def _detect_actual_wrap_las30(
     # window, with NO 1-value depth line, is a column-count mismatch —
     # treat as non-wrapped so the graceful short-row null-fill preserves
     # the data (mirrors data_reader.py:622-628).
-    if (
-        len(window) >= 2
-        and full_count == 0
-        and len(set(window)) == 1
-        and 1 < window[0] < n_curves
-    ):
+    if len(window) >= 2 and full_count == 0 and len(set(window)) == 1 and 1 < window[0] < n_curves:
         return False
 
     # Two full rows among the first 4 → definitively non-wrapped.
@@ -520,21 +550,32 @@ def _build_spec_form_array_info(
         for pos, curve_idx in enumerate(indices, start=1):
             curve = result[curve_idx]
             offset: float | None = None
-            match = _SPEC_FORM_ARRAY_RE.search(curve.description or "")
+            description = curve.description or ""
+            match = _SPEC_FORM_ARRAY_RE.search(description)
             if match and match.group("offset"):
                 try:
                     offset = float(match.group("offset"))
                 except ValueError:
                     offset = None
+            # L30-01: When the {A:N} marker survived in the description
+            # (the parser-side coordination change preserves it for LAS 3.0
+            # A-format spec-form curves), strip it here so the WRITER
+            # re-emits {A:N} exactly once — from array_info.time_offset
+            # (_writer_base.py:350-374).  Keeping the marker would produce
+            # a doubled ``NMR Echo Array {A:0}  {A:0}`` on write.
+            if match:
+                description = _SPEC_FORM_ARRAY_RE.sub("", description).strip()
             result[curve_idx] = CurveDefinition(
                 mnemonic=f"{base}[{pos}]",
                 unit=curve.unit,
                 api_code=curve.api_code,
-                description=curve.description,
+                description=description,
                 original_mnemonic=curve.original_mnemonic or curve.mnemonic,
                 data_format=curve.data_format,
                 array_info=ArrayElementInfo(
-                    base_name=base, index=pos, time_offset=offset,
+                    base_name=base,
+                    index=pos,
+                    time_offset=offset,
                 ),
             )
     return result
@@ -654,8 +695,7 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
         # F32: Warn when data is present but no curves are defined
         # for this section, then return early.
         warnings.warn(
-            "ASCII data present but no curves defined for this section. "
-            "Data has been discarded.",
+            "ASCII data present but no curves defined for this section. Data has been discarded.",
             UserWarning,
             stacklevel=2,
         )
@@ -679,8 +719,7 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
             if _base not in _array_groups:
                 _array_groups[_base] = []
             _array_groups[_base].append(
-                (curve.array_info.index, curve.mnemonic,
-                 curve.data_format or "", _pos)
+                (curve.array_info.index, curve.mnemonic, curve.data_format or "", _pos)
             )
     for _base_name, _elements in _array_groups.items():
         if len(_elements) < 2:
@@ -729,17 +768,14 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
     # with array_info set) contain numeric data and must be routed as
     # numeric, not stored as np.str_.
     string_curves = {
-        i: c.data_format in ("S",)
-        or (c.data_format in ("A",) and c.array_info is None)
+        i: c.data_format in ("S",) or (c.data_format in ("A",) and c.array_info is None)
         for i, c in enumerate(section_curves)
     }
 
     # L-03: Detect {I} integer-format curves.  Stored as int64 (when the
     # null sentinel is integral) and parsed via int() so values above 2^53
     # are not silently rounded by float().
-    integer_curves = {
-        i: c.data_format == "I" for i, c in enumerate(section_curves)
-    }
+    integer_curves = {i: c.data_format == "I" for i, c in enumerate(section_curves)}
 
     # F2-05: Validate curve format types — unrecognized formats silently
     # produce null data when routed through _to_finite_float().  Known
@@ -843,6 +879,16 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
         if curve.original_mnemonic and not ctx.las_file.curves[global_idx].original_mnemonic:
             ctx.las_file.curves[global_idx].original_mnemonic = curve.original_mnemonic
         ctx.las_file.curves[global_idx].mnemonic = curve.mnemonic
+        # PF-19 (L30-01 completion): Propagate the section-level description
+        # to the GLOBAL curve definition, mirroring the mnemonic/array_info
+        # propagation.  For spec-form array channels, _build_spec_form_array_info
+        # stripped the {A:N} marker from the section curve's description (the
+        # writer re-emits {A:N} from array_info.time_offset); without this copy
+        # the global curve keeps the raw marker, which to_dict() leaks and the
+        # no-data_sections write path double-emits as ``{A:0}  {A:0}``.
+        # Non-array channels are the same objects (slice aliasing), so this is
+        # a self-assignment no-op for them.
+        ctx.las_file.curves[global_idx].description = curve.description
         ctx.las_file.curves_order[global_idx] = deduped_order[i]
         # M-08: Propagate array_info synthesized for spec-form array
         # channels to the GLOBAL curve definitions.  The parser builds
@@ -914,20 +960,14 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
         elif integer_curves.get(i, False) and _null_is_integral:
             # L-03: int64 storage for {I} curves — preserves exact integer
             # values above 2^53 that float64 cannot represent.
-            data_section.data[curve.mnemonic] = np.zeros(
-                actual_count, dtype=np.int64
-            )
+            data_section.data[curve.mnemonic] = np.zeros(actual_count, dtype=np.int64)
         elif integer_curves.get(i, False):
             # EXT-04: fractional declared NULL — object dtype preserves
             # exact {I} integers above 2^53 while null cells keep the
             # fractional sentinel (int64 would truncate -999.25 → -999).
-            data_section.data[curve.mnemonic] = np.zeros(
-                actual_count, dtype=object
-            )
+            data_section.data[curve.mnemonic] = np.zeros(actual_count, dtype=object)
         else:
-            data_section.data[curve.mnemonic] = np.zeros(
-                actual_count, dtype=np.float64
-            )
+            data_section.data[curve.mnemonic] = np.zeros(actual_count, dtype=np.float64)
             # F2-014: las_file.logs assigned via defensive copy after data
             # fill to avoid shared mutable ndarray between LASFile.logs
             # and DataSection.data — in-place mutations were silently
@@ -943,9 +983,16 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
     idx = 0
     extra_count = 0  # I2-XPD-03: Row-count accumulator for extra columns
     short_count = 0  # I2-XPD-03: Row-count accumulator for short rows
+    # L30-02: Row-count accumulator for extra columns caused by an embedded
+    # delimiter inside a {S} string value (DLM=COMMA/TAB).  The string is
+    # truncated at the delimiter, every following column shifts, and the
+    # genuine trailing values are lost as "extra columns" — the split cannot
+    # distinguish an embedded delimiter from a column separator.  Mirrors the
+    # LAS 1.2/2.0 twin (I2-02) fix so both paths emit the same loud warning.
+    embedded_delim_count = 0  # I2-02 twin: delimiter-in-string truncation
     _fc = [0]  # F-002: Mutable counter for float conversion diagnostics
     # F-39, F-40, I2-F-03: Desanitize reversal warning dedup flags.
-    _desan_warned_ws = False   # whitespace→underscore (F-39)
+    _desan_warned_ws = False  # whitespace→underscore (F-39)
     _desan_warned_tab = False  # tab→space (F-40)
     _desan_warned_empty = False  # empty→"-" (I2-F-03)
     # N-I-31: When the ~Well section is not yet known, record every cell
@@ -1020,6 +1067,33 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
         # Warn about extra columns being silently discarded
         if len(values) > num_curves:
             extra_count += 1
+            # L30-02: DLM=COMMA/TAB + embedded delimiter in a {S} string
+            # value truncates the string AND shifts every following column
+            # — the next column's genuine value is destroyed and trailing
+            # values are lost as "extra columns" (verified: `100.0,WELL A,
+            # B,10.0` with DEPT/WELLS{S}/GR → WELLS truncated to 'WELL A',
+            # GR receives ' B' → conversion failure → -999.25, genuine 10.0
+            # discarded).  csv.reader quote-awareness is deliberately NOT
+            # used (F2-015: the writer emits raw delimiter.join() with no
+            # CSV quotes, so adding quote parsing would break the writer's
+            # own roundtrips) — the correct response for external files is
+            # a LOUD warning naming the delimiter-in-string mechanism, not
+            # a silent shift.  Mirrors the LAS 1.2/2.0 I2-02 fix.
+            if delimiter != " " and any(string_curves.get(i, False) for i in range(num_curves)):
+                if embedded_delim_count == 0:
+                    warnings.warn(
+                        f"Data section '{ctx.current_section_name or 'ASCII'}': "
+                        f"row has {len(values)} values but only {num_curves} "
+                        f"declared curves with DLM={delimiter!r}. A string "
+                        f"curve value may contain the delimiter character, "
+                        f"truncating the string and shifting the following "
+                        f"columns (genuine values may be lost). Consider "
+                        f"quoting string values or using a delimiter not "
+                        f"present in the data.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                embedded_delim_count += 1
 
         # F-11: Warn when non-wrapped data lines have fewer values than
         # declared curves.  Short rows in wrapped mode are expected
@@ -1100,7 +1174,9 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
                 # return the float sentinel (not int(null_value)).
                 _fc_before = _fc[0]
                 int_val = _to_integer_value(
-                    val_str, null_value, _failure_counter=_fc,
+                    val_str,
+                    null_value,
+                    _failure_counter=_fc,
                     _null_as_float=not _null_is_integral,
                 )
                 if track_fill and (_fc[0] > _fc_before or not val_str):
@@ -1147,6 +1223,21 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
             UserWarning,
             stacklevel=2,
         )
+    # L30-02: Summary for embedded-delimiter string truncation.  The first
+    # occurrence already warned with full context above; this counts the
+    # total so automated tools can enumerate affected rows (mirrors the
+    # LAS 1.2/2.0 I2-02 twin).
+    if embedded_delim_count > 1:
+        warnings.warn(
+            f"Data section '{ctx.current_section_name or 'ASCII'}': "
+            f"{embedded_delim_count} row(s) had more values than the "
+            f"{num_curves} declared curves with DLM={delimiter!r}. String "
+            f"curve values may contain the delimiter character; those "
+            f"strings were truncated and following columns' genuine values "
+            f"may have been lost.",
+            UserWarning,
+            stacklevel=2,
+        )
     if short_count > 0:
         warnings.warn(
             f"Data section '{ctx.current_section_name or 'ASCII'}': "
@@ -1186,9 +1277,7 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
     if is_log_data and not ctx.las_file.logs:
         for curve in section_curves:
             if curve.mnemonic in data_section.data:
-                ctx.las_file.logs[curve.mnemonic] = (
-                    data_section.data[curve.mnemonic].copy()
-                )
+                ctx.las_file.logs[curve.mnemonic] = data_section.data[curve.mnemonic].copy()
         # M-04: Record which section's arrays were copied into the
         # top-level logs view so _reconcile_null_sentinels only writes
         # fill cells back into the SAME section's logs arrays (the gate
@@ -1213,9 +1302,9 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
                 # F2-014: Defensive copy — prevents shared-reference
                 # mutation between LASFile.string_data and
                 # DataSection.string_data.
-                ctx.las_file.string_data[curve.mnemonic] = (
-                    data_section.string_data[curve.mnemonic].copy()
-                )
+                ctx.las_file.string_data[curve.mnemonic] = data_section.string_data[
+                    curve.mnemonic
+                ].copy()
 
     # N-I-31: Attach the tracked fill cells to the section so a later
     # process_ascii_data call (once ~Well is known) can re-fill them

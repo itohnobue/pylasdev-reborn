@@ -1,4 +1,5 @@
 """Writer package — re-exports public API and internal utilities for tests."""
+
 from ._writer_base import (  # noqa: F401
     _escape_colons_for_las_value,
     _format_data_rows,

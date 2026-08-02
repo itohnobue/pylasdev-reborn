@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import tempfile
 import threading
 import warnings
 from pathlib import Path
+from typing import Any, ClassVar
 
 import numpy as np
 import pytest
@@ -494,9 +496,7 @@ Line two of free text.
         assert data["DT"][0] == 50.0
         # Row 2: DEPT="-999.25" (the actual null sentinel from the fallback),
         #         DT="BAD_VALUE" (non-numeric → replaced with null_value).
-        assert data["DEPT"][2] == -999.25, (
-            "DEPTH null sentinel -999.25 must be stored as -999.25"
-        )
+        assert data["DEPT"][2] == -999.25, "DEPTH null sentinel -999.25 must be stored as -999.25"
         assert data["DT"][2] == -999.25, (
             "Non-numeric BAD_VALUE must be replaced with null_value (-999.25)"
         )
@@ -830,12 +830,8 @@ Line two of free text.
         # Only the first ~A block's 2 data lines are ingested.
         assert len(data["logs"]["DEPT"]) == 2
         assert len(data["logs"]["DT"]) == 2
-        np.testing.assert_array_almost_equal(
-            data["logs"]["DEPT"], [100.0, 101.0]
-        )
-        np.testing.assert_array_almost_equal(
-            data["logs"]["DT"], [50.0, 51.0]
-        )
+        np.testing.assert_array_almost_equal(data["logs"]["DEPT"], [100.0, 101.0])
+        np.testing.assert_array_almost_equal(data["logs"]["DT"], [50.0, 51.0])
 
     # ── F-S9-01: DataSection idx increment after save/swap ─────────
 
@@ -865,8 +861,7 @@ Line two of free text.
         las = parser.parse(content)
         assert len(las.data_sections) == 2
         assert las.data_sections[0].name != las.data_sections[1].name, (
-            f"DataSection names must be unique: got '{las.data_sections[0].name}' "
-            f"for both sections"
+            f"DataSection names must be unique: got '{las.data_sections[0].name}' for both sections"
         )
 
     def test_deferred_data_pre_curve_scoping(self) -> None:
@@ -952,8 +947,7 @@ Line two of free text.
         # Pre-~V section: should NOT be named 'POST_V_NAME'
         sec_pre = las.data_sections[0]
         assert sec_pre.name != "POST_V_NAME", (
-            f"Pre-~V DataSection must not inherit post-~V section name: "
-            f"got '{sec_pre.name}'"
+            f"Pre-~V DataSection must not inherit post-~V section name: got '{sec_pre.name}'"
         )
 
         # Post-~V section: should keep its name
@@ -1528,11 +1522,17 @@ class TestLAS30AsciiDataBranches:
             assert len(mandatory_warnings) == 0
 
     def test_las12_no_mandatory_field_warning(self) -> None:
-        """LAS 1.2 files should trigger mandatory well field check.
+        """LAS 1.2 files with the 4 numeric well fields trigger NO warnings.
 
-        After F-M24 expanded mandatory field validation to LAS 1.2,
-        missing COMP, WELL, FLD, LOC, SRVC, DATE fields should emit
-        warnings (M-11: UWI is NOT mandatory per lascheck).
+        I2-07: The lascheck 10-field set is a LAS 2.0-era requirement —
+        lascheck itself documents "supports checking against LAS 2.0
+        standard only" (research s1-research-las12-report.md), and
+        frackoptima/GERDA require only the four numeric fields
+        (STRT, STOP, STEP, NULL) for LAS 1.2.  Applying the 10-field set
+        to 1.2 produced 6 spurious "missing mandatory well field"
+        warnings on minimal-but-valid 1.2 files.  _LASVersionSpec now
+        returns the 4-field set for LAS 1.2 (distinct from LAS 2.0's
+        10-field set).
         """
         content = """~VERSION INFORMATION
  VERS.   1.2  : CWLS LOG ASCII STANDARD
@@ -1555,17 +1555,45 @@ class TestLAS30AsciiDataBranches:
             mandatory_warnings = [
                 x for x in w if "LAS 1.2 file missing mandatory well field" in str(x.message)
             ]
-            # M-11: LAS 1.2 requires the lascheck 10-field set — missing
-            # COMP, WELL, FLD, LOC, SRVC, DATE = 6 warnings (no UWI).
-            assert len(mandatory_warnings) == 6
-            warning_texts = [str(x.message) for x in mandatory_warnings]
-            assert not any("UWI" in t for t in warning_texts), (
-                "UWI is not mandatory per lascheck — must not warn"
+            # I2-07: LAS 1.2 requires only STRT/STOP/STEP/NULL — all present.
+            assert len(mandatory_warnings) == 0, (
+                f"Expected 0 mandatory-field warnings for LAS 1.2 with the "
+                f"4 numeric fields, got: "
+                f"{[str(x.message) for x in mandatory_warnings]}"
             )
+
+    def test_las12_missing_numeric_field_warns(self) -> None:
+        """LAS 1.2 missing one of the 4 numeric well fields DOES warn."""
+        content = """~VERSION INFORMATION
+ VERS.   1.2  : CWLS LOG ASCII STANDARD
+ WRAP.   NO   :
+~WELL INFORMATION
+ STRT.M    : 1670.0000
+ STOP.M    : 1680.0000
+ NULL.    : -999.25
+~CURVE INFORMATION
+ DEPT.M   : DEPTH
+~A
+ 100.0
+ 101.0
+"""
+        parser = LASParser()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            parser.parse(content)
+            mandatory_warnings = [
+                str(x.message)
+                for x in w
+                if "LAS 1.2 file missing mandatory well field" in str(x.message)
+            ]
+            assert any("STEP" in t for t in mandatory_warnings), (
+                f"Expected missing STEP warning for LAS 1.2, got: {mandatory_warnings}"
+            )
+            # COMP/WELL/FLD/etc. are NOT mandatory for 1.2.
             for _f in ("COMP", "WELL", "FLD", "LOC", "SRVC", "DATE"):
-                assert any(_f in t for t in warning_texts), (
-                    f"Expected missing-field warning for {_f}, got {warning_texts}"
-                )
+                assert not any(
+                    f"missing mandatory well field: {_f}" in t for t in mandatory_warnings
+                ), f"{_f} must not be reported as mandatory for LAS 1.2: {mandatory_warnings}"
 
     # --- F-M2: Pre-scan only counts ~A/~ASCII sections ---
     def test_pre_scan_ignores_non_ascii_sections(self, tmp_path: Path) -> None:
@@ -1752,7 +1780,11 @@ class TestG4bLas30DataFixes:
         # Global curves/curves_order must reflect the dedup rename.
         assert las.curves_order == ["DEPT", "DT", "CORE_DEPT", "CORE_DT", "CORE_DT_2"]
         assert [c.mnemonic for c in las.curves] == [
-            "DEPT", "DT", "CORE_DEPT", "CORE_DT", "CORE_DT_2",
+            "DEPT",
+            "DT",
+            "CORE_DEPT",
+            "CORE_DT",
+            "CORE_DT_2",
         ]
         assert las.curves[4].original_mnemonic == "CORE_DT"
 
@@ -1835,9 +1867,7 @@ class TestG4bLas30DataFixes:
         assert las.data_sections[0].data["DT"].tolist() == [-999.0, -999.0]
         assert las.data_sections[0].data["GR"].tolist() == [-999.0, 76.0]
         # The tracked fill-cell record is cleared after reconciliation.
-        assert getattr(
-            las.data_sections[0], "_pylasdev_null_fill_cells", []
-        ) == []
+        assert getattr(las.data_sections[0], "_pylasdev_null_fill_cells", []) == []
         assert las.well.get("NULL") == "-999"
 
     # --- N-I-32: logs from LOG_DATA section, not first section ---
@@ -1936,12 +1966,9 @@ class TestVERSValidation:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             las = parser.parse(content)
-            vers_warnings = [
-                x for x in w if "Unknown VERS value" in str(x.message)
-            ]
+            vers_warnings = [x for x in w if "Unknown VERS value" in str(x.message)]
             assert len(vers_warnings) >= 1, (
-                f"Expected VERS warning for coma decimal, got: "
-                f"{[str(x.message) for x in w]}"
+                f"Expected VERS warning for coma decimal, got: {[str(x.message) for x in w]}"
             )
             assert "1,2" in str(vers_warnings[0].message)
             # Must default to "2.0" — not "1,2" (which would be unusable)
@@ -1964,12 +1991,9 @@ class TestVERSValidation:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             las = parser.parse(content)
-            vers_warnings = [
-                x for x in w if "Non-standard VERS value" in str(x.message)
-            ]
+            vers_warnings = [x for x in w if "Non-standard VERS value" in str(x.message)]
             assert len(vers_warnings) >= 1, (
-                f"Expected warning for non-standard VERS 1.20, got: "
-                f"{[str(x.message) for x in w]}"
+                f"Expected warning for non-standard VERS 1.20, got: {[str(x.message) for x in w]}"
             )
             assert "1.20" in str(vers_warnings[0].message)
             # Value must be preserved as-is for reader's own validation
@@ -1988,11 +2012,10 @@ class TestVERSValidation:
             warnings.simplefilter("always")
             las = parser.parse(content)
             vers_warnings = [
-                x for x in w
-                if "VERS" in str(x.message) and (
-                    "Non-standard" in str(x.message)
-                    or "Unknown VERS" in str(x.message)
-                )
+                x
+                for x in w
+                if "VERS" in str(x.message)
+                and ("Non-standard" in str(x.message) or "Unknown VERS" in str(x.message))
             ]
             assert len(vers_warnings) == 0, (
                 f"Unexpected VERS warning: {[str(x.message) for x in vers_warnings]}"
@@ -2028,9 +2051,7 @@ class TestEmptyUnitWellEntry:
         parser = LASParser()
         las = parser.parse(content)
         # The unit dict entry must exist with an empty string value
-        assert "MNEM" in las.well.units, (
-            f"Empty unit should be stored, got units: {las.well.units}"
-        )
+        assert "MNEM" in las.well.units, f"Empty unit should be stored, got units: {las.well.units}"
         assert las.well.units["MNEM"] == "", (
             f"Expected empty string unit, got: {las.well.units['MNEM']!r}"
         )
@@ -2309,9 +2330,7 @@ class TestValueOnlyPattern:
         import tempfile
         from pathlib import Path
 
-        with tempfile.NamedTemporaryFile(
-            suffix=".las", delete=False, mode="w"
-        ) as tf:
+        with tempfile.NamedTemporaryFile(suffix=".las", delete=False, mode="w") as tf:
             write_las_file(tf.name, las)
             out_path = Path(tf.name)
 
@@ -2378,9 +2397,9 @@ class TestValueOnlyPattern:
         parser = LASParser()
         with caplog.at_level(logging.WARNING):
             parser.parse(content)
-        assert not any(
-            "WRAP=YES" in record.message for record in caplog.records
-        ), f"Unexpected WRAP=YES warning: {[r.message for r in caplog.records]}"
+        assert not any("WRAP=YES" in record.message for record in caplog.records), (
+            f"Unexpected WRAP=YES warning: {[r.message for r in caplog.records]}"
+        )
 
     # ── F-05: Indexed _DATA sections ────────────────────────────
 
@@ -2393,7 +2412,6 @@ class TestValueOnlyPattern:
         assert _is_indexed_data_section("TEST_DATA[1]") is True
         assert _is_indexed_data_section("PERFORATIONS_DATA[2]") is True
         assert _is_indexed_data_section("LOG_DATA[1]") is True
-
 
     # --- F-8-003: WRAP=YES trailing-comma regression ---
 
@@ -2458,9 +2476,7 @@ class TestValueOnlyPattern:
 
     # --- F-7-004: deferred-population uncovered-curve guard ---
 
-    def test_las30_no_uncovered_curve_warning_on_normal_parse(
-        self, caplog
-    ) -> None:
+    def test_las30_no_uncovered_curve_warning_on_normal_parse(self, caplog) -> None:
         """F-7-004: Normal LAS 3.0 parse does NOT emit uncovered-curve warnings.
 
         DataSection.__post_init__ (models.py:989-993) has a guard that skips
@@ -2486,14 +2502,8 @@ class TestValueOnlyPattern:
         parser = LASParser()
         with caplog.at_level(logging.WARNING):
             parser.parse(content)
-        uncovered_warnings = [
-            r.message
-            for r in caplog.records
-            if "uncovered" in r.message.lower()
-        ]
-        assert not uncovered_warnings, (
-            f"Unexpected uncovered-curve warnings: {uncovered_warnings}"
-        )
+        uncovered_warnings = [r.message for r in caplog.records if "uncovered" in r.message.lower()]
+        assert not uncovered_warnings, f"Unexpected uncovered-curve warnings: {uncovered_warnings}"
 
 
 class TestMaxGuardLimits:
@@ -2730,7 +2740,8 @@ class TestPipeDelimitedSectionHeaders:
         assert sec.data["DEPT"][0] == 100.0
 
     def test_pipe_target_resets_on_unrecognized_target(
-        self, caplog: pytest.LogCaptureFixture,
+        self,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Unrecognized pipe target logs warning and resets curve indices."""
         content = """~VERSION INFORMATION
@@ -2765,7 +2776,8 @@ class TestIndexedSectionOrdering:
     """
 
     def test_indexed_section_before_definition_emits_warning(
-        self, caplog: pytest.LogCaptureFixture,
+        self,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """CORE[1] data section before ~CORE_DEFINITION should emit a
         per-type ordering warning."""
@@ -2793,15 +2805,24 @@ class TestIndexedSectionOrdering:
                 f"Expected ordering warning for CORE[1]; got: {warning_text}"
             )
 
-        # CORE[1] data before definition is discarded (no curves available);
-        # CORE[2] data after definition is properly stored.
-        assert len(las.data_sections) == 1
-        assert las.data_sections[0].name == "CORE[2]"
-        assert las.data_sections[0].data["RHOZ"][0] == 4.0
-        assert las.data_sections[0].data["PHIZ"][0] == 0.2
+        # PARS-05: CORE[1] data before the definition is no longer silently
+        # discarded — it is buffered and attached once the curves parse, so
+        # both sections are preserved (the ordering warning above still
+        # fires as a diagnostic; the data itself is retained).
+        assert len(las.data_sections) == 2
+        first = las.data_sections[0]
+        assert first.data["RHOZ"][0] == 2.5
+        assert first.data["PHIZ"][0] == 0.15
+        assert first.data["RHOZ"][1] == 3.1
+        assert first.data["PHIZ"][1] == 0.18
+        # CORE[2] data after definition is still properly stored.
+        assert las.data_sections[1].name == "CORE[2]"
+        assert las.data_sections[1].data["RHOZ"][0] == 4.0
+        assert las.data_sections[1].data["PHIZ"][0] == 0.2
 
     def test_indexed_section_after_definition_no_warning(
-        self, caplog: pytest.LogCaptureFixture,
+        self,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """CORE[1] after ~CORE_DEFINITION (correct order) — no warning."""
         content = """~VERSION INFORMATION
@@ -2899,6 +2920,7 @@ class TestNonLetterTildeHeaders:
 # Production Check Regression Tests
 # ============================================================
 
+
 class TestProductionCheckParserFix:
     """Regression test for F-212 fix in parser.py."""
 
@@ -2969,9 +2991,7 @@ class TestProductionCheckParserFix:
         assert str_vals[0] == "hello", f"Row 1: expected 'hello', got {str_vals[0]!r}"
         assert str_vals[1] == "world", f"Row 2: expected 'world', got {str_vals[1]!r}"
         # Row 3: empty-string padding (the fix), NOT "-999.25"
-        assert str_vals[2] == "", (
-            f"Row 3: expected empty-string padding, got {str_vals[2]!r}"
-        )
+        assert str_vals[2] == "", f"Row 3: expected empty-string padding, got {str_vals[2]!r}"
 
 
 class TestValidateCrossSectionConsistency:
@@ -2989,7 +3009,8 @@ class TestValidateCrossSectionConsistency:
     # --- (1) Curve count vs data column count ---
 
     def test_column_count_mismatch_warns(
-        self, caplog: pytest.LogCaptureFixture,
+        self,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Data section with more/less data columns than declared curves warns."""
         import numpy as np
@@ -3014,7 +3035,8 @@ class TestValidateCrossSectionConsistency:
             assert "data columns" in caplog.text
 
     def test_column_count_match_no_warning(
-        self, caplog: pytest.LogCaptureFixture,
+        self,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Data section with matching curves and data columns does not warn."""
         import numpy as np
@@ -3035,7 +3057,8 @@ class TestValidateCrossSectionConsistency:
     # --- (2) Data format x placement mismatch ---
 
     def test_s_format_curve_in_numeric_data_warns(
-        self, caplog: pytest.LogCaptureFixture,
+        self,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """S-format curve placed in data (numeric) triggers warning."""
         import numpy as np
@@ -3067,7 +3090,8 @@ class TestValidateCrossSectionConsistency:
     # --- (3) LAS 3.0 section ordering (data before definition) ---
 
     def test_data_before_definition_ordering_warns(
-        self, caplog: pytest.LogCaptureFixture,
+        self,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Data section appearing before its definition emits ordering warning."""
         content = """~VERSION INFORMATION
@@ -3086,14 +3110,13 @@ class TestValidateCrossSectionConsistency:
         with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
             parser.parse(content)
             warning_text = caplog.text
-            assert "before" in warning_text, (
-                f"Expected ordering warning; got: {warning_text}"
-            )
+            assert "before" in warning_text, f"Expected ordering warning; got: {warning_text}"
 
     # --- (4) Definition→Data gap ---
 
     def test_definition_without_data_section_warns(
-        self, caplog: pytest.LogCaptureFixture,
+        self,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Definition type without any corresponding data section warns."""
         content = """~VERSION INFORMATION
@@ -3119,7 +3142,8 @@ class TestValidateCrossSectionConsistency:
     # --- (5) Duplicate reserved section headers ---
 
     def test_duplicate_version_section_warns(
-        self, caplog: pytest.LogCaptureFixture,
+        self,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Duplicate ~V (reserved single-occurrence) section emits warning."""
         content = """~VERSION INFORMATION
@@ -3145,7 +3169,8 @@ class TestValidateCrossSectionConsistency:
     # --- (6) Parameter-after-definition ordering ---
 
     def test_parameter_after_definition_ordering_warns(
-        self, caplog: pytest.LogCaptureFixture,
+        self,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Parameter section after its definition emits ordering warning."""
         content = """~VERSION INFORMATION
@@ -3220,7 +3245,8 @@ class TestValidateCrossSectionConsistency:
         )
 
     def test_final_flush_clears_state_preventing_dangling_warning(
-        self, caplog: pytest.LogCaptureFixture,
+        self,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """I2F-020: parse() final flush MUST clear ascii_data_lines and
         increment current_data_section_idx — mirroring _flush_ascii_data()
@@ -3298,10 +3324,7 @@ class TestValidateCrossSectionConsistency:
 
         # Validate parser state — must not contain "dangling data" issue
         state_issues = parser._state.validate(las)
-        dangling_issues = [
-            iss for iss in state_issues
-            if "dangling data" in iss
-        ]
+        dangling_issues = [iss for iss in state_issues if "dangling data" in iss]
         assert len(dangling_issues) == 0, (
             f"Unexpected dangling data issues after fix: {dangling_issues}"
         )
@@ -3309,7 +3332,8 @@ class TestValidateCrossSectionConsistency:
     # --- R-005: format-vs-placement raise path coverage ---
 
     def test_parse_s_format_in_logs_raises(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """R-005 + P-11: String-format curve placed in logs triggers
         LASParseError during parser finalization (parser.py:743-766).
@@ -3349,9 +3373,14 @@ class TestValidateCrossSectionConsistency:
         # re-fire __post_init__.
         _mismatched = LASFile(
             version=VersionSection(vers="3.0", wrap="NO", dlm="SPACE"),
-            well=WellSection(entries={
-                "STRT": "0", "STOP": "100", "STEP": "10", "NULL": "-999",
-            }),
+            well=WellSection(
+                entries={
+                    "STRT": "0",
+                    "STOP": "100",
+                    "STEP": "10",
+                    "NULL": "-999",
+                }
+            ),
             curves=[CurveDefinition(mnemonic="STR", data_format="S")],
             curves_order=["STR"],
             # No logs / string_data — avoid __post_init__ format check
@@ -3386,7 +3415,8 @@ class TestValidateCrossSectionConsistency:
             parser.parse(content)
 
     def test_parse_numeric_format_in_string_data_raises(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """R-005 + P-11: Numeric-format curve in string_data triggers
         LASParseError during parser finalization (parser.py:743-766,
@@ -3412,9 +3442,14 @@ class TestValidateCrossSectionConsistency:
 
         _mismatched = LASFile(
             version=VersionSection(vers="3.0", wrap="NO", dlm="SPACE"),
-            well=WellSection(entries={
-                "STRT": "0", "STOP": "100", "STEP": "10", "NULL": "-999",
-            }),
+            well=WellSection(
+                entries={
+                    "STRT": "0",
+                    "STOP": "100",
+                    "STEP": "10",
+                    "NULL": "-999",
+                }
+            ),
             curves=[CurveDefinition(mnemonic="GR", data_format="F")],
             curves_order=["GR"],
             # No logs / string_data — avoid __post_init__ format check
@@ -3508,6 +3543,7 @@ class TestValidateCrossSectionConsistency:
 # non-A section must not merge (groupby key collision)
 # ──────────────────────────────────────────────────────────────
 
+
 class TestP03PreVDataSectionsSeparatedByNonA:
     """P-03: A→W→A pre-~V data sections must NOT merge into one DataSection.
 
@@ -3539,8 +3575,7 @@ class TestP03PreVDataSectionsSeparatedByNonA:
         parser = LASParser()
         las = parser.parse(content)
         assert len(las.data_sections) == 2, (
-            f"Expected 2 DataSections (A→W→A before ~V), got "
-            f"{len(las.data_sections)}"
+            f"Expected 2 DataSections (A→W→A before ~V), got {len(las.data_sections)}"
         )
         sec0 = las.data_sections[0]
         assert list(sec0.data["DEPT"]) == [100.0, 101.0]
@@ -3571,8 +3606,7 @@ class TestP03PreVDataSectionsSeparatedByNonA:
         parser = LASParser()
         las = parser.parse(content)
         assert len(las.data_sections) == 2, (
-            f"Expected 2 DataSections (A→C→A before ~V), got "
-            f"{len(las.data_sections)}"
+            f"Expected 2 DataSections (A→C→A before ~V), got {len(las.data_sections)}"
         )
         assert list(las.data_sections[0].data["DEPT"]) == [100.0]
         assert list(las.data_sections[1].data["DEPT"]) == [200.0]
@@ -3582,6 +3616,7 @@ class TestP03PreVDataSectionsSeparatedByNonA:
 # P-01 (MEDIUM): LAS 1.2 well-format lasio layout branch-2
 # inversion — value-before-colon non-mandatory fields
 # ──────────────────────────────────────────────────────────────
+
 
 class TestP01WellFormatLasioInversion:
     """P-01: auto-mode branch-2 must extract the PRE-colon text as the
@@ -3642,6 +3677,7 @@ class TestP01WellFormatLasioInversion:
 # P-02 (MEDIUM): WRAP=YES LAS 3.0 detection must stay live
 # ──────────────────────────────────────────────────────────────
 
+
 class TestP02WrapYesDetectionLive:
     """P-02: the F-051 WRAP reset made genuine-wrap detection dead code.
 
@@ -3661,7 +3697,7 @@ class TestP02WrapYesDetectionLive:
             " DEPT.M       :  Depth {F}\n"
             " GR.API       :  Gamma Ray {F}\n"
             "~ASCII\n"
-            " 1670.0\n"   # genuinely wrapped: depth only, GR on next line
+            " 1670.0\n"  # genuinely wrapped: depth only, GR on next line
             " 45.5\n"
             " 1670.5\n"
             " 46.0\n"
@@ -3716,6 +3752,7 @@ class TestP02WrapYesDetectionLive:
 # P-04 (MEDIUM): DATA_LINE_PATTERN first-colon delimiter
 # ──────────────────────────────────────────────────────────────
 
+
 class TestP04FirstColonDelimiter:
     """P-04: descriptions containing ": " must not be split/truncated.
 
@@ -3754,8 +3791,7 @@ class TestP04FirstColonDelimiter:
         las = parser.parse(content)
         assert las.well["WELL"] == "VESPA-1"
         assert las.well.descriptions.get("WELL") == "WELL : NAME", (
-            f"Expected description 'WELL : NAME', got "
-            f"{las.well.descriptions.get('WELL')!r}"
+            f"Expected description 'WELL : NAME', got {las.well.descriptions.get('WELL')!r}"
         )
 
 
@@ -3763,6 +3799,7 @@ class TestP04FirstColonDelimiter:
 # P-11 (MEDIUM): LASDataError / bare ValueError must not escape
 # parse() — normalized to LASParseError
 # ──────────────────────────────────────────────────────────────
+
 
 class TestP11NoExceptionEscape:
     """P-11: parse() must only raise LASParseError at its boundary.
@@ -3790,6 +3827,7 @@ class TestP11NoExceptionEscape:
 # P-15 (MEDIUM): single-curve WRAP=YES-before-VERS not rejected
 # ──────────────────────────────────────────────────────────────
 
+
 class TestP15SingleCurveWrapExemption:
     """P-15: single-curve LAS 3.0 files with WRAP=YES must not be
     rejected even when WRAP appears before VERS (n_curves<=1 exemption,
@@ -3816,6 +3854,7 @@ class TestP15SingleCurveWrapExemption:
 # ──────────────────────────────────────────────────────────────
 # P-05 (MEDIUM): ~ASCII|CURVE no-space pipe — parser pre-scan
 # ──────────────────────────────────────────────────────────────
+
 
 class TestP05NoSpacePipeAsciiHeader:
     """P-05: no-space pipe data header (~ASCII|CURVE) — parser-side
@@ -3846,14 +3885,14 @@ class TestP05NoSpacePipeAsciiHeader:
         assert list(las.data_sections[0].data["DEPT"]) == [100.0, 101.0]
         # Pre-scan count must reflect the ~ASCII|CURVE data lines
         assert parser.data_line_count == 2, (
-            f"Expected data_line_count 2 for ~ASCII|CURVE, got "
-            f"{parser.data_line_count}"
+            f"Expected data_line_count 2 for ~ASCII|CURVE, got {parser.data_line_count}"
         )
 
 
 # ──────────────────────────────────────────────────────────────
 # G2 (N-I-22 / N-I-01 / N-I-04): parser iter-2 new findings
 # ──────────────────────────────────────────────────────────────
+
 
 class TestNI22UnitCharacterClassWidening:
     """N-I-22 (HIGH): the parser unit character class (word chars, hyphen,
@@ -3944,9 +3983,9 @@ class TestNI01MissingVersionGate:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             las = LASParser().parse(content="", lines=[])
-        assert any(
-            "Empty or whitespace-only LAS content" in str(w.message) for w in caught
-        ), "empty source must warn, not raise"
+        assert any("Empty or whitespace-only LAS content" in str(w.message) for w in caught), (
+            "empty source must warn, not raise"
+        )
         assert las.version.vers == "2.0"
 
 
@@ -3990,3 +4029,1210 @@ class TestNI04TypedDataSectionScopeReset:
         # (including MUDW from the earlier MUD_DEFINITION).
         tops_curves = [c.mnemonic for c in sections["TOPS_DATA"].section_curves]
         assert tops_curves == ["DEPTH", "MUDW", "DEPTH_2", "CORE"], tops_curves
+
+
+# ──────────────────────────────────────────────────────────────
+# s8-fix-parser-a regression tests (PARS-11, PARS-01, PARS-02,
+# PARS-09, I2-05, I2-06, I2-07, I2-08)
+# ──────────────────────────────────────────────────────────────
+
+
+class TestS8PARS11NoCatastrophicBacktracking:
+    """PARS-11 (HIGH): DATA_LINE_PATTERN was O(n³) on no-colon
+    whitespace-run lines at the 2000-char gate boundary (3.86s pre-fix).
+    Possessive quantifiers make it linear; the gate no longer has a
+    cliff at 2000/2001 chars."""
+
+    def _assert_fast(self, line: str, budget_ms: float = 500.0) -> Any:
+        import time as _time
+
+        start = _time.perf_counter()
+        result = LASParser()._match_data_line(line)
+        elapsed_ms = (_time.perf_counter() - start) * 1000.0
+        assert elapsed_ms < budget_ms, (
+            f"DATA_LINE_PATTERN took {elapsed_ms:.1f} ms on "
+            f"{len(line)}-char line (regression: O(n³) backtracking)"
+        )
+        return result
+
+    def test_pathological_2000_char_line_is_fast(self) -> None:
+        """Adversarial no-colon whitespace-run line at the regex gate
+        boundary must complete in well under the pre-fix 3.86s.
+
+        The _SAFE_REGEX_LINE_LENGTH gate bypasses the regex for lines
+        STRICTLY LONGER than 2000 chars, so the worst regex case is a
+        TOTAL line of exactly 2000 chars ('AB.CD' + 1995 spaces)."""
+        line = "AB.CD" + " " * 1995
+        assert len(line) == 2000
+        self._assert_fast(line)
+
+    def test_pathological_2001_char_line_is_fast(self) -> None:
+        """One char past the boundary (manual-scan path) must also be fast."""
+        line = "AB.CD" + " " * 1996
+        assert len(line) == 2001
+        self._assert_fast(line)
+
+    def test_large_pathological_line_is_fast(self) -> None:
+        """10K-char no-colon line through the manual scan."""
+        self._assert_fast("AB.CD" + " " * 10_000)
+
+    def test_end_to_end_parse_with_pathological_curve_line(self) -> None:
+        """The gate must not produce a cliff at 2000/2001 chars when a
+        pathological line appears in a real file (public API)."""
+        import time as _time
+
+        for n in (2000, 2001):
+            content = (
+                "~VERSION INFORMATION\n"
+                " VERS.   3.0  : CWLS\n"
+                " WRAP.   NO   :\n"
+                "~CURVE INFORMATION\n"
+                " AB.CD" + " " * (n - 5) + "\n"
+            )
+            start = _time.perf_counter()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                LASParser().parse(content)
+            elapsed_ms = (_time.perf_counter() - start) * 1000.0
+            assert elapsed_ms < 2000.0, (
+                f"parse() took {elapsed_ms:.1f} ms with {n}-char pathological "
+                f"line (pre-fix: 3.86s cliff at 2000)"
+            )
+
+    def test_semantics_preserved_on_realistic_shapes(self) -> None:
+        """Possessive quantifiers must not change parsing semantics."""
+        shapes = [
+            ("DEPT.M  1000.0 : Depth", "DEPT", "M", "1000.0", "Depth"),
+            (
+                " BLOWD.                                 :BLOW DESCRIPTION        {S}",
+                "BLOWD",
+                "",
+                "",
+                "BLOW DESCRIPTION        {S}",
+            ),
+            ("DEPT.FT  : desc", "DEPT", "FT", "", " desc"),
+            ("GR.GAPI 45.5 : Gamma Ray", "GR", "GAPI", "45.5", "Gamma Ray"),
+            ("A.B 5 :", "A", "B", "5", ""),
+            ("NMR[1].ms 10 : Echo {A:0}", "NMR[1]", "ms", "10", "Echo {A:0}"),
+        ]
+        for line, mn, unit, val, desc in shapes:
+            match = LASParser()._match_data_line(line)
+            assert match is not None, f"no match for {line!r}"
+            assert match.group("mnemonic") == mn, (line, match.group("mnemonic"))
+            assert match.group("unit") == unit, (line, match.group("unit"))
+            assert match.group("value") == val, (line, match.group("value"))
+            assert match.group("description") == desc, (line, match.group("description"))
+
+
+class TestS8PARS01SAFormatOverAccept:
+    """PARS-01 (MEDIUM): the old ``[SA]\\w*`` accepted S/A-prefixed words
+    ({API}, {SAND}, {SLATE}) as data formats, stripping the description
+    and misclassifying numeric data as string/array."""
+
+    def _parse_curve_line(self, desc: str) -> tuple[str, str]:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS\n"
+            " WRAP.   NO   :\n"
+            " DLM.   COMMA :\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            " STRT.M  1670.0 : START\n"
+            " STOP.M  713.0 : STOP\n"
+            " STEP.M  -0.125 : STEP\n"
+            "~CURVE INFORMATION\n"
+            f" GR.API       : {desc}\n"
+            "~ASCII\n"
+            "45.0\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        gr = next(c for c in las.curves if c.mnemonic == "GR")
+        return gr.data_format, gr.description
+
+    def test_api_units_not_treated_as_data_format(self) -> None:
+        """'Gamma Ray in {API} units' must parse GR as numeric (no data
+        format) with the full description preserved."""
+        df, desc = self._parse_curve_line("Gamma Ray in {API} units")
+        assert df == "", f"data_format must be cleared, got {df!r}"
+        assert desc == "Gamma Ray in {API} units", f"desc stripped: {desc!r}"
+
+    def test_sand_not_treated_as_data_format(self) -> None:
+        """'{SAND}' is a lithology token, not a data format."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            content = (
+                "~VERSION INFORMATION\n"
+                " VERS.   3.0  : CWLS\n"
+                " WRAP.   NO   :\n"
+                " DLM.   COMMA :\n"
+                "~WELL INFORMATION\n"
+                " NULL.   -999.25 : NULL VALUE\n"
+                " STRT.M  1670.0 : START\n"
+                " STOP.M  713.0 : STOP\n"
+                " STEP.M  -0.125 : STEP\n"
+                "~CURVE INFORMATION\n"
+                " GR.API       : Gamma Ray {SAND}\n"
+                "~ASCII\n"
+                "45.0\n"
+            )
+            LASParser().parse(content)
+        invalid = [str(x.message) for x in w if "Invalid data format" in str(x.message)]
+        assert len(invalid) == 1, f"expected cleared-format warning, got {invalid}"
+        df, desc = self._parse_curve_line("Gamma Ray {SAND}")
+        assert df == ""
+        assert "Gamma Ray {SAND}" in desc
+
+    def test_single_s_and_a_still_valid(self) -> None:
+        """Plain {S}/{A} formats must still be accepted."""
+        df, _ = self._parse_curve_line("String curve {S}")
+        assert df == "S", f"plain {{S}} must be accepted, got {df!r}"
+        df, _ = self._parse_curve_line("Array curve {A:0}")
+        assert df == "A", f"plain {{A}} must be accepted, got {df!r}"
+
+
+class TestS8PARS02PipeTargetResolution:
+    """PARS-02 (MEDIUM): the cross-section consistency checker derived
+    LOG_DEFINITION/__MAIN__ mismatches for `| CURVE` pipe targets and
+    fired spurious ordering warnings on canonical LAS 3.0 files.
+
+    NOTE: these ordering warnings are emitted via the LOGGING module
+    (``logger.warning``), not the warnings API — the test must capture
+    caplog, not catch_warnings.
+    """
+
+    def _spurious_warnings(self, content: str, caplog: pytest.LogCaptureFixture) -> list[str]:
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            LASParser().parse(content)
+        return [
+            line
+            for line in caplog.text.splitlines()
+            if ("before" in line or "no corresponding" in line)
+        ]
+
+    def test_sample_las3_spec_no_spurious_warnings(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        spec_file = Path(__file__).resolve().parent.parent / "test_data" / "sample_las3.0_spec.las"
+        content = spec_file.read_text(encoding="utf-8")
+        assert self._spurious_warnings(content, caplog) == []
+
+    def test_minimal_curve_plus_ascii_pipe_curve(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS\n"
+            " WRAP.   NO   :\n"
+            " DLM.   COMMA :\n"
+            "~WELL INFORMATION\n"
+            " STRT.M  1670.0 : START\n"
+            " STOP.M  713.0 : STOP\n"
+            " STEP.M  -0.125 : STEP\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       : DEPTH  {F}\n"
+            " GR.API       : GAMMA  {F}\n"
+            "~ASCII | CURVE\n"
+            "1670.0,45.0\n"
+            "1669.0,46.0\n"
+        )
+        assert self._spurious_warnings(content, caplog) == []
+
+    def test_data_before_definition_still_warns(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A genuinely out-of-order data section must STILL warn — the
+        pipe resolution must not suppress real ordering violations."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS\n"
+            " WRAP.   NO   :\n"
+            " DLM.   COMMA :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~Core_Data\n"
+            " 2.5,0.15\n"
+            "~CORE_DEFINITION\n"
+            " RHOZ.OHMM       :  RESISTIVITY  {F}\n"
+            " PHIZ.V/V        :  POROSITY  {F}\n"
+        )
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            LASParser().parse(content)
+        assert "~CORE_DATA before ~CORE_DEFINITION" in caplog.text, (
+            f"expected genuine ordering warning, got: {caplog.text}"
+        )
+
+
+class TestS8PARS09RepeatedPlainCurveMerge:
+    """PARS-09 (MEDIUM): repeated plain ~C blocks overwrote the __MAIN__
+    curve range last-writer-wins; a `~A|CURVE` pipe resolved to a
+    truncated scope and DEPT/GR columns were silently discarded."""
+
+    def test_repeated_plain_curve_all_curves_present(self) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS\n"
+            " WRAP.   NO   :\n"
+            " DLM.   COMMA :\n"
+            "~WELL INFORMATION\n"
+            " STRT.M  1670.0 : START\n"
+            " STOP.M  713.0 : STOP\n"
+            " STEP.M  -0.125 : STEP\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       : DEPTH  {F}\n"
+            " GR.API       : GAMMA  {F}\n"
+            "~CURVE INFORMATION\n"
+            " RHOB.K/M3    : DENSITY  {F}\n"
+            "~ASCII | CURVE\n"
+            "1670.0,45.0,2550.0\n"
+            "1669.0,46.0,2551.0\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        assert len(las.data_sections) == 1
+        ds = las.data_sections[0]
+        curves = [c.mnemonic for c in ds.section_curves]
+        assert curves == ["DEPT", "GR", "RHOB"], (
+            f"~A|CURVE must see all plain-~C curves, got {curves}"
+        )
+        assert list(ds.data.keys()) == ["DEPT", "GR", "RHOB"]
+        np.testing.assert_array_almost_equal(ds.data["DEPT"], [1670.0, 1669.0])
+        np.testing.assert_array_almost_equal(ds.data["GR"], [45.0, 46.0])
+        np.testing.assert_array_almost_equal(ds.data["RHOB"], [2550.0, 2551.0])
+
+
+class TestS8I205WideDataRow:
+    """I2-05 (MEDIUM): parser MAX_LINE_LENGTH (50KB) hard-rejected wide
+    data rows that data_reader would accept (advertised MAX_CURVES=100K
+    unreachable).  MAX_LINE_LENGTH now covers MAX_CURVES * 24."""
+
+    def test_wide_data_row_within_advertised_limits_parses(self) -> None:
+        row = " ".join(["-999.25"] * 9_500)  # ~76KB row — > old 50KB cap
+        assert len(row) > 50_000
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   :\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   : Depth\n"
+            "~A\n" + row + "\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        assert las.version.vers == "2.0"
+
+    def test_still_rejects_absurd_single_line(self) -> None:
+        """The DoS guard must still reject absurd single lines."""
+        from pylasdev import parser as parser_mod
+
+        absurd = "A" * (parser_mod.MAX_LINE_LENGTH + 1)
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS\n"
+            " WRAP.   NO   :\n"
+            "~WELL INFORMATION\n"
+            " STRT.M  100.0 : \n"
+            " STOP.M  200.0 : \n"
+            " STEP.M  1.0 : \n"
+            " NULL.   -999.25 : \n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M  : Depth\n"
+            "~A\n" + absurd + "\n"
+        )
+        with pytest.raises(LASParseError):
+            LASParser().parse(content)
+
+
+class TestS8I206SecondABlockWarning:
+    """I2-06 (MEDIUM): a second ~A data block separated by a non-~A
+    section was silently dropped; only a logger.warning (invisible to the
+    warnings API) fired with a direction-misstating message.  Now a
+    warnings-API warning fires stating the LATER block is dropped."""
+
+    def test_two_a_blocks_warning_captured(self) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   :\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A  DEPT  DT\n"
+            "100.0  50.0\n"
+            "101.0  51.0\n"
+            "~OTHER\n"
+            "Freeform text here.\n"
+            "~A  DEPT  DT\n"
+            "200.0  60.0\n"
+        )
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            LASParser().parse(content)
+        dropped = [
+            str(x.message)
+            for x in w
+            if "later ~A blocks" in str(x.message) or "Only the FIRST" in str(x.message)
+        ]
+        assert len(dropped) == 1, (
+            f"expected one warnings-API 'later ~A dropped' warning, got {dropped}"
+        )
+        assert "DROPPED" in dropped[0]
+
+    def test_single_a_block_no_warning(self) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   :\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            "~A  DEPT\n"
+            "100.0\n"
+            "101.0\n"
+        )
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            LASParser().parse(content)
+        dropped = [
+            str(x.message)
+            for x in w
+            if "later ~A blocks" in str(x.message) or "Only the FIRST" in str(x.message)
+        ]
+        assert dropped == []
+
+
+class TestS8I207Las12MandatoryFields:
+    """I2-07 (MEDIUM): the lascheck 10-field well set is LAS 2.0-only;
+    LAS 1.2 requires only the 4 numeric fields (STRT/STOP/STEP/NULL)."""
+
+    def test_minimal_las12_no_warnings(self) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   :\n"
+            "~WELL INFORMATION\n"
+            " STRT.M    : 1670.0000\n"
+            " STOP.M    : 713.2500\n"
+            " STEP.M    : -0.1250\n"
+            " NULL.     : -999.25\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   : DEPTH\n"
+            "~A\n"
+            " 100.0\n"
+        )
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            LASParser().parse(content)
+        mandatory = [str(x.message) for x in w if "missing mandatory well field" in str(x.message)]
+        assert len(mandatory) == 0, (
+            f"LAS 1.2 with the 4 numeric fields must not warn; got {mandatory}"
+        )
+
+    def test_las20_missing_member_warns(self) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   :\n"
+            "~WELL INFORMATION\n"
+            " STRT.M  1670.0  :\n"
+            " STOP.M  1680.0  :\n"
+            " STEP.M  0.1     :\n"
+            " NULL.   -999.25 :\n"
+            " COMP.   ACME    :\n"
+            " WELL.   WELL_A  :\n"
+            " FLD.    NORTH   :\n"
+            " LOC.    LOC_A   :\n"
+            " SRVC.   SRVC_A  :\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   : DEPTH\n"
+            "~A\n"
+            " 100.0\n"
+        )
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            LASParser().parse(content)
+        mandatory = [
+            str(x.message)
+            for x in w
+            if "LAS 2.0 file missing mandatory well field" in str(x.message)
+        ]
+        assert len(mandatory) == 1, mandatory
+        assert "DATE" in mandatory[0]
+
+
+class TestS8I208MixedPrePostVDataPreserved:
+    """I2-08 (MEDIUM): mixed pre-~V + post-~V data sections before ~C
+    discarded BOTH blocks (the deferred replay fired while curves were
+    still empty).  The flush is now deferred until curves are available."""
+
+    def test_pre_and_post_v_data_both_preserved(self) -> None:
+        content = (
+            "~ASCII\n"
+            "1000.0,50.0\n"
+            "1001.0,51.0\n"
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   :\n"
+            " DLM.   COMMA :\n"
+            "~ASCII\n"
+            "2000.0,60.0\n"
+            "2001.0,61.0\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       : DEPTH  {F}\n"
+            " GR.API       : GAMMA  {F}\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        assert len(las.data_sections) == 2, (
+            f"expected 2 data sections (pre-~V + post-~V), got {len(las.data_sections)}"
+        )
+        sec0, sec1 = las.data_sections
+        np.testing.assert_array_almost_equal(sec0.data["DEPT"], [1000.0, 1001.0])
+        np.testing.assert_array_almost_equal(sec0.data["GR"], [50.0, 51.0])
+        np.testing.assert_array_almost_equal(sec1.data["DEPT"], [2000.0, 2001.0])
+        np.testing.assert_array_almost_equal(sec1.data["GR"], [60.0, 61.0])
+
+    def test_simple_pre_v_data_still_works(self) -> None:
+        """The pre-existing simple deferred layout must be unaffected."""
+        content = (
+            "~ASCII\n"
+            "1000.0,50.0\n"
+            "1001.0,51.0\n"
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   :\n"
+            " DLM.   COMMA :\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       : DEPTH  {F}\n"
+            " GR.API       : GAMMA  {F}\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        assert len(las.data_sections) == 1
+        np.testing.assert_array_almost_equal(las.data_sections[0].data["DEPT"], [1000.0, 1001.0])
+
+
+class TestS8PARS04DeferredMnemonicHeader:
+    """PARS-04 (MEDIUM): deferred (pre-~V) data sections bypassed the
+    M-40 standalone-mnemonic-header skip, producing a phantom all-null
+    first row.  The header-row filter must also run at replay time when
+    the curve block is known."""
+
+    def test_pre_v_mnemonic_header_parses_without_phantom_row(self) -> None:
+        content = (
+            "~ASCII\n"
+            "DEPT,GR\n"
+            "1000.0,50.0\n"
+            "1001.0,55.0\n"
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        assert len(las.data_sections) == 1
+        ds = las.data_sections[0]
+        # No phantom all-null first row.
+        np.testing.assert_array_almost_equal(ds.data["DEPT"], [1000.0, 1001.0])
+        np.testing.assert_array_almost_equal(ds.data["GR"], [50.0, 55.0])
+
+
+class TestS8PARS05NonDeferredDataBeforeCurves:
+    """PARS-05 (MEDIUM): non-deferred data-before-curves silently
+    discarded data — the 'data-before-curves supported' claim held only
+    via deferral.  The non-deferred path must buffer and attach the data
+    once curves parse."""
+
+    def test_data_before_curve_block_attaches(self) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~ASCII\n"
+            "1000.0 50.0\n"
+            "1001.0 55.0\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        assert len(las.data_sections) == 1
+        np.testing.assert_array_almost_equal(las.data_sections[0].data["DEPT"], [1000.0, 1001.0])
+        np.testing.assert_array_almost_equal(las.data_sections[0].data["GR"], [50.0, 55.0])
+
+    def test_data_before_curve_defined_later_attaches(self) -> None:
+        """~A with data, then a typed _Definition, then the plain ~C —
+        the deferred data must attach to the main block curves."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~ASCII\n"
+            "1000.0 50.0\n"
+            "1001.0 55.0\n"
+            "~CORE_DEFINITION\n"
+            " RHOB.K/M3 : Density\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        assert len(las.data_sections) == 1
+        np.testing.assert_array_almost_equal(las.data_sections[0].data["DEPT"], [1000.0, 1001.0])
+
+
+class TestS8PARS06DeferredForwardPipeDefinition:
+    """PARS-06 (MEDIUM): a deferred '| X_Definition' FORWARD pipe (the
+    target definition appears later in the file) was not sentineled —
+    only |CURVE/|C got _DEFERRED_MAIN_CURVE_SCOPE — so replay mapped the
+    data against the FINAL curve list and produced phantom columns.  The
+    forward pipe must resolve to the definition's range once parsed."""
+
+    def test_forward_pipe_to_later_definition_resolves(self) -> None:
+        content = (
+            "~ASCII | Core_Definition\n"
+            "1.5\n"
+            "1.6\n"
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            "~Core_Definition\n"
+            " RHOB.K/M3 : Density\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        assert len(las.data_sections) == 1
+        ds = las.data_sections[0]
+        # The piped section must scope to Core_Definition's curves only —
+        # no phantom DEPT/GR columns from the main block.
+        assert list(ds.data.keys()) == ["RHOB"], (
+            f"expected only RHOB column, got {list(ds.data.keys())}"
+        )
+        np.testing.assert_array_almost_equal(ds.data["RHOB"], [1.5, 1.6])
+
+
+class TestS8I209BareDeferredScoping:
+    """I2-09 (MEDIUM): a bare (no-pipe) deferred data section with a
+    later _Definition got an unbounded (0,None) replay scope → phantom
+    DEPT_2/GR_2 columns AND top-level model pollution.  The bare section
+    must scope like its non-deferred twin at replay (def_prefix → __MAIN__
+    → unbounded), never (0,None)-all-final-curves."""
+
+    def test_bare_deferred_before_later_definition_no_pollution(self) -> None:
+        # ADV-M2 exact repro: bare ~A LOG_DATA before ~V, main ~C block,
+        # then a later CORE_DEFINITION.  The bare LOG_DATA section has no
+        # LOG_DEFINITION to resolve to, so it falls back to __MAIN__ —
+        # DEPT/GR only, no phantom DEPT_2/GR_2 from the later definition.
+        content = (
+            "~A LOG_DATA\n"
+            "1.0 10.0\n"
+            "2.0 20.0\n"
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            "~CORE_DEFINITION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        # No fabricated DEPT_2/GR_2 in the top-level model.
+        names = list(las.curves_order)
+        assert "DEPT_2" not in names and "GR_2" not in names, f"top-level pollution: {names}"
+        assert len(las.data_sections) == 1
+        ds = las.data_sections[0]
+        # No phantom columns in the section — data attaches to DEPT/GR only.
+        assert list(ds.data.keys()) == ["DEPT", "GR"], (
+            f"expected DEPT/GR only, got {list(ds.data.keys())}"
+        )
+        np.testing.assert_array_almost_equal(ds.data["DEPT"], [1.0, 2.0])
+        np.testing.assert_array_almost_equal(ds.data["GR"], [10.0, 20.0])
+
+    def test_bare_deferred_matches_non_deferred_twin(self) -> None:
+        """When the later definition matches the section's def_prefix
+        (LOG_DEFINITION for a bare ~A), the deferred path must resolve
+        identically to the non-deferred twin."""
+        content = (
+            "~A\n"
+            "1000 45\n"
+            "1001 46\n"
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            "~Log_Definition\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            " RHOB.K/M3 : Density\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        names = list(las.curves_order)
+        assert "DEPT_2" not in names and "GR_2" not in names, f"top-level pollution: {names}"
+        assert len(las.data_sections) == 1
+        ds = las.data_sections[0]
+        # The section resolves to the LOG_DEFINITION range (def_prefix) —
+        # DEPT/GR/RHOB with RHOB null-filled, exactly like the non-deferred
+        # twin of the same layout.  No DEPT_2/GR_2 fabrication.
+        assert list(ds.data.keys()) == ["DEPT", "GR", "RHOB"], (
+            f"expected DEFT/GR/RHOB, got {list(ds.data.keys())}"
+        )
+        np.testing.assert_array_almost_equal(ds.data["DEPT"], [1000.0, 1001.0])
+        np.testing.assert_array_almost_equal(ds.data["GR"], [45.0, 46.0])
+        np.testing.assert_array_almost_equal(ds.data["RHOB"], [-999.25, -999.25])
+
+
+class TestS8I210ManualColonScanUnitValueParity:
+    """I2-10 (MEDIUM): _manual_colon_scan swapped unit/value on
+    >2000-char empty-value lines because the unit regex ran on the
+    rstripped tail.  The unit must be parsed from the non-rstripped
+    slice, matching the primary DATA_LINE_PATTERN."""
+
+    @staticmethod
+    def _long_line(prefix: str, filler: str) -> str:
+        return prefix + filler
+
+    def test_empty_value_line_unit_parity(self) -> None:
+        from pylasdev.parser import DATA_LINE_PATTERN
+
+        long_line = "DEPT.FT : " + "D" * 2100
+        manual = LASParser._manual_colon_scan(long_line)
+        assert manual is not None
+        # Same result as the primary regex path on a short twin.
+        short = DATA_LINE_PATTERN.match("DEPT.FT : desc")
+        assert short is not None
+        assert manual["unit"] == short.group("unit") == "FT"
+        assert manual["value"] == short.group("value") == ""
+
+    def test_normal_value_line_unchanged(self) -> None:
+        long_line = "GR.API 45.5 : " + "G" * 2100
+        manual = LASParser._manual_colon_scan(long_line)
+        assert manual is not None
+        assert manual["unit"] == "API"
+        assert manual["value"] == "45.5"
+
+
+class TestS8I211LeadingColonValuePreserved:
+    """I2-11 (MEDIUM): a leading-colon value (WELL=':Oil Well #1') on a
+    >2000-char line was lost — the first structurally-valid colon inside
+    the value was treated as the delimiter.  The manual scan must
+    reproduce the regex separator semantics: the unit→value whitespace
+    run is consumed before the separator search."""
+
+    def test_leading_colon_value_roundtrips(self) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   :\n"
+            "~WELL INFORMATION\n"
+            " WELL.  :Oil Well #1 : " + "D" * 2100 + "\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            "~A\n"
+            "1000.0 50.0\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        assert las.well["WELL"] == ":Oil Well #1", f"leading-colon value lost: {las.well['WELL']!r}"
+
+    def test_manual_scan_leading_colon(self) -> None:
+        long_line = "WELL.  :Oil Well #1 : " + "D" * 2100
+        manual = LASParser._manual_colon_scan(long_line)
+        assert manual is not None
+        assert manual["value"] == ":Oil Well #1", (
+            f"expected ':Oil Well #1', got {manual['value']!r}"
+        )
+
+
+class TestS8PXM06CurveAliasBeforeCanonical:
+    """PXM-06 (HIGH): curve collision alias-before-canonical caused a
+    silent data identity swap in the reader.
+
+    When a file carries both an alias and its canonical (GR+GK with
+    GR→GK in mnem_base, LLD+BFV, AK+DT) and the alias appears FIRST, the
+    collision handler mislabeled data — logs['GK'] held GR's data and the
+    real GK was demoted to GK_2.  The well path (models.py:3306-3316)
+    had a `raw == resolved` canonical-priority branch; the curve path
+    lacked it.  Fix: the parser's `_normalize_curve_mnemonic` now has the
+    raw==resolved branch so the canonical keeps its name and the earlier
+    alias is re-keyed to its ORIGINAL mnemonic.
+    """
+
+    _MNEM_BASE: ClassVar[dict[str, str]] = {"GR": "GK"}
+
+    @staticmethod
+    def _read(las_content: str, mnem_base: dict[str, str]) -> Any:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".las", delete=False) as f:
+            f.write(las_content)
+            tmp = f.name
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return read_las_file_as_object(Path(tmp), mnem_base=mnem_base)
+
+    def test_gr_then_gk_no_swap(self) -> None:
+        """GR (alias→GK) then GK (canonical): logs['GK'] must hold GK's
+        data, GR must keep its own identity — no silent swap."""
+        las_content = """~VERSION INFORMATION
+ VERS.                2.0 : CWLS LOG ASCII STANDARD
+~WELL INFORMATION
+ WELL.                WELL1 : Well
+~CURVE INFORMATION
+DEPT.               : Depth
+GR.GAPI             : Gamma Ray
+GK.GAPI             : Gamma K
+~A  DEPT  GR  GK
+100.0  10.0  50.0
+101.0  11.0  51.0
+"""
+        las = self._read(las_content, self._MNEM_BASE)
+        # Canonical keeps its name; alias is re-keyed to its original.
+        assert las.curves_order == ["DEPT", "GR", "GK"], las.curves_order
+        assert las.logs["GK"].tolist() == [50.0, 51.0], (
+            f"logs['GK'] holds swapped data: {las.logs['GK'].tolist()}"
+        )
+        assert las.logs["GR"].tolist() == [10.0, 11.0], (
+            f"logs['GR'] lost GR's data: {las.logs['GR'].tolist()}"
+        )
+        # No GK_2 demotion — the canonical was not renamed away.
+        assert "GK_2" not in las.curves_order, las.curves_order
+
+    def test_lld_then_bfv_no_swap(self) -> None:
+        """LLD (alias→BFV) then BFV (canonical) — same contract."""
+        las_content = """~VERSION INFORMATION
+ VERS.                2.0 : CWLS LOG ASCII STANDARD
+~WELL INFORMATION
+ WELL.                WELL1 : Well
+~CURVE INFORMATION
+DEPT.               : Depth
+LLD.OHMM            : Laterolog Deep
+BFV.OHMM            : Laterolog Shallow
+~A  DEPT  LLD  BFV
+100.0  10.0  50.0
+101.0  11.0  51.0
+"""
+        las = self._read(las_content, {"LLD": "BFV"})
+        assert las.curves_order == ["DEPT", "LLD", "BFV"], las.curves_order
+        assert las.logs["BFV"].tolist() == [50.0, 51.0]
+        assert las.logs["LLD"].tolist() == [10.0, 11.0]
+        assert "BFV_2" not in las.curves_order
+
+    def test_from_dict_accepts_colliding_state(self) -> None:
+        """The models side must accept the colliding curves_order without
+        LASDataError (MODELS agent applies the from_dict twin)."""
+        from pylasdev.models import LASFile
+
+        data = {
+            "version": {"VERS": "2.0"},
+            "well": {"WELL": "W1"},
+            "curves_order": ["DEPT", "GR", "GK"],
+            "curves": [
+                {"mnemonic": "DEPT", "unit": ""},
+                {"mnemonic": "GR", "unit": "GAPI"},
+                {"mnemonic": "GK", "unit": "GAPI"},
+            ],
+            "logs": {
+                "DEPT": [100.0, 101.0],
+                "GR": [10.0, 11.0],
+                "GK": [50.0, 51.0],
+            },
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASFile.from_dict(data, mnem_base=self._MNEM_BASE)
+        assert las.curves_order == ["DEPT", "GR", "GK"]
+        assert las.logs["GK"].tolist() == [50.0, 51.0]
+
+
+class TestS8PXM01WellMnemonicCollision:
+    """PXM-01 (MEDIUM): well-section mnemonic collision asymmetry.
+
+    The parser well path previously did a plain lookup last-wins — a well
+    with LLD+LLS (both→BFV via mnem_base) LOST the LLD value with only a
+    warning, while from_dict (M-44) preserved both via collision-aware
+    re-keying.  Fix: the parser's `_normalize_well_mnemonic` mirrors
+    from_dict so both sides preserve both values.
+    """
+
+    _MNEM_BASE: ClassVar[dict[str, str]] = {"LLD": "BFV", "LLS": "BFV"}
+
+    @staticmethod
+    def _read(las_content: str, mnem_base: dict[str, str]) -> Any:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".las", delete=False) as f:
+            f.write(las_content)
+            tmp = f.name
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return read_las_file_as_object(Path(tmp), mnem_base=mnem_base)
+
+    def test_lls_then_lls_both_preserved(self) -> None:
+        """Well with LLD+LLS (both→BFV): parser preserves both values,
+        matching from_dict."""
+        las_content = """~VERSION INFORMATION
+ VERS.                2.0 : CWLS LOG ASCII STANDARD
+~WELL INFORMATION
+ WELL.                WELL1 : Well
+LLD.OHMM 100 : Deep Laterolog
+LLS.OHMM 200 : Shallow Laterolog
+~CURVE INFORMATION
+DEPT.               : Depth
+~A  DEPT
+100.0
+101.0
+"""
+        las = self._read(las_content, self._MNEM_BASE)
+        entries = dict(las.well.entries)
+        # LLD claims the canonical slot (BFV=100); LLS keeps its original
+        # mnemonic (LLS=200).  Both values survive — no last-wins drop.
+        assert entries.get("BFV") == "100", entries
+        assert entries.get("LLS") == "200", entries
+        assert len(entries) >= 3, entries  # WELL + BFV + LLS
+
+    def test_parser_matches_from_dict(self) -> None:
+        """Parser and from_dict must preserve the SAME both-values state."""
+        from pylasdev.models import LASFile
+
+        data = {
+            "version": {"VERS": "2.0"},
+            "well": {"WELL": "W1", "LLD": "100", "LLS": "200"},
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las2 = LASFile.from_dict(data, mnem_base=self._MNEM_BASE)
+        parser_entries = {
+            "BFV": "100",
+            "LLS": "200",
+        }
+        fd_entries = {k: v for k, v in las2.well.entries.items() if k != "WELL"}
+        assert fd_entries == parser_entries, (fd_entries, parser_entries)
+
+    def test_deferred_well_preserves_both(self) -> None:
+        """~W before ~V (deferred well path) must also preserve both."""
+        las_content = """~WELL INFORMATION
+ WELL.                WELL1 : Well
+LLD.OHMM 100 : Deep Laterolog
+LLS.OHMM 200 : Shallow Laterolog
+~VERSION INFORMATION
+ VERS.                2.0 : CWLS LOG ASCII STANDARD
+~CURVE INFORMATION
+DEPT.               : Depth
+~A  DEPT
+100.0
+101.0
+"""
+        las = self._read(las_content, self._MNEM_BASE)
+        entries = dict(las.well.entries)
+        assert entries.get("BFV") == "100", entries
+        assert entries.get("LLS") == "200", entries
+
+
+class TestS8PXM03VERSNormalization:
+    """PXM-03 (MEDIUM): VERS normalization asymmetry.
+
+    The parser normalizes "1.2.0"→"1.2" and defaults "1,2"→"2.0" (with a
+    warning); from_dict previously kept the value verbatim so a VERS="1,2"
+    model wrote with LASWriteError while the same input parsed from a file
+    wrote fine.  The MODELS agent fixes the from_dict side; this test
+    pins the parser behavior as the reference contract.
+    """
+
+    def _parse_vers(self, vers: str) -> str:
+        content = f"""~VERSION INFORMATION
+ VERS.   {vers}  :
+~WELL INFORMATION
+ WELL.   W1 :
+"""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        return las.version.vers
+
+    def test_comma_vers_defaults_to_2_0(self) -> None:
+        assert self._parse_vers("1,2") == "2.0"
+
+    def test_three_segment_vers_stripped(self) -> None:
+        assert self._parse_vers("1.2.0") == "1.2"
+        assert self._parse_vers("2.0.1") == "2.0"
+
+    def test_known_vers_preserved(self) -> None:
+        assert self._parse_vers("1.2") == "1.2"
+        assert self._parse_vers("2.0") == "2.0"
+        assert self._parse_vers("3.0") == "3.0"
+
+
+class TestS8W08OtherSectionDesanitize:
+    """W-08 (parser side coordination): the writer escapes #-prefixed ~O
+    lines as _#comment so COMMENT_PATTERN doesn't drop them; the parser
+    must restore _# → # on re-read via _desanitize_las_value."""
+
+    def test_other_comment_roundtrip(self) -> None:
+        from pylasdev._writer_base import write_las_file
+
+        las_content = """~VERSION INFORMATION
+ VERS.                2.0 : CWLS LOG ASCII STANDARD
+~WELL INFORMATION
+ WELL.                WELL1 : Well
+ STRT.                100.0 : Start
+ STOP.                101.0 : Stop
+ STEP.                1.0 : Step
+ NULL.                -999.25 : Null
+~CURVE INFORMATION
+DEPT.               : Depth
+~A  DEPT
+100.0
+101.0
+"""
+        las = LASParser().parse(las_content)
+        las.other = "#comment line\n#second\nnormal line\n"
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".las", delete=False) as f:
+            tmp = f.name
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(tmp, las)
+        written = Path(tmp).read_text()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las2 = LASParser().parse(written)
+        assert las2.other == "#comment line\n#second\nnormal line\n", (
+            f"~O #comment not restored: {las2.other!r}"
+        )
+
+    def test_direct_parse_restores_underscore_hash(self) -> None:
+        content = """~VERSION INFORMATION
+ VERS.   2.0  :
+~OTHER INFORMATION
+_#comment line one
+_#comment line two
+"""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        assert las.other == "#comment line one\n#comment line two\n", (
+            f"~O _# escape not restored: {las.other!r}"
+        )
+
+
+class TestS9PF01ConsecutiveDataPipeTarget:
+    """PF-01 (MEDIUM, CONFIRMED — incomplete PARS-06 fix): A→A consecutive
+    data sections lost the FIRST section's forward-pipe target.  The second
+    ~A section's classification (parser.py:1468) reset ``_current_pipe_target``
+    BEFORE ``_flush_ascii_data`` ran for the first section, so the first
+    section's forward ``| X_Definition`` pipe was never recorded in
+    ``_deferred_pipe_targets`` and its replay scoped to ``__MAIN__`` (DEPT/GR)
+    instead of the piped ``_Definition`` (RHOB) — silent data mislabeling.
+
+    ``_CapturedState`` now carries ``current_pipe_target`` and the A→A
+    consecutive-data path restores it during the first section's flush."""
+
+    def test_a_to_a_forward_pipe_preserves_first_section_target(self) -> None:
+        # ~V first (version_found=True → deferral path), then a forward-piped
+        # ~A, then a bare ~A, then ~C (DEPT/GR), then the piped definition.
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~A | RHOB_DEFINITION\n"
+            "1.5\n"
+            "1.6\n"
+            "~A\n"
+            "2.5\n"
+            "2.6\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            "~RHOB_DEFINITION\n"
+            " RHOB.K/M3 : Density\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        assert len(las.data_sections) == 2
+        ds0 = las.data_sections[0]
+        # FIRST section must scope to the piped definition's columns (RHOB),
+        # NOT the main curve block (DEPT/GR).
+        assert list(ds0.data.keys()) == ["RHOB"], (
+            f"first section scoped to {list(ds0.data.keys())}, expected ['RHOB']"
+        )
+        np.testing.assert_array_almost_equal(ds0.data["RHOB"], [1.5, 1.6])
+        ds1 = las.data_sections[1]
+        assert list(ds1.data.keys()) == ["DEPT", "GR"], (
+            f"second section scoped to {list(ds1.data.keys())}, expected ['DEPT', 'GR']"
+        )
+        np.testing.assert_array_almost_equal(ds1.data["DEPT"], [2.5, 2.6])
+
+
+class TestS9PF02OtherScopedDesanitize:
+    """PF-02 (MEDIUM, CONFIRMED — REGRESSION): ``_parse_other`` ran every ~O
+    line through the blanket ``_desanitize_las_value``, which unescaped
+    ``_~`` → ``~`` and ANY whitespace-adjacent ``_#`` — escapes the ~O writer
+    NEVER emits.  Genuine ``_~``-prefixed and mid-line ``_#`` content was
+    silently altered on write→read.  The scoped ``_desanitize_other_line``
+    restores ONLY the writer's actual escape positions (line-start ``_#``),
+    preserving genuine content.  The W-08 ``#comment`` roundtrip must not
+    regress."""
+
+    _LAS2_BASE = """~VERSION INFORMATION
+ VERS.                2.0 : CWLS LOG ASCII STANDARD
+~WELL INFORMATION
+ WELL.                WELL1 : Well
+ STRT.                100.0 : Start
+ STOP.                101.0 : Stop
+ STEP.                1.0 : Step
+ NULL.                -999.25 : Null
+~CURVE INFORMATION
+DEPT.               : Depth
+~A  DEPT
+100.0
+101.0
+"""
+
+    def _roundtrip_other(self, other: str) -> str:
+        from pylasdev._writer_base import write_las_file
+
+        las = LASParser().parse(self._LAS2_BASE)
+        las.other = other
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".las", delete=False) as f:
+            tmp = f.name
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                write_las_file(tmp, las)
+            written = Path(tmp).read_text()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                las2 = LASParser().parse(written)
+            return las2.other
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+
+    def test_underscore_tilde_and_midline_hash_roundtrip_unchanged(self) -> None:
+        # Genuine content the ~O writer never escapes: _~ at line start and
+        # _# mid-line.  Both must survive write→read unchanged.
+        other = "_~weird line\nKeep _#literal_under intact"
+        assert self._roundtrip_other(other) == ("_~weird line\nKeep _#literal_under intact\n"), (
+            "genuine _~/_# ~O content altered on roundtrip"
+        )
+
+    def test_comment_line_start_still_roundtrips(self) -> None:
+        # W-08 no-regression: a model #comment (line start) is escaped by the
+        # writer to _#comment and must be restored to #comment on re-read.
+        other = "#comment line\n#second\nnormal line"
+        assert self._roundtrip_other(other) == ("#comment line\n#second\nnormal line\n"), (
+            "~O #comment not restored on roundtrip"
+        )
+
+
+class TestS8L3001SpecFormArrayTimeOffset:
+    """L30-01 (parser side coordination): the parser must PRESERVE the
+    {A:N} spec-form array offset marker so _build_spec_form_array_info can
+    extract time_offset for LAS 3.0 spec-form array channels (plain
+    repeated mnemonics + per-element {A:N} format codes)."""
+
+    _CONTENT = """~VERSION INFORMATION
+ VERS.   3.0  :
+ WRAP.   NO   :
+ DLM.   COMMA :
+~WELL INFORMATION
+ WELL.   W1 :
+ STRT.   100.0 :
+ STOP.   101.0 :
+ STEP.   1.0 :
+ NULL.   -999.25 :
+~CURVE INFORMATION
+ DEPT.M       : DEPTH  {F}
+ NMR.ms       : NMR Echo Array {A:0}
+ NMR.ms       : NMR Echo Array {A:5}
+~A
+100,10,11
+101,12,13
+"""
+
+    def test_spec_form_time_offset_preserved(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(self._CONTENT)
+        offsets = {
+            c.mnemonic: (c.array_info.time_offset if c.array_info else None) for c in las.curves
+        }
+        assert offsets.get("NMR[1]") == 0.0, offsets
+        assert offsets.get("NMR[2]") == 5.0, offsets
+
+    def test_spec_form_roundtrip_keeps_offsets(self) -> None:
+        from pylasdev._writer_base import write_las_file
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(self._CONTENT)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".las", delete=False) as f:
+            tmp = f.name
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(tmp, las)
+        written = Path(tmp).read_text()
+        # Writer re-emits {A:N} exactly once per element.
+        assert written.count("{A:0}") == 1, written
+        assert written.count("{A:5}") == 1, written
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las2 = LASParser().parse(written)
+        offsets2 = {
+            c.mnemonic: (c.array_info.time_offset if c.array_info else None) for c in las2.curves
+        }
+        assert offsets2.get("NMR[1]") == 0.0, offsets2
+        assert offsets2.get("NMR[2]") == 5.0, offsets2

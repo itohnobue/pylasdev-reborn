@@ -100,9 +100,9 @@ class _ParserState:
 
     # --- Deferred parsing state --------------------------------------------
     deferred_well_entries: list[dict[str, str]] = field(default_factory=list)
-    deferred_ascii_data_lines: list[
-        tuple[str, str, int, str, int, int | None]
-    ] = field(default_factory=list)
+    deferred_ascii_data_lines: list[tuple[str, str, int, str, int, int | None]] = field(
+        default_factory=list
+    )
 
     # --- Section tracking --------------------------------------------------
     section_sequence: list[str] = field(default_factory=list)
@@ -165,9 +165,7 @@ class _ParserState:
     # Invariant checks
     # ------------------------------------------------------------------
 
-    def _check_las30_section_consistency(
-        self, issues: list[str], las_file: LASFile
-    ) -> None:
+    def _check_las30_section_consistency(self, issues: list[str], las_file: LASFile) -> None:
         """Invariant 1+3: LAS 3.0 sections vs VERS + data sections vs is_las30."""
         # Invariant 1: LAS 3.0 sections seen but version is not LAS 3.0.
         if self.las30_sections_seen and not las_file.version.is_las30:
@@ -232,9 +230,7 @@ class _ParserState:
                 f"reachable; this may indicate a corrupted counter."
             )
 
-    def _check_curve_index_bounds(
-        self, issues: list[str], las_file: LASFile
-    ) -> None:
+    def _check_curve_index_bounds(self, issues: list[str], las_file: LASFile) -> None:
         """Invariant 9 (F-29): Curve index bounds consistency.
 
         Validates that ``main_curve_end``, ``definition_curve_ranges``,
@@ -259,24 +255,19 @@ class _ParserState:
         # section_curve_start_idx must be >= 0.
         if self.section_curve_start_idx < 0:
             issues.append(
-                f"section_curve_start_idx is "
-                f"{self.section_curve_start_idx} (should be >= 0)."
+                f"section_curve_start_idx is {self.section_curve_start_idx} (should be >= 0)."
             )
 
         # section_curve_end_idx must be >= 0 or None.
         if self.section_curve_end_idx is not None and self.section_curve_end_idx < 0:
             issues.append(
-                f"section_curve_end_idx is {self.section_curve_end_idx} "
-                f"(should be >= 0 or None)."
+                f"section_curve_end_idx is {self.section_curve_end_idx} (should be >= 0 or None)."
             )
 
         # Each definition_curve_range must have valid start ≤ end.
         for key, (start, end) in self.definition_curve_ranges.items():
             if start < 0:
-                issues.append(
-                    f"definition_curve_ranges['{key}']: start={start} "
-                    f"is negative."
-                )
+                issues.append(f"definition_curve_ranges['{key}']: start={start} is negative.")
             if end < start:
                 issues.append(
                     f"definition_curve_ranges['{key}']: start={start} > "
@@ -284,6 +275,5 @@ class _ParserState:
                 )
             if end > n_curves:
                 issues.append(
-                    f"definition_curve_ranges['{key}']: end={end} "
-                    f"exceeds {n_curves} curves."
+                    f"definition_curve_ranges['{key}']: end={end} exceeds {n_curves} curves."
                 )

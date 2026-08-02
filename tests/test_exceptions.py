@@ -134,12 +134,14 @@ class TestLASDataError:
         from pylasdev.models import LASFile
 
         with pytest.raises(LASDataError):
-            LASFile.from_dict({
-                "version": {"VERS": "2.0"},
-                "well": {"NULL": "-999.25"},
-                "logs": {"DEPT": [1, 2], "GR": [3, 4, 5]},
-                "curves_order": ["DEPT", "GR"],
-            })
+            LASFile.from_dict(
+                {
+                    "version": {"VERS": "2.0"},
+                    "well": {"NULL": "-999.25"},
+                    "logs": {"DEPT": [1, 2], "GR": [3, 4, 5]},
+                    "curves_order": ["DEPT", "GR"],
+                }
+            )
 
     def test_raises_on_null_column_data(self) -> None:
         """DevFile.from_dict with None column data raises LASDataError.

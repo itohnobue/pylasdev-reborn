@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from pylasdev import read_dev_file, read_dev_file_as_object
-from pylasdev.exceptions import DEVReadError
+from pylasdev.exceptions import DEVReadError, LASEncodingError
 from pylasdev.models import DevFile
 
 
@@ -420,10 +420,13 @@ class TestDevSafetyGuards:
         test_file.write_text(content, encoding="utf-8")
 
         # G-012: IndexError handler removed — error now propagates
-        with mock.patch(
-            "pylasdev.dev_reader._to_finite_float",
-            side_effect=IndexError("simulated"),
-        ), pytest.raises(IndexError, match="simulated"):
+        with (
+            mock.patch(
+                "pylasdev.dev_reader._to_finite_float",
+                side_effect=IndexError("simulated"),
+            ),
+            pytest.raises(IndexError, match="simulated"),
+        ):
             read_dev_file(test_file)
 
     def test_index_error_handler_read_dev_file_as_object(self, tmp_path: Path) -> None:
@@ -438,10 +441,13 @@ class TestDevSafetyGuards:
         test_file.write_text(content, encoding="utf-8")
 
         # G-012: IndexError handler removed — error now propagates
-        with mock.patch(
-            "pylasdev.dev_reader._to_finite_float",
-            side_effect=IndexError("simulated"),
-        ), pytest.raises(IndexError, match="simulated"):
+        with (
+            mock.patch(
+                "pylasdev.dev_reader._to_finite_float",
+                side_effect=IndexError("simulated"),
+            ),
+            pytest.raises(IndexError, match="simulated"),
+        ):
             read_dev_file_as_object(test_file)
 
     # ── F-R-08: MAX_DATA_LINES at-limit acceptance ───────────────────
@@ -493,7 +499,7 @@ class TestDevSafetyGuards:
 
         Part of F-R-04 character class expansion.
         """
-        content = "MD TVD\n0.0\x7F0.0\n"
+        content = "MD TVD\n0.0\x7f0.0\n"
         test_file = tmp_path / "del_byte.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -517,12 +523,12 @@ class TestDevSafetyGuards:
         import warnings
 
         content = (
-            "MD TVD INC\n"              # 3 columns expected
-            "0.0 0.0 0.0\n"             # matching row (row 1)
-            "1.0 1.0 1.0 9.0\n"         # extra column (row 2)
-            "2.0 2.0 2.0 9.0\n"         # extra column (row 3)
-            "3.0 3.0\n"                 # short row (row 4)
-            "4.0 4.0\n"                 # short row (row 5)
+            "MD TVD INC\n"  # 3 columns expected
+            "0.0 0.0 0.0\n"  # matching row (row 1)
+            "1.0 1.0 1.0 9.0\n"  # extra column (row 2)
+            "2.0 2.0 2.0 9.0\n"  # extra column (row 3)
+            "3.0 3.0\n"  # short row (row 4)
+            "4.0 4.0\n"  # short row (row 5)
         )
         test_file = tmp_path / "counter.dev"
         test_file.write_text(content, encoding="utf-8")
@@ -550,10 +556,12 @@ class TestDevSafetyGuards:
         assert len(summary_short) == 1, f"Expected 1 short-row summary, got {warning_texts}"
 
         # The summary should show count 2 (rows 2 and 3 for extra, rows 4 and 5 for short)
-        assert any("2 data line(s)" in m for m in summary_extra), \
+        assert any("2 data line(s)" in m for m in summary_extra), (
             f"Extra-col summary should mention '2 data line(s)', got: {summary_extra}"
-        assert any("2 data line(s)" in m for m in summary_short), \
+        )
+        assert any("2 data line(s)" in m for m in summary_short), (
             f"Short-row summary should mention '2 data line(s)', got: {summary_short}"
+        )
 
 
 class TestDevDedupWhileLoop:
@@ -1099,11 +1107,11 @@ class TestFormatAutoDetection:
         import warnings
 
         content = (
-            "WELL-1 1000.0 2000.0 50.0\n"   # Petrel well-header
-            "MD INC AZI TVD\n"                # real column names
-            "0.0 0.0 90.0 0.0\n"             # data row 1
-            "100.0 0.0 90.0 -100.0\n"         # data row 2
-            "200.0 0.0 90.0 -200.0\n"         # data row 3
+            "WELL-1 1000.0 2000.0 50.0\n"  # Petrel well-header
+            "MD INC AZI TVD\n"  # real column names
+            "0.0 0.0 90.0 0.0\n"  # data row 1
+            "100.0 0.0 90.0 -100.0\n"  # data row 2
+            "200.0 0.0 90.0 -200.0\n"  # data row 3
         )
         test_file = tmp_path / "petrel.dev"
         test_file.write_text(content, encoding="utf-8")
@@ -1113,13 +1121,9 @@ class TestFormatAutoDetection:
             data = read_dev_file(test_file)
 
         # Verify Petrel well-header warning was emitted
-        petrel_warnings = [
-            str(x.message) for x in w
-            if "Petrel well-header" in str(x.message)
-        ]
+        petrel_warnings = [str(x.message) for x in w if "Petrel well-header" in str(x.message)]
         assert len(petrel_warnings) == 1, (
-            f"Expected Petrel well-header warning, got: "
-            f"{[str(x.message) for x in w]}"
+            f"Expected Petrel well-header warning, got: {[str(x.message) for x in w]}"
         )
 
         # Verify correct column names (NOT "WELL-1", "1000.0", etc.)
@@ -1146,24 +1150,18 @@ class TestFormatAutoDetection:
         content line, it should remain headerless (or simple with numeric
         column names) — NOT trigger Petrel detection.
         """
-        content = (
-            "100 200 300\n"
-            "1.0 2.0 3.0\n"
-            "4.0 5.0 6.0\n"
-        )
+        content = "100 200 300\n1.0 2.0 3.0\n4.0 5.0 6.0\n"
         test_file = tmp_path / "numeric_header.dev"
         test_file.write_text(content, encoding="utf-8")
 
         import warnings
+
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             _ = read_dev_file(test_file)
 
         # Should NOT have a Petrel warning
-        petrel_warnings = [
-            str(x.message) for x in w
-            if "Petrel well-header" in str(x.message)
-        ]
+        petrel_warnings = [str(x.message) for x in w if "Petrel well-header" in str(x.message)]
         assert len(petrel_warnings) == 0, (
             "Should NOT detect Petrel well-header for all-numeric line"
         )
@@ -1273,12 +1271,7 @@ class TestExplicitDelimiterParameter:
         """
         # col_count=3 but second line has 4 float tokens (mismatch)
         # 3+ content entries → fallback activates
-        content = (
-            "3\n"
-            "1.0 2.0 3.0 4.0\n"
-            "100.0 200.0 300.0 400.0\n"
-            "500.0 600.0 700.0 800.0\n"
-        )
+        content = "3\n1.0 2.0 3.0 4.0\n100.0 200.0 300.0 400.0\n500.0 600.0 700.0 800.0\n"
         test_file = tmp_path / "dv01_fallback.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -1309,12 +1302,7 @@ class TestExplicitDelimiterParameter:
         3.14159) are parsed as DATA values, not fabricated numeric column
         names — no row is lost, no numeric header is created.
         """
-        content = (
-            "2\n"
-            "1.0e2 2.0E-1 3.14159\n"
-            "100.0 200.0 300.0\n"
-            "400.0 500.0 600.0\n"
-        )
+        content = "2\n1.0e2 2.0E-1 3.14159\n100.0 200.0 300.0\n400.0 500.0 600.0\n"
         test_file = tmp_path / "dv01_sci.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -1605,11 +1593,7 @@ class TestDelimiterAutoCorrectionHeader:
 
     def test_auto_correction_simple_format(self, tmp_path: Path) -> None:
         """Comma-delimited header + space-delimited data: columns correct."""
-        content = (
-            "MD,TVD,INC\n"
-            "1000.0 2000.0 3000.0\n"
-            "1100.0 2100.0 3100.0\n"
-        )
+        content = "MD,TVD,INC\n1000.0 2000.0 3000.0\n1100.0 2100.0 3100.0\n"
         test_file = tmp_path / "mix_comma_header_space_data.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -1628,13 +1612,7 @@ class TestDelimiterAutoCorrectionHeader:
 
     def test_auto_correction_dug_format(self, tmp_path: Path) -> None:
         """DUG format: comma-header + space-data — columns correct."""
-        content = (
-            "Well-Survey\n"
-            "3\n"
-            "MD,TVD,INC\n"
-            "1000.0 2000.0 3000.0\n"
-            "1100.0 2100.0 3100.0\n"
-        )
+        content = "Well-Survey\n3\nMD,TVD,INC\n1000.0 2000.0 3000.0\n1100.0 2100.0 3100.0\n"
         test_file = tmp_path / "dug_mix_delim.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -1666,10 +1644,7 @@ class TestDelimiterAutoCorrectionHeader:
         the column counts mismatch (4 tokens in header, 3 in data).
         Auto-correction correctly rejects this as unresolvable.
         """
-        content = (
-            "*COLUMNS,*MD,*TVD,*GR\n"
-            "100.0 50.0 75.0\n"
-        )
+        content = "*COLUMNS,*MD,*TVD,*GR\n100.0 50.0 75.0\n"
         test_file = tmp_path / "columns_mix_delim.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -1686,9 +1661,7 @@ class TestDelimiterAutoCorrectionHeader:
 
         data = read_dev_file(test_file)
         # Trailing comma stripped by the filter logic
-        assert list(data.keys()) == ["MD", "TVD"], (
-            f"Expected ['MD','TVD'], got {list(data.keys())}"
-        )
+        assert list(data.keys()) == ["MD", "TVD"], f"Expected ['MD','TVD'], got {list(data.keys())}"
         assert len(data["MD"]) == 2
 
     def test_auto_correction_with_commas_and_spaces(self, tmp_path: Path) -> None:
@@ -1897,6 +1870,7 @@ class TestF035FailureCounterRegression:
 # Production Check Regression Tests
 # ============================================================
 
+
 class TestProductionCheckDevReaderFixes:
     """Regression tests for production check fixes in dev_reader.py."""
 
@@ -2027,13 +2001,9 @@ class TestProductionCheckDevReaderFixes:
         # Values with leading/trailing whitespace between tabs
         line = "  MD  \t\t  100.0  \t  200.0  "
         tokens = _split_delimited_line(line, "\t")
-        assert tokens == ["MD", "", "100.0", "200.0"], (
-            f"Expected stripped tokens, got {tokens!r}"
-        )
+        assert tokens == ["MD", "", "100.0", "200.0"], f"Expected stripped tokens, got {tokens!r}"
 
-    def test_tab_delimited_dev_file_whitespace_stripped(
-        self, tmp_path: Path
-    ) -> None:
+    def test_tab_delimited_dev_file_whitespace_stripped(self, tmp_path: Path) -> None:
         """M-33: Full DEV file read with tab-delimited whitespace values.
 
         End-to-end: tab-delimited .dev file with values that have
@@ -2072,9 +2042,7 @@ class TestProductionCheckDevReaderFixes:
         assert data["col_2"][0] == 2.0
         assert data["col_3"][0] == 3.0
 
-    def test_minus_nan_sentinel_headerless_whitespace(
-        self, tmp_path: Path
-    ) -> None:
+    def test_minus_nan_sentinel_headerless_whitespace(self, tmp_path: Path) -> None:
         """F-044: '-nan' in whitespace-delimited line is recognised as sentinel."""
         content = "100.0 -nan 200.0\n50.0 75.0 100.0\n"
         test_file = tmp_path / "minus_nan_sentinel.dev"
@@ -2107,9 +2075,7 @@ class TestProductionCheckDevReaderFixes:
 
     # === F-043: Case-insensitive column lookups ===
 
-    def test_lowercase_md_header_triggers_validation(
-        self, tmp_path: Path
-    ) -> None:
+    def test_lowercase_md_header_triggers_validation(self, tmp_path: Path) -> None:
         """F-043: Lowercase 'md' header triggers MD validation.
 
         With normalize_aliases=False and lowercase column names,
@@ -2128,8 +2094,7 @@ class TestProductionCheckDevReaderFixes:
             data = read_dev_file_as_object(test_file, normalize_aliases=False)
         # Negative MD should trigger a warning
         assert any("negative MD" in str(x.message) for x in w), (
-            f"Expected 'negative MD' warning, got: "
-            f"{[str(x.message) for x in w]}"
+            f"Expected 'negative MD' warning, got: {[str(x.message) for x in w]}"
         )
         # Columns should be lowercase as-is
         assert "md" in data.columns
@@ -2188,9 +2153,7 @@ class TestProductionCheckDevReaderFixes:
 
     # === F-041: DevFile __post_init__ called after reader construction ===
 
-    def test_read_dev_file_as_object_runs_post_init_validation(
-        self, tmp_path: Path
-    ) -> None:
+    def test_read_dev_file_as_object_runs_post_init_validation(self, tmp_path: Path) -> None:
         """F-041: read_dev_file_as_object calls __post_init__ after construction.
 
         __post_init__ runs validate(complete=True) which checks NaN/Inf
@@ -2207,13 +2170,9 @@ class TestProductionCheckDevReaderFixes:
             dev = read_dev_file_as_object(test_file)
         # __post_init__ runs validate(complete=True) which warns about
         # NaN in INC column
-        inc_nan_warnings = [
-            x for x in w
-            if "DevFile: column 'INC'" in str(x.message)
-        ]
+        inc_nan_warnings = [x for x in w if "DevFile: column 'INC'" in str(x.message)]
         assert len(inc_nan_warnings) >= 1, (
-            f"Expected __post_init__ validate() warning for INC NaN, "
-            f"got {len(inc_nan_warnings)}"
+            f"Expected __post_init__ validate() warning for INC NaN, got {len(inc_nan_warnings)}"
         )
         # Data should be parsed correctly
         assert dev.columns["MD"][0] == 100.0
@@ -2253,9 +2212,7 @@ class TestProductionCheckDevReaderFixes:
         assert data["X"][0] == 100.0
         assert data["Y"][0] == 200.0
 
-    def test_semicolon_delimited_trailing_semicolons(
-        self, tmp_path: Path
-    ) -> None:
+    def test_semicolon_delimited_trailing_semicolons(self, tmp_path: Path) -> None:
         """F-046: Semicolon-delimited file with trailing semicolons."""
         content = "MD;TVD;X;\n0.0;0.0;100.0;\n100.0;99.0;101.0;\n"
         test_file = tmp_path / "semicolon_trail.dev"
@@ -2284,9 +2241,7 @@ class TestProductionCheckDevReaderFixes:
 
     # === F-047: Multi-line delimiter cross-validation ===
 
-    def test_multi_line_delimiter_consistency_warns(
-        self, tmp_path: Path
-    ) -> None:
+    def test_multi_line_delimiter_consistency_warns(self, tmp_path: Path) -> None:
         """F-047: Inconsistent delimiter across data lines triggers warning.
 
         A file where some lines have a different number of tokens
@@ -2297,11 +2252,11 @@ class TestProductionCheckDevReaderFixes:
         import warnings
 
         content = (
-            "MD TVD INC\n"             # 3-column header
-            "0.0 0.0 0.0\n"            # 3 tokens (consistent)
-            "100.0 99.0\n"             # 2 tokens (mismatch)
+            "MD TVD INC\n"  # 3-column header
+            "0.0 0.0 0.0\n"  # 3 tokens (consistent)
+            "100.0 99.0\n"  # 2 tokens (mismatch)
             "200.0 198.0 30.0 40.0\n"  # 4 tokens (mismatch)
-            "300.0 297.0 60.0\n"       # 3 tokens (back to consistent)
+            "300.0 297.0 60.0\n"  # 3 tokens (back to consistent)
         )
         test_file = tmp_path / "multi_line_inconsist.dev"
         test_file.write_text(content, encoding="utf-8")
@@ -2315,17 +2270,13 @@ class TestProductionCheckDevReaderFixes:
 
         # Check for delimiter consistency warning
         consistency_warnings = [
-            str(x.message) for x in w
-            if "Delimiter consistency warning" in str(x.message)
+            str(x.message) for x in w if "Delimiter consistency warning" in str(x.message)
         ]
         assert len(consistency_warnings) >= 1, (
-            f"Expected delimiter consistency warning, got: "
-            f"{[str(x.message) for x in w]}"
+            f"Expected delimiter consistency warning, got: {[str(x.message) for x in w]}"
         )
 
-    def test_multi_line_delimiter_consistent_no_warning(
-        self, tmp_path: Path
-    ) -> None:
+    def test_multi_line_delimiter_consistent_no_warning(self, tmp_path: Path) -> None:
         """F-047: Consistent delimiter across data lines — no spurious warning."""
         import warnings
 
@@ -2345,19 +2296,15 @@ class TestProductionCheckDevReaderFixes:
             _ = read_dev_file(test_file)
 
         consistency_warnings = [
-            str(x.message) for x in w
-            if "Delimiter consistency warning" in str(x.message)
+            str(x.message) for x in w if "Delimiter consistency warning" in str(x.message)
         ]
         assert len(consistency_warnings) == 0, (
-            f"Expected NO delimiter consistency warning, got: "
-            f"{consistency_warnings}"
+            f"Expected NO delimiter consistency warning, got: {consistency_warnings}"
         )
 
     # === I2F-001: DUG Pattern A all-float false positive ===
 
-    def test_dug_pattern_a_all_float_count_match_is_headerless(
-        self, tmp_path: Path
-    ) -> None:
+    def test_dug_pattern_a_all_float_count_match_is_headerless(self, tmp_path: Path) -> None:
         """I2F-001/N-I-24: All-float second line with count match → headerless.
 
         Reproducer: "4\\n1.0 2.0 3.0 4.0\\n5.0 6.0 7.0 8.0\\n9.0..."
@@ -2370,12 +2317,7 @@ class TestProductionCheckDevReaderFixes:
         PREFIX, not data — skip it and derive 4 columns from the first
         real data line, preserving all 3 data rows.
         """
-        content = (
-            "4\n"
-            "1.0 2.0 3.0 4.0\n"
-            "5.0 6.0 7.0 8.0\n"
-            "9.0 10.0 11.0 12.0\n"
-        )
+        content = "4\n1.0 2.0 3.0 4.0\n5.0 6.0 7.0 8.0\n9.0 10.0 11.0 12.0\n"
         test_file = tmp_path / "dug_float_count_match.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -2440,10 +2382,7 @@ class TestProductionCheckDevReaderFixes:
             _validate_dev_data(dev)
 
         # Both AZI and AZIM should be validated; AZIM has out-of-range values
-        azi_warnings = [
-            str(x.message) for x in w
-            if "Azimuth column" in str(x.message)
-        ]
+        azi_warnings = [str(x.message) for x in w if "Azimuth column" in str(x.message)]
         assert len(azi_warnings) >= 1, (
             f"Expected at least 1 azimuth warning (AZIM out of range), got "
             f"{len(azi_warnings)}: {azi_warnings}"
@@ -2473,8 +2412,7 @@ class TestProductionCheckDevReaderFixes:
 
         # TVDSS has >50% NaN → NaN density warning expected
         tvd_nan_warnings = [
-            str(x.message) for x in w
-            if "TVD" in str(x.message) and "NaN" in str(x.message)
+            str(x.message) for x in w if "TVD" in str(x.message) and "NaN" in str(x.message)
         ]
         assert len(tvd_nan_warnings) >= 1, (
             f"Expected at least 1 TVD NaN warning, got "
@@ -2495,9 +2433,7 @@ class TestFixGroupG9:
 
     # === V-01 (HIGH): DUG Pattern B false positive ===
 
-    def test_v01_dug_pattern_b_not_misdetected_on_ragged_first_row(
-        self, tmp_path: Path
-    ) -> None:
+    def test_v01_dug_pattern_b_not_misdetected_on_ragged_first_row(self, tmp_path: Path) -> None:
         """V-01: Normal header + ragged single-integer first data row.
 
         DUG Pattern B's count-mismatch fallback consumed the real header
@@ -2506,12 +2442,7 @@ class TestFixGroupG9:
         zero warnings.  After the fix the all-float third line falls
         through to simple format and the ragged row is NaN-filled.
         """
-        content = (
-            "MD TVD X Y\n"
-            "0\n"
-            "100.0 1000.0 100.0 200.0\n"
-            "200.0 1100.0 150.0 250.0\n"
-        )
+        content = "MD TVD X Y\n0\n100.0 1000.0 100.0 200.0\n200.0 1100.0 150.0 250.0\n"
         test_file = tmp_path / "v01_ragged_first.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -2530,9 +2461,7 @@ class TestFixGroupG9:
 
     # === V-02 (HIGH): comma count-prefix DUG misdetection ===
 
-    def test_v02_comma_count_prefix_not_misdetected_as_dug(
-        self, tmp_path: Path
-    ) -> None:
+    def test_v02_comma_count_prefix_not_misdetected_as_dug(self, tmp_path: Path) -> None:
         """V-02/N-I-24: "4\\n1.0,2.0,3.0,4.0\\n..." must be headerless, not DUG.
 
         The comma path returned ("dug", 2), consuming the first data row
@@ -2542,12 +2471,7 @@ class TestFixGroupG9:
         skipped, 4 columns are derived from the first real data line, and
         all 3 data rows are preserved.
         """
-        content = (
-            "4\n"
-            "1.0,2.0,3.0,4.0\n"
-            "5.0,6.0,7.0,8.0\n"
-            "9.0,10.0,11.0,12.0\n"
-        )
+        content = "4\n1.0,2.0,3.0,4.0\n5.0,6.0,7.0,8.0\n9.0,10.0,11.0,12.0\n"
         test_file = tmp_path / "v02_comma_count_prefix.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -2562,9 +2486,7 @@ class TestFixGroupG9:
 
     # === V-03 (MEDIUM): Pattern B all-float count-match returns DUG ===
 
-    def test_v03_dug_pattern_b_all_float_count_match_not_dug(
-        self, tmp_path: Path
-    ) -> None:
+    def test_v03_dug_pattern_b_all_float_count_match_not_dug(self, tmp_path: Path) -> None:
         """V-03: Pattern B all-float count-match must not return DUG.
 
         A normal header + single-integer count + all-float first data row
@@ -2573,11 +2495,7 @@ class TestFixGroupG9:
         format, preserving real column names and data.
         """
         content = (
-            "MD TVD X Y\n"
-            "4\n"
-            "0.0 0.0 0.0 0.0\n"
-            "100.0 1000.0 100.0 200.0\n"
-            "200.0 1100.0 150.0 250.0\n"
+            "MD TVD X Y\n4\n0.0 0.0 0.0 0.0\n100.0 1000.0 100.0 200.0\n200.0 1100.0 150.0 250.0\n"
         )
         test_file = tmp_path / "v03_all_float_b.dev"
         test_file.write_text(content, encoding="utf-8")
@@ -2594,20 +2512,14 @@ class TestFixGroupG9:
 
     # === V-04 (MEDIUM): headerless semicolon first row consumed as names ===
 
-    def test_v04_headerless_semicolon_first_row_not_names(
-        self, tmp_path: Path
-    ) -> None:
+    def test_v04_headerless_semicolon_first_row_not_names(self, tmp_path: Path) -> None:
         """V-04: Semicolon-delimited headerless file keeps first row as data.
 
         Before the fix there was no semicolon pre-check, so the first
         all-numeric row was consumed as column names ("1.00","2.00","3.00")
         and the real data shifted.
         """
-        content = (
-            "1.00;2.00;3.00\n"
-            "4.00;5.00;6.00\n"
-            "7.00;8.00;9.00\n"
-        )
+        content = "1.00;2.00;3.00\n4.00;5.00;6.00\n7.00;8.00;9.00\n"
         test_file = tmp_path / "v04_semicolon.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -2629,10 +2541,7 @@ class TestFixGroupG9:
         became column names and the real header became NaN data.
         """
         content = (
-            "WELL-1,1000.0,2000.0,50.0\n"
-            "MD,INC,AZI,TVD\n"
-            "0.0,0.0,90.0,0.0\n"
-            "100.0,0.0,90.0,-100.0\n"
+            "WELL-1,1000.0,2000.0,50.0\nMD,INC,AZI,TVD\n0.0,0.0,90.0,0.0\n100.0,0.0,90.0,-100.0\n"
         )
         test_file = tmp_path / "v05_petrel_comma.dev"
         test_file.write_text(content, encoding="utf-8")
@@ -2641,13 +2550,9 @@ class TestFixGroupG9:
             warnings.simplefilter("always")
             data = read_dev_file(test_file)
 
-        petrel_warnings = [
-            str(x.message) for x in w
-            if "Petrel well-header" in str(x.message)
-        ]
+        petrel_warnings = [str(x.message) for x in w if "Petrel well-header" in str(x.message)]
         assert len(petrel_warnings) == 1, (
-            f"Expected Petrel well-header warning, got: "
-            f"{[str(x.message) for x in w]}"
+            f"Expected Petrel well-header warning, got: {[str(x.message) for x in w]}"
         )
         assert list(data.keys()) == ["MD", "INC", "AZI", "TVD"], (
             f"Expected ['MD','INC','AZI','TVD'], got {list(data.keys())}"
@@ -2659,9 +2564,7 @@ class TestFixGroupG9:
 
     # === V-06 (MEDIUM): short FIRST data row raises instead of NaN-fill ===
 
-    def test_v06_short_first_data_row_nan_filled_not_raise(
-        self, tmp_path: Path
-    ) -> None:
+    def test_v06_short_first_data_row_nan_filled_not_raise(self, tmp_path: Path) -> None:
         """V-06: Ragged first data row NaN-fills instead of DEVReadError.
 
         A short first row (only MD) was indistinguishable from a delimiter
@@ -2669,12 +2572,7 @@ class TestFixGroupG9:
         cross-validation raised.  With corroborating full rows later in the
         file, the short row is NaN-filled like any other ragged row.
         """
-        content = (
-            "MD TVD X Y\n"
-            "0.0\n"
-            "100.0 1000.0 100.0 200.0\n"
-            "200.0 1100.0 150.0 250.0\n"
-        )
+        content = "MD TVD X Y\n0.0\n100.0 1000.0 100.0 200.0\n200.0 1100.0 150.0 250.0\n"
         test_file = tmp_path / "v06_short_first.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -2694,11 +2592,7 @@ class TestFixGroupG9:
         and ``,`` as the decimal separator.  Before the fix these values
         became NaN (no comma-to-dot conversion anywhere).
         """
-        content = (
-            "MD;TVD;INC;AZI\n"
-            "1,00;2,00;3,00;4,00\n"
-            "5,00;6,00;7,00;8,00\n"
-        )
+        content = "MD;TVD;INC;AZI\n1,00;2,00;3,00;4,00\n5,00;6,00;7,00;8,00\n"
         test_file = tmp_path / "v07_locale.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -2711,9 +2605,7 @@ class TestFixGroupG9:
 
     # === V-08 (MEDIUM): thousands separator silently corrupts in comma mode ===
 
-    def test_v08_thousands_separator_recombined_with_warning(
-        self, tmp_path: Path
-    ) -> None:
+    def test_v08_thousands_separator_recombined_with_warning(self, tmp_path: Path) -> None:
         """V-08: "1,234.5" in comma mode is recombined, not column-shifted.
 
         Before the fix the comma delimiter split "1,234.5" into "1" and
@@ -2722,11 +2614,7 @@ class TestFixGroupG9:
         thousands fragment is recombined to "1234.5" with a specific
         warning.
         """
-        content = (
-            "MD,TVD,X,Y\n"
-            "0.0,0.0,0.0,0.0\n"
-            "1000.0,1,234.5,5000.0,6000.0\n"
-        )
+        content = "MD,TVD,X,Y\n0.0,0.0,0.0,0.0\n1000.0,1,234.5,5000.0,6000.0\n"
         test_file = tmp_path / "v08_thousands.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -2739,14 +2627,11 @@ class TestFixGroupG9:
         np.testing.assert_array_equal(data["X"], [0.0, 5000.0])
         np.testing.assert_array_equal(data["Y"], [0.0, 6000.0])
 
-        thousands_warnings = [
-            str(x.message) for x in w
-            if "thousands separator" in str(x.message)
-        ]
+        thousands_warnings = [str(x.message) for x in w if "thousands separator" in str(x.message)]
         assert len(thousands_warnings) >= 1, (
-            f"Expected thousands-separator warning, got: "
-            f"{[str(x.message) for x in w]}"
+            f"Expected thousands-separator warning, got: {[str(x.message) for x in w]}"
         )
+
 
 class TestFixGroupG10:
     """G10: dev_reader validation/columns fixes (V-13, V-17, V-18, E-01,
@@ -2766,11 +2651,7 @@ class TestFixGroupG10:
         MD0/INC0/AZI45 is a realistic surface station — it must be parsed
         as the first data row, not fabricated into columns "0"/"0_2"/"45".
         """
-        content = (
-            "0 0 45\n"
-            "100 5 90\n"
-            "200 8 120\n"
-        )
+        content = "0 0 45\n100 5 90\n200 8 120\n"
         test_file = tmp_path / "v13_surface_station.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -2789,11 +2670,7 @@ class TestFixGroupG10:
         all-integer headerless first row with a matching second-row count
         was consumed as column names.  All rows must survive as data.
         """
-        content = (
-            "100 200 300 400\n"
-            "1.0 2.0 3.0 4.0\n"
-            "5.0 6.0 7.0 8.0\n"
-        )
+        content = "100 200 300 400\n1.0 2.0 3.0 4.0\n5.0 6.0 7.0 8.0\n"
         test_file = tmp_path / "v13_integer_row.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -2829,21 +2706,17 @@ class TestFixGroupG10:
             warnings.simplefilter("always")
             data = read_dev_file(test_file)
 
-        assert "MD_2" in data, (
-            f"Expected MD_2 survivor column, got {list(data.keys())}"
-        )
+        assert "MD_2" in data, f"Expected MD_2 survivor column, got {list(data.keys())}"
         md2_warnings = [
-            str(x.message) for x in w
+            str(x.message)
+            for x in w
             if "MD_2 values are not monotonically increasing" in str(x.message)
         ]
         assert len(md2_warnings) >= 1, (
-            f"Expected MD_2 monotonicity warning, got: "
-            f"{[str(x.message) for x in w]}"
+            f"Expected MD_2 monotonicity warning, got: {[str(x.message) for x in w]}"
         )
 
-    def test_v17_natural_md2_column_validated_not_md_not_found(
-        self, tmp_path: Path
-    ) -> None:
+    def test_v17_natural_md2_column_validated_not_md_not_found(self, tmp_path: Path) -> None:
         """V-17: a NATURAL MD_2 depth column is validated, not skipped.
 
         When the file has only MD_2 (no plain MD), the old exact-match
@@ -2852,10 +2725,7 @@ class TestFixGroupG10:
         ``_md_col is None``.
         """
         content = (
-            "MD_2 TVD X Y\n"
-            "0.0 0.0 1.0 2.0\n"
-            "-10.0 100.0 101.0 102.0\n"
-            "-20.0 200.0 201.0 202.0\n"
+            "MD_2 TVD X Y\n0.0 0.0 1.0 2.0\n-10.0 100.0 101.0 102.0\n-20.0 200.0 201.0 202.0\n"
         )
         test_file = tmp_path / "v17_natural_md2.dev"
         test_file.write_text(content, encoding="utf-8")
@@ -2865,20 +2735,17 @@ class TestFixGroupG10:
             data = read_dev_file(test_file)
 
         assert "MD_2" in data
-        not_found_warnings = [
-            str(x.message) for x in w if "MD column not found" in str(x.message)
-        ]
+        not_found_warnings = [str(x.message) for x in w if "MD column not found" in str(x.message)]
         assert len(not_found_warnings) == 0, (
-            f"Natural MD_2 column must not trigger 'MD column not found': "
-            f"{not_found_warnings}"
+            f"Natural MD_2 column must not trigger 'MD column not found': {not_found_warnings}"
         )
         md2_warnings = [
-            str(x.message) for x in w
+            str(x.message)
+            for x in w
             if "MD_2 values are not monotonically increasing" in str(x.message)
         ]
         assert len(md2_warnings) >= 1, (
-            f"Expected MD_2 monotonicity warning, got: "
-            f"{[str(x.message) for x in w]}"
+            f"Expected MD_2 monotonicity warning, got: {[str(x.message) for x in w]}"
         )
 
     # === V-18 (MEDIUM): empty MIDDLE header cell → column shift ===
@@ -2891,11 +2758,7 @@ class TestFixGroupG10:
         value, Y received X's value, the last value was discarded.  A
         non-trailing empty cell is a malformed header: reject loudly.
         """
-        content = (
-            "MD,TVD,,X,Y\n"
-            "0,0,1,2,3\n"
-            "100,50,30,40,20\n"
-        )
+        content = "MD,TVD,,X,Y\n0,0,1,2,3\n100,50,30,40,20\n"
         test_file = tmp_path / "v18_empty_middle.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -2909,11 +2772,7 @@ class TestFixGroupG10:
         columns — the fix must not regress the documented trailing-comma
         behavior.
         """
-        content = (
-            "MD,TVD,X,Y,\n"
-            "0,0,1,2\n"
-            "100,50,30,40\n"
-        )
+        content = "MD,TVD,X,Y,\n0,0,1,2\n100,50,30,40\n"
         test_file = tmp_path / "v18_trailing.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -2928,24 +2787,20 @@ class TestFixGroupG10:
 
     def test_v18_dug_path_empty_middle_header_rejected(self, tmp_path: Path) -> None:
         """V-18: the DUG header path rejects middle empty cells too."""
-        content = (
-            "Survey\n"
-            "4\n"
-            "MD,TVD,,X,Y\n"
-            "0,0,1,2,3\n"
-        )
+        content = "Survey\n4\nMD,TVD,,X,Y\n0,0,1,2,3\n"
         test_file = tmp_path / "v18_dug_middle.dev"
         test_file.write_text(content, encoding="utf-8")
 
         with pytest.raises(DEVReadError, match="Empty column name in the middle"):
             read_dev_file(test_file)
 
-    # === E-01 (MEDIUM): DEV docstrings promise LASEncodingError ===
+    # === E-01 (MEDIUM) / ENC-03: DEV docstring error contract ===
 
-    def test_e01_dev_docstrings_do_not_promise_lasencodingerror(self) -> None:
-        """E-01: both DEV entry-point docstrings match the DEVReadError-only
-        contract (the code wraps ALL encoding failures into DEVReadError at
-        the read path; the LAS twin was corrected by F-219, DEV was not).
+    def test_e01_dev_docstrings_promise_lasencodingerror(self) -> None:
+        """E-01/ENC-03: both DEV entry-point docstrings document the
+        LASEncodingError propagation contract.  A genuine decoding failure
+        raises LASEncodingError (NOT a misleading 'size exceeded'
+        DEVReadError); the docstrings' Raises sections must list it.
         """
         import inspect
 
@@ -2954,18 +2809,14 @@ class TestFixGroupG10:
         for fn in (read_dev_file, read_dev_file_as_object):
             doc = inspect.getdoc(fn)
             assert doc is not None, f"Missing docstring on {fn.__name__}"
-            assert "LASEncodingError" not in doc, (
-                f"{fn.__name__} docstring still promises LASEncodingError"
+            assert "LASEncodingError" in doc, (
+                f"{fn.__name__} docstring must document LASEncodingError propagation (ENC-03)"
             )
-            assert "DEVReadError" in doc, (
-                f"{fn.__name__} docstring must document DEVReadError"
-            )
+            assert "DEVReadError" in doc, f"{fn.__name__} docstring must document DEVReadError"
 
     # === N-I-24 (MEDIUM, PFA): whitespace count-prefix data loss ===
 
-    def test_n_i24_whitespace_count_prefix_preserves_all_columns(
-        self, tmp_path: Path
-    ) -> None:
+    def test_n_i24_whitespace_count_prefix_preserves_all_columns(self, tmp_path: Path) -> None:
         """N-I-24: whitespace count-prefix file keeps all columns/rows.
 
         `4\\n1.0 2.0 3.0 4.0\\n...` — the count line is a column-count
@@ -2974,12 +2825,7 @@ class TestFixGroupG10:
         I2F-001 test asserted that wrong result).  After the fix the count
         line is skipped and all 3 data rows are preserved in 4 columns.
         """
-        content = (
-            "4\n"
-            "1.0 2.0 3.0 4.0\n"
-            "5.0 6.0 7.0 8.0\n"
-            "9.0 10.0 11.0 12.0\n"
-        )
+        content = "4\n1.0 2.0 3.0 4.0\n5.0 6.0 7.0 8.0\n9.0 10.0 11.0 12.0\n"
         test_file = tmp_path / "n_i24_count_prefix.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -2992,21 +2838,14 @@ class TestFixGroupG10:
         np.testing.assert_array_equal(data["col_2"], [3.0, 7.0, 11.0])
         np.testing.assert_array_equal(data["col_3"], [4.0, 8.0, 12.0])
 
-    def test_n_i24_comma_count_prefix_consistent_with_whitespace(
-        self, tmp_path: Path
-    ) -> None:
+    def test_n_i24_comma_count_prefix_consistent_with_whitespace(self, tmp_path: Path) -> None:
         """N-I-24: comma count-prefix file matches the whitespace contract.
 
         The comma twin must produce the same 4-column / all-rows-preserved
         result as the whitespace side (the asymmetry was the finding's
         crux; G9's V-02 fix aligned it with the wrong I2F-001 result).
         """
-        content = (
-            "4\n"
-            "1.0,2.0,3.0,4.0\n"
-            "5.0,6.0,7.0,8.0\n"
-            "9.0,10.0,11.0,12.0\n"
-        )
+        content = "4\n1.0,2.0,3.0,4.0\n5.0,6.0,7.0,8.0\n9.0,10.0,11.0,12.0\n"
         test_file = tmp_path / "n_i24_comma_prefix.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -3021,9 +2860,7 @@ class TestFixGroupG10:
 
     # === N-I-25 (MEDIUM): mixed-delimiter headerless → single col_0 ===
 
-    def test_n_i25_mixed_delimiter_first_line_delimiter_governs(
-        self, tmp_path: Path
-    ) -> None:
+    def test_n_i25_mixed_delimiter_first_line_delimiter_governs(self, tmp_path: Path) -> None:
         """N-I-25: a space first line is not re-interpreted via a later
         comma line.
 
@@ -3033,11 +2870,7 @@ class TestFixGroupG10:
         line's own delimiter must govern; the comma lines become ragged
         rows (NaN-filled) with warnings.
         """
-        content = (
-            "1.0 2.0 3.0\n"
-            "4.0,5.0,6.0\n"
-            "7.0,8.0,9.0\n"
-        )
+        content = "1.0 2.0 3.0\n4.0,5.0,6.0\n7.0,8.0,9.0\n"
         test_file = tmp_path / "n_i25_mixed.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -3046,8 +2879,7 @@ class TestFixGroupG10:
             data = read_dev_file(test_file)
 
         assert list(data.keys()) == ["col_0", "col_1", "col_2"], (
-            f"Expected 3 columns from the first line's delimiter, got "
-            f"{list(data.keys())}"
+            f"Expected 3 columns from the first line's delimiter, got {list(data.keys())}"
         )
         # First (space-delimited) line is parsed correctly
         assert data["col_0"][0] == 1.0
@@ -3056,9 +2888,7 @@ class TestFixGroupG10:
 
     # === N-I-26 (MEDIUM): unbounded str.split DoS bypass ===
 
-    def test_n_i26_delimiter_detection_split_respects_token_cap(
-        self, tmp_path: Path
-    ) -> None:
+    def test_n_i26_delimiter_detection_split_respects_token_cap(self, tmp_path: Path) -> None:
         """N-I-26: delimiter-detection splits are bounded by the G-18 cap.
 
         The delimiter-detection block ran unbounded ``str.split()`` on the
@@ -3070,11 +2900,7 @@ class TestFixGroupG10:
         """
         from unittest import mock
 
-        content = (
-            "A,B,C D E F G\n"
-            "1,2,3 4 5 6 7\n"
-            "8,9,10 11 12 13\n"
-        )
+        content = "A,B,C D E F G\n1,2,3 4 5 6 7\n8,9,10 11 12 13\n"
         test_file = tmp_path / "n_i26_capped.dev"
         test_file.write_text(content, encoding="utf-8")
 
@@ -3085,6 +2911,598 @@ class TestFixGroupG10:
         # also capped at 3 → comma (3) >= space (3) → comma delimiter.
         # An UNBOUNDED space split (5 tokens) would pick space instead.
         assert list(data.keys()) == ["A", "B"], (
-            f"Expected comma delimiter with capped token counts, got "
-            f"{list(data.keys())}"
+            f"Expected comma delimiter with capped token counts, got {list(data.keys())}"
+        )
+
+
+class TestFixDev01SemicolonCountPrefix:
+    """DEV-01 (MEDIUM): semicolon count-prefix file silently destroyed.
+
+    ``4\\n1.0;2.0;3.0;4.0\\n...`` — the comma pre-check and the whitespace
+    DUG Pattern A return ("headerless", 1) for a single-integer column-count
+    prefix first line, but the semicolon pre-check returned ("headerless", 0)
+    unconditionally, so the count line was consumed as the first data row and
+    3 of 4 columns were lost (col_0=[4.0,nan,nan,nan]).  The header
+    re-derivation also only searched for comma-bearing lines, so the
+    semicolon data line was never found and the delimiter fell back to space.
+
+    Each test FAILS on pre-fix code and PASSES on post-fix code.
+    """
+
+    def test_semicolon_count_prefix_preserves_all_columns(self, tmp_path: Path) -> None:
+        """The semicolon twin must match the comma/whitespace contract."""
+        content = "4\n1.0;2.0;3.0;4.0\n5.0;6.0;7.0;8.0\n9.0;10.0;11.0;12.0\n"
+        test_file = tmp_path / "dev01_semi_prefix.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["col_0", "col_1", "col_2", "col_3"], (
+            f"Expected 4 headerless columns, got {list(data.keys())}"
+        )
+        np.testing.assert_array_equal(data["col_0"], [1.0, 5.0, 9.0])
+        np.testing.assert_array_equal(data["col_1"], [2.0, 6.0, 10.0])
+        np.testing.assert_array_equal(data["col_2"], [3.0, 7.0, 11.0])
+        np.testing.assert_array_equal(data["col_3"], [4.0, 8.0, 12.0])
+
+    def test_semicolon_count_prefix_explicit_delimiter(self, tmp_path: Path) -> None:
+        """Explicit delimiter=";" must not rescue differently (count line
+        is still skipped)."""
+        content = "4\n1.0;2.0;3.0;4.0\n5.0;6.0;7.0;8.0\n9.0;10.0;11.0;12.0\n"
+        test_file = tmp_path / "dev01_semi_prefix_explicit.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file, delimiter=";")
+
+        assert list(data.keys()) == ["col_0", "col_1", "col_2", "col_3"], (
+            f"Expected 4 headerless columns, got {list(data.keys())}"
+        )
+        np.testing.assert_array_equal(data["col_0"], [1.0, 5.0, 9.0])
+        np.testing.assert_array_equal(data["col_1"], [2.0, 6.0, 10.0])
+
+
+class TestFixDev02RaggedRowNoFalseMerge:
+    """DEV-02 (MEDIUM): thousands-recombination false-merge.
+
+    M-76's relaxed gate (``len(values) > expected``) merged a genuinely
+    ragged row's columns into one bogus value: ``MD,TVD,X,Y`` + row
+    ``100,200,300.5,400,500`` → MD=100200300.5, Y=NaN, with a factually
+    wrong "thousands separator" warning.  The recombine function must
+    reject the run when the recombined row cannot satisfy the declared
+    column count and leave the genuine columns intact.
+
+    FAILS on pre-fix code (false merge), PASSES on post-fix code.
+    """
+
+    def test_headered_ragged_row_not_false_merged(self, tmp_path: Path) -> None:
+        content = "MD,TVD,X,Y\n100,200,300.5,400,500\n101,201,301.5,401,501\n"
+        test_file = tmp_path / "dev02_ragged.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        # Genuine values preserved — NO 100200300.5 bogus value.
+        np.testing.assert_array_equal(data["MD"], [100.0, 101.0])
+        np.testing.assert_array_equal(data["TVD"], [200.0, 201.0])
+        np.testing.assert_array_equal(data["X"], [300.5, 301.5])
+        np.testing.assert_array_equal(data["Y"], [400.0, 401.0])
+
+        # The warning must NOT claim a thousands separator (factually wrong).
+        thousands_warnings = [str(x.message) for x in w if "thousands separator" in str(x.message)]
+        assert len(thousands_warnings) == 0, (
+            f"Ragged row must not be reported as a thousands separator, got: {thousands_warnings}"
+        )
+
+    def test_headerless_ragged_row_not_false_merged(self, tmp_path: Path) -> None:
+        content = "100,200,300.5,400,500\n101,201,301.5,401,501\n"
+        test_file = tmp_path / "dev02_ragged_hdrless.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+
+        # All five genuine columns survive (no 100200300.5 merge).
+        assert list(data.keys()) == ["col_0", "col_1", "col_2", "col_3", "col_4"], (
+            f"Expected 5 genuine columns, got {list(data.keys())}"
+        )
+        np.testing.assert_array_equal(data["col_0"], [100.0, 101.0])
+        np.testing.assert_array_equal(data["col_2"], [300.5, 301.5])
+        np.testing.assert_array_equal(data["col_4"], [500.0, 501.0])
+
+
+class TestFixDev03TwoThousandsValues:
+    """DEV-03 (MEDIUM): only the first of two thousands values recombined.
+
+    M-53's first-match early return recombined only the FIRST run per row;
+    a second thousands value (``5,987,654.3``) was destroyed into fabricated
+    columns with NO warning.  Every completed run must now recombine with
+    its own warning.
+
+    FAILS on pre-fix code (second value destroyed, single warning),
+    PASSES on post-fix code.
+    """
+
+    def test_two_thousands_values_both_recombined(self, tmp_path: Path) -> None:
+        content = "A,B,C,D,E,F\n1,2,4,123,456.7,5,987,654.3\n"
+        test_file = tmp_path / "dev03_two_thousands.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        np.testing.assert_array_equal(data["A"], [1.0])
+        np.testing.assert_array_equal(data["B"], [2.0])
+        np.testing.assert_array_equal(data["C"], [4123456.7])
+        # Second thousands value recombined instead of D=5.0/E=987.0/F=654.3.
+        np.testing.assert_array_equal(data["D"], [5987654.3])
+
+        thousands_warnings = [str(x.message) for x in w if "thousands separator" in str(x.message)]
+        assert len(thousands_warnings) >= 2, (
+            f"Expected a warning for EVERY recombined value, got: {[str(x.message) for x in w]}"
+        )
+        assert any("5,987,654.3" in m for m in thousands_warnings), (
+            f"Second thousands value must be warned, got: {thousands_warnings}"
+        )
+
+
+class TestFixDev04SemicolonCommaDecimalHeaderless:
+    """DEV-04 (MEDIUM): semicolon+comma-decimal headerless mis-delimited.
+
+    The format detector correctly reports headerless (semicolon path), but
+    the delimiter picker counted comma FRAGMENTS ("1","00;2","00" = 3) vs
+    semicolon tokens (2) and picked comma, so ``1,00;2,00`` became 3 columns
+    with ``2,00`` destroyed.  For headerless files the delimiter must be
+    chosen by how cleanly it splits the first data line into numeric values.
+
+    FAILS on pre-fix code (3 columns), PASSES on post-fix code (2 columns).
+    """
+
+    def test_semicolon_comma_decimal_headerless_two_columns(self, tmp_path: Path) -> None:
+        content = "1,00;2,00\n3,00;4,00\n5,00;6,00\n"
+        test_file = tmp_path / "dev04_semi_locale.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["col_0", "col_1"], (
+            f"Expected 2 semicolon-delimited columns, got {list(data.keys())}"
+        )
+        np.testing.assert_array_equal(data["col_0"], [1.0, 3.0, 5.0])
+        np.testing.assert_array_equal(data["col_1"], [2.0, 4.0, 6.0])
+
+    def test_semicolon_comma_decimal_first_line_shape(self, tmp_path: Path) -> None:
+        """Literal task shape: ``1,5;2,0;3,0`` first line must stay
+        semicolon-delimited with all three comma-decimal values intact."""
+        content = "1,5;2,0;3,0\n4,5;5,0;6,0\n"
+        test_file = tmp_path / "dev04_semi_locale3.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["col_0", "col_1", "col_2"], (
+            f"Expected 3 semicolon-delimited columns, got {list(data.keys())}"
+        )
+        np.testing.assert_array_equal(data["col_0"], [1.5, 4.5])
+        np.testing.assert_array_equal(data["col_1"], [2.0, 5.0])
+        np.testing.assert_array_equal(data["col_2"], [3.0, 6.0])
+
+
+class TestFixDev05SpaceHeaderlessThousandsFirstRow:
+    """DEV-05 (MEDIUM): space headerless + thousands first row.
+
+    ``1,234 5,678\\n...`` — the whitespace headerless detection rejected the
+    thousands tokens (M-25 gate: "1,234" is NOT a float), so the first data
+    row was consumed as a fabricated comma-split header AND the delimiter
+    switched to comma (3 comma fragments > 2 space tokens), destroying the
+    whole file (cols ['1','234 5','678']).  Thousands-style tokens must be
+    recognised as numeric data for detection/delimiter purposes (values
+    still parse to NaN per the documented M-25 thousands behavior, with a
+    warning — but the structure, delimiter, and row count are correct).
+
+    FAILS on pre-fix code (fabricated 3-column header), PASSES on post-fix.
+    """
+
+    def test_space_thousands_first_row_not_consumed_as_header(self, tmp_path: Path) -> None:
+        content = "1,234 5,678\n9,000 10,456\n11,000 12,789\n"
+        test_file = tmp_path / "dev05_space_thousands.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        # Structure: 2 space-delimited columns, 3 data rows — the first
+        # row is NOT consumed as a fabricated header ('1','234 5','678').
+        assert list(data.keys()) == ["col_0", "col_1"], (
+            f"Expected 2 columns from the space delimiter, got {list(data.keys())}"
+        )
+        assert len(data["col_0"]) == 3, f"Expected 3 data rows, got {len(data['col_0'])}"
+        # M-25 documented behavior: thousands values in space-delimited
+        # data are left unconverted (NaN) with an explicit warning.
+        assert all(np.isnan(v) for v in data["col_0"]), (
+            f"col_0 should be all-NaN (thousands unsupported), got {list(data['col_0'])}"
+        )
+        thousands_warnings = [str(x.message) for x in w if "thousands separators" in str(x.message)]
+        assert len(thousands_warnings) >= 1, (
+            f"Expected a thousands-separator warning, got: {[str(x.message) for x in w]}"
+        )
+
+
+class TestFixI2_14SpaceCommaDecimalHeaderless:
+    """I2-14 (MEDIUM): space-delimited comma-decimal headerless file.
+
+    ``1,5 2,0 3,0`` headerless was mis-delimited as comma (the raw
+    fragment-count heuristic always beat space: 4 comma fragments > 3 space
+    tokens), destroying the file (M-54's own docstring example corrupts).
+    The delimiter picker is now comma-decimal-aware (DEV-A's
+    ``_pick_headerless_delimiter`` scores by numeric-token fraction, so
+    space wins 3/3 vs comma 2/4), and the count-prefix variant
+    (``3\\n1,5 2,0 3,0\\n...``) is no longer misdetected as DUG (the DUG
+    Pattern A second-line check is comma-decimal aware).
+
+    FAILS on pre-fix code (fabricated cols ['1','5 2','0 3','0']), PASSES
+    on post-fix.
+    """
+
+    def test_space_comma_decimal_headerless_m_docstring_example(self, tmp_path: Path) -> None:
+        """M-54's own docstring example ``1,5 2,0 3,0`` parses as space."""
+        content = "1,5 2,0 3,0\n2,5 4,0 6,0\n3,5 6,0 9,0\n"
+        test_file = tmp_path / "i214_space_locale.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["col_0", "col_1", "col_2"], (
+            f"Expected 3 space-delimited columns, got {list(data.keys())}"
+        )
+        np.testing.assert_array_equal(data["col_0"], [1.5, 2.5, 3.5])
+        np.testing.assert_array_equal(data["col_1"], [2.0, 4.0, 6.0])
+        np.testing.assert_array_equal(data["col_2"], [3.0, 6.0, 9.0])
+
+    def test_count_prefix_variant_not_misdetected_as_dug(self, tmp_path: Path) -> None:
+        """``3\\n1,5 2,0 3,0\\n...`` — count-prefix stays headerless,
+        not DUG (pre-fix: ('dug', 2), fabricated comma-split columns)."""
+        content = "3\n1,5 2,0 3,0\n4,5 5,0 6,0\n7,5 8,0 9,0\n"
+        test_file = tmp_path / "i214_count_prefix.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["col_0", "col_1", "col_2"], (
+            f"Expected 3 space-delimited columns (count-prefix), got {list(data.keys())}"
+        )
+        np.testing.assert_array_equal(data["col_0"], [1.5, 4.5, 7.5])
+        np.testing.assert_array_equal(data["col_1"], [2.0, 5.0, 8.0])
+        np.testing.assert_array_equal(data["col_2"], [3.0, 6.0, 9.0])
+
+
+class TestFixI2_15NumericPetrelWellName:
+    """I2-15 (MEDIUM): numeric Petrel well name defeats F-093.
+
+    A Petrel well-header whose well NAME is numeric (``100 1000.0 2000.0
+    50.0``) is all-numeric, so F-093's ``not _is_float_token(_hdr_tokens[0])``
+    guard rejected it → headerless misdetection, fabricated col_0..col_3,
+    real 10-column header row all-NaN.  The fix: when the SECOND content
+    line is a genuine text column header, the all-float headerless paths
+    fall through to F-093, and F-093 accepts a numeric well name.
+
+    FAILS on pre-fix code (fabricated col_0..col_3), PASSES on post-fix.
+    """
+
+    def test_numeric_well_name_petrel_parses_correctly(self, tmp_path: Path) -> None:
+        content = (
+            "100 1000.0 2000.0 50.0\n"  # Petrel well-header, numeric name
+            "MD TVD INC AZI\n"  # real column names
+            "0 0 45 1.0\n"  # data row 1
+            "100 100.0 45.5 2.0\n"  # data row 2
+            "200 200.0 45.6 3.0\n"  # data row 3
+        )
+        test_file = tmp_path / "i215_numeric_petrel.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        # Correct column names from the real header (NOT col_0..col_3
+        # fabricated from the well-header, and NOT the well-header tokens).
+        assert list(data.keys()) == ["MD", "TVD", "INC", "AZI"], (
+            f"Expected ['MD','TVD','INC','AZI'], got {list(data.keys())}"
+        )
+        # Real data rows (the header row must NOT become an all-NaN row).
+        np.testing.assert_array_equal(data["MD"], [0.0, 100.0, 200.0])
+        np.testing.assert_array_equal(data["TVD"], [0.0, 100.0, 200.0])
+        np.testing.assert_array_equal(data["INC"], [45.0, 45.5, 45.6])
+        np.testing.assert_array_equal(data["AZI"], [1.0, 2.0, 3.0])
+        # The well-header warning still fires (F-093 behavior preserved).
+        petrel_warnings = [str(x.message) for x in w if "Petrel well-header" in str(x.message)]
+        assert len(petrel_warnings) == 1, (
+            f"Expected Petrel well-header warning, got: {[str(x.message) for x in w]}"
+        )
+
+
+class TestFixI2_17SemicolonUSThousands:
+    """I2-17 (MEDIUM): semicolon US-locale files silently corrupted.
+
+    ``MD;TVD\\n100.0;1,234\\n`` read TVD as [1.234] — a genuine US-locale
+    thousands value 1234 silently converted to 1.234 (1000x corruption)
+    with ZERO warnings (F-13 ungated the semicolon path, contradicting
+    M-25's documented intent).  The fix reads 3-digit comma groups in
+    semicolon files as thousands VALUES (1234) with a LOUD summary warning.
+
+    FAILS on pre-fix code (TVD=[1.234,2.345], 0 warnings), PASSES on
+    post-fix.
+    """
+
+    def test_semicolon_us_thousands_read_as_thousands_with_warning(self, tmp_path: Path) -> None:
+        content = "MD;TVD\n100.0;1,234\n200.0;2,345\n"
+        test_file = tmp_path / "i217_semi_us.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["MD", "TVD"]
+        np.testing.assert_array_equal(data["MD"], [100.0, 200.0])
+        # Thousands reading: 1,234 -> 1234 (NOT 1.234).
+        np.testing.assert_array_equal(data["TVD"], [1234.0, 2345.0])
+        # A LOUD warning must fire (pre-fix: zero warnings).
+        thousands_warnings = [str(x.message) for x in w if "thousands separators" in str(x.message)]
+        assert len(thousands_warnings) >= 1, (
+            f"Expected a thousands-separator warning, got: {[str(x.message) for x in w]}"
+        )
+        assert "read as thousands" in thousands_warnings[0], (
+            f"Warning must state the thousands reading, got: {thousands_warnings[0]}"
+        )
+
+    def test_semicolon_v07_locale_decimals_still_convert(self, tmp_path: Path) -> None:
+        """V-07 regression guard: 1-2 digit comma decimals still convert."""
+        content = "MD;TVD;INC;AZI\n1,00;2,00;3,00;4,00\n5,00;6,00;7,00;8,00\n"
+        test_file = tmp_path / "i217_v07_guard.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["MD", "TVD", "INC", "AZI"]
+        np.testing.assert_array_equal(data["MD"], [1.0, 5.0])
+        np.testing.assert_array_equal(data["TVD"], [2.0, 6.0])
+        np.testing.assert_array_equal(data["INC"], [3.0, 7.0])
+        np.testing.assert_array_equal(data["AZI"], [4.0, 8.0])
+
+
+class TestFixI2_18LinearThousandsRecombine:
+    """I2-18 (MEDIUM): O(n²) hang in _recombine_thousands_separators.
+
+    A comma row of n bare 3-digit tokens (e.g. ``234,234,...``) triggered a
+    quadratic scan — ~18min at 100K tokens.  The recombine is now a single
+    left-to-right pass: a run without a closing decimal/exponent fragment
+    is emitted and LOCKED (never re-scanned from inside).  The function is
+    linear; a 20000-bare-token row completes in well under a second.
+
+    FAILS on pre-fix code (44.5s at n=20000 end-to-end), PASSES on post-fix.
+    """
+
+    def test_large_bare_three_digit_row_is_linear(self, tmp_path: Path) -> None:
+        import time
+
+        from pylasdev.dev_reader import _recombine_thousands_separators
+
+        n = 20000
+        values = ["234"] * n
+        t0 = time.perf_counter()
+        _recombine_thousands_separators(values, n - 1)
+        elapsed = time.perf_counter() - t0
+        # Linear single-pass: ~4ms at n=20000 post-fix (was ~44s end-to-end
+        # pre-fix).  A generous <2s bound rejects the quadratic pre-fix
+        # behavior while leaving headroom for slow CI machines.
+        assert elapsed < 2.0, (
+            f"_recombine_thousands_separators took {elapsed:.2f}s on a "
+            f"{n}-token bare row — must be linear, not O(n²) (I2-18)"
+        )
+
+    def test_large_bare_three_digit_row_end_to_end(self, tmp_path: Path) -> None:
+        """End-to-end through the reader on a headerless comma file with 2
+        rows of n bare 3-digit tokens (finding baseline: 29.28s at n=16000).
+        """
+        import time
+
+        n = 8000
+        row = ",".join(["234"] * n)
+        content = f"{row}\n{row}\n"
+        test_file = tmp_path / "i218_bare_row.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            t0 = time.perf_counter()
+            data = read_dev_file(test_file)
+            elapsed = time.perf_counter() - t0
+
+        assert list(data.keys()) == [f"col_{i}" for i in range(n)], (
+            f"Expected {n} columns, got {len(list(data.keys()))}"
+        )
+        assert elapsed < 5.0, (
+            f"End-to-end read took {elapsed:.2f}s for n={n} bare tokens — "
+            f"must be linear (pre-fix: 7.30s at n=8000, 29.28s at n=16000; "
+            f"post-fix: ~0.5s at n=8000)"
+        )
+
+
+class TestFixENC03DevEncodingErrorPropagation:
+    """ENC-03 (dev_reader side): genuine LASEncodingError is not relabeled.
+
+    read_dev_file / read_dev_file_as_object previously caught LASEncodingError
+    in the ``(ValueError, LookupError, LASEncodingError)`` tuple and re-raised
+    a misleading ``DEVReadError('size exceeded or invalid parameter')``.  The
+    tuple is now ``except ValueError`` (size-exceeded stays DEVReadError per
+    README/code/tests consensus); LASEncodingError propagates with its
+    accurate message.
+
+    FAILS on pre-fix code (DEVReadError 'size exceeded'), PASSES on post-fix.
+    """
+
+    def test_genuine_decode_failure_propagates_las_encoding_error(self, tmp_path: Path) -> None:
+        from unittest import mock
+
+        content = b"\xff\xfe\x00\x01"  # Invalid encoding bytes
+        test_file = tmp_path / "enc03_bad_encoding.dev"
+        test_file.write_bytes(content)
+
+        # Without chardet and empty fallback chain, encoding fails.
+        with mock.patch("pylasdev.encoding.FALLBACK_ENCODINGS", []):
+            with mock.patch("pylasdev.encoding.HAS_CHARDET", False):
+                with pytest.raises(LASEncodingError, match="Failed to decode"):
+                    read_dev_file(test_file)
+
+    def test_size_exceeded_stays_dev_read_error(self, tmp_path: Path) -> None:
+        """Guard: the size-exceeded contract stays DEVReadError (ENC-03)."""
+        content = "MD TVD\n0 0\n100 100\n"
+        test_file = tmp_path / "enc03_size.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with pytest.raises(DEVReadError, match="size exceeded"):
+            read_dev_file(test_file, max_file_size=1)
+
+
+class TestFixMOD11DevMetaFilter:
+    """MOD-11 (dev_reader side): legacy dict filter respects _DEV_META_KEYS.
+
+    read_dev_file's legacy dict filter stripped EVERY ``_meta_``-prefixed key
+    unconditionally, hijacking a user column literally named ``_meta_...``
+    (e.g. ``_meta_source_file`` with an array value).  The filter now uses
+    models' ``_is_encoded_dev_metadata_key`` (closed ``_DEV_META_KEYS`` +
+    value-shape disambiguation): only ``_meta_<known>`` with a
+    metadata-shaped value is metadata; everything else is a user column
+    verbatim.
+
+    FAILS on pre-fix code (column dropped), PASSES on post-fix.
+    """
+
+    def test_meta_source_file_user_column_preserved(self, tmp_path: Path) -> None:
+        content = "_meta_source_file MD\n1 0\n2 100\n"
+        test_file = tmp_path / "mod11_meta_col.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file, normalize_aliases=False)
+
+        # The user column must survive the legacy dict filter.
+        assert "_meta_source_file" in data, (
+            f"User column '_meta_source_file' must be preserved, got {list(data.keys())}"
+        )
+        assert "MD" in data, f"Expected MD column, got {list(data.keys())}"
+        # Real metadata keys still strip (they are not columns).
+        assert "source_file" not in data, (
+            f"Metadata key 'source_file' must be stripped, got {list(data.keys())}"
+        )
+        assert "encoding" not in data
+        assert "column_order" not in data
+        # Column data is intact.
+        np.testing.assert_array_equal(data["_meta_source_file"], [1.0, 2.0])
+        np.testing.assert_array_equal(data["MD"], [0.0, 100.0])
+
+    def test_real_metadata_keys_still_strip(self, tmp_path: Path) -> None:
+        """Guard: genuine metadata still removed; collision roundtrip works."""
+        content = "source_file MD\n0 0\n100 100\n"
+        test_file = tmp_path / "mod11_collision.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # normalize_aliases=False keeps the literal "source_file" column
+            # name so the metadata collision path (to_dict emits
+            # _meta_source_file) is exercised.
+            data = read_dev_file(test_file, normalize_aliases=False)
+
+        # Column named "source_file" is data, preserved verbatim.
+        assert "source_file" in data, (
+            f"Column 'source_file' must be preserved, got {list(data.keys())}"
+        )
+        # The METADATA emitted as _meta_source_file (collision path) strips.
+        assert not any(k.startswith("_meta_") for k in data), (
+            f"No _meta_ metadata may leak, got {list(data.keys())}"
+        )
+        assert "MD" in data
+
+
+class TestFixI2_16HeaderedThousandsNoFalseMerge:
+    """I2-16 (MEDIUM): F-07 4-digit-leading-group guard for ALL rows.
+
+    The F-07 guard (a 4+ digit leading group like ``1000`` in
+    ``1000,234.5`` is NOT a valid thousands grouping) was previously wired
+    only to the headerless FIRST row; headered rows and headerless LATER
+    rows false-merged ``1000,234.5`` -> ``1000234.5``, destroying the
+    genuine 1000 and 234.5 values.  The recombine function now enforces
+    the guard inside for EVERY row (DEV-A's rewrite, I2-16).
+
+    FAILS on pre-fix code (MD=[1000234.5]), PASSES on post-fix.
+    """
+
+    def test_headered_row_four_digit_leading_group_not_merged(self, tmp_path: Path) -> None:
+        """Finding shape: 2-column header + 3-token row (surplus) — the
+        4+ digit leading group ``1000`` must NOT recombine into 1000234.5.
+        """
+        content = "MD,INC\n1000,234.5,999\n1001,235.5,998\n"
+        test_file = tmp_path / "i216_headered.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["MD", "INC"], f"Expected ['MD','INC'], got {list(data.keys())}"
+        # 1000 and 234.5 must stay separate columns — NOT 1000234.5.
+        np.testing.assert_array_equal(data["MD"], [1000.0, 1001.0])
+        np.testing.assert_array_equal(data["INC"], [234.5, 235.5])
+        # No thousands warning — nothing was recombined.
+        thousands_warnings = [str(x.message) for x in w if "thousands separator" in str(x.message)]
+        assert len(thousands_warnings) == 0, (
+            f"No thousands warning expected (no merge), got: {thousands_warnings}"
+        )
+
+    def test_headerless_later_row_four_digit_leading_group_not_merged(self, tmp_path: Path) -> None:
+        """Finding shape (ADV-M2): headerless file whose FIRST row defines 2
+        columns, and a LATER row carries ``1000,234.5,999`` (surplus).  The
+        F-07 guard was wired only to the headerless FIRST row, so the later
+        row false-merged 1000,234.5 -> 1000234.5.  The guard now applies
+        inside the recombine function for EVERY row (I2-16)."""
+        content = "1,2\n3,4\n1000,234.5,999\n"
+        test_file = tmp_path / "i216_later.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["col_0", "col_1"], (
+            f"Expected 2 columns (first row defines count), got {list(data.keys())}"
+        )
+        # 1000 and 234.5 must stay separate — NOT 1000234.5 in col_0.
+        np.testing.assert_array_equal(data["col_0"], [1.0, 3.0, 1000.0])
+        np.testing.assert_array_equal(data["col_1"], [2.0, 4.0, 234.5])
+        # The extra 999 is discarded with an extra-column warning (not a
+        # thousands merge warning).
+        thousands_warnings = [str(x.message) for x in w if "thousands separator" in str(x.message)]
+        assert len(thousands_warnings) == 0, (
+            f"No thousands warning expected (no merge), got: {thousands_warnings}"
         )

@@ -29,6 +29,16 @@ MAX_DATA_LINES = 10_000_000
 # with 1K curves x 1M lines (1B elements ≈ 8 GB) passes both guards independently
 # but OOMs during np.zeros pre-allocation. Overridable by setting module constant.
 MAX_TOTAL_ELEMENTS = 1_000_000_000
+# DR-05: Python-object accumulation cap for string data on the LAS 1.2/2.0
+# paths.  MAX_TOTAL_ELEMENTS guards numpy array allocation at ~8 B/element
+# (~8 GB intent), but each Python str object stored in an object-dtype array
+# or list costs ~50-100 B (measured) — a crafted file that passes the element
+# guard can amplify to ~50-100 GB.  The LAS 3.0 path already caps string
+# values at MAX_TOTAL_ELEMENTS // 12 (_las30_data._MAX_STRING_VALUES); this
+# is the equivalent cap for _read_normal / _read_wrapped string accumulation.
+# When the cap is exceeded the file is malformed/crafted — reject like the
+# other MAX_* guards.  Overridable by setting the module constant.
+MAX_STRING_VALUES = MAX_TOTAL_ELEMENTS // 12
 # G-18: Per-line token limit to prevent single-line memory DoS via unbounded
 # split().  Existing guards (MAX_DATA_LINES, MAX_CURVES, MAX_TOTAL_ELEMENTS)
 # are product-based and do not protect against a single line with millions
@@ -108,6 +118,7 @@ def _get_parser_module() -> ModuleType:
     call time, avoiding the cycle.
     """
     from . import parser as _p
+
     return _p
 
 
@@ -139,7 +150,7 @@ def _desanitize_las_value(value: str, _enabled: bool | None = None) -> str:
         return value[1:]
     idx = value.find("_#")
     if idx > 0 and value[idx - 1].isspace():
-        return value[:idx] + value[idx + 1:]
+        return value[:idx] + value[idx + 1 :]
     return value
 
 
@@ -190,17 +201,22 @@ def _get_null_value(
     try:
         # IT3-THR-01: case-insensitive NULL lookup (see _get_well_entry_ci)
         # so declared NULL and the fill sentinel always agree.
-        null_value = _parse_float_with_d_notation(
-            _get_well_entry_ci(well, "NULL", default)
-        )
+        null_value = _parse_float_with_d_notation(_get_well_entry_ci(well, "NULL", default))
         # F-04: Reject non-finite sentinel values (NaN, Inf, -Inf) which
         # float() accepts without error.  These propagate through numpy
         # arrays → corrupted statistics → writer outputs "nan" (invalid LAS).
         if not np.isfinite(null_value):
-            raise LASParseError(
-                f"NULL value must be a finite number, got {null_value!r}"
-            )
+            raise LASParseError(f"NULL value must be a finite number, got {null_value!r}")
         return null_value
+    except OverflowError:
+        # DR-02: Python <=3.12 float('1e400') raises OverflowError instead
+        # of returning inf.  Match the F-04 finite-guard behavior below (the
+        # 3.13+ path) so the documented LASParseError boundary holds on all
+        # supported Pythons; falling back to the default here would diverge
+        # per-version (3.12 falls back to the sentinel, 3.13 raises).
+        raise LASParseError(
+            "NULL value must be a finite number, got a value that overflows the float range"
+        ) from None
     except (ValueError, TypeError, AttributeError):
         # F-I2-XPD-05: Log a warning when falling back to the default
         # null value.  Silent fallback to -999.25 with zero diagnostics
@@ -367,8 +383,9 @@ def _to_finite_float(
     return val
 
 
-def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int,
-                    desanitize: bool = True) -> None:
+def read_ascii_data(
+    lines: list[str], las_file: LASFile, data_line_count: int, desanitize: bool = True
+) -> None:
     """Read the ~A (ASCII data) section and populate las_file.logs.
 
     Args:
@@ -455,12 +472,19 @@ def read_ascii_data(lines: list[str], las_file: LASFile, data_line_count: int,
         _desanitize_enabled = bool(_parser_mod._DESANITIZE_ENABLED)
         if actual_wrap:
             _read_wrapped(
-                lines, las_file, curve_count, delimiter,
+                lines,
+                las_file,
+                curve_count,
+                delimiter,
                 _desanitize_enabled=_desanitize_enabled,
             )
         else:
             _read_normal(
-                lines, las_file, curve_count, data_line_count, delimiter,
+                lines,
+                las_file,
+                curve_count,
+                data_line_count,
+                delimiter,
                 _desanitize_enabled=_desanitize_enabled,
             )
     finally:
@@ -587,6 +611,42 @@ def _detect_actual_wrap(
         # DEPT/curve alignment.)
         return n >= curve_count
 
+    # F-07 (DR-01/I2-04): depth-line evidence rule.  A genuine wrapped
+    # file ALWAYS has depth lines (rows with exactly 1 value); a
+    # non-wrapped file essentially never has a mid-window 1-value row (a
+    # mnemonic-header masquerade IS wrapped evidence, DR-01a).  When any
+    # later window line carries exactly 1 value:
+    #   - declared WRAP=YES → wrapped (I2-04: [3,3,1,1] — two full
+    #     leading rows no longer beat the declaration + depth evidence)
+    #   - first line full AND the depth evidence is unambiguous → wrapped
+    #     (DR-01 both triggers: mixed-wrap / mnemonic-header masquerade
+    #     [3,1,1] / [3,1,2,1] with WRAP=NO or absent — content outranks a
+    #     NO header).  "Unambiguous" means a 1-value row immediately
+    #     after the full first row, OR at least two 1-value rows in the
+    #     window — a single trailing 1-value row after short rows
+    #     ([3,2,1]) is a ragged non-wrapped row and must stay non-wrapped
+    #     (graceful short-row null-fill).
+    #     REFINEMENT (mirrors _las30_data.py, I2-03 contract divergence):
+    #     for curve_count == 2 a 1-value row is AMBIGUOUS — a wrapped
+    #     continuation line also carries curve_count-1 == 1 value, so a
+    #     single 1-value row right after the full first row ([2,1,2], a
+    #     string-padding file where the second row has one missing column)
+    #     must NOT be treated as unambiguous depth evidence.  The
+    #     ≥2-one-value-rows arm still catches genuine 2-curve wrapped
+    #     files ([2,1,1,1] mixed-wrap: depth + continuation pairs).  For
+    #     curve_count >= 3 a 1-value row can ONLY be a depth line
+    #     (continuations carry >= 2 values) → the window[1]==1 arm is
+    #     unambiguous there.
+    # Otherwise fall through to the existing rules unchanged.
+    depth_later = len(window) > 1 and any(n == 1 for n in window[1:])
+    if depth_later:
+        if declared_wrap is not None and declared_wrap.upper() == "YES":
+            return True
+        if _is_full(window[0]) and (
+            (curve_count >= 3 and window[1] == 1) or sum(1 for n in window[1:] if n == 1) >= 2
+        ):
+            return True
+
     # First line full → non-wrapped (wrapped first line is always depth).
     # M-38: BUT a WRAP=YES header with a COMPLETE first row can still be a
     # genuine mixed-wrap file (per-row line-width wrapping): first row
@@ -664,9 +724,7 @@ def _deduplicate_curves(las_file: LASFile, _stacklevel: int = 2) -> None:
     for idx, name in enumerate(las_file.curves_order):
         if name in seen:
             seen[name] += 1
-            new_name = _resolve_unique_curve_name(
-                name, seen[name], output_names
-            )
+            new_name = _resolve_unique_curve_name(name, seen[name], output_names)
             # Update the seen counter to match the actual suffix used
             seen[name] = _suffix_from_name(new_name, name)
             _rename_duplicate_curve(
@@ -685,9 +743,7 @@ def _deduplicate_curves(las_file: LASFile, _stacklevel: int = 2) -> None:
             # ["DEPT","DEPT_2","DEPT_2_2"], not
             # ["DEPT","DEPT_2","DEPT_2"] with duplicate keys.
             if name in output_names:
-                new_name = _resolve_unique_curve_name(
-                    name, 2, output_names
-                )
+                new_name = _resolve_unique_curve_name(name, 2, output_names)
                 seen[name] = _suffix_from_name(new_name, name)
                 _rename_duplicate_curve(
                     las_file,
@@ -743,7 +799,7 @@ def _suffix_from_name(name: str, base_name: str) -> int:
     assigned by :func:`_resolve_unique_curve_name`.
     """
     try:
-        return int(name[len(base_name) + 1:])
+        return int(name[len(base_name) + 1 :])
     except (ValueError, IndexError):
         return 0
 
@@ -889,6 +945,11 @@ def _read_normal(
     # mnemonics) once per read — building it per data row would make the
     # hot loop O(rows x curves) for set construction.
     _mnemonic_declared = _mnemonic_header_declared(las_file)
+    # DR-05: Count string-curve values stored.  MAX_TOTAL_ELEMENTS accounts
+    # numpy allocation at ~8 B/element, but each Python str object costs
+    # ~50-100 B — a crafted file can pass the element guard and still
+    # allocate ~50-100 GB.  Mirror the LAS 3.0 _MAX_STRING_VALUES cap.
+    _string_value_count = 0
 
     # L-03: The null sentinel must be known BEFORE allocation to decide the
     # dtype.  int64 allocation would truncate a fractional null sentinel
@@ -902,8 +963,7 @@ def _read_normal(
     # dtype path (EXT-04) which holds arbitrary Python ints exactly.
     null_value = _get_null_value(las_file.well)
     _null_is_integral = (
-        float(null_value).is_integer()
-        and _INT64_MIN <= int(null_value) <= _INT64_MAX
+        float(null_value).is_integer() and _INT64_MIN <= int(null_value) <= _INT64_MAX
     )
 
     # Pre-allocate arrays — string curves go to string_data, numeric to logs.
@@ -913,29 +973,21 @@ def _read_normal(
     _string_curve_map: dict[int, str] = {}  # index → curve_name for fast lookup
     for i, curve_name in enumerate(las_file.curves_order):
         if i in _string_curve_indices:
-            las_file.string_data[curve_name] = np.full(
-                data_line_count, "", dtype=object
-            )
+            las_file.string_data[curve_name] = np.full(data_line_count, "", dtype=object)
             _string_curve_map[i] = curve_name
         elif i in _integer_curve_indices:
             if _null_is_integral:
                 # L-03: int64 storage for {I} curves — preserves exact
                 # integer values above 2^53 that float64 cannot represent.
-                las_file.logs[curve_name] = np.zeros(
-                    data_line_count, dtype=np.int64
-                )
+                las_file.logs[curve_name] = np.zeros(data_line_count, dtype=np.int64)
             else:
                 # EXT-04: fractional declared NULL — object dtype preserves
                 # exact integer values above 2^53 while null cells keep the
                 # fractional sentinel (int64 would truncate -999.25 → -999).
-                las_file.logs[curve_name] = np.zeros(
-                    data_line_count, dtype=object
-                )
+                las_file.logs[curve_name] = np.zeros(data_line_count, dtype=object)
             _numeric_curve_indices.append(i)
         else:
-            las_file.logs[curve_name] = np.zeros(
-                data_line_count, dtype=np.float64
-            )
+            las_file.logs[curve_name] = np.zeros(data_line_count, dtype=np.float64)
             _numeric_curve_indices.append(i)
 
     # FIX-CONV-2: data_line_count is a pre-allocation hint, never a
@@ -947,8 +999,7 @@ def _read_normal(
     # Pre-extract numeric arrays for fast inner-loop access.
     # String array access is direct via las_file.string_data since we
     # cannot mix dtypes in a homogeneous list.
-    curve_arrays = [las_file.logs[name] for name in las_file.curves_order
-                    if name in las_file.logs]
+    curve_arrays = [las_file.logs[name] for name in las_file.curves_order if name in las_file.logs]
     # Build a mapping from logical curve index → numeric array index
     # for the inner loop (string curves are excluded from curve_arrays).
     _logical_to_numeric: dict[int, int] = {}
@@ -964,6 +1015,8 @@ def _read_normal(
     # counted silently; a summary is logged at the end of the section.
     extra_col_count: int | None = None  # Track extra-column count for summary
     short_row_count: int | None = None  # F-11: Track short-row count for summary
+    # I2-02: Track embedded-delimiter string truncation for summary.
+    embedded_delim_count: int | None = None
 
     for stripped in _iter_ascii_data_lines(lines):
         # Split using DLM-aware split (shared utility).
@@ -976,7 +1029,10 @@ def _read_normal(
         # all-null first row and shifted every value by one column.  Skip
         # it so it is not counted as a data row.
         if _is_mnemonic_header_row(
-            values, las_file, curve_count, _string_curve_indices,
+            values,
+            las_file,
+            curve_count,
+            _string_curve_indices,
             declared=_mnemonic_declared,
         ):
             continue
@@ -996,6 +1052,33 @@ def _read_normal(
                 extra_col_count = 1
             else:
                 extra_col_count += 1
+            # I2-02: DLM=COMMA + embedded comma in a {S} string value
+            # truncates the string AND shifts every following column —
+            # the next column's genuine value is destroyed (verified:
+            # `100.0,WELL, TX,10` with DEPT/WELL{S}/GR → WELL truncated
+            # to "WELL", GR receives " TX" → null, genuine 10 lost as a
+            # discarded extra column).  csv.reader quote-awareness is
+            # deliberately NOT used (F2-015: the writer emits raw
+            # delimiter.join() with no CSV quotes, so adding quote
+            # parsing would break the writer's own roundtrips) — the
+            # correct response for external files is a LOUD warning that
+            # the value was truncated/lost, not a silent shift.
+            if delimiter != " " and _string_curve_indices:
+                if embedded_delim_count is None:
+                    warnings.warn(
+                        f"Data line has {len(values)} values but only {curve_count} "
+                        f"curves declared with DLM={delimiter!r}. A string curve "
+                        f"value may contain the delimiter character, truncating "
+                        f"the string and shifting the following columns (genuine "
+                        f"values may be lost). Consider quoting string values or "
+                        f"using a delimiter not present in the data. "
+                        f"(Further occurrences will be counted.)",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    embedded_delim_count = 1
+                else:
+                    embedded_delim_count += 1
 
         # F-11: Warn when non-wrapped data lines have fewer values than
         # declared curves. Short rows in WRAP=YES mode are expected;
@@ -1036,7 +1119,7 @@ def _read_normal(
                 if curve_name in las_file.logs:
                     _old_arr = las_file.logs[curve_name]
                     _new_arr = np.zeros(_new_capacity, dtype=_old_arr.dtype)
-                    _new_arr[:_old_arr.shape[0]] = _old_arr
+                    _new_arr[: _old_arr.shape[0]] = _old_arr
                     # Whole-container growth: EVERY curve array is resized to
                     # the same _new_capacity, so the M-43 equal-length
                     # invariant holds after the pass.  Bypass the per-key
@@ -1047,21 +1130,30 @@ def _read_normal(
                 if curve_name in las_file.string_data:
                     _old_str = las_file.string_data[curve_name]
                     _new_str = np.full(_new_capacity, "", dtype=object)
-                    _new_str[:_old_str.shape[0]] = _old_str
+                    _new_str[: _old_str.shape[0]] = _old_str
                     dict.__setitem__(las_file.string_data, curve_name, _new_str)
             _allocated = _new_capacity
             # Rebuild the pre-extracted numeric references — they now point
             # at the old (too-small) arrays.
             curve_arrays = [
-                las_file.logs[name]
-                for name in las_file.curves_order
-                if name in las_file.logs
+                las_file.logs[name] for name in las_file.curves_order if name in las_file.logs
             ]
 
         for i in range(min(len(values), curve_count)):
             if i in _string_curve_indices:
                 # F-WXP-01: String curve — store raw value verbatim.
+                # DR-05: Cap Python-object accumulation (string values
+                # amplify ~6-12x beyond the element guard's 8 B/element).
+                # Mirrors _las30_data._check_string_cap semantics: raise
+                # once the count reaches the cap, before storing.
                 curve_name = _string_curve_map[i]
+                if _string_value_count >= MAX_STRING_VALUES:
+                    raise LASParseError(
+                        f"String curve values exceed maximum allowed "
+                        f"({MAX_STRING_VALUES}). The file may be malformed "
+                        f"or corrupt."
+                    )
+                _string_value_count += 1
                 las_file.string_data[curve_name][current_line] = _desanitize_las_value(
                     values[i], _desanitize_enabled
                 )
@@ -1073,14 +1165,16 @@ def _read_normal(
                 ni = _logical_to_numeric[i]
                 curve_arrays[ni][current_line] = _to_integer_value(
                     _desanitize_las_value(values[i], _desanitize_enabled),
-                    null_value, _fc,
+                    null_value,
+                    _fc,
                     _null_as_float=not _null_is_integral,
                 )
             else:
                 ni = _logical_to_numeric[i]
                 curve_arrays[ni][current_line] = _to_finite_float(
                     _desanitize_las_value(values[i], _desanitize_enabled),
-                    null_value, _fc,
+                    null_value,
+                    _fc,
                 )
 
         # Fill remaining curves with null_value when line has fewer values
@@ -1129,6 +1223,15 @@ def _read_normal(
         warnings.warn(
             f"{extra_col_count} data line(s) had more values than the {curve_count} declared curves. "
             f"Extra columns were discarded.",
+            UserWarning,
+            stacklevel=2,
+        )
+    if embedded_delim_count is not None and embedded_delim_count > 1:
+        warnings.warn(
+            f"{embedded_delim_count} data line(s) had more values than the {curve_count} "
+            f"declared curves with DLM={delimiter!r}. String curve values may contain "
+            f"the delimiter character; those strings were truncated and following "
+            f"columns' genuine values may have been lost.",
             UserWarning,
             stacklevel=2,
         )
@@ -1261,9 +1364,20 @@ def _read_wrapped(
     _mnemonic_declared = _mnemonic_header_declared(las_file)
     # F-R-03: Accumulate string values into lists (same pattern as
     # data_lists).  Pad/trim and convert to np.array at the end.
-    _string_lists: dict[str, list[str]] = {
-        _name: [] for _name in _string_curve_map.values()
-    }
+    _string_lists: dict[str, list[str]] = {_name: [] for _name in _string_curve_map.values()}
+    # DR-05: Cap Python-object accumulation for string values in wrapped
+    # mode (mirrors _las30_data._MAX_STRING_VALUES; string objects amplify
+    # ~6-12x beyond the element guard's 8 B/element intent).
+    _string_value_count = 0
+
+    def _check_string_cap() -> None:
+        nonlocal _string_value_count
+        if _string_value_count >= MAX_STRING_VALUES:
+            raise LASParseError(
+                f"String curve values exceed maximum allowed "
+                f"({MAX_STRING_VALUES}). The file may be malformed or corrupt."
+            )
+        _string_value_count += 1
 
     # L-03: Detect {I} integer-format curves and pre-compute the null
     # sentinel BEFORE allocation — the int64 dtype branch is only taken
@@ -1276,8 +1390,7 @@ def _read_wrapped(
     _integer_curve_indices: set[int] = _detect_integer_curves(las_file)
     null_value = _get_null_value(las_file.well)
     _null_is_integral = (
-        float(null_value).is_integer()
-        and _INT64_MIN <= int(null_value) <= _INT64_MAX
+        float(null_value).is_integer() and _INT64_MIN <= int(null_value) <= _INT64_MAX
     )
     _fc: list[int] = [0]  # F-PXR-03: count non-trivial conversion failures
 
@@ -1288,9 +1401,7 @@ def _read_wrapped(
     # (the guard counts final arrays only).  Capacity starts at the
     # depth-step estimate and grows geometrically; the dynamic
     # total_elements counter below still bounds total accumulation.
-    _numeric_indices = [
-        i for i in range(curve_count) if i not in _string_curve_indices
-    ]
+    _numeric_indices = [i for i in range(curve_count) if i not in _string_curve_indices]
     _est_steps = max(1, math.ceil(_count / curve_count)) if curve_count > 0 else 0
     data_arrays: dict[int, np.ndarray] = {}
     data_fill: dict[int, int] = {}
@@ -1336,7 +1447,10 @@ def _read_wrapped(
         # fall-through routes such files into the wrapped path, so the
         # skip is required here (not just in _read_normal).
         if _is_mnemonic_header_row(
-            values, las_file, curve_count, _string_curve_indices,
+            values,
+            las_file,
+            curve_count,
+            _string_curve_indices,
             declared=_mnemonic_declared,
         ):
             continue
@@ -1362,6 +1476,7 @@ def _read_wrapped(
                 # test_wrapped_depth_line_extra_values).
                 for _ci, _v in enumerate(values):
                     if _ci in _string_curve_indices:
+                        _check_string_cap()
                         _string_lists[_string_curve_map[_ci]].append(
                             _desanitize_las_value(_v, _desanitize_enabled)
                         )
@@ -1370,7 +1485,8 @@ def _read_wrapped(
                             _ci,
                             _to_integer_value(
                                 _desanitize_las_value(_v, _desanitize_enabled),
-                                null_value, _fc,
+                                null_value,
+                                _fc,
                                 _null_as_float=not _null_is_integral,
                             ),
                         )
@@ -1379,7 +1495,8 @@ def _read_wrapped(
                             _ci,
                             _to_finite_float(
                                 _desanitize_las_value(_v, _desanitize_enabled),
-                                null_value, _fc,
+                                null_value,
+                                _fc,
                             ),
                         )
                     total_elements += 1
@@ -1412,6 +1529,7 @@ def _read_wrapped(
             # cover numeric curves, so the placeholder is dropped; string
             # lengths are already considered by _max_len via F-007-fix.)
             if 0 in _string_curve_indices:
+                _check_string_cap()
                 _string_lists[_string_curve_map[0]].append(
                     _desanitize_las_value(values[0], _desanitize_enabled)
                 )
@@ -1420,7 +1538,8 @@ def _read_wrapped(
                     0,
                     _to_integer_value(
                         _desanitize_las_value(values[0], _desanitize_enabled),
-                        null_value, _fc,
+                        null_value,
+                        _fc,
                         _null_as_float=not _null_is_integral,
                     ),
                 )
@@ -1429,7 +1548,8 @@ def _read_wrapped(
                     0,
                     _to_finite_float(
                         _desanitize_las_value(values[0], _desanitize_enabled),
-                        null_value, _fc,
+                        null_value,
+                        _fc,
                     ),
                 )
             total_elements += 1
@@ -1517,6 +1637,7 @@ def _read_wrapped(
                 # F-R-03: Dispatch string curves to _string_lists,
                 # float curves to data_lists via _to_finite_float.
                 if counter in _string_curve_indices:
+                    _check_string_cap()
                     _string_lists[_string_curve_map[counter]].append(
                         _desanitize_las_value(val_str, _desanitize_enabled)
                     )
@@ -1525,7 +1646,8 @@ def _read_wrapped(
                         counter,
                         _to_integer_value(
                             _desanitize_las_value(val_str, _desanitize_enabled),
-                            null_value, _fc,
+                            null_value,
+                            _fc,
                             _null_as_float=not _null_is_integral,
                         ),
                     )
@@ -1534,7 +1656,8 @@ def _read_wrapped(
                         counter,
                         _to_finite_float(
                             _desanitize_las_value(val_str, _desanitize_enabled),
-                            null_value, _fc,
+                            null_value,
+                            _fc,
                         ),
                     )
                 total_elements += 1
@@ -1634,7 +1757,7 @@ def _read_wrapped(
         and data_fill[0] >= 2
         and np.issubdtype(data_arrays[0].dtype, np.number)
     ):
-        _depth_vals = data_arrays[0][:data_fill[0]]
+        _depth_vals = data_arrays[0][: data_fill[0]]
         _diffs = np.diff(_depth_vals)
         if not (np.all(_diffs >= 0) or np.all(_diffs <= 0)):
             warnings.warn(
@@ -1683,7 +1806,7 @@ def _read_wrapped(
 
     # Convert pre-allocated columns to final (trimmed) numpy arrays
     for i in _float_indices:
-        las_file.logs[las_file.curves_order[i]] = data_arrays[i][:data_fill[i]]
+        las_file.logs[las_file.curves_order[i]] = data_arrays[i][: data_fill[i]]
 
     # F-R-03: Pad/trim and convert string lists to numpy arrays.
     # String curve values are accumulated into _string_lists using the

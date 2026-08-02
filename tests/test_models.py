@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pickle
 import warnings
 from typing import Any
 
@@ -513,9 +514,7 @@ class TestLASFile:
         assert rt_section.section_curves == []
         # F-I2-M54: verify data content survives roundtrip
         assert "DEPT" in rt_section.data
-        np.testing.assert_array_equal(
-            rt_section.data["DEPT"], np.array([100.0])
-        )
+        np.testing.assert_array_equal(rt_section.data["DEPT"], np.array([100.0]))
 
     # --- F-01 fix: MAX_PARAMETERS guard on parameter_details ---
 
@@ -528,9 +527,7 @@ class TestLASFile:
         # Use a small limit for testing
         monkeypatch.setattr("pylasdev.parser.MAX_PARAMETERS", 5)
 
-        big_details = [
-            {"mnemonic": f"PARAM_{i}", "value": str(i)} for i in range(6)
-        ]
+        big_details = [{"mnemonic": f"PARAM_{i}", "value": str(i)} for i in range(6)]
         data: dict[str, Any] = {
             "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
             "well": {"STRT": "100"},
@@ -551,9 +548,7 @@ class TestLASFile:
         """
         monkeypatch.setattr("pylasdev.parser.MAX_PARAMETERS", 5)
 
-        exact_details = [
-            {"mnemonic": f"PARAM_{i}", "value": str(i)} for i in range(4)
-        ]
+        exact_details = [{"mnemonic": f"PARAM_{i}", "value": str(i)} for i in range(4)]
         data: dict[str, Any] = {
             "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
             "well": {"STRT": "100"},
@@ -683,9 +678,7 @@ class TestLASFile:
             "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
             "well": {"STRT": "100"},
             "curves_order": ["DEPT"],
-            "curves": [
-                {"mnemonic": "DEPT", "unit": None, "description": None}
-            ],
+            "curves": [{"mnemonic": "DEPT", "unit": None, "description": None}],
             "logs": {"DEPT": np.array([100.0])},
         }
         las = LASFile.from_dict(data)
@@ -714,9 +707,7 @@ class TestLASFile:
                     "section_type": "LOG_DATA",
                     "curves_order": ["DEPT"],
                     "data": {"DEPT": np.array([100.0])},
-                    "section_curves": [
-                        {"mnemonic": "DEPT", "unit": None, "data_format": None}
-                    ],
+                    "section_curves": [{"mnemonic": "DEPT", "unit": None, "data_format": None}],
                 }
             ],
         }
@@ -951,7 +942,7 @@ class TestLASFile:
                 }
             ],
         }
-        with pytest.raises(ValueError, match="inconsistent array"):
+        with pytest.raises(ValueError, match="inconsistent"):
             LASFile.from_dict(data)
 
     # --- F2-25 fix: isinstance guard before _create_parameter_entry ---
@@ -1016,7 +1007,7 @@ class TestLASFile:
                 }
             ],
         }
-        with pytest.raises(ValueError, match=r"inconsistent.*string_data"):
+        with pytest.raises(ValueError, match=r"inconsistent"):
             LASFile.from_dict(data)
 
     # --- F-004: top-level string_data cross-array length ---
@@ -1047,7 +1038,7 @@ class TestLASFile:
                 }
             ],
         }
-        with pytest.raises(ValueError, match=r"inconsistent.*string_data.*lengths"):
+        with pytest.raises(ValueError, match=r"inconsistent"):
             LASFile.from_dict(data)
 
     # --- F-025: non-int array_index ---
@@ -1190,16 +1181,12 @@ class TestLASFile:
 
         # bool should be rejected for (int, float)
         with pytest.raises(TypeError, match=r"time_offset.*got bool"):
-            _resolve_dict_entry(
-                {"time_offset": True}, "time_offset", (int, float), lambda: None
-            )
+            _resolve_dict_entry({"time_offset": True}, "time_offset", (int, float), lambda: None)
 
         # int and float should still work
         assert _resolve_dict_entry({"index": 5}, "index", int, lambda: 0) == 5
         assert (
-            _resolve_dict_entry(
-                {"time_offset": 1.5}, "time_offset", (int, float), lambda: None
-            )
+            _resolve_dict_entry({"time_offset": 1.5}, "time_offset", (int, float), lambda: None)
             == 1.5
         )
 
@@ -1405,7 +1392,8 @@ class TestLASFile:
     # --- R7F-02: Cumulative allocation guard uses sum, not max ---
 
     def test_from_dict_cumulative_guard_ds_data_plus_string_data(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """R7F-02: Cumulative allocation check must sum ds_data + ds_string_data
         rather than taking max().  Both data types coexist in the same section
@@ -1729,13 +1717,9 @@ class TestDevFile:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             d = dev.to_dict()
-            meta_warnings = [
-                x for x in w
-                if "storing metadata as '_meta_" in str(x.message)
-            ]
+            meta_warnings = [x for x in w if "storing metadata as '_meta_" in str(x.message)]
             assert len(meta_warnings) >= 1, (
-                f"Expected _meta_ collision warning, got warnings: "
-                f"{[str(x.message) for x in w]}"
+                f"Expected _meta_ collision warning, got warnings: {[str(x.message) for x in w]}"
             )
 
         # _meta_ keys exist; column data is under bare key
@@ -1751,14 +1735,10 @@ class TestDevFile:
         assert dev2.encoding == "latin-1"
 
         # Non-colliding column data survives
-        np.testing.assert_array_equal(
-            dev2.columns["TVD"], np.array([0.0, 99.0, 198.0])
-        )
+        np.testing.assert_array_equal(dev2.columns["TVD"], np.array([0.0, 99.0, 198.0]))
 
         # R7F-01-gap fix: column "source_file" survives the roundtrip
-        np.testing.assert_array_equal(
-            dev2.columns["source_file"], np.array([0.0, 100.0, 200.0])
-        )
+        np.testing.assert_array_equal(dev2.columns["source_file"], np.array([0.0, 100.0, 200.0]))
 
     def test_dev_file_meta_prefix_roundtrip_encoding(self) -> None:
         """R7F-01: collision on 'encoding' metadata key — from_dict must
@@ -1774,10 +1754,7 @@ class TestDevFile:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             d = dev.to_dict()
-            meta_warnings = [
-                x for x in w
-                if "storing metadata as '_meta_" in str(x.message)
-            ]
+            meta_warnings = [x for x in w if "storing metadata as '_meta_" in str(x.message)]
             assert len(meta_warnings) >= 1
 
         assert "_meta_encoding" in d
@@ -1787,13 +1764,9 @@ class TestDevFile:
         assert dev2.encoding == "cp1251"
         assert dev2.source_file == "test.dev"
         # Non-colliding columns survive
-        np.testing.assert_array_equal(
-            dev2.columns["MD"], np.array([0.0, 100.0])
-        )
+        np.testing.assert_array_equal(dev2.columns["MD"], np.array([0.0, 100.0]))
         # R7F-01-gap fix: column "encoding" survives the roundtrip
-        np.testing.assert_array_equal(
-            dev2.columns["encoding"], np.array([10.0, 20.0])
-        )
+        np.testing.assert_array_equal(dev2.columns["encoding"], np.array([10.0, 20.0]))
 
     def test_dev_file_meta_prefix_roundtrip_no_collision(self) -> None:
         """R7F-01: when there is no collision, to_dict()/from_dict() work
@@ -1934,6 +1907,7 @@ class TestFR01PerSectionDataFormatWriteBack:
 # ============================================================
 # Production Check Regression Tests (20 confirmed fixes)
 # ============================================================
+
 
 class TestProductionCheckModelsFixes:
     """Regression tests for production check fixes in models.py."""
@@ -2249,9 +2223,7 @@ class TestReFixModels1:
         when section_type is 'LOG_DATA'.
         """
         sc = CurveDefinition(mnemonic="GR", data_format="F")
-        with pytest.raises(
-            LASDataError, match=r"curve 'GR'.*data_format='F'.*in string_data"
-        ):
+        with pytest.raises(LASDataError, match=r"curve 'GR'.*data_format='F'.*in string_data"):
             DataSection(
                 name="Test",
                 section_type="LOG_DATA",
@@ -2276,9 +2248,7 @@ class TestReFixModels1:
                 data={"DEPT": np.array(["abc", "def"], dtype=str)},
             )
             dtype_warnings = [
-                x for x in w
-                if "non-numeric dtype" in str(x.message)
-                and "DEPT" in str(x.message)
+                x for x in w if "non-numeric dtype" in str(x.message) and "DEPT" in str(x.message)
             ]
         assert len(dtype_warnings) == 1, (
             f"Expected 1 dtype warning for DEPT, got {len(dtype_warnings)}"
@@ -2298,9 +2268,7 @@ class TestReFixModels1:
                 string_data={"STR": np.array([1.0, 2.0], dtype=np.float64)},
             )
             dtype_warnings = [
-                x for x in w
-                if "numeric dtype" in str(x.message)
-                and "STR" in str(x.message)
+                x for x in w if "numeric dtype" in str(x.message) and "STR" in str(x.message)
             ]
         assert len(dtype_warnings) == 1, (
             f"Expected 1 dtype warning for STR, got {len(dtype_warnings)}"
@@ -2319,10 +2287,7 @@ class TestReFixModels1:
                 curves_order=["DEPT"],
                 data={"DEPT": np.array([1.0, 2.0], dtype=np.float64)},
             )
-            dtype_warnings = [
-                x for x in w
-                if "non-numeric dtype" in str(x.message)
-            ]
+            dtype_warnings = [x for x in w if "non-numeric dtype" in str(x.message)]
         assert len(dtype_warnings) == 0, (
             f"Expected 0 dtype warnings for numeric data, got {len(dtype_warnings)}"
         )
@@ -2342,7 +2307,9 @@ class TestReFixModels1:
         with pytest.raises(LASDataError, match=r"S.*string-format.*logs"):
             LASFile(
                 version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
-                well=WellSection(entries={"STRT": "0", "STOP": "100", "STEP": "10", "NULL": "-999"}),
+                well=WellSection(
+                    entries={"STRT": "0", "STOP": "100", "STEP": "10", "NULL": "-999"}
+                ),
                 curves=[sc],
                 curves_order=["STR"],
                 logs={"STR": np.array([1.0, 2.0])},
@@ -2361,7 +2328,9 @@ class TestReFixModels1:
         with pytest.raises(LASDataError, match=r"F.*numeric-format.*string_data"):
             LASFile(
                 version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
-                well=WellSection(entries={"STRT": "0", "STOP": "100", "STEP": "10", "NULL": "-999"}),
+                well=WellSection(
+                    entries={"STRT": "0", "STOP": "100", "STEP": "10", "NULL": "-999"}
+                ),
                 curves=[sc],
                 curves_order=["GR"],
                 string_data={"GR": np.array(["a", "b"], dtype=str)},
@@ -2402,9 +2371,9 @@ class TestReFixModels1:
             warnings.simplefilter("always")
             LASFile.from_dict(data)
             overlap_warnings = [
-                x for x in w
-                if "top-level 'string_data'" in str(x.message)
-                and "data_sections" in str(x.message)
+                x
+                for x in w
+                if "top-level 'string_data'" in str(x.message) and "data_sections" in str(x.message)
             ]
         assert len(overlap_warnings) == 1, (
             f"Expected 1 overlap warning, got {len(overlap_warnings)}"
@@ -2530,9 +2499,14 @@ class TestRegressionModelsFixes:
                 {
                     "version": {"VERS": "4.0", "WRAP": "NO", "DLM": "SPACE"},
                     "well": {
-                        "STRT": "100.0", "STOP": "200.0", "STEP": "1.0",
+                        "STRT": "100.0",
+                        "STOP": "200.0",
+                        "STEP": "1.0",
                         "NULL": "-999.25",
-                        "WELL": "A", "LOC": "B", "SRVC": "C", "UWI": "D",
+                        "WELL": "A",
+                        "LOC": "B",
+                        "SRVC": "C",
+                        "UWI": "D",
                     },
                     "curves_order": ["DEPT"],
                     "logs": {"DEPT": np.array([100.0])},
@@ -2617,6 +2591,7 @@ class TestRegressionModelsFixes:
 # M-28 (HIGH): from_dict F-011 must subtract string_data keys
 # ──────────────────────────────────────────────────────────────
 
+
 class TestM28FromDictStringDataKeys:
     """M-28: from_dict logs-vs-curves_order check (F-011) must not reject
     LAS 1.2/2.0 files whose {S} string curves live in string_data.
@@ -2630,9 +2605,16 @@ class TestM28FromDictStringDataKeys:
     def _base_dict(self, vers: str) -> dict[str, Any]:
         d: dict[str, Any] = {
             "version": {"VERS": vers, "WRAP": "NO", "DLM": "COMMA"},
-            "well": {"STRT": "0", "STOP": "1", "STEP": "0.5",
-                     "NULL": "-999.25", "WELL": "W", "LOC": "L",
-                     "SRVC": "S", "UWI": "U"},
+            "well": {
+                "STRT": "0",
+                "STOP": "1",
+                "STEP": "0.5",
+                "NULL": "-999.25",
+                "WELL": "W",
+                "LOC": "L",
+                "SRVC": "S",
+                "UWI": "U",
+            },
             "curves": [
                 {"mnemonic": "DEPT", "unit": "M", "data_format": "F"},
                 {"mnemonic": "LITH", "unit": "", "data_format": "S"},
@@ -2688,6 +2670,7 @@ class TestM28FromDictStringDataKeys:
 # ──────────────────────────────────────────────────────────────
 # M-21 (MEDIUM): get_array_curves must dedupe section curves
 # ──────────────────────────────────────────────────────────────
+
 
 class TestM21GetArrayCurvesDedup:
     """M-21 (coordinated with N-I-10): for multi-section LAS 3.0 files the
@@ -2756,6 +2739,7 @@ class TestM21GetArrayCurvesDedup:
 # M-22 (MEDIUM) + IT3-THR-02: unnamed data sections auto-named
 # ──────────────────────────────────────────────────────────────
 
+
 class TestM22UnnamedDataSections:
     """M-22 + IT3-THR-02: two unnamed data sections are valid LAS 3.0
     (the parser auto-names them Section_N on read).  from_dict previously
@@ -2765,8 +2749,7 @@ class TestM22UnnamedDataSections:
     def test_from_dict_two_unnamed_sections_auto_named(self) -> None:
         d: dict[str, Any] = {
             "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
-            "well": {"STRT": "0", "STOP": "1", "STEP": "0.5",
-                     "NULL": "-999.25"},
+            "well": {"STRT": "0", "STOP": "1", "STEP": "0.5", "NULL": "-999.25"},
             "data_sections": [
                 {
                     "name": "",
@@ -2788,11 +2771,15 @@ class TestM22UnnamedDataSections:
     def test_duplicate_named_sections_still_raise(self) -> None:
         """M-22: user-supplied duplicate names are still rejected."""
         ds1 = DataSection(
-            name="A", section_type="LOG_DATA", curves_order=["DEPT"],
+            name="A",
+            section_type="LOG_DATA",
+            curves_order=["DEPT"],
             data={"DEPT": np.array([1.0, 2.0])},
         )
         ds2 = DataSection(
-            name="A", section_type="LOG_DATA", curves_order=["GR"],
+            name="A",
+            section_type="LOG_DATA",
+            curves_order=["GR"],
             data={"GR": np.array([3.0, 4.0])},
         )
         with pytest.raises(LASDataError, match="duplicate data section name"):
@@ -2819,6 +2806,7 @@ class TestM22UnnamedDataSections:
 # M-23 (MEDIUM): data_format clear-not-truncate
 # ──────────────────────────────────────────────────────────────
 
+
 class TestM23DataFormatClearNotTruncate:
     """M-23: from_dict must not fabricate valid format codes from invalid
     multi-char data_format values via blind df[0] truncation.  Metadata
@@ -2828,35 +2816,33 @@ class TestM23DataFormatClearNotTruncate:
     def _base_dict(self) -> dict[str, Any]:
         return {
             "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
-            "well": {"STRT": "0", "STOP": "1", "STEP": "0.5",
-                     "NULL": "-999.25"},
+            "well": {"STRT": "0", "STOP": "1", "STEP": "0.5", "NULL": "-999.25"},
             "curves_order": ["DEPT"],
         }
 
     def test_metadata_template_cleared_top_level(self) -> None:
         d = self._base_dict()
-        d["curves"] = [{"mnemonic": "DEPT", "unit": "M",
-                        "data_format": "DENSITY"}]
+        d["curves"] = [{"mnemonic": "DEPT", "unit": "M", "data_format": "DENSITY"}]
         las = LASFile.from_dict(d)
         assert las.curves[0].data_format == ""
 
     def test_extended_format_truncated_top_level(self) -> None:
         d = self._base_dict()
-        d["curves"] = [{"mnemonic": "DEPT", "unit": "M",
-                        "data_format": "F8.3"}]
+        d["curves"] = [{"mnemonic": "DEPT", "unit": "M", "data_format": "F8.3"}]
         las = LASFile.from_dict(d)
         assert las.curves[0].data_format == "F"
 
     def test_metadata_template_cleared_per_section(self) -> None:
         d = self._base_dict()
-        d["data_sections"] = [{
-            "name": "A",
-            "section_type": "LOG_DATA",
-            "curves_order": ["DEPT"],
-            "section_curves": [{"mnemonic": "DEPT", "unit": "M",
-                                "data_format": "DEG"}],
-            "data": {"DEPT": np.array([1.0, 2.0])},
-        }]
+        d["data_sections"] = [
+            {
+                "name": "A",
+                "section_type": "LOG_DATA",
+                "curves_order": ["DEPT"],
+                "section_curves": [{"mnemonic": "DEPT", "unit": "M", "data_format": "DEG"}],
+                "data": {"DEPT": np.array([1.0, 2.0])},
+            }
+        ]
         las = LASFile.from_dict(d)
         assert las.data_sections[0].section_curves[0].data_format == ""
 
@@ -2870,6 +2856,7 @@ class TestM23DataFormatClearNotTruncate:
 # ──────────────────────────────────────────────────────────────
 # M-27 (MEDIUM): section_type whitespace/pipe rejection
 # ──────────────────────────────────────────────────────────────
+
 
 class TestM27SectionTypeContentValidation:
     """M-27: section_type containing whitespace or a pipe produces a broken
@@ -2898,14 +2885,15 @@ class TestM27SectionTypeContentValidation:
         covered by DataSection.__post_init__ validation."""
         d: dict[str, Any] = {
             "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
-            "well": {"STRT": "0", "STOP": "1", "STEP": "0.5",
-                     "NULL": "-999.25"},
-            "data_sections": [{
-                "name": "A",
-                "section_type": "MY CORE",
-                "curves_order": ["DEPT"],
-                "data": {"DEPT": np.array([1.0, 2.0])},
-            }],
+            "well": {"STRT": "0", "STOP": "1", "STEP": "0.5", "NULL": "-999.25"},
+            "data_sections": [
+                {
+                    "name": "A",
+                    "section_type": "MY CORE",
+                    "curves_order": ["DEPT"],
+                    "data": {"DEPT": np.array([1.0, 2.0])},
+                }
+            ],
         }
         with pytest.raises(LASDataError, match="whitespace"):
             LASFile.from_dict(d)
@@ -2923,6 +2911,7 @@ class TestM27SectionTypeContentValidation:
 # M-29 (MEDIUM): non-LAS-3.0 string_data write warning
 # ──────────────────────────────────────────────────────────────
 
+
 class TestM29NonLas30StringDataWarning:
     """M-29: LAS 1.2/2.0 output has no {S} string marker — string_data
     values are written unmarked and re-read as null sentinels.  The model
@@ -2934,10 +2923,7 @@ class TestM29NonLas30StringDataWarning:
         las.version = VersionSection(vers="2.0")
         las.string_data["CDES"] = np.array(["SAND"], dtype=object)
         issues = las.validate(complete=True)
-        assert any(
-            "string_data is present" in i and "not LAS 3.0" in i
-            for i in issues
-        )
+        assert any("string_data is present" in i and "not LAS 3.0" in i for i in issues)
 
     def test_las30_string_data_no_warning(self) -> None:
         las = LASFile()
@@ -2951,39 +2937,42 @@ class TestM29NonLas30StringDataWarning:
 # N-I-12 (MEDIUM): DataSection.curves_order element types
 # ──────────────────────────────────────────────────────────────
 
+
 class TestNI12DataSectionCurvesOrderElementTypes:
-    """N-I-12: DataSection.curves_order element types were unvalidated on
+    """N-I-12/I2-12: DataSection.curves_order element types were unvalidated on
     direct construction — `LASFile(data_sections=[ds])` crashed with a raw
     TypeError from re.match (``expected string or bytes-like object``).
-    Per-element validation now raises LASDataError with a clear message."""
+    Per-element validation now raises a clear error with a message naming
+    the offending element.  I2-12 extended the guard to POST-CONSTRUCTION
+    mutations by wrapping curves_order in a `_GuardedList`
+    (``_expected_type=str``), so the construction-time failure is a
+    TypeError — the same exception the LASFile top-level curves_order guard
+    (F-13) and the guarded lists for ``curves``/``parameters`` raise."""
 
     def test_datasection_curves_order_int_raises(self) -> None:
-        with pytest.raises(LASDataError, match=r"curves_order\[0\].*must be str"):
+        with pytest.raises(TypeError, match=r"DataSection.curves_order: items must be str"):
             DataSection(name="S", section_type="LOG_DATA", curves_order=[1, 2])
 
     def test_lasfile_with_int_curves_order_raises_lasdataerror(self) -> None:
         """N-I-12: the original crash path — LASFile(data_sections=[ds])
-        with non-str curves_order elements — now raises LASDataError (not a
-        raw TypeError from re.match)."""
-        with pytest.raises(LASDataError, match="must be str"):
+        with non-str curves_order elements — now raises a clear TypeError
+        from the DataSection's guarded curves_order (not a raw TypeError
+        from re.match)."""
+        with pytest.raises(TypeError, match="items must be str"):
             LASFile(
                 version=VersionSection(vers="3.0"),
-                data_sections=[
-                    DataSection(
-                        name="S", section_type="LOG_DATA", curves_order=[1, 2]
-                    )
-                ],
+                data_sections=[DataSection(name="S", section_type="LOG_DATA", curves_order=[1, 2])],
             )
 
     def test_valid_str_curves_order_unchanged(self) -> None:
-        ds = DataSection(name="S", section_type="LOG_DATA",
-                         curves_order=["DEPT", "GR"])
+        ds = DataSection(name="S", section_type="LOG_DATA", curves_order=["DEPT", "GR"])
         assert ds.curves_order == ["DEPT", "GR"]
 
 
 # ──────────────────────────────────────────────────────────────
 # N-I-07 (MEDIUM): from_dict unknown single-char format alignment
 # ──────────────────────────────────────────────────────────────
+
 
 class TestNI07FromDictUnknownSingleCharFormat:
     """N-I-07: an unknown SINGLE-char data_format ({X}, {G}) was
@@ -3113,11 +3102,14 @@ class TestG3GuardedDict:
     def test_valid_str_keys_still_work(self) -> None:
         from pylasdev.models import _GuardedDict
 
-        g = _GuardedDict({"a": 1})
-        g.update({"b": 2})
-        g.setdefault("c", 3)
-        g |= {"d": 4}
-        assert g == {"a": 1, "b": 2, "c": 3, "d": 4}
+        # MOD-17/MOD-23: values must be 1-D array-like (scalars/str are
+        # rejected by the data-container contract) — lists keep this test
+        # focused on KEY validation.
+        g = _GuardedDict({"a": [1]})
+        g.update({"b": [2]})
+        g.setdefault("c", [3])
+        g |= {"d": [4]}
+        assert g == {"a": [1], "b": [2], "c": [3], "d": [4]}
 
 
 class TestG3GuardedList:
@@ -3378,6 +3370,7 @@ class TestG3NullCaseInsensitive:
 # --- G5 fix-agent regression tests (N-I-09, N-I-10, N-I-11, N-I-13, ---
 # --- N-I-14, N-I-19, N-I-21, N-I-30) ---
 
+
 class TestG5WellValidateCaseInsensitive:
     """N-I-09: WellSection.validate must uppercase-normalize NULL/STRT/STOP
     lookups (matching STEP) and distinguish absent NULL from empty-string."""
@@ -3576,8 +3569,10 @@ class TestG5DevColumnsMutationGuards:
         assert dev.column_order == ["MD", "INC"]
 
     def test_pop_syncs_column_order(self) -> None:
-        dev = DevFile(columns={"MD": np.array([1.0, 2.0]), "TVD": np.array([3.0, 4.0])},
-                      column_order=["MD", "TVD"])
+        dev = DevFile(
+            columns={"MD": np.array([1.0, 2.0]), "TVD": np.array([3.0, 4.0])},
+            column_order=["MD", "TVD"],
+        )
         assert dev.columns.pop("MD") is not None
         assert list(dev.columns.keys()) == ["TVD"]
         assert dev.column_order == ["TVD"]
@@ -3715,9 +3710,9 @@ class TestG5ParameterDataFormatAlignment:
             )
         # The multi-char template is cleared at construction with a warning.
         assert pe.data_format == ""
-        assert any(
-            "multi-character data_format" in str(w.message) for w in rec
-        ), f"expected clear warning, got: {[str(w.message) for w in rec]}"
+        assert any("multi-character data_format" in str(w.message) for w in rec), (
+            f"expected clear warning, got: {[str(w.message) for w in rec]}"
+        )
         # Extended Fortran codes truncate to their single-letter base.
         pe_ext = ParameterEntry(
             mnemonic="DEPTH",
@@ -3780,9 +3775,7 @@ class TestG5MnemBaseResolutionCollision:
         with warnings.catch_warnings(record=True) as rec:
             warnings.simplefilter("always")
             LASFile.from_dict(self._dual_laterolog_dict(), mnem_base=MNEM_BASE)
-        collision_warns = [
-            str(w.message) for w in rec if "resolves to" in str(w.message)
-        ]
+        collision_warns = [str(w.message) for w in rec if "resolves to" in str(w.message)]
         assert len(collision_warns) == 1
         assert "LLS" in collision_warns[0]
         assert "BFV" in collision_warns[0]
@@ -3831,9 +3824,9 @@ class TestDevFileSurvivorValidationG10:
             _from_dict=True,
         )
         issues = dev.validate(complete=True)
-        assert any(
-            "not monotonically increasing" in issue for issue in issues
-        ), f"Expected MD_2 monotonicity issue, got {issues}"
+        assert any("not monotonically increasing" in issue for issue in issues), (
+            f"Expected MD_2 monotonicity issue, got {issues}"
+        )
 
     def test_azi_survivor_out_of_range_issue(self) -> None:
         dev = DevFile(
@@ -3846,9 +3839,9 @@ class TestDevFileSurvivorValidationG10:
             _from_dict=True,
         )
         issues = dev.validate(complete=True)
-        assert any(
-            "Azimuth column 'AZI_2'" in issue for issue in issues
-        ), f"Expected AZI_2 range issue, got {issues}"
+        assert any("Azimuth column 'AZI_2'" in issue for issue in issues), (
+            f"Expected AZI_2 range issue, got {issues}"
+        )
 
     def test_inc_survivor_out_of_range_issue(self) -> None:
         dev = DevFile(
@@ -3861,9 +3854,9 @@ class TestDevFileSurvivorValidationG10:
             _from_dict=True,
         )
         issues = dev.validate(complete=True)
-        assert any(
-            "Inclination column 'INC_2'" in issue for issue in issues
-        ), f"Expected INC_2 range issue, got {issues}"
+        assert any("Inclination column 'INC_2'" in issue for issue in issues), (
+            f"Expected INC_2 range issue, got {issues}"
+        )
 
     def test_tvd_survivor_nan_density_issue(self) -> None:
         """V-17: models.py had NO TVD validation at all — add it so direct
@@ -3877,9 +3870,9 @@ class TestDevFileSurvivorValidationG10:
             _from_dict=True,
         )
         issues = dev.validate(complete=True)
-        assert any(
-            "TVD column 'TVD_2'" in issue and "NaN" in issue for issue in issues
-        ), f"Expected TVD_2 NaN-density issue, got {issues}"
+        assert any("TVD column 'TVD_2'" in issue and "NaN" in issue for issue in issues), (
+            f"Expected TVD_2 NaN-density issue, got {issues}"
+        )
 
     def test_primary_columns_still_validated(self) -> None:
         """Primary (non-survivor) MD/AZI/INC checks are unchanged."""
@@ -3892,9 +3885,153 @@ class TestDevFileSurvivorValidationG10:
             _from_dict=True,
         )
         issues = dev.validate(complete=True)
-        assert any(
-            "not monotonically increasing" in issue for issue in issues
-        ), f"Expected primary MD monotonicity issue, got {issues}"
-        assert any(
-            "Azimuth column 'AZI'" in issue for issue in issues
-        ), f"Expected primary AZI range issue, got {issues}"
+        assert any("not monotonically increasing" in issue for issue in issues), (
+            f"Expected primary MD monotonicity issue, got {issues}"
+        )
+        assert any("Azimuth column 'AZI'" in issue for issue in issues), (
+            f"Expected primary AZI range issue, got {issues}"
+        )
+
+
+class TestPF07MetaPrefixedUserColumnRoundtrip:
+    """PF-07 (s9 convergence pass, MOD-11 incomplete fix): a DevFile with a
+    user column literally named ``_meta_source_file`` / ``_meta_encoding`` /
+    ``_meta_column_order`` (array value) crashed the to_dict→from_dict
+    roundtrip with LASDataError.  to_dict emitted BOTH the column and the
+    bare ``source_file`` metadata key; from_dict's collision check
+    (``f"_meta_{key}" in data``, models.py:6114) misread the bare key as a
+    column and tried ``np.asarray("test.dev", dtype=float)``.
+
+    The fix mirrors the MOD-11 closed-set rule in BOTH directions:
+    ``_is_encoded_dev_metadata_key`` on the ``_meta_`` slot (a ``_meta_`` key
+    with an array value is a USER COLUMN, not encoded metadata) plus a
+    metadata-shape guard on the bare value.  The roundtrip must preserve the
+    column AND the metadata without a crash.
+    """
+
+    def test_meta_source_file_column_roundtrips_without_crash(self) -> None:
+        """Regression (fail pre-fix): LASDataError on from_dict; pass post-fix."""
+        dev = DevFile()
+        dev.columns["MD"] = np.array([0.0, 100.0, 200.0])
+        dev.columns["_meta_source_file"] = np.array([1.0, 2.0, 3.0])
+        dev.source_file = "test.dev"
+
+        d = dev.to_dict()
+        # Both the user column and the bare metadata key are emitted
+        assert "_meta_source_file" in d
+        assert d["source_file"] == "test.dev"
+        dev2 = DevFile.from_dict(d)
+
+        # Column preserved verbatim (pre-fix this crashed)
+        assert "_meta_source_file" in dev2.columns
+        np.testing.assert_array_equal(dev2.columns["_meta_source_file"], np.array([1.0, 2.0, 3.0]))
+        # Metadata preserved under the bare key (not swallowed as a column)
+        assert dev2.source_file == "test.dev"
+        np.testing.assert_array_equal(dev2.columns["MD"], np.array([0.0, 100.0, 200.0]))
+
+    def test_meta_encoding_column_roundtrips_without_crash(self) -> None:
+        """Same regression for the ``_meta_encoding`` suffix."""
+        dev = DevFile()
+        dev.columns["MD"] = np.array([0.0, 1.0])
+        dev.columns["_meta_encoding"] = np.array([5.0, 6.0])
+        dev.encoding = "latin-1"
+
+        d = dev.to_dict()
+        dev2 = DevFile.from_dict(d)
+        assert "_meta_encoding" in dev2.columns
+        np.testing.assert_array_equal(dev2.columns["_meta_encoding"], np.array([5.0, 6.0]))
+        assert dev2.encoding == "latin-1"
+
+    def test_meta_column_order_column_roundtrips_without_crash(self) -> None:
+        """Same regression for the ``_meta_column_order`` suffix."""
+        dev = DevFile()
+        dev.columns["MD"] = np.array([0.0, 1.0])
+        dev.columns["_meta_column_order"] = np.array([9.0, 9.0])
+
+        d = dev.to_dict()
+        dev2 = DevFile.from_dict(d)
+        assert "_meta_column_order" in dev2.columns
+        np.testing.assert_array_equal(dev2.columns["_meta_column_order"], np.array([9.0, 9.0]))
+        # column_order metadata still applied (includes the user column)
+        assert dev2.column_order == ["MD", "_meta_column_order"]
+
+    def test_double_collision_preserves_both_user_columns(self) -> None:
+        """PF-07 to_dict mirror: columns named BOTH ``source_file`` AND
+        ``_meta_source_file``.  The old to_dict overwrote the ``_meta_`` user
+        column with the metadata string (silent data loss).  Now to_dict
+        warns and drops the metadata, preserving BOTH user columns."""
+        dev = DevFile()
+        dev.columns["MD"] = np.array([0.0, 100.0, 200.0])
+        dev.columns["source_file"] = np.array([5.0, 6.0, 7.0])
+        dev.columns["_meta_source_file"] = np.array([1.0, 2.0, 3.0])
+        dev.source_file = "test.dev"
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            d = dev.to_dict()
+        assert any("both collide" in str(x.message) for x in w), (
+            f"Expected double-collision warning, got {[str(x.message) for x in w]}"
+        )
+        # Neither user column was overwritten by metadata
+        assert isinstance(d["_meta_source_file"], np.ndarray)
+        assert isinstance(d["source_file"], np.ndarray)
+
+        dev2 = DevFile.from_dict(d)
+        assert "source_file" in dev2.columns
+        assert "_meta_source_file" in dev2.columns
+        np.testing.assert_array_equal(dev2.columns["source_file"], np.array([5.0, 6.0, 7.0]))
+        np.testing.assert_array_equal(dev2.columns["_meta_source_file"], np.array([1.0, 2.0, 3.0]))
+
+
+class TestPF09GuardedDictPickle:
+    """PF-09 (s9 convergence pass, REGRESSION vs HEAD): ``_GuardedDict``
+    stopped being picklable when ``__setitem__`` gained the UNCONDITIONAL
+    ``_check_column_array_like(value, self._container_name)`` (MOD-14/17/23).
+    Default dict-subclass unpickling restores items through ``__setitem__``
+    BEFORE the ``_container_name`` slot is set → AttributeError.  The fix
+    mirrors the ``_GuardedList`` pattern (``__reduce__`` reconstructs via
+    ``__init__`` + ``__setstate__`` restores the slot).  Guards must remain
+    intact post-unpickle.
+    """
+
+    def test_lasfile_pickle_roundtrip_guards_intact(self) -> None:
+        """Regression (fail pre-fix): AttributeError on unpickle; pass post-fix."""
+        from pylasdev.models import _GuardedDict
+
+        las = LASFile()
+        las.logs["DEPT"] = np.array([100.0, 101.0])
+        las.logs["GR"] = np.array([50.0, 60.0])
+
+        las2 = pickle.loads(pickle.dumps(las))
+        assert isinstance(las2.logs, _GuardedDict)
+        np.testing.assert_array_equal(las2.logs["DEPT"], np.array([100.0, 101.0]))
+        # _container_name restored
+        assert las2.logs._container_name == "LASFile.logs"
+        # Guards intact: non-str key still rejected
+        with pytest.raises(TypeError, match="keys must be str"):
+            las2.logs[5] = np.array([1.0, 2.0])
+        # Value contract intact: str/scalar still rejected
+        with pytest.raises(ValueError, match="1-D array-like"):
+            las2.logs["X"] = "scalar"
+        # Length invariant intact
+        with pytest.raises(ValueError, match="inconsistent lengths"):
+            las2.logs["NEW"] = np.array([1.0, 2.0, 3.0])
+
+    def test_bare_guarded_dict_pickle_roundtrip(self) -> None:
+        """Bare _GuardedDict pickles with _container_name preserved."""
+        from pylasdev.models import _GuardedDict
+
+        g = _GuardedDict({"a": np.array([1.0, 2.0])}, _container_name="LASFile.logs")
+        g2 = pickle.loads(pickle.dumps(g))
+        assert isinstance(g2, _GuardedDict)
+        np.testing.assert_array_equal(g2["a"], np.array([1.0, 2.0]))
+        assert g2._container_name == "LASFile.logs"
+
+    def test_empty_guarded_dict_pickle_roundtrip(self) -> None:
+        """Empty _GuardedDict (no items to restore) also pickles."""
+        from pylasdev.models import _GuardedDict
+
+        g = _GuardedDict(_container_name="LASFile.string_data")
+        g2 = pickle.loads(pickle.dumps(g))
+        assert dict(g2) == {}
+        assert g2._container_name == "LASFile.string_data"

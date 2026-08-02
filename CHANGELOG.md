@@ -5,6 +5,30 @@ All notable changes to pylasdev will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.3] — 2026-08-02
+
+### Production Check
+
+A third full production-check audit fixed **60 verified defects** plus **8 post-fix
+convergence findings** across the source tree, with additional regression tests. The
+regression suite now passes 1420 tests (0 failures, 1 skipped) at 86.44% coverage;
+ruff and mypy are clean.
+
+### Fixed
+
+- **Parser**: deferred/replay and pipe-scoping corrections — phantom rows, discarded
+  data, and forward pipes no longer mis-parse
+- **Data reader**: wrap-detection contract unified across the LAS 2.0 and 3.0 paths;
+  string-object caps and error-boundary corrections applied
+- **DEV reader**: thousands-separator recombination, semicolon/locale handling, and
+  format detection hardened
+- **Models**: guarded-container invariants completed; pickle support and `from_dict`
+  symmetry fixed
+- **Writer**: duplicate-curve dedup scoping, mutation guards, precision preservation,
+  and `~O` roundtrip corrected
+- **Encoding**: smart-punctuation and №-adjacency detection fixes
+- **ReDoS/security hardening**: regex parsing paths bounded against pathological inputs
+
 ## [2.0.2] — 2026-08-02
 
 ### Production Check

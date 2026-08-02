@@ -1236,7 +1236,14 @@ MNEM_BASE: dict[str, str] = {
     "PSocn": "SP",
     "PSyuyoe": "SP",
     "PSyuyoe1": "SP",
-    "GZ1": "PZ",
+    # I2-19: GZ1 is a terminal canonical, NOT an alias for PZ.  The
+    # previous ``"GZ1": "PZ"`` entry re-routed 24 GZ1-targeting keys
+    # (GZ11, GZ110, GZ1A, ...) through GZ1 to PZ, silently renaming a
+    # GZ11 curve to PZ on read with mnem_base=MNEM_BASE (with zero
+    # warnings).  GZ1 is now a canonical like GKST: GZ11 resolves to GZ1
+    # and GZ1 resolves to itself.  The GZ2-GZ5 → PZ mappings are kept —
+    # those keys are direct aliases for PZ, not chain intermediates, and
+    # no other mnemonic targets them.
     "GZ2": "PZ",
     "GZ3": "PZ",
     "GZ4": "PZ",
@@ -2033,18 +2040,26 @@ def resolve_mnemonic(
     for _ in range(max_depth):
         if current not in mnem_base:
             return current
-        nxt = mnem_base[current]
+        # MN-01: Uppercase the chain VALUE before using it as the next
+        # lookup key.  The previous code used the raw value verbatim, so a
+        # mixed-case value (e.g. {'AK': 'Dt', 'DT': 'X'}) failed the
+        # case-sensitive membership test and the chain terminated early,
+        # silently returning the non-canonical lowercase name.  Uppercasing
+        # here is a no-op for already-canonical tables (shipped MNEM_BASE)
+        # and makes the walk robust to user-supplied mixed-case mnem_base
+        # values — matching the documented "case-insensitive lookup"
+        # contract (build_mnemonic_lookup docstring).
+        nxt = mnem_base[current].upper()
         if nxt in seen:
             # Cycle detected — return current as-is
-            logger.warning(
-                "Mnemonic cycle detected for %r at %r", mnemonic, current
-            )
+            logger.warning("Mnemonic cycle detected for %r at %r", mnemonic, current)
             return current
         seen.add(current)
         current = nxt
     logger.warning(
         "Mnemonic resolution exceeded max_depth=%d for %r",
-        max_depth, mnemonic,
+        max_depth,
+        mnemonic,
     )
     return current
 
@@ -2074,5 +2089,12 @@ def build_mnemonic_lookup(mnem_base: dict[str, str]) -> dict[str, str]:
     for k, v in sorted_items:
         key = k.upper()
         if key not in _raw_upper:
-            _raw_upper[key] = v
+            # MN-01: Uppercase the VALUE on storage as well as the key.
+            # The previous code stored the raw value, so a mixed-case value
+            # was both returned as a non-canonical name AND broke chain
+            # walking in resolve_mnemonic (the case-sensitive membership
+            # test failed on the next hop).  Values must be canonical
+            # (uppercase) for the "Uppercased mnemonic-to-canonical
+            # mapping" contract the returned dict documents.
+            _raw_upper[key] = v.upper()
     return {k: resolve_mnemonic(_raw_upper, k) for k in _raw_upper}

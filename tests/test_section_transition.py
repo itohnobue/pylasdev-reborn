@@ -142,7 +142,8 @@ class TestMAXTOTAL_ELEMENTS:
     """
 
     def test_cumulative_max_total_elements_across_sections(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Cumulative guard fires when multiple sections exceed total limit.
 
@@ -172,7 +173,8 @@ class TestMAXTOTAL_ELEMENTS:
             parser.parse(content)
 
     def test_cumulative_max_total_elements_below_limit_passes(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Cumulative guard does NOT fire when total is at or below limit.
 
@@ -201,7 +203,8 @@ class TestMAXTOTAL_ELEMENTS:
         assert len(las.data_sections[1].data["DEPT"]) == 1
 
     def test_cumulative_guard_not_triggered_by_single_section(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Single section under per-section limit passes cumulative guard.
 
@@ -226,7 +229,8 @@ class TestMAXTOTAL_ELEMENTS:
         assert len(las.data_sections[0].data["DEPT"]) == 10
 
     def test_cumulative_guard_uses_live_state_after_replay(
-        self, monkeypatch: pytest.MonkeyPatch,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Verifies F-56/F-57 fix: cumulative counter after deferred replay.
 

@@ -343,18 +343,19 @@ except LASParseError as e:
     print(f"Malformed LAS file: {e}")
 ```
 
-> **Important:** The `max_file_size` parameter raises `ValueError`, which is **not** a
-> subclass of `PylasdevError`. A blanket `except PylasdevError` will silently miss
-> file-size-limit violations. Always catch `ValueError` separately when using
-> `max_file_size`:
+> **Important:** The `max_file_size` parameter raises `LASReadError` (or
+> `DEVReadError` when reading DEV files), which **is** a subclass of
+> `PylasdevError`. A blanket `except PylasdevError` will catch
+> file-size-limit violations. To handle them distinctly, catch
+> `LASReadError`/`DEVReadError` before the generic `PylasdevError`:
 >
 > ```python
-> from pylasdev import read_las_file, PylasdevError
+> from pylasdev import read_las_file, LASReadError, PylasdevError
 >
 > try:
 >     data = read_las_file("large.las", max_file_size=10_000_000)
-> except ValueError as e:
->     print(f"File exceeds size limit: {e}")
+> except LASReadError as e:
+>     print(f"File unreadable or exceeds size limit: {e}")
 > except PylasdevError as e:
 >     print(f"LAS error: {e}")
 > ```

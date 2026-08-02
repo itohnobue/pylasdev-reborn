@@ -47,14 +47,16 @@ def _make_well_dict(vers: str, numeric_only: bool = True) -> dict[str, str]:
         "NULL": "-999.25",
     }
     if not numeric_only:
-        well.update({
-            "COMP": "TEST COMPANY",
-            "WELL": "TEST-WELL-01",
-            "FLD": "TEST FIELD",
-            "LOC": "12-34-56-78W5",
-            "SRVC": "TEST SRVC",
-            "DATE": "01/01/2020",
-        })
+        well.update(
+            {
+                "COMP": "TEST COMPANY",
+                "WELL": "TEST-WELL-01",
+                "FLD": "TEST FIELD",
+                "LOC": "12-34-56-78W5",
+                "SRVC": "TEST SRVC",
+                "DATE": "01/01/2020",
+            }
+        )
     return well
 
 
@@ -170,7 +172,9 @@ def _make_las_text(
         lines.append("~VERSION INFORMATION")
     vers_desc = "CWLS LOG ASCII STANDARD -VERSION 3.0" if is_las30 else "CWLS LOG ASCII STANDARD"
     lines.append(f" VERS.  {vers} : {vers_desc}")
-    lines.append(f" WRAP.  {wrap} : {'MULTIPLE LINES PER DEPTH STEP' if wrap == 'YES' else 'ONE LINE PER DEPTH STEP'}")
+    lines.append(
+        f" WRAP.  {wrap} : {'MULTIPLE LINES PER DEPTH STEP' if wrap == 'YES' else 'ONE LINE PER DEPTH STEP'}"
+    )
     # DLM: suppressed for LAS 1.2, always emitted for non-SPACE in 2.0/3.0
     if not is_las12 and dlm.upper() != "SPACE":
         lines.append(f" DLM .  {dlm} : DELIMITING CHARACTER BETWEEN DATA COLUMNS")
@@ -259,7 +263,9 @@ def _write_las30_data_sections(
             lines.append("")
             lines.append(f"~{def_name}")
             for cname, cunit, cfmt, cdesc in definition_curves:
-                lines.append(f" {cname}.{cunit}                                : {cdesc}  {{{cfmt}}}")
+                lines.append(
+                    f" {cname}.{cunit}                                : {cdesc}  {{{cfmt}}}"
+                )
             lines.append("")
 
         # Write data section header
@@ -369,7 +375,11 @@ def _build_las30_multi_section_dict() -> dict[str, Any]:
     ]
 
     return _make_las_dict(
-        vers, wrap, dlm, curves, logs,
+        vers,
+        wrap,
+        dlm,
+        curves,
+        logs,
         well_extra={"COMP": "TEST COMPANY", "WELL": "MULTI-01"},
         curves_defs=curves_defs,
         data_sections=data_sections,
@@ -416,7 +426,11 @@ def _build_las30_core_curves_dict() -> dict[str, Any]:
     ]
 
     return _make_las_dict(
-        vers, wrap, dlm, curves, logs,
+        vers,
+        wrap,
+        dlm,
+        curves,
+        logs,
         well_extra={"COMP": "CORE TEST", "WELL": "CORE-01"},
         curves_defs=curves_defs,
         data_sections=data_sections,
@@ -450,7 +464,12 @@ TEST_MATRIX: list[TestSpec] = [
         "path": "parse",
         "curves": ["DEPT", "DT", "RHOB"],
         "string_curves": set(),
-        "well_extra": {"COMP": "TEST COMPANY", "WELL": "CWLS-01", "FLD": "TEST FIELD", "LOC": "12-34-56-78W5"},
+        "well_extra": {
+            "COMP": "TEST COMPANY",
+            "WELL": "CWLS-01",
+            "FLD": "TEST FIELD",
+            "LOC": "12-34-56-78W5",
+        },
         "description": "las12 + SPACE + CWLS well fields + parse + roundtrip",
     },
     {
@@ -461,10 +480,14 @@ TEST_MATRIX: list[TestSpec] = [
         "path": "from_dict",
         "curves": ["DEPT", "DT", "RHOB"],
         "string_curves": set(),
-        "well_extra": {"COMP": "TEST COMPANY", "WELL": "WELL-01", "FLD": "TEST FLD", "LOC": "12-34-56-78W5"},
+        "well_extra": {
+            "COMP": "TEST COMPANY",
+            "WELL": "WELL-01",
+            "FLD": "TEST FLD",
+            "LOC": "12-34-56-78W5",
+        },
         "description": "las12 + SPACE + mandatory 8 fields + from_dict + roundtrip",
     },
-
     # ---- LAS 2.0 cases ----
     {
         "id": "las20_space_numeric_parse",
@@ -512,7 +535,6 @@ TEST_MATRIX: list[TestSpec] = [
         "well_extra": {"COMP": "ANY OIL COMPANY INC.", "WELL": "AAAAA_2"},
         "description": "las20 + SPACE + WRAP=NO + from_dict + roundtrip",
     },
-
     # ---- LAS 3.0 cases ----
     {
         "id": "las30_space_wrap_no_log_data_parse",
@@ -666,6 +688,7 @@ TEST_MATRIX: list[TestSpec] = [
 # Parametrized test function
 # =============================================================================
 
+
 @pytest.mark.parametrize("spec", TEST_MATRIX, ids=lambda s: s["id"])
 class TestCombinatorialRoundtrip:
     """Combinatorial roundtrip tests covering all major LAS parameter combinations."""
@@ -724,7 +747,11 @@ class TestCombinatorialRoundtrip:
             # Standard from_dict path
             curves_defs = _make_curves_defs(curves, string_curves, is_las30=vers.startswith("3."))
             return _make_las_dict(
-                vers, wrap, dlm, curves, logs,
+                vers,
+                wrap,
+                dlm,
+                curves,
+                logs,
                 well_extra=well_extra,
                 curves_defs=curves_defs,
                 string_curves=string_curves,
@@ -951,7 +978,11 @@ class TestCombinatorialRoundtrip:
         ]
 
         return _make_las_dict(
-            vers, wrap, dlm, curves, logs,
+            vers,
+            wrap,
+            dlm,
+            curves,
+            logs,
             well_extra=well_extra,
             curves_defs=curves_defs,
             data_sections=data_sections,
@@ -1003,8 +1034,10 @@ class TestCombinatorialRoundtrip:
 
         # Curves
         has_multi_section = bool(
-            spec.get("multi_section") or spec.get("core_data") or
-            spec.get("consecutive_sections") or spec.get("indexed_core")
+            spec.get("multi_section")
+            or spec.get("core_data")
+            or spec.get("consecutive_sections")
+            or spec.get("indexed_core")
         )
         if has_multi_section:
             # LAS 3.0 multi-section: parser may add curves from _Definition
@@ -1025,7 +1058,9 @@ class TestCombinatorialRoundtrip:
             if numeric_curves:
                 logs = data.get("logs", {})
                 for curve in numeric_curves:
-                    assert curve in logs, f"Missing numeric curve '{curve}' in logs for {spec['id']}"
+                    assert curve in logs, (
+                        f"Missing numeric curve '{curve}' in logs for {spec['id']}"
+                    )
 
     def _validate_roundtrip(
         self, original: dict[str, Any], roundtrip: dict[str, Any], spec: TestSpec
@@ -1035,9 +1070,11 @@ class TestCombinatorialRoundtrip:
         vers_str = spec["vers"]
         is_las30 = vers_str.startswith("3.")
         has_structured = bool(
-            spec.get("multi_section") or spec.get("core_data") or
-            spec.get("consecutive_sections") or spec.get("indexed_core") or
-            spec.get("las30_structured")
+            spec.get("multi_section")
+            or spec.get("core_data")
+            or spec.get("consecutive_sections")
+            or spec.get("indexed_core")
+            or spec.get("las30_structured")
         )
 
         # --- Version preservation ---
@@ -1052,9 +1089,7 @@ class TestCombinatorialRoundtrip:
         if not expect_wrap_override:
             orig_wrap = str(original["version"].get("WRAP", "")).upper()
             rt_wrap = str(roundtrip["version"].get("WRAP", "")).upper()
-            assert rt_wrap == orig_wrap, (
-                f"WRAP changed: {orig_wrap} -> {rt_wrap} in {spec['id']}"
-            )
+            assert rt_wrap == orig_wrap, f"WRAP changed: {orig_wrap} -> {rt_wrap} in {spec['id']}"
 
         # --- Well field preservation ---
         orig_well = original.get("well", {})
@@ -1095,7 +1130,8 @@ class TestCombinatorialRoundtrip:
                 f"string_data key '{key}' missing after roundtrip in {spec['id']}"
             )
             np.testing.assert_array_equal(
-                orig_string[key], rt_string[key],
+                orig_string[key],
+                rt_string[key],
                 err_msg=f"string_data mismatch for '{key}' in {spec['id']}",
             )
 
@@ -1135,7 +1171,9 @@ class TestCombinatorialRoundtrip:
                 continue
             try:
                 np.testing.assert_allclose(
-                    orig_arr, rt_arr, rtol=1e-5,
+                    orig_arr,
+                    rt_arr,
+                    rtol=1e-5,
                     err_msg=f"Data mismatch for '{curve}' in section {section_idx} ({sec_type}) for {test_id}",
                 )
             except TypeError:
@@ -1148,7 +1186,8 @@ class TestCombinatorialRoundtrip:
         for key in orig_str:
             if key in rt_str:
                 np.testing.assert_array_equal(
-                    orig_str[key], rt_str[key],
+                    orig_str[key],
+                    rt_str[key],
                     err_msg=f"string_data mismatch for '{key}' in section {section_idx} for {test_id}",
                 )
 
@@ -1170,13 +1209,16 @@ class TestCombinatorialRoundtrip:
                 try:
                     # Try numeric comparison first
                     np.testing.assert_allclose(
-                        orig_arr, rt_arr, rtol=1e-5,
+                        orig_arr,
+                        rt_arr,
+                        rtol=1e-5,
                         err_msg=f"Data mismatch for '{curve}' in {spec['id']}",
                     )
                 except TypeError:
                     # String comparison
                     np.testing.assert_array_equal(
-                        orig_arr, rt_arr,
+                        orig_arr,
+                        rt_arr,
                         err_msg=f"String data mismatch for '{curve}' in {spec['id']}",
                     )
 
@@ -1192,6 +1234,7 @@ class TestCombinatorialRoundtrip:
 # =============================================================================
 # Specific tests for cases needing special handling
 # =============================================================================
+
 
 def test_las30_multi_section_from_dict_roundtrip(tmp_path: Path) -> None:
     """Test LAS 3.0 multi-section from_dict roundtrip."""
@@ -1316,7 +1359,12 @@ def test_las20_from_dict_explicit_curves(tmp_path: Path) -> None:
         "curves_order": ["DEPT", "DT", "RHOB"],
         "curves": [
             {"mnemonic": "DEPT", "unit": "M", "description": "Depth", "data_format": "F"},
-            {"mnemonic": "DT", "unit": "US/M", "description": "Sonic Transit Time", "data_format": "F"},
+            {
+                "mnemonic": "DT",
+                "unit": "US/M",
+                "description": "Sonic Transit Time",
+                "data_format": "F",
+            },
             {"mnemonic": "RHOB", "unit": "K/M3", "description": "Bulk Density", "data_format": "F"},
         ],
         "logs": {
@@ -1339,5 +1387,7 @@ def test_las20_from_dict_explicit_curves(tmp_path: Path) -> None:
     assert parsed["curves_order"] == d["curves_order"]
     for curve in d["curves_order"]:
         np.testing.assert_allclose(
-            d["logs"][curve], parsed["logs"][curve], rtol=1e-5,
+            d["logs"][curve],
+            parsed["logs"][curve],
+            rtol=1e-5,
         )

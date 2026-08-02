@@ -252,9 +252,7 @@ class TestRoundTrip:
         # Roundtrip: re-read and verify section_type preserved
         data = read_las_file(temp_file)
         param_details = data.get("parameter_details", [])
-        assert len(param_details) >= 2, (
-            f"Expected at least 2 parameters, got {len(param_details)}"
-        )
+        assert len(param_details) >= 2, f"Expected at least 2 parameters, got {len(param_details)}"
 
         # Find BHT (section_type should be None → not in output or default)
         bht_params = [p for p in param_details if p.get("mnemonic") == "BHT"]
@@ -329,9 +327,7 @@ class TestRoundTrip:
         content = temp_file.read_text()
 
         # Both per-section parameter blocks should be present
-        assert "~CORE_Parameter" in content, (
-            f"Missing ~CORE_Parameter section:\n{content[:2000]}"
-        )
+        assert "~CORE_Parameter" in content, f"Missing ~CORE_Parameter section:\n{content[:2000]}"
         assert "~DRILLING_Parameter" in content, (
             f"Missing ~DRILLING_Parameter section:\n{content[:2000]}"
         )
@@ -393,6 +389,7 @@ class TestDEVRoundtripSkipped:
 # ──────────────────────────────────────────────────────────────
 # G2 (N-I-22 / N-I-02): parser/writer iter-2 new findings
 # ──────────────────────────────────────────────────────────────
+
 
 class TestNI22UnitRoundtrip:
     """N-I-22 (HIGH): units containing ``%`` / ``°C`` / ``ohm.m`` must
@@ -524,9 +521,7 @@ class TestNI02ParameterPipeRoundtrip:
             warnings.simplefilter("ignore")
             write_las_file(out, las)
             rt = read_las_file_as_object(out)
-        assert rt.parameters[0].description == "Note | Extra text", (
-            rt.parameters[0].description
-        )
+        assert rt.parameters[0].description == "Note | Extra text", rt.parameters[0].description
         assert rt.parameters[0].zone is None
 
     def test_las30_real_zone_still_roundtrips(self, tmp_path: Path) -> None:

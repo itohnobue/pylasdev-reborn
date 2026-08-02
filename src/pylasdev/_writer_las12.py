@@ -95,8 +95,16 @@ class _Las12Writer(_WriterBase):
             value = self._las_file.well.entries[key]
             unit = _sanitize_las_value(self._las_file.well.units.get(key, ""))
             unit_dot = f".{unit}" if unit else "."
-            val = _sanitize_las_value(value)
-            desc = _sanitize_las_value(self._las_file.well.descriptions.get(key, ""))
+            # W-07 (M-28 parity): well values/descriptions are emitted
+            # mid-line (never at line start) so a leading '~' must be
+            # preserved, not stripped — matching the LAS 2.0/3.0 base
+            # writer.  Stripping it silently corrupted the model value on
+            # write→read (WELL='~INCIDENTAL' → 'INCIDENTAL').
+            val = _sanitize_las_value(value, preserve_leading_tilde=True)
+            desc = _sanitize_las_value(
+                self._las_file.well.descriptions.get(key, ""),
+                preserve_leading_tilde=True,
+            )
             val = _escape_colons_for_las_value(val)
             desc = _escape_colons_for_las_value(desc)
             desc_str = f"  {desc}" if desc else ""
@@ -138,9 +146,9 @@ class _Las12Writer(_WriterBase):
         if _actual_wrap == "YES":
             self._las_file.version.wrap = "NO"
 
-        check_line_limit = self._spec.line_length_limit_for_wrap(
-            self._las_file.version.wrap
-        ) is not None
+        check_line_limit = (
+            self._spec.line_length_limit_for_wrap(self._las_file.version.wrap) is not None
+        )
 
         try:
             lines.extend(self._write_ascii_legacy(delimiter, check_line_limit))

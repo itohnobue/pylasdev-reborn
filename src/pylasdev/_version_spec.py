@@ -85,21 +85,39 @@ class _LASVersionSpec:
     def mandatory_well_fields(self) -> tuple[str, ...]:
         """Mandatory well-section field mnemonics for the current version.
 
-        LAS 1.2 and 2.0 require the lascheck 10-field set for ~W:
-        STRT, STOP, STEP, NULL, COMP, WELL, FLD, LOC, SRVC, DATE.
-        LAS 3.0 requires the four numeric depth-control fields
-        (STRT, STOP, STEP, NULL).
+        LAS 1.2 requires the four numeric depth-control fields
+        (STRT, STOP, STEP, NULL).  The lascheck 10-field set
+        (STRT, STOP, STEP, NULL, COMP, WELL, FLD, LOC, SRVC, DATE) is a
+        LAS 2.0-era requirement — lascheck's own documentation states it
+        "currently supports checking against LAS 2.0 standard only"
+        (research s1-research-las12-report.md:18).  frackoptima and GERDA
+        require only the 4 numeric fields for LAS 1.2 (research:20), so
+        applying the 10-field set to 1.2 produced 6 spurious "missing
+        mandatory well field" warnings on minimal-but-valid 1.2 files
+        (I2-07).
+        LAS 3.0 inherits the LAS 2.0 mandatory-well-field requirements per
+        the spec (STRT, STOP, STEP, NULL).
 
         M-11: UWI is NOT in lascheck's required set (it is optional when
         present) — previously LAS 1.2 wrongly required it, producing a
         false-positive "missing: UWI" warning on common files that carry no
         UWI.  COMP/FLD/DATE were previously omitted, producing false
-        negatives.
+        negatives for LAS 2.0.
         """
-        if self.is_las12 or self.is_las20:
+        if self.is_las12:
+            return ("STRT", "STOP", "STEP", "NULL")
+        if self.is_las20:
             return (
-                "STRT", "STOP", "STEP", "NULL",
-                "COMP", "WELL", "FLD", "LOC", "SRVC", "DATE",
+                "STRT",
+                "STOP",
+                "STEP",
+                "NULL",
+                "COMP",
+                "WELL",
+                "FLD",
+                "LOC",
+                "SRVC",
+                "DATE",
             )
         return ("STRT", "STOP", "STEP", "NULL")
 

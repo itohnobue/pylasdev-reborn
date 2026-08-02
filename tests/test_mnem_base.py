@@ -260,15 +260,9 @@ class TestResolveMnemonic:
         to the GK family.
         """
         uppered = _build_uppercased_first_wins(MNEM_BASE)
-        assert resolve_mnemonic(uppered, "AGK") == "GK", (
-            "AGK must resolve to GK, not GRO"
-        )
-        assert resolve_mnemonic(uppered, "Agk") == "GK", (
-            "Agk must resolve to GK, not GRO"
-        )
-        assert resolve_mnemonic(uppered, "aGK") == "GK", (
-            "aGK must resolve to GK, not GRO"
-        )
+        assert resolve_mnemonic(uppered, "AGK") == "GK", "AGK must resolve to GK, not GRO"
+        assert resolve_mnemonic(uppered, "Agk") == "GK", "Agk must resolve to GK, not GRO"
+        assert resolve_mnemonic(uppered, "aGK") == "GK", "aGK must resolve to GK, not GRO"
 
     # --- F-H-005: BK collision fix ---
 
@@ -280,12 +274,8 @@ class TestResolveMnemonic:
         incorrectly.  After the fix, both casing variants resolve to BFV.
         """
         uppered = _build_uppercased_first_wins(MNEM_BASE)
-        assert resolve_mnemonic(uppered, "BK") == "BFV", (
-            "BK must resolve to BFV"
-        )
-        assert resolve_mnemonic(uppered, "bk") == "BFV", (
-            "bk must resolve to BFV"
-        )
+        assert resolve_mnemonic(uppered, "BK") == "BFV", "BK must resolve to BFV"
+        assert resolve_mnemonic(uppered, "bk") == "BFV", "bk must resolve to BFV"
 
 
 class TestMnemBaseDualLaterologCollision:
@@ -325,9 +315,7 @@ class TestMnemBaseDualLaterologCollision:
         # its ORIGINAL mnemonic instead of being renamed to a duplicate
         # BFV — the warning documents the preservation.
         keep_warns = [
-            str(w.message)
-            for w in rec
-            if "Keeping the original mnemonic" in str(w.message)
+            str(w.message) for w in rec if "Keeping the original mnemonic" in str(w.message)
         ]
         assert len(keep_warns) >= 1, (
             "Expected 'Keeping the original mnemonic' collision warning, "

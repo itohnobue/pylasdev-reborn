@@ -349,6 +349,7 @@ class TestBOMHandling:
 # Production Check Regression Tests
 # ============================================================
 
+
 class TestProductionCheckEncodingFix:
     """Regression test for F-217 fix in encoding.py."""
 
@@ -368,7 +369,9 @@ class TestProductionCheckEncodingFix:
 
         # Cyrillic content in Russian (cp1251 encoded)
         # "Привет из России" — common Russian text
-        russian_text = "\u041f\u0440\u0438\u0432\u0435\u0442 \u0438\u0437 \u0420\u043e\u0441\u0441\u0438\u0438"
+        russian_text = (
+            "\u041f\u0440\u0438\u0432\u0435\u0442 \u0438\u0437 \u0420\u043e\u0441\u0441\u0438\u0438"
+        )
         russian_part = "~VERSION INFORMATION\n" + russian_text + "\n"
 
         content = large_preamble + russian_part
@@ -377,6 +380,7 @@ class TestProductionCheckEncodingFix:
 
         # Should detect and read the file correctly without crashing
         from pylasdev.encoding import read_with_encoding
+
         enc, text = read_with_encoding(test_file)
         assert isinstance(enc, str)
         assert len(text) > 0
@@ -393,9 +397,7 @@ class TestE06NumeroSignCyrillic:
     near-tie Cyrillic preference must override only that small margin.
     """
 
-    def test_cp1251_with_numero_sign_detected_as_cp1251(
-        self, tmp_path: Path
-    ) -> None:
+    def test_cp1251_with_numero_sign_detected_as_cp1251(self, tmp_path: Path) -> None:
         """E-06: a cp1251 Russian file with "№" decodes as cp1251, not cp1252."""
         russian = "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410 \u2116 123 \u041c\u0415\u0421\u0422\u041e\u0420\u041e\u0416\u0414\u0415\u041d\u0418\u0415 \u041f\u041b\u0410\u0421\u0422 "
         # "СКВАЖИНА № 123 МЕСТОРОЖДЕНИЕ ПЛАСТ "
@@ -410,9 +412,7 @@ class TestE06NumeroSignCyrillic:
             return_value="utf-8",
         ):
             enc, _text = read_with_encoding(test_file)
-        assert enc == "cp1251", (
-            f"E-06: cp1251 file with '№' misdecoded as {enc!r} (mojibake)"
-        )
+        assert enc == "cp1251", f"E-06: cp1251 file with '№' misdecoded as {enc!r} (mojibake)"
 
     def test_utf8_cyrillic_still_detected_after_fix(self, tmp_path: Path) -> None:
         """E-06: UTF-8 Cyrillic must not regress to cp1251 (fix-regression guard)."""
@@ -426,9 +426,7 @@ class TestE06NumeroSignCyrillic:
             return_value="latin-1",
         ):
             enc, text = read_with_encoding(test_file)
-        assert enc == "utf-8", (
-            f"E-06: UTF-8 Cyrillic file misdecoded as {enc!r}"
-        )
+        assert enc == "utf-8", f"E-06: UTF-8 Cyrillic file misdecoded as {enc!r}"
         assert "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410" in text
 
 
@@ -455,9 +453,7 @@ class TestE07CyrillicBeyond64K:
             return_value="utf-8",
         ):
             enc, text = read_with_encoding(test_file)
-        assert enc == "cp1251", (
-            f"E-07: Cyrillic beyond 64K misdecoded as {enc!r}"
-        )
+        assert enc == "cp1251", f"E-07: Cyrillic beyond 64K misdecoded as {enc!r}"
         assert "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410" in text
 
     def test_cp866_cyrillic_beyond_64k_detected(self, tmp_path: Path) -> None:
@@ -482,12 +478,138 @@ class TestE07CyrillicBeyond64K:
             return_value="utf-8",
         ):
             enc, text = read_with_encoding(test_file)
-        assert enc in ("cp1251", "cp866"), (
-            f"E-07: cp866 Cyrillic beyond 64K misdecoded as {enc!r}"
-        )
+        assert enc in ("cp1251", "cp866"), f"E-07: cp866 Cyrillic beyond 64K misdecoded as {enc!r}"
         # Pre-fix the file fell to the Western tiebreak (latin-1).  Post-fix
         # it is recognized as Cyrillic — the decoded text must contain
         # Cyrillic code points, not raw Western control chars.
         assert any(0x0400 <= ord(c) <= 0x04FF for c in text), (
             "E-07: cp866 tail decoded without any Cyrillic characters"
         )
+
+
+# ──────────────────────────────────────────────────────────────
+# ENC-01 (encoding, MEDIUM): №-adjacency Cyrillic rule false-positive.
+# A Western cp1252 "¹" (0xB9) ADJACENT to a 3+ accent run fired the
+# №-adjacency rule → the whole file decoded as cp1251 (mojibake).
+# F-18 fixed the far-away case only; the adjacent case was untested.
+# The rule must require the unambiguous № byte (0x85, cp866) or a 0xB9
+# followed by an ASCII digit (the Russian "СКВ №1"/"ПЛАСТ №2" convention)  # noqa: RUF003
+# — a Western footnote "¹" is not a "№ <number>" prefix.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestENC01NumeroAdjacencyFalsePositive:
+    """ENC-01: Western '¹' adjacent to an accent run must NOT confirm
+    Cyrillic — 'Nota¹ Ñáñez' (cp1252) decodes as cp1252, not cp1251."""
+
+    def test_western_adjacent_superscript_stays_cp1252(self, tmp_path: Path) -> None:
+        text = "Nota\u00b9 \u00d1\u00e1\u00f1ez"  # 'Nota¹ Ñáñez' in cp1252
+        test_file = tmp_path / "enc01_adjacent_superscript.las"
+        test_file.write_bytes(text.encode("cp1252"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", f"ENC-01: adjacent-¹ Western file misdecoded as {enc!r} (mojibake)"
+        assert not any(0x0400 <= ord(c) <= 0x04FF for c in content)
+
+    def test_genuine_cp1251_numero_label_stays_cp1251(self, tmp_path: Path) -> None:
+        """Positive control: genuine cp1251 'СКВ №1' (3-run + digit-follow
+        №) still confirms Cyrillic — no over-correction of the fix."""  # noqa: RUF002
+        russian = "\u0421\u041a\u0412 \u2116 1"  # 'СКВ № 1' in cp1251  # noqa: RUF003
+        test_file = tmp_path / "enc01_genuine_cp1251.las"
+        test_file.write_bytes(russian.encode("cp1251"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1251", (
+            f"ENC-01 positive control: genuine cp1251 №-label misdecoded as {enc!r}"
+        )
+        assert "\u0421\u041a\u0412" in content
+
+
+# ──────────────────────────────────────────────────────────────
+# ENC-02 (encoding, HIGH): word-char-ratio selection flips genuine
+# Western cp1252/latin-1 content to cp866/cp1251 when Windows-1252 smart
+# punctuation (0x91-0x97) is present — silent mojibake of ALL header
+# strings; overrides even a perfect chardet answer.  Fix: (a) honor a
+# high-confidence chardet detection (material-margin guard), (b) Western
+# near-tie rescue with smart-punct artifact subtraction (mirror of E-06).
+# ──────────────────────────────────────────────────────────────
+
+
+class TestENC02SmartPunctuationWestern:
+    """ENC-02: Western files with smart punctuation decode as cp1252."""
+
+    def test_western_smart_punct_stays_cp1252(self, tmp_path: Path) -> None:
+        """A cp1252 file with smart quotes/dashes decodes as cp1252 (not
+        cp866) via the smart-punct artifact subtraction (chardet absent)."""
+        text = 'Puits "Jean-Joseph" \u2014 R\u00e9servoir \u00e0 l\u2019ouest: profondeur 2450,5 m'
+        test_file = tmp_path / "enc02_smart_punct.las"
+        test_file.write_bytes(text.encode("cp1252"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", f"ENC-02: cp1252 smart-punct file misdecoded as {enc!r} (mojibake)"
+        assert "R\u00e9servoir" in content
+
+    def test_mocked_chardet_cp1252_answer_honored(self, tmp_path: Path) -> None:
+        """Even a mocked (perfect) chardet cp1252 answer is honored — the
+        ratio sort must not override a high-confidence detection."""
+        text = 'Puits "Jean-Joseph" \u2014 R\u00e9servoir \u00e0 l\u2019ouest: profondeur 2450,5 m'
+        test_file = tmp_path / "enc02_chardet_cp1252.las"
+        test_file.write_bytes(text.encode("cp1252"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="cp1252",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.99,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", f"ENC-02: mocked chardet cp1252 answer overridden to {enc!r}"
+        assert "R\u00e9servoir" in content
+
+    def test_utf8_cyrillic_still_utf8(self, tmp_path: Path) -> None:
+        """Guard: UTF-8 Cyrillic must still decode as UTF-8 (no regression
+        from the Western rescue / detected-encoding priority)."""
+        russian = (
+            "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410 "
+            "\u0422\u0415\u0421\u0422 \u041c\u0415\u0421\u0422\u041e\u0420\u041e\u0416\u0414\u0415\u041d\u0418\u0415 \u041f\u041b\u0410\u0421\u0422 "
+        )
+        test_file = tmp_path / "enc02_utf8_cyrillic.las"
+        test_file.write_bytes((russian * 50).encode("utf-8"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="latin-1",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.99,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "utf-8", f"ENC-02 guard: UTF-8 Cyrillic misdecoded as {enc!r}"
+        assert "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410" in content

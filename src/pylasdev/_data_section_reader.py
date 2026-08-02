@@ -83,28 +83,49 @@ def _is_section_header(stripped: str) -> bool:
 # after splitting).  Validating section words against this known set before
 # breaking data reading prevents premature termination caused by injected
 # artifacts.  Aligned with parser.py's known section-type dispatch tables.
-_KNOWN_SECTION_WORDS: frozenset[str] = frozenset({
-    # Data section words (from parser._DATA_SECTION_WORDS)
-    "A", "ASCII",
-    "CORE", "CORE_DATA",
-    "DRILLING", "DRILLING_DATA",
-    "FORMATION", "FORMATION_DATA",
-    "INCLINOMETRY", "INCLINOMETRY_DATA",
-    "LOG", "LOG_DATA",
-    "MUD", "MUD_DATA",
-    "PERFORATIONS", "PERFORATIONS_DATA",
-    "RISK", "RISK_DATA",
-    "STRUCTURE", "STRUCTURE_DATA",
-    "TEST", "TEST_DATA",
-    "TOPS", "TOPS_DATA",
-    # Non-data section words (from parser dispatch table)
-    "C", "CURVE",
-    "D", "DEFINITION",
-    "O", "OTHER",
-    "P", "PARAMETER", "PARAMETERS",
-    "V", "VERSION",
-    "W", "WELL",
-})
+_KNOWN_SECTION_WORDS: frozenset[str] = frozenset(
+    {
+        # Data section words (from parser._DATA_SECTION_WORDS)
+        "A",
+        "ASCII",
+        "CORE",
+        "CORE_DATA",
+        "DRILLING",
+        "DRILLING_DATA",
+        "FORMATION",
+        "FORMATION_DATA",
+        "INCLINOMETRY",
+        "INCLINOMETRY_DATA",
+        "LOG",
+        "LOG_DATA",
+        "MUD",
+        "MUD_DATA",
+        "PERFORATIONS",
+        "PERFORATIONS_DATA",
+        "RISK",
+        "RISK_DATA",
+        "STRUCTURE",
+        "STRUCTURE_DATA",
+        "TEST",
+        "TEST_DATA",
+        "TOPS",
+        "TOPS_DATA",
+        # Non-data section words (from parser dispatch table)
+        "C",
+        "CURVE",
+        "D",
+        "DEFINITION",
+        "O",
+        "OTHER",
+        "P",
+        "PARAMETER",
+        "PARAMETERS",
+        "V",
+        "VERSION",
+        "W",
+        "WELL",
+    }
+)
 
 
 def _is_recognized_section_word(word: str) -> bool:

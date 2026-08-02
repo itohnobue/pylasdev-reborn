@@ -132,10 +132,7 @@ class TestCompareListsEdgeCases:
     def test_length_mismatch_via_per_element_path(self) -> None:
         # list with a dict element -> _list_to_numeric_array returns None ->
         # _has_nan(dict) False -> l1 != l2 shortcut False -> per-element path
-        assert (
-            _compare_lists([{"a": 1}], [{"a": 1}, {"b": 2}], "x", 1e-7, 0.0)
-            is False
-        )
+        assert _compare_lists([{"a": 1}], [{"a": 1}, {"b": 2}], "x", 1e-7, 0.0) is False
 
     def test_type_mismatch_non_list_first(self) -> None:
         # l1 is a dict (not a list) whose value contains NaN -> _has_nan
@@ -143,10 +140,7 @@ class TestCompareListsEdgeCases:
         assert _compare_lists({"a": np.nan}, [np.nan], "x", 1e-7, 0.0) is False
 
     def test_list_of_dicts_equal(self) -> None:
-        assert (
-            _compare_lists([{"a": 1}], [{"a": 1}], "x", 1e-7, 0.0)
-            is True
-        )
+        assert _compare_lists([{"a": 1}], [{"a": 1}], "x", 1e-7, 0.0) is True
 
     def test_length_mismatch_with_nan_routes_to_len_check(self) -> None:
         # Both lists contain a NaN and a string -> _list_to_numeric_array
@@ -221,9 +215,7 @@ class TestParserStateValidate:
 
     def test_data_sections_present_but_not_las30(self) -> None:
         las = self._las()
-        las.data_sections.append(
-            DataSection(name="S", section_type="LOG_DATA")
-        )
+        las.data_sections.append(DataSection(name="S", section_type="LOG_DATA"))
         st = _ParserState()
         issues = st.validate(las)
         assert any("but is_las30 is False" in i for i in issues)
@@ -421,12 +413,7 @@ class TestSpecFormGroupDataIsNumeric:
         assert _spec_form_group_data_is_numeric(["1 2"], None, [0, 1]) is False
 
     def test_comment_and_blank_lines_skipped(self) -> None:
-        assert (
-            _spec_form_group_data_is_numeric(
-                ["# c", "   ", "1.0 2.0"], " ", [0, 1]
-            )
-            is True
-        )
+        assert _spec_form_group_data_is_numeric(["# c", "   ", "1.0 2.0"], " ", [0, 1]) is True
 
     def test_short_row_ignored(self) -> None:
         assert _spec_form_group_data_is_numeric(["1.0"], " ", [0, 1]) is True
@@ -437,10 +424,8 @@ class TestBuildSpecFormArrayInfo:
 
     def _pair(self) -> list[CurveDefinition]:
         return [
-            CurveDefinition(mnemonic="NMR", unit="ms", data_format="A",
-                            description="Echo {A:0}"),
-            CurveDefinition(mnemonic="NMR", unit="ms", data_format="A",
-                            description="Echo {A:5}"),
+            CurveDefinition(mnemonic="NMR", unit="ms", data_format="A", description="Echo {A:0}"),
+            CurveDefinition(mnemonic="NMR", unit="ms", data_format="A", description="Echo {A:5}"),
         ]
 
     def test_synthesis_with_numeric_data(self) -> None:
@@ -488,11 +473,13 @@ class TestBuildSpecFormArrayInfo:
     def test_existing_array_info_members_skip_grouping(self) -> None:
         sc = [
             CurveDefinition(
-                mnemonic="NMR[1]", data_format="A",
+                mnemonic="NMR[1]",
+                data_format="A",
                 array_info=ArrayElementInfo(base_name="NMR", index=1, time_offset=0.0),
             ),
             CurveDefinition(
-                mnemonic="NMR", data_format="A",
+                mnemonic="NMR",
+                data_format="A",
             ),
         ]
         out = _build_spec_form_array_info(sc, ["1 2"], " ")

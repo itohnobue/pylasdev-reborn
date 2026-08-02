@@ -59,6 +59,14 @@ class _CapturedState:
     # Previous definition name — for saving C section curve ranges
     previous_definition_name: str | None
 
+    # PF-01: Pipe target of the PREVIOUS (leaving) data section, captured
+    # BEFORE classification resets ``_current_pipe_target`` to the NEW
+    # section's value (parser.py:1468).  The A→A consecutive-data path must
+    # restore this so ``_flush_ascii_data``'s pre-~V deferral records the
+    # FIRST section's forward "| X_Definition" pipe (PARS-06) instead of the
+    # second section's (bare → None) target.
+    current_pipe_target: str | None = None
+
 
 class _SectionTransitionHandler:
     """Handles the three-phase section-transition lifecycle.
@@ -115,6 +123,19 @@ class _SectionTransitionHandler:
                 p._state.definition_curve_ranges[p._state.current_definition_name] = (start, end)
             else:
                 # H-01: Non-_Definition ~C section — save under sentinel.
+                # PARS-09: A "| CURVE" pipe must see the UNION of ALL repeated
+                # plain ~C blocks (``~C(DEPT,GR) ~C(RHOB) ~A|CURVE`` previously
+                # resolved to a truncated (2,3) scope and silently discarded
+                # DEPT/GR).  __MAIN_ALL__ accumulates the union; __MAIN__ keeps
+                # last-writer-wins for the BARE-~A fallback (F-S9-02: a bare
+                # data section scopes to the MOST RECENT plain ~C block).
+                _prev_all = p._state.definition_curve_ranges.get("__MAIN_ALL__")
+                if _prev_all is not None:
+                    _all_start = min(_prev_all[0], start)
+                    _all_end = max(_prev_all[1], end)
+                else:
+                    _all_start, _all_end = start, end
+                p._state.definition_curve_ranges["__MAIN_ALL__"] = (_all_start, _all_end)
                 p._state.definition_curve_ranges["__MAIN__"] = (start, end)
 
         return _CapturedState(
@@ -127,15 +148,21 @@ class _SectionTransitionHandler:
             version_found=p._state.version_found,
             las_file=p.las_file,
             previous_definition_name=p._state.current_definition_name,
+            # PF-01: Capture the pipe target at snapshot time — the
+            # classification block that runs AFTER capture resets it to the
+            # NEW section's target (parser.py:1468).  getattr guard: tests
+            # that monkeypatch _reset() (R-005 format-vs-placement path) do
+            # not initialize this attribute; a missing target is equivalent
+            # to "no pipe on the previous section" (mirrors the
+            # _section_pipe_targets guard in parser.py).
+            current_pipe_target=getattr(p, "_current_pipe_target", None),
         )
 
     # ------------------------------------------------------------------
     # Phase 2 — PROCESS: finalize the previous section
     # ------------------------------------------------------------------
 
-    def process_previous_section(
-        self, captured: _CapturedState, new_section: str | None
-    ) -> int:
+    def process_previous_section(self, captured: _CapturedState, new_section: str | None) -> int:
         """Process the previous section's accumulated data and finalize its state.
 
         REQUIRES: ``captured`` from a prior ``capture_current_state()`` call.
@@ -219,9 +246,7 @@ class _SectionTransitionHandler:
         ):
             p._state.current_section_name = section_word
         else:
-            p._state.current_section_name = (
-                section_name.strip() if section_name else section_word
-            )
+            p._state.current_section_name = section_name.strip() if section_name else section_word
 
         # F-34: Track section sequence for cross-section validation.
         # Section label uses section_word (e.g. "CURVE", "VERSION")
@@ -289,6 +314,14 @@ class _SectionTransitionHandler:
         p._state.section_curve_start_idx = captured.curve_start_idx
         p._state.section_curve_end_idx = captured.curve_end_idx
 
+        # PF-01: Classification has already overwritten _current_pipe_target
+        # with the NEW section's target (parser.py:1468).  Save it, restore
+        # the PREVIOUS section's captured target so _flush_ascii_data's
+        # pre-~V deferral records the first section's forward "| X_Definition"
+        # pipe (PARS-06), then restore the new target on exit.
+        _new_pipe_target = p._current_pipe_target
+        p._current_pipe_target = captured.current_pipe_target
+
         try:
             # Swap data section type: save new, restore old.
             _new_type = p._state.current_data_section_type
@@ -299,7 +332,9 @@ class _SectionTransitionHandler:
             # Restore new section's type.
             p._state.current_data_section_type = _new_type
         finally:
-            # Restore new section's curve indices and reset accumulators.
+            # Restore new section's pipe target and curve indices and reset
+            # accumulators.
+            p._current_pipe_target = _new_pipe_target
             p._state.section_curve_start_idx = _new_curve_start
             p._state.section_curve_end_idx = _new_curve_end
 
@@ -314,9 +349,7 @@ class _SectionTransitionHandler:
 
         start = captured.curve_start_idx
         end = (
-            captured.curve_end_idx
-            if captured.curve_end_idx is not None
-            else len(p.las_file.curves)
+            captured.curve_end_idx if captured.curve_end_idx is not None else len(p.las_file.curves)
         )
 
         if captured.previous_definition_name is not None:
@@ -325,4 +358,14 @@ class _SectionTransitionHandler:
             p._state.definition_curve_ranges[captured.previous_definition_name] = (start, end)
         else:
             # H-01: Non-_Definition ~C section — save under sentinel.
+            # PARS-09: keep __MAIN__ last-writer-wins for the bare-~A
+            # fallback, but accumulate __MAIN_ALL__ (union) for "| CURVE"
+            # pipe resolution (see capture_current_state).
+            _prev_all = p._state.definition_curve_ranges.get("__MAIN_ALL__")
+            if _prev_all is not None:
+                _all_start = min(_prev_all[0], start)
+                _all_end = max(_prev_all[1], end)
+            else:
+                _all_start, _all_end = start, end
+            p._state.definition_curve_ranges["__MAIN_ALL__"] = (_all_start, _all_end)
             p._state.definition_curve_ranges["__MAIN__"] = (start, end)
