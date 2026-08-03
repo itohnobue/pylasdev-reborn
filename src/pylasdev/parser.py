@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 import re
 import sys
-import threading
 import types
 import warnings
 from collections.abc import Sequence
@@ -23,7 +22,14 @@ from typing import Any, ClassVar
 
 import numpy as np
 
+# II-10b (import-order trap): this _data_section_reader import MUST sit
+# AFTER `from . import data_reader as _data_reader` above — the module-level
+# chain parser → _data_section_reader → data_reader (partial) →
+# _data_section_reader (partial) ImportErrors when _data_section_reader's
+# names are not yet defined.  Placing the import before line 26 triggers it.
+from . import _sanitize as _sanitize_mod
 from . import data_reader as _data_reader
+from ._data_section_reader import _split_header_row, is_mnemonic_header_row
 from ._las30_data import (
     AsciiDataContext,
     _reconcile_null_sentinels,
@@ -69,41 +75,29 @@ MAX_OTHER_LINES = 1_000_000
 # external data is genuine content, not a writer escape.  Defaults to
 # True (preserves existing roundtrip behavior).  Set to False before
 # reading external files to prevent data corruption.
-# F-21: Thread-local storage to prevent race conditions when concurrent
-# callers use different desanitize values.  Module-level attribute
-# setting (e.g. data_reader's ``_DESANITIZE_ENABLED = desanitize``)
-# is intercepted via ``_DesanitizeModule.__setattr__`` and routed to
-# per-thread storage.  Truthiness checks via ``_DesanitizeProxy.__bool__``
-# also route to per-thread storage.
-_desanitize_storage = threading.local()
-_desanitize_storage.enabled = True  # Default on the importing thread.
-
-
-def _is_desanitize_enabled() -> bool:
-    """Return True if desanitization is enabled (thread-local, default True)."""
-    return getattr(_desanitize_storage, "enabled", True)
-
-
-def _set_desanitize_enabled(value: bool) -> None:
-    """Set the desanitization flag for the current thread."""
-    _desanitize_storage.enabled = value
+# F-21: The thread-local storage itself moved to _sanitize.py (II-9 —
+# single storage shared by parser, data_reader, reader, and _las30_data).
+# This module keeps a delegating module-class shim so the 23 test
+# references that access ``pylasdev.parser._DESANITIZE_ENABLED`` directly
+# keep routing to the same thread-local storage.
 
 
 class _DesanitizeModule(types.ModuleType):
     """Module subclass that routes ``_DESANITIZE_ENABLED`` reads and writes
-    to thread-local storage.  This intercepts the ``= desanitize`` assignment
-    in data_reader.py and ``if not _DESANITIZE_ENABLED:`` truthiness checks
-    in this module and data_reader, all without modifying those modules.
+    to the shared thread-local storage in ``_sanitize.py``.  This delegates
+    to ``_sanitize._is_desanitize_enabled`` / ``_set_desanitize_enabled`` —
+    the storage is unified, so a write through this shim is visible to
+    data_reader and reader, and vice versa.
     """
 
     def __getattr__(self, name: str) -> object:
         if name == "_DESANITIZE_ENABLED":
-            return _is_desanitize_enabled()
+            return _sanitize_mod._is_desanitize_enabled()
         raise AttributeError(f"module '{__name__}' has no attribute {name!r}")
 
     def __setattr__(self, name: str, value: object) -> None:
         if name == "_DESANITIZE_ENABLED":
-            _set_desanitize_enabled(bool(value))
+            _sanitize_mod._set_desanitize_enabled(bool(value))
         else:
             super().__setattr__(name, value)
 
@@ -548,136 +542,53 @@ def _is_indexed_data_section(section_word: str) -> bool:
 def _unescape_colons_for_las_value(value: str) -> str:
     """Reverse the ``_escape_colons_for_las_value`` transformation.
 
-    The writer applies a two-step colon escape to prevent the parser from
-    misinterpreting embedded colons as structural separators:
-
-    1. Insert ``_`` between whitespace and colon: ``" :"`` → ``" _:"``
-    2. Insert ``_`` after colon followed by whitespace or end: ``": "`` → ``":_ "``
-
-    The combined effect on ``" : "`` produces ``" _:_ "``.
-
-    This function reverses both steps in the opposite order (step 2 first,
-    then step 1), restoring the original colon-separated text.  It is
-    applied during parsing to all values and descriptions that may have
-    been escaped by the writer — well entries, parameter values, curve
-    descriptions, and curve API codes.
-
-    .. note::
-
-       Legitimate underscore characters that happen to form the escape
-       pattern (e.g., ``tag_:`` in original data) will be incorrectly
-       unescaped.  This is the same trade-off acknowledged by the writer's
-       docstring — the roundtrip loss is limited to the contrived case
-       where user data naturally contains the escape-artifact patterns.
+    Thin wrapper over :func:`pylasdev._sanitize._unescape_colons_for_las_value`
+    (shared read-side inverse of the writer's colon escape).
     """
-    # Undo step 2 first: remove ``_`` after colon when followed by
-    # whitespace or end-of-string (``:_ `` → ``: ``, ``:_$`` → ``:$``).
-    value = re.sub(r":_(?=\s|$)", ":", value)
-    # Undo step 1: remove ``_`` between whitespace and colon
-    # (`` _:`` → `` :``, ``\t_:`` → ``\t:``).
-    # M-61: `(\s+)_:` is quadratic on long whitespace runs NOT followed by
-    # `_:` — `\s+` greedily consumes the run, `_:` fails, `\s+` backtracks
-    # one char at a time → O(k²).  A fixed-width lookbehind `(?<=\s)_:` has
-    # no quantifier to backtrack → linear.  Semantics identical: the
-    # single-char lookbehind preserves the whitespace (zero-width) and the
-    # matched `_:` is replaced by `:`, exactly like `(\s+)_:` → `\1:`.
-    value = re.sub(r"(?<=\s)_:", ":", value)
-    return value
+    return _sanitize_mod._unescape_colons_for_las_value(value)
 
 
 def _unescape_pipes_for_las_value(value: str) -> str:
     """Reverse the ``_escape_pipes_for_las_value`` transformation.
 
-    The writer escapes literal pipes in parameter descriptions
-    (``|`` → ``\\|``) so genuine description text containing a pipe is
-    not misparsed as a LAS 3.0 zone association (``| Zone``) on re-read.
-    This function restores the original pipe.
-
-    .. note::
-
-       Legitimate backslash-pipe text in original data (e.g., a literal
-       ``\\|`` in a description) will be incorrectly unescaped.  This is
-       the same trade-off acknowledged by the colon-escape helpers — the
-       roundtrip loss is limited to the contrived case where user data
-       naturally contains the escape-artifact pattern.
+    Thin wrapper over :func:`pylasdev._sanitize._unescape_pipes_for_las_value`
+    (shared read-side inverse of the writer's pipe escape).
     """
-    return value.replace("\\|", "|")
+    return _sanitize_mod._unescape_pipes_for_las_value(value)
 
 
 def _desanitize_las_value(value: str) -> str:
-    """Reverse the _sanitize_las_value ``#``-prefix escape.
+    """Reverse the writer's ``_``-prefix-on-``#`` escape (shared helper).
 
-    The writer prefixes ``#``-starting values with ``_`` to prevent the
-    parser from interpreting them as comment lines.  This function strips
-    that prefix, restoring the original ``#``-prefixed value.
+    Thin wrapper over :func:`pylasdev._sanitize.desanitize_las_value` used
+    by the header call sites (well/curve/param values and descriptions).
 
-    Two cases (matching writer's ``_sanitize_las_value``):
-
-    1. ``value.startswith("#")`` → writer prepends ``_`` → ``"_#..."``
-       → reverse: strip the leading ``_``.
-    2. ``value.lstrip().startswith("#")`` → writer inserts ``_`` after
-       leading whitespace → ``" _#..."`` → reverse: remove the ``_``
-       between whitespace and ``#``.
-
-    F-25: Case 2 applies ONLY when the ``_#`` is the first non-whitespace
-    content (preceded exclusively by leading whitespace) — the writer's
-    actual escape scope.  Internal ``" _#"`` content the writer never
-    escapes (e.g. ``"ACME _#Oil Corp"``) is preserved unchanged.
+    II-13/F-8: ``restore_tilde`` stays at the fail-safe default ``False``
+    here.  The parser-side header call sites previously restored ``_~`` →
+    ``~`` unconditionally, silently corrupting genuine ``_~``-prefixed
+    header content (F-02) — the writer NEVER emits ``_~`` in header
+    fields (the M-85 escape is data-rows-only), so not restoring is the
+    correct, roundtrip-preserving behavior.  The LAS 3.0 DATA path
+    (``_las30_data.process_ascii_data``) passes ``restore_tilde=True``
+    explicitly (II-13).
     """
-    if not _is_desanitize_enabled():
-        return value
-    if value.startswith("_#"):
-        return value[1:]
-    # M-85: The writer escapes a FIRST-column string value starting with
-    # '~'+non-letter (or bare '~') as '_~' so the emitted data line never
-    # starts with '~' (which the reader skips as a section-header
-    # heuristic — dropping the whole row).  Restore the leading '~'.
-    # The escape is position-independent on the read side (any string
-    # value that legitimately begins '_~' is a contrived case, same
-    # trade-off as '_#').
-    if value.startswith("_~"):
-        return value[1:]
-    # Case 2: whitespace-prefixed value with sanitized _# (e.g., " _#comment")
-    # F-25: Restrict to the writer's ACTUAL escape scope.  The writer
-    # (_sanitize_las_value, _writer_base.py:122-127) escapes '#' ONLY at
-    # value start (startswith("#")) or after LEADING whitespace
-    # (lstrip().startswith("#")).  The previous blanket
-    # ``value.find("_#") + whitespace-before`` unescaped INTERNAL " _#
-    # content the writer never escapes (e.g. "ACME _#Oil Corp" → "ACME
-    # #Oil Corp") — a silent write→read corruption.  Only an "_#" preceded
-    # exclusively by leading whitespace (the FIRST non-whitespace content)
-    # is a writer escape artifact; mid-value "_#" is preserved, mirroring
-    # _desanitize_other_line's scoped restore.
-    stripped = value.lstrip()
-    if len(stripped) < len(value) and stripped.startswith("_#"):
-        leading = value[: len(value) - len(stripped)]
-        return leading + stripped[1:]
-    return value
+    return _sanitize_mod.desanitize_las_value(value)
 
 
 def _desanitize_other_line(line: str) -> str:
     """Scoped W-08 restore for ~O (other) lines — reverse ONLY the escapes
     the ~O writer actually emits.
 
+    Thin wrapper over :func:`pylasdev._sanitize.desanitize_other_line` —
+    the ``~O``-scoped ``_#``-only restore.  ``restore_tilde`` is NOT
+    exposed here (the ~O writer never emits ``_~``; II-13).
+
     PF-02 (regression fix): ``_parse_other`` previously ran every ~O line
     through the blanket ``_desanitize_las_value``, which also reversed the
     data-row ``_~`` escape and ANY whitespace-adjacent ``_#`` — escapes the
-    ~O writer (``_sanitize_las_value``, _writer_base.py:96-130) NEVER emits.
-    Genuine ``_~``-prefixed lines and mid-line ``_#`` content were silently
+    ~O writer (``_sanitize_las_value``) NEVER emits.  Genuine
+    ``_~``-prefixed lines and mid-line ``_#`` content were silently
     altered on write→read.
-
-    The ~O writer's actual escape scope is narrow: a line whose content
-    begins with ``#`` (at the very start, or after leading whitespace) is
-    prefixed with ``_`` so the parser's COMMENT_PATTERN does not drop it.
-    This restores exactly those two positions:
-
-    1. ``line.startswith("_#")`` → strip the ``_`` (``_#comment`` → ``#comment``).
-    2. ``_#`` preceded ONLY by leading whitespace → strip the ``_``
-       (`` _#comment`` → `` #comment``), mirroring the writer's
-       whitespace-preserving escape.
-
-    Everything else — ``_~`` anywhere (the ~O writer never emits it), and
-    mid-line ``_#`` — is preserved unchanged.
 
     .. note::
 
@@ -686,15 +597,7 @@ def _desanitize_other_line(line: str) -> str:
        convention (restore writer escapes) wins at position 0.  Mid-line and
        ``_~`` content carry no such ambiguity and are preserved.
     """
-    if not _is_desanitize_enabled():
-        return line
-    if line.startswith("_#"):
-        return line[1:]
-    stripped = line.lstrip()
-    if len(stripped) < len(line) and stripped.startswith("_#"):
-        leading = line[: len(line) - len(stripped)]
-        return leading + stripped[1:]
-    return line
+    return _sanitize_mod.desanitize_other_line(line)
 
 
 # F-27: Reusable cross-section curve count validation — extracted from
@@ -1506,19 +1409,25 @@ class LASParser:
                     #       Count uses the dedicated distinct-curve counter
                     #       (curve_def_count), never len(curve_mnems) —
                     #       aliases would over-count on mnem_base files.
-                    if curve_mnems:
-                        _tokens = re.split(r"[\s,]+", stripped)
-                        while _tokens and _tokens[-1] == "":
-                            _tokens.pop()
-                        if (
-                            count == 0
-                            and _tokens
-                            and len(_tokens) >= min(2, curve_def_count)
-                            and len(_tokens) <= curve_def_count
-                            and string_curve_count != curve_def_count
-                            and all(_tok.upper() in curve_mnems for _tok in _tokens)
-                        ):
-                            continue
+                    # Shared predicate (H-scope single source of truth).
+                    # H-1/II-11: the pre-scan already tokenized on the
+                    # superset split; _split_header_row makes that explicit
+                    # so all 3 sites share one tokenizer.  The count == 0
+                    # first-line gate stays caller-side (DR-M3), as do the
+                    # dedicated distinct-curve counter (curve_def_count,
+                    # H-4) and the pre-scan's text-mirror match set
+                    # (curve_mnems — no post-dedup _2 renames, H-02).
+                    if (
+                        curve_mnems
+                        and count == 0
+                        and is_mnemonic_header_row(
+                            _split_header_row(stripped),
+                            declared=curve_mnems,
+                            curve_count=curve_def_count,
+                            all_string=(string_curve_count == curve_def_count),
+                        )
+                    ):
+                        continue
                     count += 1
 
         # F-I2-M10: Always append final block count — even zero.
@@ -3881,16 +3790,11 @@ class LASParser:
             # Curves not parsed yet (e.g. data-before-~C) — cannot verify
             # mnemonics; treat the line as data (conservative).
             return False
-        delimiter = self.las_file.version.delimiter_char
         stripped = line.strip()
-        if delimiter == " ":
-            tokens = stripped.split()
-        else:
-            tokens = stripped.split(delimiter)
-            # Mirror _las30_data.process_ascii_data: strip trailing empty
-            # fields (trailing delimiter produces phantom columns).
-            while tokens and tokens[-1] == "":
-                tokens.pop()
+        # H-1/II-11: superset tokenizer (whitespace OR comma), matching the
+        # reader and pre-scan sites — a space-separated mnemonic header row
+        # in a DLM=COMMA file is recognized instead of consumed as data.
+        tokens = _split_header_row(stripped)
         if not tokens:
             return False
         start = self._state.section_curve_start_idx
@@ -3954,9 +3858,12 @@ class LASParser:
             _cached = (_expected, _all_string)
             self._mnemonic_header_scope_cache[_scope_key] = _cached
         expected, all_string = _cached
-        if all_string:
-            return False
-        return all(tok.upper() in expected for tok in tokens)
+        return is_mnemonic_header_row(
+            tokens,
+            declared=expected,
+            curve_count=section_count,
+            all_string=all_string,
+        )
 
     def _parse_ascii_data(self, line: str) -> None:
         """Collect ASCII data lines for later processing.

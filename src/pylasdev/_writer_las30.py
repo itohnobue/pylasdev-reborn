@@ -15,6 +15,8 @@ from ._writer_base import (
     _format_curve_line,
     _format_data_rows,
     _format_parameter_line,
+    _lookup_data_array,
+    _mnem_key,
     _sanitize_las_value,
     _section_type_to_prefix,
     _WriterBase,
@@ -129,10 +131,18 @@ class _Las30Writer(_WriterBase):
         {S} marker here.  Per-section Definitions use the section's own
         string_data keys instead.
         """
-        mnems = set(self._las_file.string_data.keys()) if self._las_file.string_data else set()
+        # N2b-1: the set is built UPPER-CASED (matching
+        # _format_curve_line's _mnem_key membership) so a case-variant
+        # string_data key ('dept_str' vs curve 'DEPT_STR') still forces
+        # the {S} marker.
+        mnems = (
+            {_mnem_key(k) for k in self._las_file.string_data.keys()}
+            if self._las_file.string_data
+            else set()
+        )
         for ds in self._las_file.data_sections:
             if ds.string_data:
-                mnems.update(ds.string_data.keys())
+                mnems.update(_mnem_key(k) for k in ds.string_data.keys())
         return frozenset(mnems)
 
     # ── Version section ──────────────────────────────────────────────
@@ -222,13 +232,18 @@ class _Las30Writer(_WriterBase):
                         for curve in ds.section_curves:
                             _emitted = _emitted_mnemonic(curve)
                             _override: str | None = None
-                            if _emitted in emitted_mnems:
+                            # N2b-2: emitted_mnems stores UPPER-CASED keys —
+                            # a case-variant duplicate pair ('DEPT' + 'dept')
+                            # must be treated as the duplicate it is (re-read
+                            # identity is case-insensitive and would rename
+                            # the second to DEPT_2).
+                            if _mnem_key(_emitted) in emitted_mnems:
                                 # W-10: M-59 collision — a reader-renamed
                                 # duplicate (IK_2 with original_mnemonic
                                 # ='IK') or a mnem_base vendor-rename
                                 # collision falls back to its OWN mnemonic
                                 # when free, preserving the distinct column.
-                                if curve.mnemonic not in emitted_mnems:
+                                if _mnem_key(curve.mnemonic) not in emitted_mnems:
                                     _override = curve.mnemonic
                                 else:
                                     # W-01: dedup-by-mnemonic silently drops a
@@ -240,7 +255,9 @@ class _Las30Writer(_WriterBase):
                                     # on desc/api_code mismatch, preserving the
                                     # richer definition (M-83).
                                     for _i, emitted in enumerate(curves_to_emit):
-                                        if _emitted_mnemonic(emitted) == _emitted:
+                                        if _mnem_key(_emitted_mnemonic(emitted)) == _mnem_key(
+                                            _emitted
+                                        ):
                                             _emitted_unit = emitted.unit or ""
                                             _curve_unit = curve.unit or ""
                                             _emitted_fmt = emitted.data_format or ""
@@ -310,7 +327,7 @@ class _Las30Writer(_WriterBase):
                                                     )
                                             break
                                     continue
-                            emitted_mnems.add(_override or _emitted)
+                            emitted_mnems.add(_mnem_key(_override or _emitted))
                             curves_to_emit.append(curve)
                             if _override is not None:
                                 _emission_overrides[id(curve)] = _override
@@ -347,9 +364,9 @@ class _Las30Writer(_WriterBase):
                         # lowercase 'dept' resolves to the DEPT definition.
                         curve_def = curves_by_mnem.get(mnem) or curves_by_mnem.get(mnem.upper())
                         _emitted = _emitted_mnemonic(curve_def) if curve_def is not None else mnem
-                        if _emitted not in emitted_mnems:
+                        if _mnem_key(_emitted) not in emitted_mnems:
                             if curve_def is not None:
-                                emitted_mnems.add(_emitted)
+                                emitted_mnems.add(_mnem_key(_emitted))
                                 curves_to_emit.append(curve_def)
                             else:
                                 # N-I-15: the section curve is absent from
@@ -393,8 +410,11 @@ class _Las30Writer(_WriterBase):
                             # case-insensitively above; the mnemonic-exact
                             # fallback compares the definition's OWN
                             # mnemonic, which is exact by construction.
-                            if curve_def is not None and curve_def.mnemonic not in emitted_mnems:
-                                emitted_mnems.add(curve_def.mnemonic)
+                            if (
+                                curve_def is not None
+                                and _mnem_key(curve_def.mnemonic) not in emitted_mnems
+                            ):
+                                emitted_mnems.add(_mnem_key(curve_def.mnemonic))
                                 curves_to_emit.append(curve_def)
                                 _emission_overrides[id(curve_def)] = curve_def.mnemonic
 
@@ -461,7 +481,7 @@ class _Las30Writer(_WriterBase):
                 )
                 for curve in self._las_file.curves:
                     _emitted = _emitted_mnemonic(curve)
-                    if _emitted in emitted_mnems:
+                    if _mnem_key(_emitted) in emitted_mnems:
                         continue
                     # I2-22 (PF-21): case-insensitive comparison — _section_mnems
                     # holds upper-cased keys, so compare the emitted/mnemonic
@@ -478,7 +498,7 @@ class _Las30Writer(_WriterBase):
                     # Definition-only: no data in any section and no
                     # top-level data either.  Emit the definition so its
                     # metadata survives; warn that it has no data.
-                    emitted_mnems.add(_emitted)
+                    emitted_mnems.add(_mnem_key(_emitted))
                     curves_to_emit.append(curve)
                     import warnings
 
@@ -549,7 +569,7 @@ class _Las30Writer(_WriterBase):
                 for c in self._main_curves
             }
             _top_str = (
-                frozenset(self._las_file.string_data.keys())
+                frozenset(_mnem_key(k) for k in self._las_file.string_data.keys())
                 if self._las_file.string_data
                 else frozenset()
             )
@@ -876,8 +896,16 @@ class _Las30Writer(_WriterBase):
             # another curve (or discarded) on re-read.  Drop it from the
             # emission and warn loudly; the data rows below are emitted
             # for the RESOLVED set only, so no column is relabeled.
+            # N2b-3: the data-bearing detection compared EXACT-case — a
+            # case-variant data key ('ghost' vs curves_order entry
+            # 'GHOST') fell into the data-free branch and fired the false
+            # "no values are lost" assurance while the column's data WAS
+            # dropped.  Match via _mnem_key (the emission path
+            # _lookup_data_array is already case-insensitive).
             for _entry in _unresolved:
-                if _entry in (section.data or {}) or _entry in (section.string_data or {}):
+                if _mnem_key(_entry) in {_mnem_key(k) for k in (section.data or {})} or _mnem_key(
+                    _entry
+                ) in {_mnem_key(k) for k in (section.string_data or {})}:
                     _warnings_module.warn(
                         f"Curve '{_entry}' appears in the curves_order of "
                         f"section {section.name!r} but has no definition "
@@ -908,16 +936,40 @@ class _Las30Writer(_WriterBase):
             # mnemonic is ALSO taken the curve is a metadata-only
             # duplicate and is dropped — a dropped curve that carries
             # data would be silently discarded on re-read, so refuse.
+            # N2b-2/N2b-3: _emitted_seen stores UPPER-CASED keys (a
+            # case-variant pair must be treated as the duplicate it is),
+            # and the data-bearing detection is case-insensitive — but it
+            # must only RAISE when the colliding entry's data is actually
+            # LOST.  A case-variant duplicate whose data key aliases the
+            # surviving curve's array (F-31: curves_order=['DEPT','dept']
+            # with data only under 'DEPT') shares the array — dropping the
+            # second entry loses nothing and the "no values are lost"
+            # warning is accurate.  An entry with its OWN distinct array
+            # under a case-variant key ('y' vs 'Y') loses that data, so the
+            # should-be LASWriteError must fire (never the false assurance).
             _emitted_seen: set[str] = set()
             _emit_pairs: list[tuple[str, CurveDefinition, str | None]] = []
             for _entry, _cd in _emission_pairs:
                 _em = _emitted_mnemonic(_cd)
                 _override: str | None = None
-                if _em in _emitted_seen:
-                    if _cd.mnemonic not in _emitted_seen:
+                if _mnem_key(_em) in _emitted_seen:
+                    if _mnem_key(_cd.mnemonic) not in _emitted_seen:
                         _override = _cd.mnemonic
                     else:
-                        if _entry in (section.data or {}) or _entry in (section.string_data or {}):
+                        _lost_arr, _ = _lookup_data_array(
+                            _entry, section.data or {}, section.string_data or {}
+                        )
+                        # Does a surviving pair already emit the SAME array?
+                        _shared = False
+                        if _lost_arr is not None:
+                            for _kept_entry, _kept_cd, _kept_override in _emit_pairs:
+                                _kept_arr, _ = _lookup_data_array(
+                                    _kept_entry, section.data or {}, section.string_data or {}
+                                )
+                                if _kept_arr is _lost_arr:
+                                    _shared = True
+                                    break
+                        if _lost_arr is not None and not _shared:
                             raise LASWriteError(
                                 f"Curve '{_entry}' in section {section.name!r} "
                                 f"emits the same mnemonic '{_em}' as another "
@@ -936,7 +988,7 @@ class _Las30Writer(_WriterBase):
                             stacklevel=4,
                         )
                         continue
-                _emitted_seen.add(_override or _em)
+                _emitted_seen.add(_mnem_key(_override or _em))
                 _emit_pairs.append((_entry, _cd, _override))
 
             # The resolved+deduped definitions in live order — the set the
@@ -1034,7 +1086,7 @@ class _Las30Writer(_WriterBase):
                         sig_map[sig] = def_section_name
                         lines.append(f"~{def_section_name}")
                         _sec_str = (
-                            frozenset(section.string_data.keys())
+                            frozenset(_mnem_key(k) for k in section.string_data.keys())
                             if section.string_data
                             else frozenset()
                         )

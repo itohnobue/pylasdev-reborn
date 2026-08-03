@@ -4839,3 +4839,286 @@ class TestM5SetattrUnitCompositionValidation:
             write_las_file(out, las)
         parsed = read_las_file(out)
         assert parsed["curves"][0]["unit"] == "M"
+
+
+# ── Case-normalization regression tests (N1a/N1b/II family) ──────────
+
+
+class TestCaseNormalizationRegression:
+    """Regression tests for the case-normalization drift fixes.
+
+    Each test FAILS on the pre-fix code (exact-case comparison sites) and
+    PASSES after the ``_case_key`` migration.  The codebase blesses
+    case-variant keys (MOD-2/MOD-3 — the writer's data lookup is
+    case-insensitive), so these tests assert that validation/construction/
+    dtype-preservation behave case-insensitively TOO.
+    """
+
+    def test_n1a1_from_dict_s_format_case_variant_log_key_raises(self) -> None:
+        """N1a-1: the IF-026 format-vs-placement guard must reject an
+        S-format curve whose data sits in logs under a case-variant key,
+        matching the same-case control.  Pre-fix the case-variant state
+        bypassed the guard and the writer silently emitted the {S} curve's
+        values as numeric."""
+        data: dict[str, Any] = {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+            "well": {"NULL": "-999.25"},
+            "curves_order": ["dept"],
+            "curves": [{"mnemonic": "dept", "data_format": "S"}],
+            "logs": {"DEPT": np.array([1.0, 2.0])},  # case-variant key
+        }
+        with pytest.raises(ValueError, match="data_format='S' but is in logs"):
+            LASFile.from_dict(data)
+
+    def test_n1a2_datasection_placement_case_variant_raises(self) -> None:
+        """N1a-2: DataSection I2F-06 placement check must reject an
+        S-format section curve whose data sits in 'data' under a
+        case-variant key.  Pre-fix the case-variant state passed both
+        construction and validate() while the same-case control raised."""
+        with pytest.raises(LASDataError, match="data_format='S' but is in data"):
+            DataSection(
+                curves_order=["GR"],
+                section_curves=[CurveDefinition(mnemonic="GR", data_format="S")],
+                data={"gr": np.array([1.0, 2.0])},
+            )
+
+    def test_n1a8_well_get_ci_lowercase_keyed(self) -> None:
+        """N1a-8: WellSection.get_ci resolves case-variant well keys while
+        the public exact-case accessors keep their documented contract.
+        Pre-fix ``w.get_ci`` did not exist — consumers hand-rolled CI loops
+        and the canonical query ``w["STRT"]`` raised KeyError for a
+        lowercase-keyed well even though validate() treated it as present."""
+        w = WellSection(entries={"strt": "100", "stop": "200", "step": "1", "null": "-999.25"})
+        assert w.get_ci("STRT") == "100"
+        assert w.get_ci("NULL") == "-999.25"
+        assert w.get_ci("missing", "fallback") == "fallback"
+        # The exact-case public accessors are unchanged (documented contract).
+        with pytest.raises(KeyError):
+            w["STRT"]
+        assert "STRT" not in w
+        assert w.get("STRT") == ""
+
+    def test_n1b1_top_level_i_precision_case_variant(self) -> None:
+        """N1b-1: the top-level {I} dtype-preservation lookup must match
+        case-insensitively.  Pre-fix a case-variant log key ('dept' vs
+        curve 'DEPT') yielded _fmt='' and silently coerced int64→float64,
+        rounding 9007199254740993 to ...992.0."""
+        las = LASFile.from_dict(
+            {
+                "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+                "well": {"NULL": "-1"},
+                "curves_order": ["DEPT"],
+                "curves": [{"mnemonic": "DEPT", "data_format": "I"}],
+                "logs": {"dept": [9007199254740993, 9007199254740995]},
+            }
+        )
+        arr = las.logs["dept"]
+        assert arr.dtype == np.int64, f"dtype {arr.dtype} — precision loss"
+        assert int(arr[0]) == 9007199254740993
+        assert int(arr[1]) == 9007199254740995
+
+    def test_n1b1_per_section_i_precision_case_variant(self) -> None:
+        """N1b-1 (per-section): the per-section {I} lookup must match
+        case-insensitively — a case-variant section data key with an
+        explicit section_curves entry preserves int64."""
+        las = LASFile.from_dict(
+            {
+                "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+                "well": {"NULL": "-1"},
+                "curves_order": ["DEPT"],
+                "curves": [{"mnemonic": "DEPT", "data_format": "I"}],
+                "logs": {"DEPT": [100.0]},
+                "data_sections": [
+                    {
+                        "name": "LOG",
+                        "section_type": "LOG_DATA",
+                        "curves_order": ["dept"],
+                        "section_curves": [{"mnemonic": "DEPT", "data_format": "I"}],
+                        "data": {"dept": [9007199254740993, 9007199254740995]},
+                    }
+                ],
+            }
+        )
+        arr = las.data_sections[0].data["dept"]
+        assert arr.dtype == np.int64, f"dtype {arr.dtype} — precision loss"
+        assert int(arr[0]) == 9007199254740993
+
+    def test_i3b_per_section_i_fallback_to_top_level(self) -> None:
+        """II-3b: a per-section {I} curve WITHOUT explicit section_curves
+        must fall back to the top-level curve's data_format.  Pre-fix
+        ``ds_section_curves=[]`` made ``next()`` return '' and the branch
+        fell to float64 even with an EXACT-case key — silent int64→float64
+        precision loss >2^53."""
+        las = LASFile.from_dict(
+            {
+                "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+                "well": {"NULL": "-1"},
+                "curves_order": ["DEPT"],
+                "curves": [{"mnemonic": "DEPT", "data_format": "I"}],
+                "logs": {"DEPT": [100.0]},
+                "data_sections": [
+                    {
+                        "name": "LOG",
+                        "section_type": "LOG_DATA",
+                        "curves_order": ["DEPT"],
+                        "data": {"DEPT": [9007199254740993, 9007199254740995]},
+                    }
+                ],
+            }
+        )
+        arr = las.data_sections[0].data["DEPT"]
+        assert arr.dtype == np.int64, f"dtype {arr.dtype} — precision loss"
+        assert int(arr[0]) == 9007199254740993
+
+    def test_n1b8_overlap_case_variant_raises_construction(self) -> None:
+        """N1b-8: the LASFile logs↔string_data overlap guard must reject
+        a case-variant pair at construction.  Pre-fix the pair passed and
+        the LAS 2.0 roundtrip SILENTLY DROPPED the string column."""
+        with pytest.raises(LASDataError, match="appear in both logs and string_data"):
+            LASFile(
+                version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+                curves_order=["DEPT"],
+                curves=[CurveDefinition(mnemonic="DEPT")],
+                logs={"DEPT": np.array([1.0, 2.0])},
+                string_data={"dept": np.array(["a", "b"], dtype=object)},
+            )
+
+    def test_n1b8_overlap_case_variant_raises_from_dict(self) -> None:
+        """N1b-8 (from_dict twin): the from_dict overlap guard must reject
+        a case-variant pair too."""
+        with pytest.raises(LASDataError, match="appear in both logs and string_data"):
+            LASFile.from_dict(
+                {
+                    "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+                    "well": {"NULL": "-999.25"},
+                    "curves_order": ["DEPT"],
+                    "curves": [{"mnemonic": "DEPT"}],
+                    "logs": {"DEPT": [1.0, 2.0]},
+                    "string_data": {"dept": ["a", "b"]},
+                }
+            )
+
+    def test_i2_datasection_overlap_case_variant_raises(self) -> None:
+        """II-2: the DataSection data↔string_data overlap guard (direct
+        construction) must reject a case-variant pair.  Pre-fix the pair
+        passed while the same-case control raised."""
+        with pytest.raises(LASDataError, match="appear in both data and string_data"):
+            DataSection(
+                curves_order=["DEPT"],
+                data={"DEPT": np.array([1.0, 2.0])},
+                string_data={"dept": np.array(["a", "b"], dtype=object)},
+            )
+
+    def test_i2_from_dict_per_section_overlap_case_variant_raises(self) -> None:
+        """II-2 (from_dict twin): the per-section data↔string_data
+        collision check must reject a case-variant pair."""
+        with pytest.raises(LASDataError, match="appear in both 'data' and 'string_data'"):
+            LASFile.from_dict(
+                {
+                    "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+                    "well": {"NULL": "-999.25"},
+                    "curves_order": ["DEPT"],
+                    "curves": [{"mnemonic": "DEPT"}],
+                    "logs": {"DEPT": [1.0, 2.0]},
+                    "data_sections": [
+                        {
+                            "name": "LOG",
+                            "section_type": "LOG_DATA",
+                            "curves_order": ["DEPT"],
+                            "data": {"DEPT": [1.0, 2.0]},
+                            "string_data": {"dept": ["a", "b"]},
+                        }
+                    ],
+                }
+            )
+
+    def test_n1b4_construction_s_format_case_variant_logs_raises(self) -> None:
+        """N1b-4: the I2F-08 direct-construction raise must fire for an
+        S-format curve whose logs key is case-variant.  Pre-fix the state
+        passed construction and the roundtrip silently migrated the
+        numeric values into string_data."""
+        with pytest.raises(LASDataError, match=r"data_format='S'.*in logs"):
+            LASFile(
+                version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+                curves_order=["DEPT"],
+                curves=[CurveDefinition(mnemonic="DEPT", data_format="S")],
+                logs={"dept": np.array([1.5, 2.5])},
+            )
+
+    def test_n1b4_validate_i_exemption_case_variant_no_false_issue(self) -> None:
+        """N1b-4: the validate() {I} object-dtype exemption must match
+        case-insensitively — a case-variant {I} log key must NOT emit the
+        false 'non-numeric dtype (object)' issue.  Pre-fix the exemption
+        map was keyed by raw curve mnemonic, so the case-variant lookup
+        missed and the valid object-dtype state was flagged."""
+        las = LASFile(
+            version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+            curves_order=["DEPT"],
+            curves=[CurveDefinition(mnemonic="DEPT", data_format="I")],
+            logs={"dept": np.array([9007199254740993, 9007199254740993], dtype=object)},
+        )
+        las.well["NULL"] = "-999.25"  # fractional NULL → object dtype is correct
+        issues = las.validate(complete=True)
+        assert not any("non-numeric dtype" in i for i in issues), issues
+
+    def test_n1b3_case_variant_duplicate_detection_construction(self) -> None:
+        """N1b-3: duplicate curve-name detection is case-insensitive — a
+        case-variant pair ('DEPT','dept') must be rejected at construction
+        like the same-case control, because the writer's FIRST-wins
+        case-insensitive resolution would silently drop the second
+        definition's identity."""
+        with pytest.raises(LASDataError, match="duplicate curve name"):
+            LASFile(
+                version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+                curves_order=["DEPT", "dept"],
+                curves=[
+                    CurveDefinition(mnemonic="DEPT", unit="M"),
+                    CurveDefinition(mnemonic="dept", unit="FT"),
+                ],
+                logs={
+                    "DEPT": np.array([1.0, 2.0]),
+                    "dept": np.array([3.0, 4.0]),
+                },
+            )
+
+    def test_n1b3_from_dict_case_variant_duplicate_detection(self) -> None:
+        """N1b-3 (from_dict): the top-level duplicate detection must reject
+        case-variant duplicates on the from_dict path too."""
+        with pytest.raises(LASDataError, match="Duplicate curve name"):
+            LASFile.from_dict(
+                {
+                    "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+                    "well": {"NULL": "-999.25"},
+                    "curves_order": ["DEPT", "dept"],
+                    "curves": [
+                        {"mnemonic": "DEPT", "unit": "M"},
+                        {"mnemonic": "dept", "unit": "FT"},
+                    ],
+                    "logs": {"DEPT": [1.0, 2.0], "dept": [3.0, 4.0]},
+                }
+            )
+
+    def test_i19_from_dict_array_cross_check_no_false_warning(self) -> None:
+        """II-19: the from_dict M-17 array cross-check must NOT fire a
+        false warning for a case-variant mnemonic/base_name pair.  Pre-fix
+        the raw mnemonic base ('nmr') was compared against the UPPERCASED
+        base_name ('NMR'), warning spuriously."""
+        las = LASFile.from_dict(
+            {
+                "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+                "well": {"NULL": "-999.25"},
+                "curves_order": ["nmr[1]"],
+                "curves": [
+                    {
+                        "mnemonic": "nmr[1]",
+                        "array_info": {"base_name": "NMR", "index": 1},
+                    }
+                ],
+                "logs": {"nmr[1]": [1.0, 2.0]},
+            }
+        )
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            LASFile.from_dict(las.to_dict())
+        false_warns = [str(w.message) for w in rec if "Cross-check mismatch" in str(w.message)]
+        assert false_warns == [], f"false M-17 cross-check warnings: {false_warns}"

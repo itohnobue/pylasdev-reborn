@@ -266,28 +266,23 @@ def _detect_actual_wrap_las30(
 ) -> bool:
     """Detect actual wrap from the section's collected data lines.
 
+    Thin per-caller wrapper: keeps the LAS 3.0 section-line window
+    collection (blank/comment skip only — the twin scans the whole file
+    for ``~A``; INT-02) and delegates the decision to the shared core
+    :func:`pylasdev._data_section_reader.detect_actual_wrap_from_window`
+    with ``empty_window_default=False`` (W-4/INT-01 — a blank-only section
+    must not be falsely rejected as WRAP=YES).
+
     M-05/M-07: The LAS 3.0 path must apply the SAME content-based wrap
-    detection as ``data_reader._detect_actual_wrap`` (F-H01) — running
-    regardless of the declared WRAP header, and using the hardened 4-line
-    majority vote instead of deciding on the first data line only.  The
-    declared WRAP header may be wrong: mislabeled Petrel exports claim
-    WRAP=YES with non-wrapped data, and WRAP=NO/absent files can contain
-    genuinely wrapped data (which would otherwise be silently misparsed
-    with a DEPT-shift).
-
-    A line is "full" (non-wrapped evidence) when it carries the complete
-    row (``len >= curve_count``) for every delimiter — trailing empties
-    are stripped, so a wrapped depth line is exactly 1 value and a
-    wrapped continuation line carries ``curve_count-1`` values, both
-    partial evidence.  Decision (mirrors data_reader):
-
-    - First line full → non-wrapped immediately (a wrapped first line is
-      always a depth line with exactly 1 value).
-    - Otherwise, if >= 2 full lines among the first 4 → non-wrapped
-      (sparse leading rows then full rows).
-    - If >= 3 partial lines among the first 4 → wrapped.
-    - Ties fall back to the declared WRAP header, then to wrapped
-      (conservative).
+    detection as the LAS 1.2/2.0 twin (F-H01) — running regardless of the
+    declared WRAP header, and using the hardened 4-line majority vote.  The
+    shared core's R-1 flowing rule makes an all-full flowing window
+    (``[6,6]`` nc=3) return True so ``process_ascii_data``'s loud
+    "LAS 3.0 WRAP=YES is not supported" LASParseError fires instead of the
+    silent depth-step loss (R-5 — detection-only; NO accumulation in
+    ``process_ascii_data``).  The R-3/II-5 discriminator keeps ragged
+    WRAP=NO windows (``[3,1,3,1]``/``[3,1,1,3]``) non-wrapped so they parse
+    instead of being falsely rejected (NEW-1).
 
     Args:
         data_lines: Collected ASCII data lines for the current section
@@ -315,99 +310,17 @@ def _detect_actual_wrap_las30(
         if len(window) >= 4:
             break
 
-    if not window:
-        # No data lines — nothing to classify as wrapped.
-        return False
+    # Lazy import mirrors the established pattern above (the module-level
+    # chain _las30_data → _data_section_reader → data_reader would
+    # ImportError when _data_section_reader's names are not yet defined).
+    from ._data_section_reader import detect_actual_wrap_from_window
 
-    def _is_full(n: int) -> bool:
-        return n >= n_curves
-
-    # F-07 (I2-03/I2-04, mirrored from data_reader._detect_actual_wrap):
-    # depth-line evidence rule.  A genuine wrapped file ALWAYS has depth
-    # lines (rows with exactly 1 value); a non-wrapped file essentially
-    # never has a mid-window 1-value row (a mnemonic-header masquerade IS
-    # wrapped evidence, DR-01a).  When any later window line carries
-    # exactly 1 value:
-    #   - declared WRAP=YES → wrapped (I2-04: [3,3,1,1] — two full
-    #     leading rows no longer beat the declaration + depth evidence)
-    #   - first line full AND at least TWO 1-value rows in the window →
-    #     wrapped (DR-01 / I2-03: mixed-wrap / mnemonic-header masquerade
-    #     [3,1,1] / [3,1,2,1] with WRAP=NO or absent — content outranks a
-    #     NO header).
-    # A SINGLE 1-value row — wherever it sits — is NOT unambiguous
-    # depth evidence: a ragged non-wrapped row missing 2+ columns also
-    # yields exactly 1 value, and it must stay non-wrapped (graceful
-    # short-row null-fill).  This covers the trailing case ([3,2,1]) AND
-    # the middle-row cases [3,1,3] / [3,1,2] (F-02 — pre-fix the
-    # n_curves>=3 window[1]==1 arm fired for ANY single 1-value row after
-    # a full first row, silently column-shifting the ragged file).  The
-    # ≥2-one-value-rows arm is strictly safer: every documented wrapped
-    # shape ([3,1,1] masquerade, [3,1,2,1] mixed-wrap, [2,1,1,1] genuine
-    # 2-curve wrapped) carries at least two 1-value rows, and a genuine
-    # wrapped file declares WRAP=YES (caught by the declaration arm).
-    # For n_curves == 2 a single 1-value row was already AMBIGUOUS (a
-    # wrapped continuation line also carries n_curves-1 == 1 value) —
-    # the 2-curve short-row shape is covered by
-    # TestPF18DataReaderTwoCurveWrapGate.  This arm is byte-identical to
-    # the data_reader twin (two-path wrap contract — any gating change
-    # must be mirrored on both paths).
-    # Otherwise fall through to the existing rules unchanged.
-    depth_later = len(window) > 1 and any(n == 1 for n in window[1:])
-    if depth_later:
-        if declared_wrap is not None and declared_wrap.upper() == "YES":
-            return True
-        if _is_full(window[0]) and sum(1 for n in window[1:] if n == 1) >= 2:
-            return True
-
-    # First line full → non-wrapped (wrapped first line is always depth).
-    # M-38 (las30 side): BUT a WRAP=YES header with a COMPLETE first row
-    # can still be a genuine mixed-wrap file (per-row line-width wrapping):
-    # first row complete, continuation lines wrapped.  The first-line-full
-    # rule serves the COMMON mislabeled case (WRAP=YES but data is fully
-    # non-wrapped — all lines full).  When the header declares WRAP=YES
-    # and later window lines are partial (continuation/depth evidence),
-    # fall through to the majority vote below instead of short-circuiting
-    # to non-wrapped.  For LAS 3.0 (no wrapped reader) the majority vote
-    # classifies such a file as wrapped → the caller raises the loud
-    # "LAS 3.0 WRAP=YES is not supported" LASParseError instead of
-    # silently misparsing.
-    if _is_full(window[0]):
-        if declared_wrap is not None and declared_wrap.upper() == "YES":
-            if len(window) > 1 and any(not _is_full(n) for n in window[1:]):
-                pass  # fall through to the majority vote below
-            else:
-                return False
-        else:
-            return False
-
-    full_count = sum(1 for n in window if _is_full(n))
-    partial_count = len(window) - full_count
-
-    # H-02 (las30 side): curve-count mismatch guard.  When ~C declares
-    # MORE curves than ~A rows contain (e.g. 3 curves declared but every
-    # row carries 2 values), every line is "partial" and the majority vote
-    # below would classify the file as WRAPPED — routing a WRAP=NO file to
-    # the loud (but factually wrong) "LAS 3.0 WRAP=YES is not supported"
-    # rejection.  A genuine wrapped file's line lengths VARY (depth lines
-    # carry exactly 1 value and continuation lines curve_count-1); a
-    # uniform short length L (1 < L < curve_count) across the whole
-    # window, with NO 1-value depth line, is a column-count mismatch —
-    # treat as non-wrapped so the graceful short-row null-fill preserves
-    # the data (mirrors data_reader.py:622-628).
-    if len(window) >= 2 and full_count == 0 and len(set(window)) == 1 and 1 < window[0] < n_curves:
-        return False
-
-    # Two full rows among the first 4 → definitively non-wrapped.
-    if full_count >= 2:
-        return False
-    # At least 3 partial rows and fewer than 2 full → wrapped.
-    if partial_count >= 3:
-        return True
-    # Ambiguous window (e.g. 2-2 or 1-1): use the declared header as the
-    # tiebreak, else default to wrapped (conservative).
-    if declared_wrap is not None:
-        return declared_wrap.upper() == "YES"
-    return True
+    return detect_actual_wrap_from_window(
+        window,
+        n_curves,
+        declared_wrap,
+        empty_window_default=False,
+    )
 
 
 # M-08: LAS 3.0 spec-form array channels are written with REPEATED PLAIN
@@ -570,19 +483,29 @@ def _build_spec_form_array_info(
             # a doubled ``NMR Echo Array {A:0}  {A:0}`` on write.
             if match:
                 description = _SPEC_FORM_ARRAY_RE.sub("", description).strip()
-            result[curve_idx] = CurveDefinition(
-                mnemonic=f"{base}[{pos}]",
-                unit=curve.unit,
-                api_code=curve.api_code,
-                description=description,
-                original_mnemonic=curve.original_mnemonic or curve.mnemonic,
-                data_format=curve.data_format,
-                array_info=ArrayElementInfo(
-                    base_name=base,
-                    index=pos,
-                    time_offset=offset,
-                ),
-            )
+            try:
+                result[curve_idx] = CurveDefinition(
+                    mnemonic=f"{base}[{pos}]",
+                    unit=curve.unit,
+                    api_code=curve.api_code,
+                    description=description,
+                    original_mnemonic=curve.original_mnemonic or curve.mnemonic,
+                    data_format=curve.data_format,
+                    array_info=ArrayElementInfo(
+                        base_name=base,
+                        index=pos,
+                        time_offset=offset,
+                    ),
+                )
+            except ValueError as exc:
+                # P-11: the parser boundary may only raise LASParseError.
+                # A negative {A:N} time offset (e.g. "{A:-5}") parses via
+                # float() but is rejected by ArrayElementInfo's >= 0
+                # validation — previously the bare ValueError escaped
+                # parse() (W-5).
+                raise LASParseError(
+                    f"Invalid spec-form array element '{base}[{pos}]' ({description!r}): {exc}"
+                ) from exc
     return result
 
 
@@ -600,11 +523,11 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
     # Lazy imports from parser.py to avoid circular import at module level.
     # parser.py imports from _las30_data; importing parser symbols here at
     # function-call time avoids the import cycle.
+    from ._sanitize import desanitize_las_value as _desanitize_las_value
     from .parser import (
         COMMENT_PATTERN,
         EMPTY_PATTERN,
         MAX_DATA_SECTIONS,
-        _desanitize_las_value,
         _validate_curve_data_format,
     )
 
@@ -709,7 +632,17 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
     # F1: Local dedup on per-section curves.  Global curve writeback
     # (see F2-07 block below) is deferred until after the actual_count
     # > 0 check — see F2-07 writeback block below.
-    deduped_order = _deduplicate_curves(ctx, section_curves, is_first_section=False)
+    # P-11 (W-6): deduplicating a duplicate BRACKET-notation array mnemonic
+    # (e.g. "NMR[1]") produces a suffixed name "NMR[1]_2" that fails
+    # CurveDefinition's _MNEMONIC_PATTERN — the construction raises a bare
+    # ValueError that would escape parse().  Wrap it as LASParseError.
+    try:
+        deduped_order = _deduplicate_curves(ctx, section_curves, is_first_section=False)
+    except ValueError as exc:
+        raise LASParseError(
+            f"Data section '{ctx.current_section_name or 'ASCII'}': "
+            f"curve deduplication failed: {exc}"
+        ) from exc
 
     # F-10: Validate cross-curve array continuity per LAS 3.0 spec
     # (section 4.3.1: curve array elements must use sequential [1]→[n]
@@ -1131,8 +1064,12 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
             # handles whitespace-prefixed "_#" escapes (case 2), so the
             # token is passed through untouched.
             val_str = values[i]
-            # F-007: Reverse the writer's _sanitize_las_value #-prefix escape
-            val_str = _desanitize_las_value(val_str)
+            # F-007: Reverse the writer's _sanitize_las_value #-prefix escape.
+            # II-13: restore_tilde=True ONLY on the LAS 3.0 data path — the
+            # LAS 3.0 writer emits the M-85 '_~' escape for first-column
+            # string values, so the restore is correct here (the LAS 1.2/2.0
+            # data path and header call sites keep the fail-safe False).
+            val_str = _desanitize_las_value(val_str, restore_tilde=True)
             if string_curves.get(i, False):
                 # F-39, F-40, I2-F-03: Desanitize reversal warnings for
                 # writer-side one-way sanitization transformations.  Each

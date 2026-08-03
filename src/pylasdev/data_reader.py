@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import math
 import warnings
-from types import ModuleType
 from typing import cast
 
 import numpy as np
@@ -79,6 +78,14 @@ from ._data_section_reader import (  # noqa: E402
     _iter_ascii_data_lines,
     _log_conversion_failures,
     _split_data_line,
+    _split_header_row,
+    detect_actual_wrap_from_window,
+    is_mnemonic_header_row,
+)
+from ._sanitize import (  # noqa: E402
+    _is_desanitize_enabled,
+    _set_desanitize_enabled,
+    desanitize_las_value,
 )
 
 
@@ -109,27 +116,15 @@ def _parse_float_with_d_notation(value_str: str) -> float:
     return float(value_str.replace("D", "E").replace("d", "e"))
 
 
-def _get_parser_module() -> ModuleType:
-    """Lazy-import the parser module to break circular import.
-
-    data_reader is imported by parser, but data_reader needs access
-    to parser's module-level attributes (e.g., _DESANITIZE_ENABLED)
-    for unified desanitize state.  Lazy import defers the import to
-    call time, avoiding the cycle.
-    """
-    from . import parser as _p
-
-    return _p
-
-
 def _desanitize_las_value(value: str, _enabled: bool | None = None) -> str:
-    """Reverse the writer's ``_``-prefix-on-``#`` escape (local copy).
+    """Reverse the writer's ``_``-prefix-on-``#`` escape (shared helper).
 
-    The writer prefixes ``#``-starting values with ``_`` to prevent the
-    parser from interpreting them as comment lines.  This function strips
-    that prefix, restoring the original ``#``-prefixed value.
-
-    Defined locally in data_reader to avoid circular import from parser.
+    Thin wrapper over :func:`pylasdev._sanitize.desanitize_las_value` with
+    the positional ``(value, _enabled)`` form the IT3-F-01 tests pin
+    (II-12).  ``restore_tilde`` stays at the fail-safe default ``False``:
+    the LAS 1.2/2.0 writer never emits ``_~`` escapes (M-85 is the LAS 3.0
+    data path), so a genuine external ``_~`` value must be preserved
+    (ADV-M3 S-1 adjudication, II-13).
 
     Two cases (matching writer's ``_sanitize_las_value``):
 
@@ -139,48 +134,19 @@ def _desanitize_las_value(value: str, _enabled: bool | None = None) -> str:
        leading whitespace → ``" _#..."`` → reverse: remove the ``_``
        between whitespace and ``#``.
 
-    M11 (mirrors the parser's F-25 fix, parser.py): Case 2 applies ONLY
-    when the ``_#`` is the first non-whitespace content (preceded
-    exclusively by leading whitespace) — the writer's actual escape
-    scope.  Internal ``" _#"`` content the writer never escapes (e.g.
-    ``"ACME _#Oil Corp"``) is preserved unchanged.  The previous blanket
-    ``value.find("_#") + whitespace-before`` unescaped INTERNAL content
-    on the flagship LAS 1.2/2.0 string-data path, silently corrupting
-    write→read roundtrips and external files.
+    M11 (mirrors the parser's F-25 fix): Case 2 applies ONLY when the
+    ``_#`` is the first non-whitespace content (preceded exclusively by
+    leading whitespace) — the writer's actual escape scope.  Internal
+    ``" _#"`` content the writer never escapes (e.g. ``"ACME _#Oil Corp"``)
+    is preserved unchanged.
 
     IT3-F-01 (perf): *enabled* hoists the ``_DESANITIZE_ENABLED`` flag
     lookup.  ``read_ascii_data`` caches the thread-local flag once per
-    read (it is constant for the duration of the read — E-04 sets it at
-    the top of the try and restores it in finally) and passes the cached
-    value through ``_read_normal``/``_read_wrapped``.  Without the hoist,
-    every data value re-ran the full import-machinery path
-    (``_get_parser_module`` → import → ``__getattr__`` →
-    ``_is_desanitize_enabled``), measured at ~1.04 µs/value.  When
-    *enabled* is None (any external caller), fall back to the machinery
-    lookup to preserve the previous behavior.
+    read and passes the cached value through ``_read_normal`` /
+    ``_read_wrapped``.  When *enabled* is None (any external caller), fall
+    back to the thread-local lookup to preserve the previous behavior.
     """
-    if _enabled is None:
-        _enabled = bool(_get_parser_module()._DESANITIZE_ENABLED)
-    if not _enabled:
-        return value
-    if value.startswith("_#"):
-        return value[1:]
-    # M11: restrict to the writer's ACTUAL escape scope.  The writer
-    # (_sanitize_las_value, _writer_base.py:122-127) escapes '#' ONLY at
-    # value start (startswith("#")) or after LEADING whitespace
-    # (lstrip().startswith("#")).  The previous blanket
-    # ``value.find("_#") + whitespace-before`` unescaped INTERNAL " _#
-    # content the writer never escapes (e.g. "ACME _#Oil Corp" → "ACME
-    # #Oil Corp") — a silent corruption on the string-data path.  Only an
-    # "_#" preceded exclusively by leading whitespace (the FIRST
-    # non-whitespace content) is a writer escape artifact; mid-value "_#"
-    # is preserved, mirroring parser._desanitize_las_value's scoped
-    # restore (F-25).
-    stripped = value.lstrip()
-    if len(stripped) < len(value) and stripped.startswith("_#"):
-        leading = value[: len(value) - len(stripped)]
-        return leading + stripped[1:]
-    return value
+    return desanitize_las_value(value, _enabled=_enabled)
 
 
 def _get_well_entry_ci(
@@ -467,18 +433,17 @@ def read_ascii_data(
     # simply eliminates a redundant check (the same bounds guard runs
     # inside _read_normal).
 
-    # F-212: Route the desanitize parameter to the unified parser flag
-    # so _desanitize_las_value and parser._desanitize_las_value share the
-    # same module-level state.
+    # F-212: Route the desanitize parameter to the unified thread-local
+    # flag in _sanitize.py so _desanitize_las_value and
+    # parser._desanitize_las_value share the same module-level state.
     # E-04: Save the prior thread-local value and restore it in a finally
-    # block.  The flag is thread-local (parser.py F-21/F-088); an
-    # unconditional reset-to-True would clobber another caller's value on
-    # the same thread.  Without the restore, a desanitize=False read left
-    # the flag False for the whole thread, silently changing the behavior
-    # of subsequent direct LASParser.parse()/read_ascii_data() users.
-    _parser_mod = _get_parser_module()
-    _prev_desanitize = _parser_mod._DESANITIZE_ENABLED
-    _parser_mod._DESANITIZE_ENABLED = desanitize  # type: ignore[attr-defined]
+    # block.  The flag is thread-local (F-21/F-088); an unconditional
+    # reset-to-True would clobber another caller's value on the same
+    # thread.  Without the restore, a desanitize=False read left the flag
+    # False for the whole thread, silently changing the behavior of
+    # subsequent direct LASParser.parse()/read_ascii_data() users.
+    _prev_desanitize = _is_desanitize_enabled()
+    _set_desanitize_enabled(desanitize)
     try:
         delimiter = las_file.version.delimiter_char
 
@@ -497,8 +462,8 @@ def read_ascii_data(
         # IT3-F-01: The desanitize flag is constant for this read (E-04
         # sets it above and restores it in finally).  Cache it once here
         # and thread it through the per-value loops instead of re-running
-        # the full import-machinery lookup per value.
-        _desanitize_enabled = bool(_parser_mod._DESANITIZE_ENABLED)
+        # the thread-local lookup per value.
+        _desanitize_enabled = _is_desanitize_enabled()
         if actual_wrap:
             _read_wrapped(
                 lines,
@@ -517,7 +482,7 @@ def read_ascii_data(
                 _desanitize_enabled=_desanitize_enabled,
             )
     finally:
-        _parser_mod._DESANITIZE_ENABLED = _prev_desanitize  # type: ignore[attr-defined]
+        _set_desanitize_enabled(_prev_desanitize)
 
 
 def _detect_actual_wrap(
@@ -528,33 +493,13 @@ def _detect_actual_wrap(
 ) -> bool:
     """Detect if data is actually wrapped by checking the first data lines.
 
-    In true wrapped mode, the first data line has only 1 value (the depth).
-    In non-wrapped mode (even if WRAP=YES header), each line has >= curve_count values.
-
-    Protocol-based detection (D-01/D-02/D-03): instead of relying on a
-    two-line heuristic, examine up to four data lines and take a
-    curve_count-aware majority vote:
-
-    - A line is "full" (non-wrapped evidence) when it carries the complete
-      row: ``len >= curve_count`` for every delimiter (COMMA/TAB trailing
-      empties are stripped by _split_data_line, so a wrapped depth line is
-      exactly 1 value and a wrapped continuation line carries
-      ``curve_count-1`` values — both are partial evidence — F-023,
-      EXT-01).
-    - A line is "partial" (wrapped evidence) otherwise.
-
-    Decision:
-    - First line full → non-wrapped immediately (a wrapped first line is
-      always a depth line with exactly 1 value).
-    - Otherwise, if >= 2 full lines appear among the first 4 data lines,
-      the file is non-wrapped (sparse leading rows then full rows — D-01's
-      trailing-comma first row and D-02's two sparse rows both produce
-      full rows quickly).
-    - If >= 3 partial lines appear (and < 2 full), the file is wrapped —
-      this covers D-03's genuine WRAP=YES file whose second line is
-      overfull (full_count stays 1 while depth lines recur).
-    - Ties (e.g. exactly 2 data lines: one full, one partial) fall back to
-      the declared WRAP header as the tiebreak, then to wrapped.
+    Thin per-caller wrapper: keeps the LAS 1.2/2.0 ``~A`` section scan
+    (window collection stays caller-side per INT-02 — the LAS 3.0 twin
+    collects from pre-scoped section lines instead) and delegates the
+    decision to the shared core
+    :func:`pylasdev._data_section_reader.detect_actual_wrap_from_window`.
+    ``empty_window_default=True`` (conservative — test_detect_wrap_no_data
+    locks empty-window → wrapped on this path; W-4/INT-01).
 
     Args:
         lines: File content split into lines.
@@ -562,9 +507,9 @@ def _detect_actual_wrap(
         delimiter: Data column delimiter character (default space).
             Uses DLM-aware splitting when delimiter is not a space.
         declared_wrap: Optional declared WRAP header value ("YES"/"NO").
-            Used only as a tiebreak when the data window is genuinely
-            ambiguous (2-2 or 1-1 split).  None means the header is
-            unavailable — default to wrapped (conservative).
+            Used as a tiebreak when the data window is genuinely ambiguous
+            (2-2 or 1-1 split).  None means the header is unavailable —
+            default to wrapped (conservative).
 
     Returns:
         True if data is actually wrapped, False if non-wrapped despite header.
@@ -577,22 +522,17 @@ def _detect_actual_wrap(
         if _is_section_header(stripped):
             # P-16: Treat every genuine ~-prefixed section header (recognized
             # OR unrecognized) as a section boundary, matching the parser's
-            # section-boundary classification.  Previously unrecognized words
-            # were skipped (continue) while in_ascii stayed True, so the body
-            # lines of an unrecognized section (e.g. ~CUSTOMSECT) were counted
-            # as data for wrap detection.  F-I2-XPD-01 retained: only genuine
-            # ~-prefixed section-like lines (checked by _is_section_header)
-            # terminate the block; control-char noise (~3D, ~., ~#) fails
-            # that check and is skipped below.
+            # section-boundary classification.  F-I2-XPD-01 retained: only
+            # genuine ~-prefixed section-like lines (checked by
+            # _is_section_header) terminate the block; control-char noise
+            # (~3D, ~., ~#) fails that check and is skipped below.
             if _is_ascii_section(stripped):
                 in_ascii = True
             elif in_ascii:
                 # F-048: Standardize section-detection guard with
-                # _iter_ascii_data_lines (uses return/break instead of
-                # just resetting in_ascii).  When we encounter a genuine
+                # _iter_ascii_data_lines — when we encounter a genuine
                 # non-~A section header while inside an ~A block, exit the
-                # loop — we've left the data section and no more data lines
-                # should be used for wrap detection.
+                # loop (we've left the data section).
                 break
             continue
 
@@ -606,16 +546,12 @@ def _detect_actual_wrap(
             continue
 
         # Data line found — split using DLM-aware split (shared utility).
-        # See _data_section_reader._split_data_line for full rationale.
         values = _split_data_line(stripped, delimiter)
 
         # F-M20: When curve_count is 1, wrapped and non-wrapped modes are
         # equivalent — every line holds exactly one value regardless of
-        # mode.  The space-delimiter heuristic ``len(values) < curve_count``
-        # is degenerate for curve_count=1 (always False), and forcing
-        # wrapped mode on a single-curve file triggers unnecessary overflow
-        # warnings and counter logic in _read_wrapped.  Use non-wrapped
-        # (the simpler path) when there is nothing to distinguish.
+        # mode.  Return False at the first data line (before the window
+        # fills), matching the pre-refactor in-loop guard position.
         if curve_count <= 1:
             return False
 
@@ -623,109 +559,12 @@ def _detect_actual_wrap(
         if len(window) >= 4:
             break
 
-    if not window:
-        return True  # No data found, default to wrapped
-
-    def _is_full(n: int) -> bool:
-        if delimiter == " ":
-            return n >= curve_count
-        # COMMA/TAB: trailing empties are stripped by _split_data_line, so
-        # value counts reflect real tokens.  A data line is "full" only
-        # when it carries the complete row (curve_count values) — a
-        # wrapped continuation line carries curve_count-1 values and a
-        # depth-only line carries exactly 1, so both are partial (wrapped)
-        # evidence.  (EXT-01: the previous ``n > 1`` predicate treated
-        # wrapped COMMA/TAB files with >=3 curves as non-wrapped because
-        # their continuation lines carry >=2 values, silently corrupting
-        # DEPT/curve alignment.)
-        return n >= curve_count
-
-    # F-07 (DR-01/I2-04): depth-line evidence rule.  A genuine wrapped
-    # file ALWAYS has depth lines (rows with exactly 1 value); a
-    # non-wrapped file essentially never has a mid-window 1-value row (a
-    # mnemonic-header masquerade IS wrapped evidence, DR-01a).  When any
-    # later window line carries exactly 1 value:
-    #   - declared WRAP=YES → wrapped (I2-04: [3,3,1,1] — two full
-    #     leading rows no longer beat the declaration + depth evidence)
-    #   - first line full AND at least TWO 1-value rows in the window →
-    #     wrapped (DR-01 both triggers: mixed-wrap / mnemonic-header
-    #     masquerade [3,1,1] / [3,1,2,1] with WRAP=NO or absent —
-    #     content outranks a NO header).
-    # A SINGLE 1-value row — wherever it sits — is NOT unambiguous
-    # depth evidence: a ragged non-wrapped row missing 2+ columns also
-    # yields exactly 1 value, and it must stay non-wrapped (graceful
-    # short-row null-fill).  This covers the trailing case ([3,2,1],
-    # documented below) AND the middle-row cases [3,1,3] / [3,1,2]
-    # (F-02 — pre-fix the window[1]==1 arm fired for ANY single 1-value
-    # row after a full first row when curve_count >= 3, silently
-    # column-shifting the ragged file).  The ≥2-one-value-rows arm is
-    # strictly safer: every documented wrapped shape ([3,1,1]
-    # masquerade, [3,1,2,1] / [3,1,1,2] mixed-wrap, [2,1,1,1] genuine
-    # 2-curve wrapped) carries at least two 1-value rows, and a genuine
-    # wrapped file declares WRAP=YES (caught by the declaration arm).
-    # Otherwise fall through to the existing rules unchanged.
-    depth_later = len(window) > 1 and any(n == 1 for n in window[1:])
-    if depth_later:
-        if declared_wrap is not None and declared_wrap.upper() == "YES":
-            return True
-        if _is_full(window[0]) and sum(1 for n in window[1:] if n == 1) >= 2:
-            return True
-
-    # First line full → non-wrapped (wrapped first line is always depth).
-    # M-38: BUT a WRAP=YES header with a COMPLETE first row can still be a
-    # genuine mixed-wrap file (per-row line-width wrapping): first row
-    # complete, continuation lines wrapped.  The first-line-full rule
-    # serves the COMMON mislabeled case (WRAP=YES but data is fully
-    # non-wrapped — all lines full).  When the header declares WRAP=YES
-    # and later window lines are partial (continuation/depth evidence),
-    # fall through to the majority vote instead of short-circuiting to
-    # non-wrapped.
-    if _is_full(window[0]):
-        if declared_wrap is not None and declared_wrap.upper() == "YES":
-            if len(window) > 1 and any(not _is_full(n) for n in window[1:]):
-                pass  # fall through to the majority vote below
-            else:
-                return False
-        else:
-            return False
-
-    full_count = sum(1 for n in window if _is_full(n))
-    partial_count = len(window) - full_count
-
-    # H-02: curve-count mismatch guard.  When ~C declares MORE curves than
-    # ~A rows contain (e.g. 3 curves declared but every row carries 2
-    # values), every line is "partial" and the majority vote below would
-    # classify the file as WRAPPED — routing it to _read_wrapped, which
-    # shifts every non-depth column and silently drops ~half the rows.
-    # A genuine wrapped file's line lengths VARY: depth lines carry exactly
-    # 1 value and continuation lines carry curve_count-1.  A uniform short
-    # length L (1 < L < curve_count) across the whole window, with NO
-    # 1-value depth line, is a column-count mismatch — treat as
-    # non-wrapped so _read_normal's graceful short-row null-fill preserves
-    # the data.  (Requires >=2 lines: a single short row is too ambiguous
-    # to override the declared header tiebreak.)
-    if (
-        len(window) >= 2
-        and full_count == 0
-        and len(set(window)) == 1
-        and 1 < window[0] < curve_count
-    ):
-        return False
-
-    # Two full rows among the first 4 → definitively non-wrapped (D-01
-    # trailing-comma first row, D-02 two sparse rows, then full rows).
-    if full_count >= 2:
-        return False
-    # At least 3 partial rows and fewer than 2 full → wrapped.  A genuine
-    # WRAP=YES file with an overfull second line (D-03) has full_count 1
-    # while depth lines recur as partial rows.
-    if partial_count >= 3:
-        return True
-    # Ambiguous window (e.g. 2-2 or 1-1): use the declared header as the
-    # tiebreak, else default to wrapped (conservative).
-    if declared_wrap is not None:
-        return declared_wrap.upper() == "YES"
-    return True
+    return detect_actual_wrap_from_window(
+        window,
+        curve_count,
+        declared_wrap,
+        empty_window_default=True,
+    )
 
 
 def _deduplicate_curves(las_file: LASFile, _stacklevel: int = 2) -> None:
@@ -889,79 +728,36 @@ def _is_mnemonic_header_row(
 ) -> bool:
     """M-37/FIX-CONV-2: True when *values* are declared curve mnemonics.
 
+    Thin per-caller wrapper over the shared pure predicate
+    :func:`pylasdev._data_section_reader.is_mnemonic_header_row`,
+    preserving the current signature/name for the 7 direct test call sites
+    (II-8).  Computes the ``all_string`` clause from *string_curve_indices*
+    and passes the match set (resolved + original mnemonics, H-02) as
+    *declared*.
+
     LAS 2.0 places curve mnemonics ON the ~A line, but some real-world
     files emit them as a standalone header row immediately after ~A
     (e.g. ``~A\\nDEPT GR\\n1000.0 50.0\\n...``).  Such a row is a column
     header, not a data row: consuming it creates a phantom all-null first
     row and shifts every subsequent value by one column.
 
-    Detection mirrors the LAS 3.0 gold standard
-    ``parser._is_standalone_mnemonic_header`` (parser.py:2991-3009) for the
-    LAS 1.2/2.0 whole-file scope, with three clauses:
-
-    1. **Token-count bounds** (parser.py:2991 analog): ``min(2, curve_count)
-       <= len(values) <= curve_count``.  A wrapped-mode continuation row
-       carries fewer tokens and can never be a full header signature; the
-       2-token minimum keeps a single-token short/ragged data row that
-       happens to equal a mnemonic (e.g. a string value ``LITH``) from
-       being wrongly skipped as a header (M-02).  For a SINGLE-curve
-       section the lower bound drops to 1 (``min(2, 1)``) so its 1-token
-       standalone mnemonic header row ("~A\\nDEPT\\n...") is still
-       recognized — the flat ``< 2`` gate consumed it as data, producing a
-       phantom all-null first row + value shift (PSR-1, Stage 11); the
-       all-string exclusion (clause 2) keeps single-curve STRING sections
-       safe.
-       M12 (F-24 headline defect): the previous STRICT equality
-       (``len(values) == curve_count``) rejected a PARTIAL mnemonic
-       header — a subset of the declared curves (e.g. ``DEPT GR`` when
-       three curves are declared) — so the reader consumed the header row
-       as data: the mnemonic tokens failed numeric conversion to the null
-       sentinel, producing a phantom all-null first row and shifting every
-       subsequent value.  A partial all-mnemonic row is still a header.
-    2. **All-string exclusion** (parser.py:3002 analog): when every curve in
-       the section is a string curve, every data value is a string, so a
-       mnemonic-coincident value is indistinguishable from a header row by
-       content alone — string data rows are never dropped (M-03, F-19).
-    3. **Match set = resolved + original mnemonics**: every token must match
-       a resolved curve mnemonic or a curve's ``original_mnemonic``
-       (parser.py:3004-3008 analog), so mnem_base-normalized header rows
-       written in raw vendor mnemonics are recognized (M-01).
-
     **DR-M3 (first-line-of-section contract):** the predicate is a HEADER
     detector, so callers MUST gate it on the section's first line(s) — the
     only position where a standalone mnemonic header can legitimately
     appear.  ``_read_normal`` calls it only when ``current_line == 0`` and
-    ``_read_wrapped`` only when ``total_elements == 0``.  Applying it to
-    every line misclassifies mid-section all-mnemonic data rows as headers
-    (silent data loss / wrapped column shift).  The M12 partial-header
-    relaxation makes this gate mandatory: with ``min(2, curve_count) <=
-    len(values)`` the predicate matches far more rows than the original
-    strict equality.
+    ``_read_wrapped`` only when ``total_elements == 0``.
 
     *declared* is the precomputed match set from :func:`_mnemonic_header_declared`;
     when omitted it is built on demand.  Callers on the hot path hoist it.
     """
-    if not values:
-        return False
-    # PSR-1 (Stage 11): the lower bound is min(2, curve_count), NOT a flat
-    # 2.  A SINGLE-curve section's standalone mnemonic header row is a
-    # single token ("~A\nDEPT\n1670.0\n...") — the DR-M2 `< 2` gate
-    # rejected it, consuming the header as data and producing a phantom
-    # all-null first row + value shift (regression vs HEAD 82cadce,
-    # adversarially verified on both sides).  For curve_count >= 2 the
-    # bound is unchanged: the 2-token minimum keeps a single-token
-    # short/ragged data row from being wrongly skipped as a header (M-02),
-    # and a 1-token row in a multi-curve section can never be a full
-    # header signature.  Single-curve STRING sections are excluded by the
-    # all-string clause below (M-03/F-19): their mnemonic-coincident
-    # values stay data.
-    if len(values) < min(2, curve_count) or len(values) > curve_count:
-        return False
-    if len(string_curve_indices) == curve_count:
-        return False
     if declared is None:
         declared = _mnemonic_header_declared(las_file)
-    return all(token.upper() in declared for token in values)
+    return is_mnemonic_header_row(
+        values,
+        declared=declared,
+        curve_count=curve_count,
+        all_string=(len(string_curve_indices) == curve_count),
+    )
 
 
 def _read_normal(
@@ -1096,7 +892,7 @@ def _read_normal(
         # relaxation misclassify mid-section all-mnemonic rows (e.g. a
         # ragged "GR ZONE" row) as headers, silently dropping real data.
         if current_line == 0 and _is_mnemonic_header_row(
-            values,
+            _split_header_row(stripped),
             las_file,
             curve_count,
             _string_curve_indices,
@@ -1350,46 +1146,37 @@ def _read_wrapped(
     delimiter: str = " ",
     _desanitize_enabled: bool | None = None,
 ) -> None:
-    """Read wrapped ASCII data using depth_line flag protocol.
+    """Read wrapped ASCII data using n_curves value accumulation.
 
-    In wrapped mode:
-    - The DEPTH value appears ALONE on its own line
-    - Subsequent lines contain the remaining curve values
-    - Once all curves for a depth step are read, the next depth line follows
+    A depth step is complete when ``curve_count`` values have accumulated,
+    whether they arrive on one line (flowing layout — depth + curve values
+    packed per line, W-A) or spread across depth/continuation lines
+    (classic wrapped layout — depth on its own line).  Values are buffered
+    in ``pending`` and flushed to the curve columns one complete step at a
+    time, so both layouts parse identically (the pre-fix depth-line flag
+    protocol could only handle depth-on-its-own-line and silently dropped
+    flowing data — the reader had NO working path for flowing input).
 
-    Uses list accumulation then np.array() at end to avoid the O(n^2)
-    numpy.append bug in the original code.
+    The M-38 mixed-wrap first-row case, W-B's mid-file depth lines, and
+    F-06's pathologically-malformed shapes all reduce to plain value
+    accumulation and parse cleanly (the F-06 hard-fail contract was
+    explicitly accepted for removal — II-4).
+
+    Keeps: the mnemonic-header skip (II-16), string/int/float dispatch,
+    ``_append_value`` geometric growth, the N-I-08 trailing-partial-step
+    diagnostic, the M-72 depth-monotonicity advisory, per-curve padding,
+    and ``_log_conversion_failures``.
     """
     # Deduplicate curve names before reading
     _deduplicate_curves(las_file)
     curve_count = len(las_file.curves_order)
 
     # Count actual data lines for MAX_DATA_LINES bound check.
-    # All other reading paths (_read_normal, parser, dev_reader)
-    # already have this guard.
-    _count_in_ascii = False
-    _count = 0
-    for line in lines:
-        stripped = line.strip()
-        if _is_section_header(stripped):
-            if _is_ascii_section(stripped):
-                _count_in_ascii = True
-            elif _count_in_ascii:
-                # P-16: Every genuine section header ends the ~A block
-                # (recognized OR unrecognized) — the parser routes
-                # unrecognized sections to other_lines, so their body is
-                # not data.  F-I2-XPD-01 retained: only genuine
-                # ~-prefixed section-like lines (checked by
-                # _is_section_header) terminate counting; control-char
-                # noise (~3D, ~., ~#) fails that check and is skipped
-                # below.
-                break  # End of ~A section
-            continue
-        # P-16: ~-prefixed non-section-header lines are not data rows.
-        if stripped.startswith("~"):
-            continue
-        if _count_in_ascii and stripped and not stripped.startswith("#"):
-            _count += 1
+    # II-14: use _iter_ascii_data_lines — the SAME section scan as the
+    # read loop — instead of a hand-rolled copy (the standalone mnemonic
+    # header row is not skipped here, matching the pre-fix count loop's
+    # ≤1 overcount slack; bounds-guard heuristic only).
+    _count = sum(1 for _ in _iter_ascii_data_lines(lines, mode_suffix=" (wrapped mode)"))
 
     if _count > MAX_DATA_LINES:
         raise LASParseError(
@@ -1398,12 +1185,12 @@ def _read_wrapped(
         )
 
     # Combined bound: protect against combination attacks.
-    # In wrapped mode each depth step spans ~curve_count lines
-    # (1 depth + curve_count-1 data values).  Estimate depth steps
-    # from total line count using the known curve_count.  The
-    # alternative heuristic of counting single-value lines (or using
-    # ceil(_count/2)) overcounts depth steps when curve values
-    # legitimately appear one per line, causing false rejection.
+    # In wrapped mode each depth step consumes curve_count values
+    # (whether they span lines or arrive packed).  Estimate depth steps
+    # from total line count using the known curve_count.  This is a
+    # bounds-guard heuristic only — flowing files carry more values per
+    # line than the line-based estimate (II-15, LOW/non-blocking); the
+    # dynamic total_elements counter below is the real backstop.
     if curve_count > 0:
         # F-54-upgrade: Use math.ceil instead of integer division to avoid
         # undercounting depth steps in wrapped mode.  Integer division
@@ -1452,8 +1239,8 @@ def _read_wrapped(
     # fractional sentinel like -999.25, corrupting every null cell).
     # M-62: the int64 branch must ALSO check int64 representability — a
     # huge integral sentinel (>= 2^63) passes is_integer() but int64
-    # assignment of int(null_value) (pad at :1382) raises OverflowError.
-    # Route to the object dtype path instead.
+    # assignment of int(null_value) raises OverflowError.  Route to the
+    # object dtype path instead.
     _integer_curve_indices: set[int] = _detect_integer_curves(las_file)
     null_value = _get_null_value(las_file.well)
     _null_is_integral = (
@@ -1497,31 +1284,33 @@ def _read_wrapped(
         _arr[_idx] = value
         data_fill[_i] = _idx + 1
 
-    depth_line = True  # First data line is always a depth line
-    counter = 0  # Tracks position within non-depth curves
-    depth_had_extra = False  # F-06: track pathologically-malformed depth lines
+    # R-2: pending-value-buffer accumulation protocol.  Every flushed step
+    # carries exactly curve_count values, so a complete step is consumed
+    # per flush regardless of line structure (depth-on-own-line, flowing
+    # [6,6], M-38 mixed-wrap, W-B mid-file depth lines all reduce to the
+    # same protocol).
+    # X-2: consumed values stay buffered until EOF — a `read_idx` pointer
+    # tracks the frontier so a wide continuation line is NOT re-copied on
+    # every flush (`pending = pending[curve_count:]` was O(n) per flush →
+    # O(n²) per line on crafted wide-line wrapped files).  The buffer is
+    # trimmed once, after the loop, with a single O(n) slice.
+    pending: list[str] = []
+    read_idx = 0
     total_elements = 0  # F-54-upgrade: dynamic element counter for wrapped mode
 
     for stripped in _iter_ascii_data_lines(lines, mode_suffix=" (wrapped mode)"):
         # Split using DLM-aware split (shared utility).
         values = _split_data_line(stripped, delimiter)
 
-        # F-03 (FIX-CONV-1): M-37's standalone-mnemonic-header skip must
-        # apply in wrapped mode too.  A header row (e.g. "~A\nDEPT GR\n"
-        # before the wrapped depth/continuation rows) is a column header,
-        # not data — consuming it produced a phantom null first row and
-        # shifted every value by one column.  The M-38 WRAP=YES
-        # fall-through routes such files into the wrapped path, so the
-        # skip is required here (not just in _read_normal).
-        # DR-M3: the header check applies ONLY to the first line(s) of the
-        # section (total_elements == 0).  A mid-section packed
-        # continuation row whose values happen to be all declared
-        # mnemonics (e.g. "LITH ZONE" for string curves LITH/ZONE) is
-        # DATA, not a header — skipping it without resetting the
-        # depth_line/counter state machine silently column-shifted every
-        # later depth step (depth values leaked into string curves).
+        # F-03 (FIX-CONV-1)/II-16: M-37's standalone-mnemonic-header skip
+        # must apply in wrapped mode too, gated on the first step only
+        # (DR-M3 — a standalone mnemonic header can only legitimately
+        # appear at the top of the section).  H-1/II-11: the predicate
+        # consumes the SUPERSET tokenization so a space-separated header
+        # row in a DLM=COMMA file is recognized (the DLM-aware values
+        # would see one token "DEPT GR" and consume the header as data).
         if total_elements == 0 and _is_mnemonic_header_row(
-            values,
+            _split_header_row(stripped),
             las_file,
             curve_count,
             _string_curve_indices,
@@ -1529,197 +1318,23 @@ def _read_wrapped(
         ):
             continue
 
-        if depth_line:
-            # Depth line: single value = depth for this step.
-            # Reset the extra-values flag at each depth step boundary
-            # so stale flags from a previous step never persist into
-            # the pathological-misalignment check for this step.
-            depth_had_extra = False
-            if not values:
-                continue
-            if len(values) == curve_count and total_elements == 0:
-                # M-38: The FIRST data line carries EXACTLY curve_count
-                # values — a COMPLETE row (a mixed-wrap file: first row
-                # written unwrapped, continuation lines wrapped, e.g.
-                # per-row line-width wrapping).  Consume it as a full step
-                # instead of warning + discarding the "extra" values,
-                # which previously shifted every later depth into a curve
-                # column (silent column/depth corruption).  Restricted to
-                # the first line: a complete-value depth line MID-file is
-                # anomalous junk (documented warn+discard behavior —
-                # test_wrapped_depth_line_extra_values).
-                for _ci, _v in enumerate(values):
-                    if _ci in _string_curve_indices:
-                        _check_string_cap()
-                        _string_lists[_string_curve_map[_ci]].append(
-                            _desanitize_las_value(_v, _desanitize_enabled)
-                        )
-                    elif _ci in _integer_curve_indices:
-                        _append_value(
-                            _ci,
-                            _to_integer_value(
-                                _desanitize_las_value(_v, _desanitize_enabled),
-                                null_value,
-                                _fc,
-                                _null_as_float=not _null_is_integral,
-                            ),
-                        )
-                    else:
-                        _append_value(
-                            _ci,
-                            _to_finite_float(
-                                _desanitize_las_value(_v, _desanitize_enabled),
-                                null_value,
-                                _fc,
-                            ),
-                        )
-                    total_elements += 1
-                    if total_elements > MAX_TOTAL_ELEMENTS:
-                        raise LASParseError(
-                            f"Total elements ({total_elements}) exceeds maximum allowed "
-                            f"({MAX_TOTAL_ELEMENTS}) in wrapped mode. "
-                            f"The file may be malformed or corrupt."
-                        )
-                # Step complete — next line starts a fresh depth step.
-                depth_line = True
-                counter = 0
-                continue
-            if len(values) > 1:
-                warnings.warn(
-                    f"Wrapped mode: depth line has {len(values)} values, expected 1. "
-                    f"Extra values discarded. Line content: '{stripped[:80]}'",
-                    stacklevel=2,
-                )
-                # F-06: Mark this depth line as malformed.  If the subsequent
-                # data line cannot fill all non-depth curves, the file is
-                # pathologically misaligned and will be rejected.
-                depth_had_extra = True
-            # F-R-03: If the depth curve is a string curve, accumulate
-            # into _string_lists.  (The previous code also appended a
-            # null_value placeholder to data_lists[0], but curve 0 is a
-            # string curve and is excluded from _float_indices — the
-            # placeholder never contributed to _max_len or to the final
-            # arrays.  IT3-F-03's pre-allocated numeric columns only
-            # cover numeric curves, so the placeholder is dropped; string
-            # lengths are already considered by _max_len via F-007-fix.)
-            if 0 in _string_curve_indices:
-                _check_string_cap()
-                _string_lists[_string_curve_map[0]].append(
-                    _desanitize_las_value(values[0], _desanitize_enabled)
-                )
-            elif 0 in _integer_curve_indices:
-                _append_value(
-                    0,
-                    _to_integer_value(
-                        _desanitize_las_value(values[0], _desanitize_enabled),
-                        null_value,
-                        _fc,
-                        _null_as_float=not _null_is_integral,
-                    ),
-                )
-            else:
-                _append_value(
-                    0,
-                    _to_finite_float(
-                        _desanitize_las_value(values[0], _desanitize_enabled),
-                        null_value,
-                        _fc,
-                    ),
-                )
-            total_elements += 1
-            if total_elements > MAX_TOTAL_ELEMENTS:
-                raise LASParseError(
-                    f"Total elements ({total_elements}) exceeds maximum allowed "
-                    f"({MAX_TOTAL_ELEMENTS}) in wrapped mode. "
-                    f"The file may be malformed or corrupt."
-                )
-            depth_line = False
-            counter = 0
-        else:
-            # Data lines: values for remaining curves
-            # F-06: Pathological misalignment detection.  If the previous
-            # depth line had extra values AND this data line has fewer
-            # values than the number of unfilled non-depth curves
-            # (curve_count - 1 - counter), the file is likely misaligned.
-            # A truly pathological case (depth line has extra data, next
-            # line has very few values, and the gap exceeds 2 curves)
-            # raises an error because data corruption is certain.
-            if depth_had_extra and curve_count >= 3:
-                remaining_curves = curve_count - 1 - counter
-                if len(values) < remaining_curves:
-                    if len(values) <= 2 and remaining_curves - len(values) >= 2:
-                        # Truly pathological: data line provides ≤2 values
-                        # but ≥2 more curves need filling — data WILL be
-                        # irrecoverably misaligned across all curves.
-                        raise LASParseError(
-                            f"Wrapped mode: pathologically malformed data — the "
-                            f"previous depth line had extra values, and this data "
-                            f"line has only {len(values)} values but "
-                            f"{remaining_curves} non-depth curves still need "
-                            f"values (total curves={curve_count}). File is "
-                            f"irrecoverably misaligned."
-                        )
-                    # Non-truly-pathological: data line has fewer values
-                    # than needed but the shift is ≤2 curves — recovery
-                    # would silently produce corrupt data (curve values
-                    # shifted by 1 depth step).  Hard-fail with a clear
-                    # diagnostic instead of producing corrupt output.
-                    raise LASParseError(
-                        f"Wrapped mode: unrecoverable data misalignment — "
-                        f"the previous depth line had extra values, and "
-                        f"this data line has only {len(values)} values "
-                        f"but {remaining_curves} non-depth curves still "
-                        f"need values (total curves={curve_count}). "
-                        f"Continuing would produce corrupt data.  Consider "
-                        f"reloading with wrapped=False if the original "
-                        f"unwrapped file is available."
-                    )
-
-            for i, val_str in enumerate(values):
-                counter += 1
-
-                if counter >= curve_count:
-                    # F2: Overflow — more values on this line than non-depth
-                    # curves remaining in the step.  Extra values would shift
-                    # subsequent lines if consumed silently; warn and discard
-                    # the overflow portion.
-                    warnings.warn(
-                        f"Wrapped mode: overflow on data line — {len(values)} "
-                        f"values but only {curve_count - 1} non-depth curves. "
-                        f"Extra value(s) discarded. Line content: '{stripped[:80]}'",
-                        stacklevel=2,
-                    )
-                    # F-I2-M15: If the previous depth line had extra values
-                    # (suggesting a multi-value non-wrapped row was parsed as
-                    # a depth line), and this data line overflows (has enough
-                    # values to exceed all remaining non-depth curves), then
-                    # the file is likely non-wrapped being read as wrapped.
-                    # The first values from each line are misrouted: what
-                    # should be the next depth step goes to C1 instead,
-                    # causing a permanent DEPTH↔C1 swap.
-                    if depth_had_extra:
-                        warnings.warn(
-                            f"Wrapped mode: suspected non-wrapped data — "
-                            f"a previous depth line had extra values and "
-                            f"this data line overflowed. DEPTH and curve "
-                            f"values are likely swapped. "
-                            f"Line content: '{stripped[:80]}'",
-                            stacklevel=2,
-                        )
-                    break
-
+        pending.extend(values)
+        while len(pending) - read_idx >= curve_count:
+            step = pending[read_idx : read_idx + curve_count]
+            read_idx += curve_count
+            for _ci, _v in enumerate(step):
                 # F-R-03: Dispatch string curves to _string_lists,
-                # float curves to data_lists via _to_finite_float.
-                if counter in _string_curve_indices:
+                # {I} curves via _to_integer_value, else _to_finite_float.
+                if _ci in _string_curve_indices:
                     _check_string_cap()
-                    _string_lists[_string_curve_map[counter]].append(
-                        _desanitize_las_value(val_str, _desanitize_enabled)
+                    _string_lists[_string_curve_map[_ci]].append(
+                        _desanitize_las_value(_v, _desanitize_enabled)
                     )
-                elif counter in _integer_curve_indices:
+                elif _ci in _integer_curve_indices:
                     _append_value(
-                        counter,
+                        _ci,
                         _to_integer_value(
-                            _desanitize_las_value(val_str, _desanitize_enabled),
+                            _desanitize_las_value(_v, _desanitize_enabled),
                             null_value,
                             _fc,
                             _null_as_float=not _null_is_integral,
@@ -1727,106 +1342,55 @@ def _read_wrapped(
                     )
                 else:
                     _append_value(
-                        counter,
+                        _ci,
                         _to_finite_float(
-                            _desanitize_las_value(val_str, _desanitize_enabled),
+                            _desanitize_las_value(_v, _desanitize_enabled),
                             null_value,
                             _fc,
                         ),
                     )
-                total_elements += 1
-                if total_elements > MAX_TOTAL_ELEMENTS:
-                    raise LASParseError(
-                        f"Total elements ({total_elements}) exceeds maximum allowed "
-                        f"({MAX_TOTAL_ELEMENTS}) in wrapped mode. "
-                        f"The file may be malformed or corrupt."
-                    )
+            total_elements += curve_count
+            if total_elements > MAX_TOTAL_ELEMENTS:
+                raise LASParseError(
+                    f"Total elements ({total_elements}) exceeds maximum allowed "
+                    f"({MAX_TOTAL_ELEMENTS}) in wrapped mode. "
+                    f"The file may be malformed or corrupt."
+                )
 
-                if counter == curve_count - 1:
-                    # All curves for this depth step are complete.
-                    # Break to discard any extra values on this line
-                    # (prevents silent misalignment if a line has
-                    # more values than expected).
-                    # F-D2-M01: Warn when extra values remain on this
-                    # line after step completion (previously silent).
-                    if i + 1 < len(values):
-                        warnings.warn(
-                            f"Wrapped mode: step complete with "
-                            f"{len(values) - i - 1} extra value(s) "
-                            f"discarded on this line. Line content: "
-                            f"'{stripped[:80]}'",
-                            stacklevel=2,
-                        )
-                        # F-I2-M15: If the previous depth line also had
-                        # extra values (depth_had_extra is True) AND this
-                        # data line completes the step with leftover values,
-                        # the file is likely non-wrapped data misread as
-                        # wrapped.  Each multi-value line contributes only
-                        # its first value where one curve value is expected,
-                        # permanently swapping DEPTH with C1 (and C1 with C2,
-                        # etc.) for all subsequent depth steps.
-                        if depth_had_extra:
-                            warnings.warn(
-                                f"Wrapped mode: suspected non-wrapped data — "
-                                f"previous depth line had extra values and "
-                                f"this data line completed the step with "
-                                f"{len(values) - i - 1} leftover value(s). "
-                                f"DEPTH and curve values may be swapped. "
-                                f"Line content: '{stripped[:80]}'",
-                                stacklevel=2,
-                            )
-                    counter = 0
-                    depth_line = True
-                    depth_had_extra = False
-                    break
+    # X-2: single O(n) trim at EOF — the read_idx pointer above avoided a
+    # per-flush list copy; this final slice leaves only the trailing
+    # partial step for the N-I-08 diagnostic below.
+    pending = pending[read_idx:]
 
-            # F11: After overflow (extra values on data line were
-            # discarded), reset for the next depth line.  The break in
-            # the overflow branch leaves counter at >= curve_count and
-            # depth_line=False; without this reset the next line would
-            # be incorrectly treated as a continuation of this depth step.
-            # Partial under-fill (fewer values than needed) is NOT reset
-            # here — in valid wrapped files data values can legitimately
-            # span multiple lines.
-            if counter >= curve_count and not depth_line:
-                depth_line = True
-                counter = 0
-                depth_had_extra = False
-
-    # N-I-08: Detect mid-file under-filled steps.  In valid wrapped mode
-    # every depth step consumes exactly curve_count values (1 depth line +
-    # curve_count-1 data values).  If the total consumed is NOT a multiple
-    # of curve_count, some step was under-filled mid-file — the reader
-    # silently consumed the next depth line as a data value, shifting the
-    # depth value into the last curve column (and the next data value into
-    # the depth column).  The F-06 guard (above) only fires for the
-    # OVER-filled depth-line variant (depth_had_extra); this catches the
-    # clean under-filled variant that previously produced only generic
-    # padding warnings while corrupting the depth column.  Trailing-EOF
-    # incomplete steps also trip this and are additionally handled by the
-    # padding warnings below (the message is accurate for both).
-    if curve_count > 0 and total_elements % curve_count != 0:
+    # N-I-08: Detect a trailing incomplete step.  In valid wrapped mode
+    # every depth step consumes exactly curve_count values; a leftover
+    # partial buffer at EOF cannot form a complete step.  Warn loudly and
+    # DISCARD the orphan values — the accepted accumulation contract
+    # (pre-fix audit R-6: test_wrapped_depth_line_extra_values → DT=[50,99]
+    # not [50,51]; the depth-line protocol previously mis-assigned them).
+    # The per-curve padding block below still pads genuine cross-curve
+    # length mismatches (e.g. string curves shorter than numeric curves).
+    if pending:
         warnings.warn(
-            f"Wrapped mode: data section consumed {total_elements} values "
-            f"but curve count is {curve_count} "
-            f"({total_elements % curve_count} value(s) not accounted for). "
-            f"A depth step appears to be under-filled mid-file; DEPTH and "
-            f"curve values may be misaligned.  Check the source file for a "
-            f"step missing one or more values.",
+            f"Wrapped mode: data section ended with {len(pending)} value(s) "
+            f"not accounted for by the curve count {curve_count}. "
+            f"A depth step appears to be under-filled at end-of-file; DEPTH "
+            f"and curve values may be misaligned.  Check the source file for "
+            f"a step missing one or more values.",
             stacklevel=2,
         )
-    # M-72: The modulo check above is blind to a mid-file under-fill whose
-    # total stays a multiple of curve_count (aligned total).  In that case
-    # every depth step "completes" from the reader's perspective, but the
-    # missing value caused the reader to consume the next depth line as a
-    # data value — permanently shifting a data value into the depth column
-    # (and a depth value into the last curve column) with ZERO diagnostics.
-    # Verify the depth column is actually depth-aligned: a genuine depth
-    # log is monotonic (non-decreasing OR non-increasing).  A non-monotonic
-    # depth column signals the shift.  Advisory warning — not an error.
+    # M-72: The N-I-08 check above only fires on a trailing partial buffer;
+    # it is blind to a mid-file under-fill whose total stays a multiple of
+    # curve_count (aligned total).  In that case every depth step
+    # "completes" from the reader's perspective, but the missing value
+    # caused the reader to consume the next depth line as a data value —
+    # permanently shifting a data value into the depth column (and a depth
+    # value into the last curve column) with ZERO diagnostics.  Verify the
+    # depth column is actually depth-aligned: a genuine depth log is
+    # monotonic (non-decreasing OR non-increasing).  A non-monotonic depth
+    # column signals the shift.  Advisory warning — not an error.
     if (
         curve_count > 0
-        and total_elements % curve_count == 0
         and 0 in data_arrays
         and data_fill[0] >= 2
         and np.issubdtype(data_arrays[0].dtype, np.number)

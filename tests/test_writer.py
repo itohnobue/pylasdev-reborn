@@ -4252,6 +4252,16 @@ class TestWriterFixBatchW010708101112:
         the first column dept.FT and re-read silently re-attributed the
         DEPT data column to the FT-unit curve.  Post-fix the first entry
         resolves to DEPT/M.
+
+        N2b-2 update: the case-normalization fix upper-cases the
+        ``emitted_mnems`` dedup in _write_curve_section, so the case-variant
+        duplicate ('dept') is now deduped against 'DEPT' in the main ~C
+        block with the W-01 differing-definition warning — the section pipes
+        ``| CURVE`` (its effective curve set matches the main block) instead
+        of getting a per-section ~Log_Definition.  The FIRST-wins contract
+        is preserved: the surviving definition is DEPT/M, the roundtrip
+        keeps unit M and the data, and re-read does NOT rename the second
+        curve to DEPT_2 (the model-identity corruption N2b-2 prevents).
         """
         las = LASFile()
         las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
@@ -4273,15 +4283,19 @@ class TestWriterFixBatchW010708101112:
         las.data_sections.append(section)
 
         out = tmp_path / "f31_case.las"
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
             write_las_file(out, las)
 
         content = out.read_text(encoding="utf-8")
-        log_def = content.split("~Log_Definition", 1)[1].split("~", 1)[0]
-        first_col = next((ln for ln in log_def.splitlines() if ln.strip()), "")
+        curve_block = content.split("~CURVE INFORMATION", 1)[1].split("~", 1)[0]
+        first_col = next((ln for ln in curve_block.splitlines() if ln.strip()), "")
         # The first column's definition must be DEPT.M — not dept.FT.
         assert "DEPT.M" in first_col, f"first column definition wrong: {first_col!r}"
+        # N2b-2: the case-variant duplicate is deduped with the W-01
+        # differing-definition warning, never emitted twice.
+        dedup_warns = [str(w.message) for w in rec if "Duplicate curve mnemonic" in str(w.message)]
+        assert dedup_warns, "expected the W-01 case-variant dedup warning"
 
         back = read_las_file_as_object(out)
         ds = back.data_sections[0]
@@ -4289,6 +4303,11 @@ class TestWriterFixBatchW010708101112:
         # The surviving section curve keeps the FIRST definition's unit (M).
         assert ds.section_curves[0].unit == "M", (
             f"section curve unit corrupted: {ds.section_curves[0].unit!r}"
+        )
+        # N2b-2: re-read must NOT rename the duplicate to DEPT_2 — the
+        # model identity is preserved.
+        assert not any("_2" in c for c in back.curves_order), (
+            f"re-read renamed a duplicate curve: {back.curves_order}"
         )
 
 
@@ -4750,3 +4769,321 @@ class TestMOD3DictWriteCaseVariant:
         back = read_las_file_as_object(out)
         np.testing.assert_allclose(back.data_sections[0].data["DEPT"], [100.0, 101.0, 102.0])
         np.testing.assert_allclose(back.data_sections[0].data["GR"], [75.0, 76.0, 77.0])
+
+
+# ── Case-normalization writer regression tests (N2b/II family) ─────────
+
+
+class TestCaseNormalizationWriterRegression:
+    """Writer-side regression tests for the case-normalization fixes.
+
+    Each FAILS on the pre-fix code and PASSES after the ``_mnem_key``
+    migration.  The writer's emission contract keeps original case
+    (M-59 original_mnemonic reconstruction); matching is case-insensitive.
+    """
+
+    def test_n2b1_string_marker_preserved_case_variant_key(self, tmp_path: Path) -> None:
+        """N2b-1: a LAS 3.0 string curve whose string_data key differs by
+        case from the curve mnemonic must still get the {S} marker and
+        round-trip its values.  Pre-fix the marker membership compared
+        exact-case, so the emitted ~C line was markerless and the parser
+        re-read the values as numeric nulls (silent destruction)."""
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.well["STRT"] = "100"
+        las.well["STOP"] = "102"
+        las.well["STEP"] = "1"
+        las.curves_order = ["DEPT_STR"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT_STR", data_format=""))
+        las.string_data["dept_str"] = np.array(["alpha", "beta", "gamma"], dtype=object)
+
+        out = tmp_path / "n2b1_case.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+
+        content = out.read_text(encoding="utf-8")
+        curve_block = content.split("~CURVE INFORMATION", 1)[1].split("~", 1)[0]
+        assert "{S}" in curve_block, f"{{S}} marker lost: {curve_block!r}"
+
+        back = read_las_file_as_object(out)
+        assert "DEPT_STR" in back.string_data, (
+            f"string values destroyed on re-read: logs={dict(back.logs) if back.logs else None}"
+        )
+        assert list(back.string_data["DEPT_STR"]) == ["alpha", "beta", "gamma"]
+
+    def test_n2b1_emitted_name_original_mnemonic_marker(self, tmp_path: Path) -> None:
+        """N2b-1 (II-7): the {S} marker membership must test the EMITTED
+        mnemonic (_emit_mnem / M-59 original_mnemonic reconstruction), NOT
+        curve.mnemonic.  A curve BFV with original_mnemonic='LLD' emits
+        'LLD' — with NO case variance — and pre-fix lost its marker and
+        destroyed the string values."""
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.well["STRT"] = "100"
+        las.well["STOP"] = "102"
+        las.well["STEP"] = "1"
+        las.curves_order = ["BFV"]
+        las.curves.append(CurveDefinition(mnemonic="BFV", original_mnemonic="LLD", data_format=""))
+        las.string_data["LLD"] = np.array(["x", "y"], dtype=object)
+        las.curves_order = ["LLD"]  # M-59 reconstruction emits 'LLD'
+
+        out = tmp_path / "n2b1_emit.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+
+        content = out.read_text(encoding="utf-8")
+        curve_block = content.split("~CURVE INFORMATION", 1)[1].split("~", 1)[0]
+        assert "{S}" in curve_block, f"{{S}} marker lost for emitted name: {curve_block!r}"
+
+        back = read_las_file_as_object(out)
+        assert "LLD" in back.string_data, (
+            f"emitted-name string values destroyed: logs={dict(back.logs) if back.logs else None}"
+        )
+        assert list(back.string_data["LLD"]) == ["x", "y"]
+
+    def test_n2b2_case_variant_duplicate_distinct_data_refuses(self, tmp_path: Path) -> None:
+        """N2b-2 (X-1): case-variant duplicate curves ('DEPT' + 'dept')
+        with DISTINCT data cannot be represented in the legacy single-block
+        format.  ~C dedups case-insensitively to one curve but ~A would
+        still emit both columns, and re-read DISCARDS the second column's
+        data ("Extra columns are discarded").  The write must REFUSE
+        (LASWriteError) rather than silently lose the data — the pre-N2b-2
+        outcome was rename-to-DEPT_2 with data preserved; the Stage-4
+        CI-dedup changed it to silent discard, which this guard restores
+        the no-loss guarantee for.
+
+        Regression: pre-fix this test PASSED while the 'dept' values were
+        discarded; it now asserts the refusal so the data is never lost."""
+        las = LASFile()
+        las.version = VersionSection(vers="2.0", wrap="NO", dlm="SPACE")
+        las.well["NULL"] = "-999.25"
+        las.well["STRT"] = "100"
+        las.well["STOP"] = "102"
+        las.well["STEP"] = "1"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT"))
+        # Post-construction mutation — the construction-time duplicate
+        # check (now case-insensitive) would reject the state; the writer
+        # dedup must handle it anyway (N2b-2's reachability path).
+        las.curves_order = ["DEPT", "dept"]
+        las.curves.append(CurveDefinition(mnemonic="dept"))
+        las.logs["DEPT"] = np.array([1.0, 2.0])
+        las.logs["dept"] = np.array([10.0, 20.0])
+
+        out = tmp_path / "n2b2_dup.las"
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            with pytest.raises(LASWriteError) as excinfo:
+                write_las_file(out, las)
+
+        dedup_warns = [str(w.message) for w in rec if "Duplicate curve mnemonic" in str(w.message)]
+        assert dedup_warns, "expected the W-01-class dedup warning"
+        msg = str(excinfo.value)
+        assert "same mnemonic" in msg and "has data" in msg, f"unclear refusal: {msg}"
+        assert not out.exists(), "no file may be written when the write refuses"
+        # No data may be silently lost: the write either refused (here) or
+        # preserved the columns — it never writes a file that discards data.
+
+    def test_x1_case_variant_duplicate_shared_data_warns_not_refuses(self, tmp_path: Path) -> None:
+        """X-1: a case-variant duplicate whose data is SHARED with the
+        surviving curve (data keyed only under 'DEPT', no 'dept' array)
+        must NOT refuse — nothing is lost, so the write succeeds, the
+        W-01 dedup warning fires, and the warning text must be ACCURATE
+        (the stale 'a re-read would rename it' claim is gone post-fix)."""
+        las = LASFile()
+        las.version = VersionSection(vers="2.0", wrap="NO", dlm="SPACE")
+        las.well["NULL"] = "-999.25"
+        las.well["STRT"] = "100"
+        las.well["STOP"] = "102"
+        las.well["STEP"] = "1"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT"))
+        las.curves_order = ["DEPT", "dept"]
+        las.curves.append(CurveDefinition(mnemonic="dept"))
+        las.logs["DEPT"] = np.array([1.0, 2.0])  # no 'dept' data — shared array
+
+        out = tmp_path / "x1_shared.las"
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+
+        dedup_warns = [str(w.message) for w in rec if "Duplicate curve mnemonic" in str(w.message)]
+        assert dedup_warns, "expected the W-01-class dedup warning"
+        stale = [str(w.message) for w in rec if "a re-read would rename it" in str(w.message)]
+        assert stale == [], f"stale warning text still present: {stale}"
+
+        back = read_las_file_as_object(out)
+        np.testing.assert_allclose(back.logs["DEPT"], [1.0, 2.0], err_msg="shared data lost")
+
+    def test_n2b3_w12_case_variant_shared_data_not_lost(self, tmp_path: Path) -> None:
+        """N2b-3 (W-12): a colliding case-variant duplicate whose data is
+        keyed under the SECOND curve's name ('y') is NOT lost — the
+        FIRST-wins surviving pair emits it as its own column.  The write
+        must succeed with the accurate 'no values are lost' warning (the
+        data survives) and the re-read must preserve the values.
+
+        Pre-fix the exact-case data-bearing check fired the false
+        assurance OR over-strictly raised for the case-variant state; the
+        fix resolves the colliding entry's data case-insensitively and
+        only refuses (LASWriteError) when that data would actually be
+        dropped (distinct array, see the W-11 sibling)."""
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        section = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["Y", "y"],
+            section_curves=[
+                CurveDefinition(mnemonic="Y", unit="M", data_format="F"),
+                CurveDefinition(mnemonic="y", unit="M", data_format="F"),
+            ],
+            data={
+                "y": np.array([7.0, 8.0]),  # case-variant key of the colliding entry
+            },
+        )
+        las.data_sections.append(section)
+
+        out = tmp_path / "n2b3_w12.las"
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+
+        false_assurance = [str(w.message) for w in rec if "no values are lost" in str(w.message)]
+        # The message is ACCURATE here: the 'y' values survive as the 'Y'
+        # column (first-wins resolution), so it must fire rather than a
+        # LASWriteError or a silent drop.
+        assert false_assurance, "expected the (accurate) no-values-lost warning"
+
+        back = read_las_file_as_object(out)
+        np.testing.assert_allclose(
+            back.data_sections[0].data["Y"], [7.0, 8.0], err_msg="data lost on roundtrip"
+        )
+
+    def test_n2b3_w11_case_variant_data_dropped_warns_data(self, tmp_path: Path) -> None:
+        """N2b-3 (W-11): an unresolvable curve whose data sits under a
+        case-variant key must fire the 'DATA is dropped' warning — never
+        the false 'no values are lost' message while the data vanishes."""
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        section = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "GHOST"],
+            data={
+                "DEPT": np.array([100.0, 110.0]),
+                "ghost": np.array([7.0, 8.0]),  # no definition; case-variant key
+            },
+        )
+        las.data_sections.append(section)
+
+        out = tmp_path / "n2b3_w11.las"
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+
+        data_dropped = [str(w.message) for w in rec if "DATA is dropped" in str(w.message)]
+        false_assurance = [str(w.message) for w in rec if "no values are lost" in str(w.message)]
+        assert data_dropped, "expected the 'DATA is dropped' warning"
+        assert false_assurance == [], f"false assurance fired: {false_assurance}"
+
+    def test_n2b1_m77_warning_fires_for_emitted_name_loss(self, tmp_path: Path) -> None:
+        """N2b-1 (II-7c): the M-77 warning guard must fire when the
+        EMITTED name (M-59 original_mnemonic) is not in the string_data
+        set — a curve BFV whose string_data is keyed 'BFV' emits 'LLD'
+        markerless and the values ARE lost.  Pre-fix the guard's F-09
+        check tested curve.mnemonic, so it falsely concluded 'no loss'
+        and suppressed the warning exactly when the values were
+        destroyed."""
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.well["STRT"] = "100"
+        las.well["STOP"] = "102"
+        las.well["STEP"] = "1"
+        las.curves_order = ["BFV"]
+        las.curves.append(CurveDefinition(mnemonic="BFV", original_mnemonic="LLD", data_format=""))
+        las.string_data["BFV"] = np.array(["a", "b"], dtype=object)
+
+        out = tmp_path / "n2b1_m77.las"
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+
+        content = out.read_text(encoding="utf-8")
+        # The emitted 'LLD' line has NO {S} marker (string_data keyed
+        # 'BFV' does not force it) — the loss is real and must be warned.
+        curve_block = content.split("~CURVE INFORMATION", 1)[1].split("~", 1)[0]
+        lld_line = next((ln for ln in curve_block.splitlines() if "LLD" in ln), "")
+        assert "{S}" not in lld_line, f"{{S}} unexpectedly forced: {lld_line!r}"
+        m77 = [str(w.message) for w in rec if "Without the {S} marker" in str(w.message)]
+        assert m77, "expected the M-77 loss warning"
+
+    def test_i20_well_units_descriptions_case_variant_preserved(self, tmp_path: Path) -> None:
+        """II-20: well units/descriptions lookups must match
+        case-insensitively — a case-mismatched entries-vs-units pair must
+        keep the unit in the emitted ~W line.  Pre-fix the exact-case
+        .get(key) silently dropped the unit/description from the output."""
+        las = LASFile(
+            version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+            curves_order=["DEPT"],
+            curves=[CurveDefinition(mnemonic="DEPT", unit="M")],
+            logs={"DEPT": np.array([1.0, 2.0])},
+        )
+        las.well.entries["strt"] = "100"
+        las.well.entries["stop"] = "102"
+        las.well.entries["step"] = "1"
+        las.well.entries["null"] = "-999.25"
+        las.well.units["STRT"] = "m"  # case-variant vs entries key 'strt'
+        las.well.descriptions["STRT"] = "START DEPTH"
+
+        out = tmp_path / "i20_well.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+
+        content = out.read_text(encoding="utf-8")
+        well_block = content.split("~WELL INFORMATION", 1)[1].split("~", 1)[0]
+        strt_line = next((ln for ln in well_block.splitlines() if "strt" in ln.lower()), "")
+        assert ".m" in strt_line, f"unit silently dropped: {strt_line!r}"
+        assert "START DEPTH" in strt_line, f"description silently dropped: {strt_line!r}"
+
+    def test_i20_well_units_descriptions_case_variant_preserved_las12(self, tmp_path: Path) -> None:
+        """II-20 (X-3): the LAS 1.2 well-section writer must use the SAME
+        case-insensitive units/descriptions lookup as the 2.0/3.0 base
+        writer.  Pre-fix _writer_las12._write_well_section used an
+        exact-case .get(key) and silently dropped the unit/description
+        from the emitted ~W line for a case-mismatched entries-vs-units
+        pair (from_dict mnem_base=None / direct construction)."""
+        las = LASFile(
+            version=VersionSection(vers="1.2", wrap="NO", dlm="SPACE"),
+            curves_order=["DEPT"],
+            curves=[CurveDefinition(mnemonic="DEPT", unit="M")],
+            logs={"DEPT": np.array([1.0, 2.0])},
+        )
+        las.well.entries["strt"] = "100"
+        las.well.entries["stop"] = "102"
+        las.well.entries["step"] = "1"
+        las.well.entries["null"] = "-999.25"
+        las.well.units["STRT"] = "m"  # case-variant vs entries key 'strt'
+        las.well.descriptions["STRT"] = "START DEPTH"
+
+        out = tmp_path / "i20_well_las12.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+
+        content = out.read_text(encoding="utf-8")
+        well_block = content.split("~WELL INFORMATION", 1)[1].split("~", 1)[0]
+        strt_line = next((ln for ln in well_block.splitlines() if "strt" in ln.lower()), "")
+        assert ".m" in strt_line, f"unit silently dropped on LAS 1.2: {strt_line!r}"
+        assert "START DEPTH" in strt_line, f"description silently dropped on LAS 1.2: {strt_line!r}"

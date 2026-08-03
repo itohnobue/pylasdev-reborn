@@ -20,51 +20,51 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from ._sanitize import (
+    _LEADING_SECTION_RE as _LEADING_SECTION_RE,
+)
+from ._sanitize import (
+    _escape_colons_for_las_value as _escape_colons_for_las_value,
+)
+from ._sanitize import (
+    _escape_pipes_for_las_value as _escape_pipes_for_las_value,
+)
+from ._sanitize import (
+    _sanitize_las_value as _sanitize_las_value,
+)
 from ._version_spec import _LASVersionSpec
-from .data_reader import _get_null_value
+from .data_reader import _get_null_value, _get_well_entry_ci
 from .exceptions import LASDataError, LASWriteError, PylasdevError
 from .models import (
     _MNEMONIC_PATTERN,
     CurveDefinition,
     LASFile,
     ParameterEntry,
+    _case_key,
     _GuardedDict,
     _GuardedList,
 )
 
+# _mnem_key is the writer's alias for the shared case-normalization
+# primitive (models._case_key): uppercased MATCHING key, original-case
+# storage/emission.  Every writer-side mnemonic comparison/lookup routes
+# through it so the writer agrees with the container's case-insensitive
+# resolution (N2b family).
+_mnem_key = _case_key
+
 # ── Module-level constants & compiled regexes ────────────────────────────
 
-# Control characters except space and tab (which are valid LAS whitespace).
-# Tab (\x09) is handled separately in _sanitize_las_value — it is replaced
-# with a space to prevent mis-tokenization on re-read.  A tab inside an
-# identifier acts as a field separator for str.split(), corrupting the
-# parsed structure.
-_CONTROL_CHARS_RE = re.compile(
-    r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85"
-    r"\u2028\u2029]"
-)
-
-# Unicode whitespace characters that should be replaced with an ASCII
-# space, not silently deleted.  These are layout/presentation characters
-# (non-breaking space, en/em quads, thin spaces, ideographic space) that
-# act as visual word separators.
-_UNICODE_WS_RE = re.compile(r"[\u00A0\u2000-\u200A\u202F\u205F\u3000]")
-
-# Previous pattern ^~([A-Za-z]) only matched a leading tilde.
-# Values like "\t~Version" or "  ~Curve" bypassed section-header
-# sanitization because leading whitespace prevented the regex match.
-_LEADING_SECTION_RE = re.compile(r"^\s*~([A-Za-z])")
+# _CONTROL_CHARS_RE / _UNICODE_WS_RE / _LEADING_SECTION_RE /
+# _COLON_PRECEDED_BY_WS_RE / _COLON_FOLLOWED_BY_WS_OR_END_RE live in
+# _sanitize.py (single source of truth for the escape helpers).  The
+# aliases above keep every existing import path working (II-22/II-25);
+# _LEADING_SECTION_RE is additionally used at :721 (M-28 first-column
+# escape) and :1311 (~O tilde warning) outside the moved functions.
 
 # The 256-character line-length limit applies to:
 #   - LAS 1.2 (all modes) per the LAS 1.2 specification.
 #   - LAS 2.0 WRAP=NO per the CWLS specification.
 MAX_LINE_LENGTH_LAS12: int = 256
-
-# Pattern matching whitespace-before-colon (\s+:).
-_COLON_PRECEDED_BY_WS_RE = re.compile(r"(\s+):")
-
-# Pattern matching colon-followed-by-whitespace-or-end (:\s|\s*$).
-_COLON_FOLLOWED_BY_WS_OR_END_RE = re.compile(r":(?=\s|$)")
 
 # Map DataSection.section_type values to the LAS 3.0 section header prefix.
 _SECTION_TYPE_TO_PREFIX: dict[str, str] = {
@@ -90,63 +90,8 @@ _SECTION_TYPE_TO_DEFINITION_PREFIX: dict[str, str] = {
 
 # ── Module-level utility functions ──────────────────────────────────────
 
-
-def _sanitize_las_value(value: str, *, preserve_leading_tilde: bool = False) -> str:
-    """Sanitize a string for safe inclusion in LAS output.
-
-    Args:
-        preserve_leading_tilde: If True, a leading ``~`` (and any preceding
-            whitespace) is NOT stripped.  The default strips a line-start
-            ``~[A-Za-z]`` pattern so a value never mimics a LAS section
-            header (``~CURVE``, ``~WELL``...).  That strip is only required
-            for text emitted at the START of an output line.  Values emitted
-            mid-line (well values, parameter values, descriptions,
-            non-first-column data cells) can never be confused with a section
-            header, and stripping them silently corrupts the model value on
-            write→read (M-28).  Pass True for such mid-line content so the
-            value survives roundtrip unchanged.
-    """
-    value = (
-        value.replace("\r\n", " ")
-        .replace("\n", " ")
-        .replace("\r", " ")
-        .replace("\u2028", " ")
-        .replace("\u2029", " ")
-        .replace("\x85", " ")
-    )
-    value = value.replace("\t", " ")
-    value = _CONTROL_CHARS_RE.sub("", value)
-    value = _UNICODE_WS_RE.sub(" ", value)
-    if not preserve_leading_tilde:
-        value = _LEADING_SECTION_RE.sub(r"\1", value, count=1)
-    if value.startswith("#"):
-        value = "_" + value
-    elif value and value.lstrip().startswith("#"):
-        stripped = value.lstrip()
-        leading = value[: len(value) - len(stripped)]
-        value = leading + "_" + stripped
-    return value
-
-
-def _escape_colons_for_las_value(value: str) -> str:
-    """Escape colons in a LAS value to prevent parser misinterpretation."""
-    value = _COLON_PRECEDED_BY_WS_RE.sub(r"\1_:", value)
-    value = _COLON_FOLLOWED_BY_WS_OR_END_RE.sub(r"\g<0>_", value)
-    return value
-
-
-def _escape_pipes_for_las_value(value: str) -> str:
-    """Escape literal pipes in a LAS description (``|`` → ``\\|``).
-
-    N-I-02: The parser treats a pipe at the END of a parameter description
-    as a LAS 3.0 zone association (``| Zone``) and strips it.  Genuine
-    description text that happens to contain a pipe would therefore be
-    truncated and misinterpreted on re-read.  Escaping literal pipes keeps
-    them out of ZONE_ASSOC_PATTERN's reach while real zone associations
-    (appended separately by the writer, unescaped) still round-trip.
-    The parser reverses this with ``_unescape_pipes_for_las_value``.
-    """
-    return value.replace("|", "\\|")
+# _sanitize_las_value / _escape_colons_for_las_value / _escape_pipes_for_las_value
+# moved to _sanitize.py (shared with the read side); re-exported above.
 
 
 def _validate_precision(precision: str) -> None:
@@ -258,10 +203,16 @@ def _dedup_by_emitted_mnemonic(curves: list[CurveDefinition]) -> list[CurveDefin
     seen: set[str] = set()
     deduped: list[CurveDefinition] = []
     for curve in curves:
+        # N2b-2: dedup keys on the UPPER-CASED emitted mnemonic — the
+        # parser's re-read identity is case-insensitive (it uppercases
+        # mnemonics at read), so two emitted names differing only by case
+        # ('DEPT' vs 'dept') WOULD collide on re-read and be renamed
+        # (DEPT_2), silently altering the model identity.  First wins,
+        # mirroring the ~C block's W-01 dedup for exact duplicates.
         emitted = _emitted_mnemonic(curve)
-        if emitted in seen:
+        if _mnem_key(emitted) in seen:
             continue
-        seen.add(emitted)
+        seen.add(_mnem_key(emitted))
         deduped.append(curve)
     return deduped
 
@@ -300,14 +251,20 @@ def _emission_plan(
     dropped: list[CurveDefinition] = []
     for curve in curves:
         candidate = _emitted_mnemonic(curve, is_las30)
-        if candidate in seen:
-            if curve.mnemonic not in seen:
+        # N2b-2: dedup on the UPPER-CASED emitted mnemonic — the parser's
+        # re-read identity is case-insensitive, so a case-variant pair
+        # ('DEPT' + 'dept') must be treated as the duplicate it is (both
+        # would emit distinct ~C lines that re-read renames to DEPT_2).
+        cand_key = _mnem_key(candidate)
+        if cand_key in seen:
+            own_key = _mnem_key(curve.mnemonic)
+            if own_key not in seen:
                 pairs.append((curve, curve.mnemonic))
-                seen.add(curve.mnemonic)
+                seen.add(own_key)
             else:
                 dropped.append(curve)
             continue
-        seen.add(candidate)
+        seen.add(cand_key)
         pairs.append((curve, None))
     return pairs, dropped
 
@@ -321,13 +278,19 @@ def _format_curve_line(
     """Format a single CurveDefinition as a LAS curve line.
 
     Args:
-        string_mnemonics: Mnemonics of curves whose DATA lives in a
-            string_data container for the emitted scope.  M-77: a LAS 3.0
-            string curve with an empty (or non-'S') data_format would be
-            emitted WITHOUT the {S} marker — the parser's ONLY string
-            signal — and re-read as numeric, silently destroying the
-            values.  Callers with string_data context pass this set so the
-            writer forces the {S} marker.
+        string_mnemonics: UPPER-CASED mnemonics (via ``_mnem_key``) of
+            curves whose DATA lives in a string_data container for the
+            emitted scope.  M-77: a LAS 3.0 string curve with an empty (or
+            non-'S') data_format would be emitted WITHOUT the {S} marker —
+            the parser's ONLY string signal — and re-read as numeric,
+            silently destroying the values.  Callers with string_data
+            context pass this set so the writer forces the {S} marker.
+            The membership tests the curve's EMITTED name (M-59
+            original_mnemonic reconstruction) uppercased, so a case-variant
+            string_data key ('dept_str' vs curve 'DEPT_STR') and an
+            emitted-name difference ('LLD' for a BFV curve) both resolve
+            the marker (N2b-1/II-7).  All 4 call sites build the set
+            upper-cased.
         mnemonic_override: When set, emit THIS mnemonic instead of the
             M-59 original_mnemonic reconstruction.  W-10: a
             reader-renamed duplicate (IK_2 with original_mnemonic='IK')
@@ -341,7 +304,38 @@ def _format_curve_line(
     unit = _escape_colons_for_las_value(unit) if unit else ""
     desc = curve.description if curve.description else ""
 
-    is_string_curve = string_mnemonics is not None and curve.mnemonic in string_mnemonics
+    # M-59: Emit the vendor-standard mnemonic when the model records one.
+    # The reader's mnem_base rename (e.g. LLD→BFV) preserves the original
+    # name in CurveDefinition.original_mnemonic, but the writer previously
+    # emitted curve.mnemonic ONLY — so a read→write roundtrip
+    # permanently canonicalized the colliding vendor name in the output
+    # file (re-read without mnem_base never recovers it).  When
+    # original_mnemonic is set and differs, emit it so the write
+    # reconstructs the vendor-standard name.  Data columns stay
+    # positional, so values remain aligned (verified: the parser routes
+    # data by ~C order, not by the ~A header).  Computed FIRST so the
+    # {S}-marker membership below tests the EMITTED name (II-7: a curve
+    # BFV with original_mnemonic='LLD' emits 'LLD', and the marker
+    # decision must match what is actually written).
+    _emit_mnem = (
+        mnemonic_override
+        if mnemonic_override is not None
+        else (
+            curve.original_mnemonic
+            if curve.original_mnemonic and curve.original_mnemonic != curve.mnemonic
+            else curve.mnemonic
+        )
+    )
+
+    # N2b-1/II-7: the {S} membership must test the EMITTED mnemonic
+    # (_emit_mnem), NOT curve.mnemonic — a curve with original_mnemonic=
+    # 'LLD' emits markerless with NO case variance when only
+    # curve.mnemonic ('BFV') is tested, destroying the string values on
+    # write→read.  Both sides compare via _mnem_key: the string_mnemonics
+    # sets are built UPPER-CASED at every call site (all 4 builders), so
+    # a case-variant string_data key ('dept_str' vs curve 'DEPT_STR')
+    # still resolves the marker.
+    is_string_curve = string_mnemonics is not None and _mnem_key(_emit_mnem) in string_mnemonics
     if is_las30 and is_string_curve and (curve.data_format or "").upper() != "S":
         # M-77: a string-data curve without data_format='S' would be
         # emitted markerless; the parser classifies columns by the {S}
@@ -425,25 +419,6 @@ def _format_curve_line(
     desc = _sanitize_las_value(desc, preserve_leading_tilde=True)
     desc = _escape_colons_for_las_value(desc)
 
-    # M-59: Emit the vendor-standard mnemonic when the model records one.
-    # The reader's mnem_base rename (e.g. LLD→BFV) preserves the original
-    # name in CurveDefinition.original_mnemonic, but the writer previously
-    # emitted curve.mnemonic ONLY — so a read→write roundtrip
-    # permanently canonicalized the colliding vendor name in the output
-    # file (re-read without mnem_base never recovers it).  When
-    # original_mnemonic is set and differs, emit it so the write
-    # reconstructs the vendor-standard name.  Data columns stay
-    # positional, so values remain aligned (verified: the parser routes
-    # data by ~C order, not by the ~A header).
-    _emit_mnem = (
-        mnemonic_override
-        if mnemonic_override is not None
-        else (
-            curve.original_mnemonic
-            if curve.original_mnemonic and curve.original_mnemonic != curve.mnemonic
-            else curve.mnemonic
-        )
-    )
     mnemonic = _sanitize_las_value(_emit_mnem)
     if is_las30 and curve.array_info is not None and "[" not in mnemonic:
         # W-09: The parser reconstructs CurveDefinition.array_info ONLY
@@ -1161,13 +1136,20 @@ class _WriterBase:
 
         for key in ordered_keys:
             value = self._las_file.well.entries[key]
-            unit = _sanitize_las_value(self._las_file.well.units.get(key, ""))
+            # II-20: well.entries keys and units/descriptions keys can
+            # differ in case (from_dict mnem_base=None / direct
+            # construction store them verbatim), so an exact-case
+            # .get(key) silently dropped the unit/description from the
+            # emitted ~W line.  Use the codebase's CI well lookup
+            # (data_reader._get_well_entry_ci), matching the mandatory-
+            # field ordering's key.upper() convention.
+            unit = _sanitize_las_value(_get_well_entry_ci(self._las_file.well.units or {}, key, ""))
             unit_dot = f".{unit}" if unit else "."
             # M-28: well values/descriptions are emitted mid-line (never at
             # line start) so a leading '~' must be preserved, not stripped.
             val = _sanitize_las_value(value, preserve_leading_tilde=True)
             desc = _sanitize_las_value(
-                self._las_file.well.descriptions.get(key, ""),
+                _get_well_entry_ci(self._las_file.well.descriptions or {}, key, ""),
                 preserve_leading_tilde=True,
             )
             val = _escape_colons_for_las_value(val)
@@ -1241,11 +1223,21 @@ class _WriterBase:
             for _curve in _dropped:
                 import warnings
 
+                # X-1 (N2b-2): the dedup warning must be ACCURATE post-fix.
+                # The old parenthetical ("a re-read would rename it and
+                # silently alter the model identity") described the PRE-fix
+                # consequence — after the case-insensitive dedup the second
+                # curve is NOT emitted to ~C, so re-read does not rename it;
+                # if it carried distinct data the legacy ~A pass refuses the
+                # write (LASWriteError) rather than discard the values on
+                # re-read (see _write_ascii_legacy), and if its data is
+                # shared with the kept definition (or absent) nothing is lost.
                 warnings.warn(
                     f"Duplicate curve mnemonic '{_emitted_mnemonic(_curve)}' "
                     f"in ~C.  Keeping the first definition; the second "
-                    f"curve's metadata is not re-emitted (a re-read would "
-                    f"rename it and silently alter the model identity).",
+                    f"curve is not re-emitted.  If it carried distinct "
+                    f"data the write refuses below rather than discard "
+                    f"the values on re-read; otherwise no data is lost.",
                     UserWarning,
                     stacklevel=3,
                 )
@@ -1260,11 +1252,14 @@ class _WriterBase:
             # 1.2/2.0 the is_las30 gate inside _format_curve_line keeps
             # the marker off (string curves are lossy there by design and
             # validate(complete=True) already warns).
+            # N2b-1: the set is built UPPER-CASED (matching
+            # _format_curve_line's _mnem_key membership) so a case-variant
+            # string_data key resolves the marker.
             lines.append(
                 _format_curve_line(
                     curve,
                     self._spec.is_las30,
-                    frozenset(self._las_file.string_data.keys()),
+                    frozenset(_mnem_key(k) for k in self._las_file.string_data.keys()),
                     mnemonic_override=_overrides.get(id(curve)),
                 )
             )
@@ -1365,22 +1360,39 @@ class _WriterBase:
         import warnings
 
         las_file = self._las_file
-        top_curves = {c.mnemonic: c for c in las_file.curves or []}
+        # N2b-1/II-7: all 7 comparison sites here are case-insensitive —
+        # the dicts are keyed by _mnem_key(mnemonic), the emitted string
+        # set holds _mnem_key keys, and lookups pass _mnem_key(mnem).  A
+        # case-variant string_data key ('dept_str' vs curve 'DEPT_STR')
+        # must resolve so the warning fires (and _format_curve_line forces
+        # {S}) instead of silently destroying the values.
+        top_curves = {_mnem_key(c.mnemonic): c for c in las_file.curves or []}
         warned: set[str] = set()
         # Union of EVERY string_data mnemonic across all scopes — the set
         # the main ~C block passes to _format_curve_line
         # (_Las30Writer._all_string_mnemonics), which is a superset of
         # every per-section Definition set.  Membership here means {S} is
         # forced at emission.
-        emitted_str_mnems: set[str] = set(las_file.string_data or {})
+        emitted_str_mnems: set[str] = {_mnem_key(k) for k in (las_file.string_data or {})}
         for ds in las_file.data_sections:
-            emitted_str_mnems.update(ds.string_data or {})
+            emitted_str_mnems.update(_mnem_key(k) for k in (ds.string_data or {}))
 
         def _warn_for(curve: CurveDefinition, mnem: str) -> None:
             if (curve.data_format or "").upper() == "S" or mnem in warned:
                 return
-            if curve.mnemonic in emitted_str_mnems:
-                # F-09: {S} is forced via string_mnemonics — no loss.
+            # F-09/II-7: {S} is forced only when the EMITTED name (M-59
+            # original_mnemonic reconstruction — the same name
+            # _format_curve_line tests) is in the string_mnemonics set.  A
+            # curve BFV with original_mnemonic='LLD' whose string_data is
+            # keyed 'BFV' emits 'LLD' markerless — testing curve.mnemonic
+            # ('BFV') here would falsely conclude "no loss" and suppress
+            # the warning exactly when the values are destroyed.
+            _emit_name = (
+                curve.original_mnemonic
+                if curve.original_mnemonic and curve.original_mnemonic != curve.mnemonic
+                else curve.mnemonic
+            )
+            if _mnem_key(_emit_name) in emitted_str_mnems:
                 return
             warnings.warn(
                 f"LAS 3.0 string curve '{mnem}' has "
@@ -1395,15 +1407,15 @@ class _WriterBase:
 
         # Top-level string_data scope (no-data_sections path).
         for mnem in las_file.string_data or {}:
-            cd = top_curves.get(mnem)
+            cd = top_curves.get(_mnem_key(mnem))
             if cd is not None:
                 _warn_for(cd, mnem)
         # Per-section scopes — definitions may live in the section itself
         # or fall back to the top-level curves list.
         for ds in las_file.data_sections:
-            sec_curves = {c.mnemonic: c for c in ds.section_curves or []}
+            sec_curves = {_mnem_key(c.mnemonic): c for c in ds.section_curves or []}
             for mnem in ds.string_data or {}:
-                cd = sec_curves.get(mnem) or top_curves.get(mnem)
+                cd = sec_curves.get(_mnem_key(mnem)) or top_curves.get(_mnem_key(mnem))
                 if cd is not None:
                     _warn_for(cd, mnem)
 
@@ -1691,6 +1703,54 @@ class _WriterBase:
                 (_o if _o is not None else _emitted_mnemonic(_c, self._spec.is_las30))
                 for _c, _o in _c_pairs
             ]
+
+            # X-1 (N2b-2 data-discard regression): the case-insensitive ~C
+            # dedup drops a case-variant duplicate ('dept' next to 'DEPT')
+            # from ~C, but curves_order can still carry BOTH names — the
+            # ~A header then emits more columns than ~C declares and
+            # re-read DISCARDS the undeclared column's data ("Extra columns
+            # are discarded").  This is the legacy-path twin of the LAS 3.0
+            # per-section W-12 contract ("only refuses LASWriteError when
+            # that data would actually be dropped"): refuse when the dropped
+            # curve carries a DISTINCT data array; a dropped curve whose
+            # data is SHARED with a surviving pair (case-variant alias of
+            # the same array) or absent loses nothing and only warns.  The
+            # ~C-side W-01 warning above is accurate for that shared/absent
+            # branch.  Scoped to LAS 1.2/2.0 (legacy ~A): the LAS 3.0
+            # top-level fall-through keeps its historical behavior (it does
+            # not raise; its per-section path enforces the same contract).
+            if not self._spec.is_las30 and _c_dropped:
+                for _dc in _c_dropped:
+                    _lost_arr, _ = _lookup_data_array(
+                        _emitted_mnemonic(_dc, False),
+                        self._las_file.logs or {},
+                        self._las_file.string_data or {},
+                    )
+                    if _lost_arr is None:
+                        continue
+                    _shared = False
+                    for _kept_c, _kept_o in _c_pairs:
+                        _kept_arr, _ = _lookup_data_array(
+                            _kept_o or _emitted_mnemonic(_kept_c, False),
+                            self._las_file.logs or {},
+                            self._las_file.string_data or {},
+                        )
+                        if _kept_arr is _lost_arr:
+                            _shared = True
+                            break
+                    if not _shared:
+                        raise LASWriteError(
+                            f"Curve '{_emitted_mnemonic(_dc, False)}' emits "
+                            f"the same mnemonic as another curve in ~C and "
+                            f"has data.  The legacy single-block format "
+                            f"cannot represent both columns: ~A would emit "
+                            f"{len(_header_names)} data column(s) but ~C "
+                            f"declares only {len(_c_emitted)} curve(s), and "
+                            f"re-read discards the undeclared column, "
+                            f"losing the data.  Rename one of the "
+                            f"colliding curves or remove its data."
+                        )
+
             if len(_c_emitted) > len(_header_names):
                 _header_upper = {h.upper() for h in _header_names}
                 _no_column = [m for m in _c_emitted if m.upper() not in _header_upper]

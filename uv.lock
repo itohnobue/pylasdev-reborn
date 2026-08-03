@@ -347,6 +347,17 @@ wheels = [
 ]
 
 [[package]]
+name = "lasio"
+version = "0.32"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/da/53/7dbbcacaee53dbb6b7dabd83c5e7de0bc613db343175e694da61404a1264/lasio-0.32-py3-none-any.whl", hash = "sha256:4c0daa5f99d99b505a62ce58144d2512944ac6ee8e620ab251109d8f2a6ca7f8", size = 46477, upload-time = "2025-08-01T13:00:11.422Z" },
+]
+
+[[package]]
 name = "librt"
 version = "0.11.0"
 source = { registry = "https://pypi.org/simple" }
@@ -728,7 +739,7 @@ wheels = [
 
 [[package]]
 name = "pylasdev"
-version = "2.0.4"
+version = "2.0.5"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
@@ -738,6 +749,7 @@ dependencies = [
 all = [
     { name = "bandit" },
     { name = "chardet" },
+    { name = "lasio" },
     { name = "mypy" },
     { name = "pip-audit" },
     { name = "pytest" },
@@ -746,6 +758,7 @@ all = [
 ]
 dev = [
     { name = "bandit" },
+    { name = "lasio" },
     { name = "mypy" },
     { name = "pip-audit" },
     { name = "pytest" },
@@ -760,6 +773,7 @@ encoding = [
 requires-dist = [
     { name = "bandit", marker = "extra == 'dev'", specifier = ">=1.7" },
     { name = "chardet", marker = "extra == 'encoding'", specifier = ">=5.0" },
+    { name = "lasio", marker = "extra == 'dev'", specifier = ">=0.32" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "pip-audit", marker = "extra == 'dev'", specifier = ">=2.7" },

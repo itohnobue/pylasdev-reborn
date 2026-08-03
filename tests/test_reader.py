@@ -660,7 +660,15 @@ class TestDataReaderEdgeCases:
 
     # --- TEST-03: Wrapped-mode incomplete depth step padding ---
     def test_wrapped_incomplete_step_padding(self, tmp_path: Path) -> None:
-        """Test wrapped mode padding when curves have unequal lengths."""
+        """Wrapped-mode incomplete final step (accumulation contract).
+
+        II-4/R-6: under the n_curves-accumulation rewrite, a trailing
+        partial buffer (fewer than curve_count values at EOF) cannot form
+        a complete step — the orphan values are DISCARDED with the
+        N-I-08-style "not accounted for" warning instead of being padded
+        into a phantom step.  Only the complete first step survives; all
+        arrays stay equal-length (the equal-length invariant is preserved
+        for the steps that exist)."""
         content = (
             "~VERSION INFORMATION\n"
             " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
@@ -675,9 +683,9 @@ class TestDataReaderEdgeCases:
             "100.0\n"
             "50.0\n"
             "75.0\n"
+            # Only 2 values for the second step → incomplete trailing buffer
             "101.0\n"
             "51.0\n"
-            # Missing GR for second depth step (incomplete)
         )
         test_file = tmp_path / "wrapped_short.las"
         test_file.write_text(content, encoding="utf-8")
@@ -685,18 +693,33 @@ class TestDataReaderEdgeCases:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             data = read_las_file(test_file)
-            # Should have padding warning
-            assert any("Padding" in str(x.message) for x in w)
+            messages = [str(x.message) for x in w]
+            # The N-I-08-style trailing-step warning replaces the old
+            # per-curve "Padding" warnings (the partial step is discarded,
+            # not padded).
+            assert any("under-filled" in m or "not accounted for" in m for m in messages), (
+                f"Expected trailing-step warning, got: {messages[-3:]}"
+            )
 
-        # All arrays should be same length after padding
+        # All arrays should be same length after trimming
         sizes = [len(data["logs"][c]) for c in data["curves_order"]]
         assert len(set(sizes)) == 1
-        # GR should have null_value for the last step
-        assert data["logs"]["GR"][-1] == -999.25
+        # Only the complete first step survives
+        assert len(data["logs"]["DEPT"]) == 1
+        assert data["logs"]["DEPT"][0] == 100.0
 
     # --- TEST-04: Wrapped-mode depth line has >1 value ---
     def test_wrapped_depth_line_extra_values(self, tmp_path: Path) -> None:
-        """Test wrapped mode warns when depth line has multiple values."""
+        """Wrapped mode with a multi-value "depth" line (accumulation).
+
+        II-4/R-6 (accepted accumulation contract): the depth-line flag
+        protocol's "depth line has 2 values → warn+discard the extra"
+        behavior is gone — _read_wrapped now uses an n_curves
+        pending-value buffer, so `101.0 99.0` contributes BOTH values to
+        the step stream: step 2 = [101.0, 99.0] (DT=99.0, not 51.0) and
+        the trailing `51.0` is an incomplete final step that is discarded
+        with the N-I-08-style "not accounted for" warning.
+        """
         content = (
             "~VERSION INFORMATION\n"
             " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
@@ -711,9 +734,9 @@ class TestDataReaderEdgeCases:
             "100.0\n"
             # DT for first step
             "50.0\n"
-            # Second depth line: 2 values -> > 1, triggers warning
+            # Second "depth" line: 2 values -> under accumulation both are data
             "101.0  99.0\n"
-            # DT for second step
+            # Trailing single value -> incomplete final step, discarded
             "51.0\n"
         )
         test_file = tmp_path / "wrapped_extra_depth.las"
@@ -722,14 +745,19 @@ class TestDataReaderEdgeCases:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             data = read_las_file(test_file)
-            assert any("depth line has 2 values" in str(x.message) for x in w)
+            messages = [str(x.message) for x in w]
+            # The depth-line warn+discard is gone; the trailing incomplete
+            # step emits the N-I-08-style warning instead.
+            assert any("under-filled" in m or "not accounted for" in m for m in messages), (
+                f"Expected trailing-step warning, got: {messages[-3:]}"
+            )
 
-        # DEPT should only have the correct depth values (100.0, 101.0)
+        # DEPT gets the two flushed steps' depth values (100.0, 101.0)
         assert data["logs"]["DEPT"][0] == 100.0
         assert data["logs"]["DEPT"][1] == 101.0
-        # DT should have correct values
+        # DT: step 2 carries 99.0 (the "extra" depth-line value is now data)
         assert data["logs"]["DT"][0] == 50.0
-        assert data["logs"]["DT"][1] == 51.0
+        assert data["logs"]["DT"][1] == 99.0
 
     # --- TEST-11: Zero-curve early return ---
     def test_zero_curves_early_return(self, tmp_path: Path) -> None:
@@ -1266,14 +1294,16 @@ class TestFortranDExponent:
 class TestWrappedPathologicalMisalignment:
     """T6/G-09: _read_wrapped pathological misalignment path."""
 
-    def test_pathological_misalignment_raises_error(self, tmp_path: Path) -> None:
-        """Test that _read_wrapped raises LASParseError for pathological
-        misalignment: ≥3 curves + extra depth values + ≤2 data values
-        + ≥2 remaining gaps."""
+    def test_pathological_misalignment_parses_cleanly(self, tmp_path: Path) -> None:
+        """II-4 (accepted): the F-06 pathological-misalignment hard-fail is
+        removed by the n_curves-accumulation rewrite — the "extra" values
+        on the second depth line are now data, and the whole section
+        accumulates into 2 clean steps instead of raising LASParseError.
+
+        The F-06 guard's premise ("depth line had extra values" = certain
+        misalignment) only held under the depth-line flag protocol; under
+        accumulation the same values align into complete steps."""
         # Curve count = 4 (DEPT + 3 non-depth curves)
-        # Depth line: 3 values (extra) → depth_had_extra = True
-        # Data line: 1 value     → ≤2 values, remaining_curves=3, gap=2
-        # This should trigger LASParseError
         content = (
             "~VERSION INFORMATION\n"
             " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
@@ -1286,26 +1316,26 @@ class TestWrappedPathologicalMisalignment:
             " GR.GAPI  :  Gamma Ray\n"
             " SP.MV    :  Spontaneous Potential\n"
             "~A\n"
-            # First depth line: 1 value → depth_line (truly wrapped)
+            # Step 1: depth + 3 continuation values
             "100.0\n"
             "50.0\n"
             "75.0\n"
             "10.0\n"
-            # Second depth line: 3 values (>1) → depth_had_extra = True
-            # Values are consumed: DEPT=101.0, counter advances to 1 for the second
-            # Actually let me construct this more carefully.
-            # Depth line with 3 values and curve_count=4, so 2 extra values beyond DEPT.
-            # Next data line: only 1 value, need 3 more for remaining curves.
-            # remaining = 4-1-1 = 2, len(values)=1, 1 ≤ 2 and 2-1=1 < 2 → no error
-            # Need: len(values) ≤ 2 AND remaining - len(values) ≥ 2
-            # With curve_count=5 (DEPT + 4 non-depth):
-            "101.0  99.0  88.0\n"  # Depth line: 3 values (> 1) → depth_had_extra
-            "77.0\n"  # Data line: 1 value, remaining=4-1=3, gap=2 ≥ 2 → error
+            # Step 2: "depth" line with 3 values + 1 continuation value —
+            # previously depth_had_extra + short next line → LASParseError
+            "101.0  99.0  88.0\n"
+            "77.0\n"
         )
         test_file = tmp_path / "pathological.las"
         test_file.write_text(content, encoding="utf-8")
-        with pytest.raises(LASParseError, match="pathologically malformed"):
-            read_las_file(test_file)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        # 2 clean steps: [100,50,75,10] and [101,99,88,77]
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 101.0])
+        np.testing.assert_allclose(data["logs"]["DT"], [50.0, 99.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [75.0, 88.0])
+        np.testing.assert_allclose(data["logs"]["SP"], [10.0, 77.0])
 
 
 class TestDetectActualWrapDLM:
@@ -2370,18 +2400,17 @@ class TestProductionCheckReaderFixes:
     # --- E-F-018 (HIGH): depth_line state machine corruption regression test ---
 
     def test_wrapped_depth_line_state_machine_non_pathological_ef018(self, tmp_path: Path) -> None:
-        """E-F-018: Regression test — non-pathological recovery now hard-fails.
-
-        When a depth line has extra values (depth_had_extra=True) and the next
-        data line has fewer values than needed but the shift is ≤2 curves,
-        the previous code at data_reader.py:898-900 silently reset the
-        state machine, producing data corruption (SP values shifted by 1
-        depth step).  The F-032 fix hard-fails with a clear diagnostic
-        instead of producing corrupt output.
+        """E-F-018 — ACCEPTED CONTRACT CHANGE (II-4/R-6): the n_curves-
+        accumulation rewrite removes the depth-line state machine's
+        "unrecoverable data misalignment" hard-fail.  The file previously
+        hard-failed; it now parses as 3 valid steps.  The second "depth"
+        line's extra value (1050.5) is data under accumulation, not
+        corrupting junk.
 
         Test scenario (curve_count=4, DEPT + DT, GR, SP):
           Step 1: depth=1000.0, data=200.0,300.0,400.0  (normal baseline)
-          Step 2: depth=1010.0 + extra 1050.5, data=210.0,310.0 (triggers fail)
+          Step 2: depth=1010.0 + extra 1050.5, data=210.0,310.0
+          Step 3: depth=1020.0, data=220.0,320.0,420.0
         """
         content = (
             "~VERSION INFORMATION\n"
@@ -2398,21 +2427,26 @@ class TestProductionCheckReaderFixes:
             # Step 1 (normal baseline): one value per line
             "1000.0\n"
             "200.0  300.0  400.0\n"
-            # Step 2 (triggers F-032 hard-fail):
-            #   Depth line: 2 values (>1) → depth_had_extra = True
-            #   Data line: 2 values (<3 remaining curves) → unrecoverable
-            #   Fix at data_reader.py now raises LASParseError
+            # Step 2: previously triggered the F-032 hard-fail (depth line
+            # with 2 values + short next line); under accumulation the
+            # 5 values flow into step 2 = [1010.0, 1050.5, 210.0, 310.0]
             "1010.0  1050.5\n"
             "210.0  310.0\n"
-            # Step 3 is never reached
+            # Step 3
             "1020.0\n"
             "220.0  320.0  420.0\n"
         )
         test_file = tmp_path / "ef018_wrapped_state_machine.las"
         test_file.write_text(content, encoding="utf-8")
 
-        with pytest.raises(LASParseError, match="unrecoverable data misalignment"):
-            read_las_file(test_file)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        # 3 clean steps under accumulation (previously LASParseError)
+        np.testing.assert_allclose(data["logs"]["DEPT"], [1000.0, 1010.0, 1020.0])
+        np.testing.assert_allclose(data["logs"]["DT"], [200.0, 1050.5, 220.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [300.0, 210.0, 320.0])
+        np.testing.assert_allclose(data["logs"]["SP"], [400.0, 310.0, 420.0])
 
     # --- F-212 (MEDIUM): _desanitize_las_value unconditional _# strip ---
 
@@ -2658,15 +2692,108 @@ class TestG6DataReaderFixes:
         )
         test_file = tmp_path / "d03_overfull.las"
         test_file.write_text(content, encoding="utf-8")
-        data = read_las_file(test_file)
-        # Wrapped: 2 depth steps, DT/GR aligned.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        # Still WRAPPED (declared YES + depth evidence in window [1,3,1,2]) —
+        # the D-03 detection outcome is preserved.  The READ semantics
+        # changed under the accepted n_curves-accumulation rewrite: the
+        # overfull continuation's extra value (99.0) "simply starts the next
+        # step" (iter-2 design), so step 2 = [99.0, 101.0, 51.0] and the
+        # trailing 76.0 is an incomplete final step (discarded with warning).
         assert len(data["logs"]["DEPT"]) == 2, (
             f"Expected 2 wrapped steps, got {len(data['logs']['DEPT'])} — "
             f"file was misdetected as non-wrapped"
         )
-        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 101.0])
-        np.testing.assert_allclose(data["logs"]["DT"], [50.0, 51.0])
-        np.testing.assert_allclose(data["logs"]["GR"], [75.0, 76.0])
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 99.0])
+        np.testing.assert_allclose(data["logs"]["DT"], [50.0, 101.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [75.0, 51.0])
+
+    # --- X-2 (O(n²) pending slicing): wide-line wrapped files ---
+
+    def _build_wide_wrapped_file(self, tmp_path: Path, n_tokens: int) -> Path:
+        """Build a WRAP=YES file whose first 4 data lines are 1-value
+        depth evidence (window [1,1,1,1] → depth-later arm → wrapped) and
+        whose 6th data line is a single *n_tokens*-wide continuation line.
+
+        The wide line is what the pre-fix pending-buffer rewrite handled
+        quadratically (``pending = pending[curve_count:]`` per flush).
+        """
+        giant = " ".join(str(i) for i in range(n_tokens))
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " DT.US/M  :  Sonic\n"
+            "~A\n"
+            "100.0\n1.0\n101.0\n2.0\n"
+            "102.0\n" + giant + "\n"
+        )
+        path = tmp_path / f"x2_wide_{n_tokens}.las"
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def test_x2_wide_wrapped_line_values_correct_and_fast(self, tmp_path: Path) -> None:
+        """X-2: a crafted wide-line wrapped file must parse with the SAME
+        value-order accumulation the pending protocol defines, and must do
+        so in near-linear time (the pre-fix per-flush list slicing was
+        O(n²) — a 90K-token line cost ~5-6s CPU; with the index pointer it
+        is ~0.1s).  A reintroduced quadratic path blows the wall-clock
+        bound below, so the regression fails on the old implementation."""
+        import time
+
+        n_tokens = 90_000
+        test_file = self._build_wide_wrapped_file(tmp_path, n_tokens)
+
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            start = time.perf_counter()
+            data = read_las_file(test_file)
+            elapsed = time.perf_counter() - start
+
+        # Value-order accumulation: every flushed step takes the next
+        # curve_count buffered values in order (line boundaries are
+        # irrelevant to the protocol).  values = [100,1,101,2,102] +
+        # range(n_tokens); steps = len(values) // 2.
+        values = [100.0, 1.0, 101.0, 2.0, 102.0] + [float(i) for i in range(n_tokens)]
+        n_steps = len(values) // 2
+        np.testing.assert_allclose(data["logs"]["DEPT"], values[0::2][:n_steps])
+        np.testing.assert_allclose(data["logs"]["DT"], values[1::2][:n_steps])
+        assert len(data["logs"]["DEPT"]) == n_steps == 45002
+        trail = [str(w.message) for w in rec if "not accounted for" in str(w.message)]
+        assert trail, "expected the N-I-08 trailing-partial warning (1 leftover value)"
+        # Near-linear bound: quadratic at 90K tokens ≈ 5s; linear ≈ 0.1s.
+        assert elapsed < 2.5, f"wide wrapped line took {elapsed:.2f}s — quadratic pending slicing?"
+
+    def test_x2_wide_wrapped_line_scales_linearly(self, tmp_path: Path) -> None:
+        """X-2: doubling the wide-line token count must roughly double the
+        read time (linear) — NOT quadruple it (the pre-fix per-flush
+        ``pending[curve_count:]`` slice was quadratic, ~4.0x per 2x).  The
+        ratio uses the minimum of 3 timed reads per size so a transient CI
+        spike inflates the denominator instead of failing the assert."""
+        import time
+
+        sizes = (30_000, 60_000)
+        best: dict[int, float] = {}
+        for n in sizes:
+            test_file = self._build_wide_wrapped_file(tmp_path, n)
+            timings: list[float] = []
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                for _ in range(4):  # 1 warm-up + 3 measured
+                    start = time.perf_counter()
+                    read_las_file(test_file)
+                    timings.append(time.perf_counter() - start)
+            best[n] = min(timings[1:])
+        ratio = best[sizes[1]] / best[sizes[0]]
+        assert ratio < 3.0, (
+            f"wide wrapped line scaling ratio {ratio:.2f} for 2x tokens — "
+            f"expected <3.0 (linear ~2.0, quadratic ~4.0)"
+        )
 
     # --- EXT-01 (regression): wrapped COMMA/TAB >=3 curves ---
 
@@ -3692,3 +3819,387 @@ class TestIsMnemonicHeaderRowSingleCurve:
 
         las = self._las(["DEPT", "GR", "RHOB"])
         assert _is_mnemonic_header_row(["DEPT", "GR", "RHOB"], las, 3, set()) is True
+
+
+# ──────────────────────────────────────────────────────────────
+# W-A / W-2 / H-1 / F-02 regression tests (IMPLEMENT read-path pass)
+# Each test FAILS on the pre-refactor library and PASSES on the new code.
+# ──────────────────────────────────────────────────────────────
+
+
+def _write_las(tmp_path: Path, name: str, content: str) -> Path:
+    p = tmp_path / name
+    p.write_text(content, encoding="utf-8")
+    return p
+
+
+def _flowing_content(version: str, wrap: str, dlm: str = "SPACE") -> str:
+    """Flowing [6,6] nc=3 content: 2 complete depth steps per line."""
+    dlm_line = f" DLM.    {dlm} :\n" if dlm != "SPACE" else ""
+    if dlm == "COMMA":
+        rows = "1000.0,10.0,20.0,1001.0,11.0,21.0\n1002.0,12.0,22.0,1003.0,13.0,23.0\n"
+    elif dlm == "TAB":
+        rows = "1000.0\t10.0\t20.0\t1001.0\t11.0\t21.0\n1002.0\t12.0\t22.0\t1003.0\t13.0\t23.0\n"
+    else:
+        rows = "1000.0 10.0 20.0 1001.0 11.0 21.0\n1002.0 12.0 22.0 1003.0 13.0 23.0\n"
+    return (
+        "~VERSION INFORMATION\n"
+        f" VERS.   {version}  : CWLS LOG ASCII STANDARD\n"
+        f" WRAP.   {wrap}  :\n"
+        f"{dlm_line}"
+        "~WELL INFORMATION\n"
+        " NULL.    -999.25 : NULL VALUE\n"
+        "~CURVE INFORMATION\n"
+        " DEPT.M   :  Depth\n"
+        " GR.GAPI  :  Gamma\n"
+        " RHOB.K/M3:  Density\n"
+        "~A\n"
+        f"{rows}"
+    )
+
+
+class TestWrapFlowingAccumulation:
+    """W-A (HIGH): the flowing layout (depth NOT on its own line — 2+
+    complete depth steps per line) must parse with ALL steps preserved.
+
+    Pre-fix the reader had NO working path for flowing data: the detector
+    misrouted all-full windows to _read_normal (2 of 4 steps silently
+    lost) and _read_wrapped's depth-line protocol corrupted it worse (3
+    of 4 lost).  The n_curves-accumulation rewrite + the multiple-of
+    detection rule fix both."""
+
+    def test_flowing_wrap_yes_las12(self, tmp_path: Path) -> None:
+        test_file = _write_las(tmp_path, "flow_yes.las", _flowing_content("1.2", "YES"))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        np.testing.assert_allclose(data["logs"]["DEPT"], [1000.0, 1001.0, 1002.0, 1003.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [10.0, 11.0, 12.0, 13.0])
+        np.testing.assert_allclose(data["logs"]["RHOB"], [20.0, 21.0, 22.0, 23.0])
+
+    def test_flowing_wrap_yes_las20(self, tmp_path: Path) -> None:
+        test_file = _write_las(tmp_path, "flow_yes20.las", _flowing_content("2.0", "YES"))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        np.testing.assert_allclose(data["logs"]["DEPT"], [1000.0, 1001.0, 1002.0, 1003.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [10.0, 11.0, 12.0, 13.0])
+        np.testing.assert_allclose(data["logs"]["RHOB"], [20.0, 21.0, 22.0, 23.0])
+
+    def test_flowing_wrap_no_declaration_independent(self, tmp_path: Path) -> None:
+        """W-A's trigger is declaration-INDEPENDENT: a WRAP=NO header must
+        not hide the flowing signature (the multiple-of rule is content-
+        based, placed before the declared-header fall-through)."""
+        test_file = _write_las(tmp_path, "flow_no.las", _flowing_content("2.0", "NO"))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        np.testing.assert_allclose(data["logs"]["DEPT"], [1000.0, 1001.0, 1002.0, 1003.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [10.0, 11.0, 12.0, 13.0])
+
+    def test_flowing_with_string_curve(self, tmp_path: Path) -> None:
+        """Flowing with a {S} string curve: step-position dispatch must
+        preserve string values in order (pre-fix S12: 2 of 4 lost)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " LITH.    :  Lithology {S}\n"
+            " GR.GAPI  :  Gamma\n"
+            "~A\n"
+            "1000.0 SAND 10.0 1001.0 SHALE 11.0\n"
+            "1002.0 LIME 12.0 1003.0 DOLO 13.0\n"
+        )
+        test_file = _write_las(tmp_path, "flow_str.las", content)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        np.testing.assert_allclose(las.logs["DEPT"], [1000.0, 1001.0, 1002.0, 1003.0])
+        np.testing.assert_array_equal(
+            las.string_data["LITH"],
+            np.array(["SAND", "SHALE", "LIME", "DOLO"], dtype=object),
+        )
+        np.testing.assert_allclose(las.logs["GR"], [10.0, 11.0, 12.0, 13.0])
+
+    def test_flowing_comma_delimiter(self, tmp_path: Path) -> None:
+        test_file = _write_las(tmp_path, "flow_comma.las", _flowing_content("2.0", "YES", "COMMA"))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        np.testing.assert_allclose(data["logs"]["DEPT"], [1000.0, 1001.0, 1002.0, 1003.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [10.0, 11.0, 12.0, 13.0])
+
+    def test_flowing_tab_delimiter(self, tmp_path: Path) -> None:
+        test_file = _write_las(tmp_path, "flow_tab.las", _flowing_content("1.2", "YES", "TAB"))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        np.testing.assert_allclose(data["logs"]["DEPT"], [1000.0, 1001.0, 1002.0, 1003.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [10.0, 11.0, 12.0, 13.0])
+
+    def test_flowing_trailing_partial_step_warns(self, tmp_path: Path) -> None:
+        """A flowing section ending with an incomplete step (2 trailing
+        values, nc=3) emits the N-I-08-style "not accounted for" warning
+        and the orphan values are discarded (R-6 contract)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            " RHOB.K/M3:  Density\n"
+            "~A\n"
+            "1000.0 10.0 20.0 1001.0 11.0 21.0\n"
+            "1002.0 12.0\n"
+        )
+        test_file = _write_las(tmp_path, "flow_partial.las", content)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_las_file(test_file)
+            messages = [str(x.message) for x in w]
+        assert any("under-filled" in m or "not accounted for" in m for m in messages), (
+            f"No trailing-step warning emitted. Got: {messages[-3:]}"
+        )
+        np.testing.assert_allclose(data["logs"]["DEPT"], [1000.0, 1001.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [10.0, 11.0])
+        np.testing.assert_allclose(data["logs"]["RHOB"], [20.0, 21.0])
+
+
+class TestWrapDetectorFlowingRule:
+    """Detector-unit locks for the R-1 multiple-of flowing rule and the
+    R-3/II-5 discriminator (all FAIL pre-fix, PASS post-fix)."""
+
+    def _detect(self, window: list[int], nc: int, decl: str | None) -> bool:
+        from pylasdev.data_reader import _detect_actual_wrap
+
+        lines = ["~A DEPT GR"]
+        for n in window:
+            lines.append(" ".join(str(i) for i in range(1, n + 1)))
+        return _detect_actual_wrap(lines, nc, " ", declared_wrap=decl)
+
+    def test_flowing_all_full_detected_wrapped(self) -> None:
+        """[6,6] nc=3 → True (W-A): a full first line carrying 2 complete
+        depth steps is flowing, regardless of the declared header."""
+        assert self._detect([6, 6], 3, "YES") is True
+        assert self._detect([6, 6], 3, "NO") is True
+
+    def test_mislabeled_all_full_stays_unwrapped(self) -> None:
+        """[3,3,3,3] nc=3 YES → False (test_regression.py:4708 lock): one
+        complete step per line is NOT flowing."""
+        assert self._detect([3, 3, 3, 3], 3, "YES") is False
+
+    def test_extra_columns_aligned_stays_unwrapped(self) -> None:
+        """[4,4] nc=3 → False (4 % 3 != 0): the extra-columns control —
+        a non-aligned all-full window stays non-wrapped so _read_normal's
+        extra-column discard is correct (QA N2 hazard)."""
+        assert self._detect([4, 4], 3, "YES") is False
+
+    def test_nc2_aligned_extra_columns_stays_unwrapped(self) -> None:
+        """[4,4] nc=2 → False: for nc=2 the multiple-of rule is disabled
+        (curve_count >= 3 guard) so test-locked extra-columns files are
+        never misrouted to the wrapped reader."""
+        assert self._detect([4, 4], 2, "NO") is False
+        assert self._detect([4, 4], 2, "YES") is False
+
+    def test_ragged_two_one_value_rows_stays_unwrapped(self) -> None:
+        """W-2/II-5: [3,1,3,1] and [3,1,1,3] WRAP=NO → False — a full row
+        immediately after a 1-value row is impossible in genuine wrapped
+        data, so the ≥2-one-value-rows arm must not fire."""
+        assert self._detect([3, 1, 3, 1], 3, "NO") is False
+        assert self._detect([3, 1, 1, 3], 3, "NO") is False
+
+
+class TestWrapRaggedNullFill:
+    """W-2 (MEDIUM): ragged WRAP=NO files with ≥2 one-value rows must
+    null-fill (not corrupt via the wrapped reader)."""
+
+    _base = (
+        "~VERSION INFORMATION\n"
+        " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
+        " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+        "~WELL INFORMATION\n"
+        " NULL.    -999.25 : NULL VALUE\n"
+        "~CURVE INFORMATION\n"
+        " DEPT.M   :  Depth\n"
+        " GR.GAPI  :  Gamma\n"
+        " RHOB.K/M3:  Density\n"
+        "~A\n"
+    )
+
+    def test_ragged_3131_wrap_no_null_fill(self, tmp_path: Path) -> None:
+        content = self._base + ("1000.0 10.0 20.0\n1001.0\n1002.0 12.0 22.0\n1003.0\n")
+        test_file = _write_las(tmp_path, "r3131.las", content)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        np.testing.assert_allclose(data["logs"]["DEPT"], [1000.0, 1001.0, 1002.0, 1003.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [10.0, -999.25, 12.0, -999.25])
+        np.testing.assert_allclose(data["logs"]["RHOB"], [20.0, -999.25, 22.0, -999.25])
+
+    def test_ragged_3113_wrap_no_null_fill(self, tmp_path: Path) -> None:
+        content = self._base + ("1000.0 10.0 20.0\n1001.0\n1002.0\n1003.0 13.0 23.0\n")
+        test_file = _write_las(tmp_path, "r3113.las", content)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        np.testing.assert_allclose(data["logs"]["DEPT"], [1000.0, 1001.0, 1002.0, 1003.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [10.0, -999.25, -999.25, 13.0])
+        np.testing.assert_allclose(data["logs"]["RHOB"], [20.0, -999.25, -999.25, 23.0])
+
+
+class TestWrapLas30FlowingRejection:
+    """R-5: the LAS 3.0 fix is DETECTION-ONLY — the shared gate's True
+    feeds the existing loud WRAP=YES rejection (no accumulation in
+    process_ascii_data); ragged WRAP=NO files parse instead of being
+    falsely rejected (NEW-1)."""
+
+    def test_las30_flowing_six_six_raises_loudly(self, tmp_path: Path) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            " DLM.    SPACE :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth {F}\n"
+            " GR.GAPI  :  Gamma {F}\n"
+            " RHOB.K/M3:  Density {F}\n"
+            "~A\n"
+            "1000.0 10.0 20.0 1001.0 11.0 21.0\n"
+            "1002.0 12.0 22.0 1003.0 13.0 23.0\n"
+        )
+        test_file = _write_las(tmp_path, "l30_flow.las", content)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pytest.raises(LASParseError, match="WRAP=YES is not supported"):
+                read_las_file(test_file)
+
+    def test_las30_ragged_3131_wrap_no_parses(self, tmp_path: Path) -> None:
+        """NEW-1: a ragged WRAP=NO file must NOT be falsely rejected as
+        "LAS 3.0 WRAP=YES" — the II-5 discriminator keeps it non-wrapped
+        and it parses with null-fill."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth {F}\n"
+            " GR.GAPI  :  Gamma {F}\n"
+            " RHOB.K/M3:  Density {F}\n"
+            "~A\n"
+            "1000.0 10.0 20.0\n"
+            "1001.0\n"
+            "1002.0 12.0 22.0\n"
+            "1003.0\n"
+        )
+        test_file = _write_las(tmp_path, "l30_ragged.las", content)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        np.testing.assert_allclose(las.logs["DEPT"], [1000.0, 1001.0, 1002.0, 1003.0])
+        np.testing.assert_allclose(las.logs["GR"], [10.0, -999.25, 12.0, -999.25])
+
+
+class TestHeaderSkipSupersetSplit:
+    """H-1 (MEDIUM): the DLM-aware reader must recognize a space-separated
+    mnemonic header row in a DLM=COMMA file (superset split at all 3
+    predicate sites), and the II-11 collision class (a genuine first-row
+    string value containing a space in a mixed COMMA section) must NOT be
+    skipped as a header."""
+
+    def test_space_separated_header_in_comma_file_skipped(self, tmp_path: Path) -> None:
+        """Pre-fix: the reader split the header row with the DLM-aware
+        tokenizer → one token "DEPT GR" → consumed as data → phantom
+        all-null first row + one-row shift."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            "~A\n"
+            "DEPT GR\n"
+            "100.0,50.0\n"
+            "101.0,51.0\n"
+        )
+        test_file = _write_las(tmp_path, "h1_comma_header.las", content)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 101.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [50.0, 51.0])
+
+    def test_space_in_string_first_row_not_header(self, tmp_path: Path) -> None:
+        """II-11 collision class: a genuine first-row {S} string value
+        containing a space ("LITH SHALE") in a COMMA-DLM mixed section is
+        split by the superset tokenizer into 4 tokens (> curve_count), so
+        the count bound keeps it DATA — never skipped as a header."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            " LITH.    :  Lithology {S}\n"
+            "~A DEPT GR LITH\n"
+            "100.0,10.0,LITH SHALE\n"
+            "101.0,11.0,SAND STONE\n"
+        )
+        test_file = _write_las(tmp_path, "h1_collision.las", content)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        np.testing.assert_allclose(las.logs["DEPT"], [100.0, 101.0])
+        np.testing.assert_array_equal(
+            las.string_data["LITH"],
+            np.array(["LITH SHALE", "SAND STONE"], dtype=object),
+        )
+
+
+class TestHeaderTildeRoundtrip:
+    """F-02/II-26: header fields must NOT restore the writer-only '_~'
+    data escape — a genuine '_~'-prefixed header value roundtrips
+    unchanged (parser header call sites use restore_tilde=False, II-13)."""
+
+    def test_well_value_underscore_tilde_roundtrips_unchanged(self, tmp_path: Path) -> None:
+        from pylasdev.writer import write_las_file
+
+        las = LASFile()
+        las.version.wrap = "NO"
+        las.well["NULL"] = "-999.25"
+        las.well["WELL"] = "_~Acme"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([100.0])
+
+        out = tmp_path / "tilde_well.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            back = read_las_file_as_object(out)
+        # Pre-fix: parser._desanitize_las_value restored '_~' → '~' at the
+        # header site, corrupting the genuine value to '~Acme'.
+        assert back.well["WELL"] == "_~Acme", (
+            f"F-02: '_~' header escape wrongly restored, got {back.well['WELL']!r}"
+        )

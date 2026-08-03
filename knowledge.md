@@ -1,5 +1,5 @@
 # Knowledge Base
-Last updated: 2026-08-03T09:22:46.679612
+Last updated: 2026-08-03T19:56:51.956252
 
 ## [dis-20260620063206-7fc4ae]
 Category: discovery
@@ -1360,4 +1360,53 @@ Tags: wrap, data_reader, las30, curve-count, ragged, regression, parser
 Changed: 2026-08-03T09:22:46.669070
 
 Wrap depth-line rule must be curve_count-aware AND ragged-shape-aware: the [2,1,2] 2-curve ambiguity (window[1]==1 after a full first row) and the [3,1,3] ragged non-wrapped nc>=3 shape (F-02, CONFIRMED MEDIUM) are BOTH misclassified as wrapped by naive arms. Resolved gate: curve_count-aware arms — (curve_count >= 3 and window[1] == 1) OR sum(1 for n in window[1:] if n == 1) >= 2 — mirrored identically on BOTH wrap-detection paths (data_reader.py:641-644 AND _las30_data.py:360-367). F-02 was the [3,1,3] ragged non-wrapped nc>=3 shape with a single short middle row; the >=2-one-value-rows arm alone catches genuine 2-curve wrapped files while the curve_count>=3 && window[1]==1 arm must NOT fire on ragged non-wrapped nc>=3 files with only ONE short row. Validated 12+ shapes. Checklist: every wrap rule arm must be curve_count-aware AND distinguish single-short-row ragged from genuine wrap; two-path parity verified by comparing gate expressions verbatim; regression-test [2,1,2] nc=2 AND [3,1,3] nc=3 WRAP=NO on both LAS 1.2 and LAS 2.0 plus string-padding.
+
+## [pat-20260803195621-cfa5ed]
+Category: pattern
+Tags: wrap, flowing, accumulation, curve_count, data_reader, las30, regression
+Changed: 2026-08-03T19:56:21.541888
+
+two-path wrap contracts must be ONE shared gate, and line-shape heuristics misclassify FLOWING layout — the reader must accumulate to curve_count, never trust line structure. W-A (HIGH, all-full window + declared WRAP=YES misrouted to _read_normal -> silent depth-step loss; adversarial strengthening: _read_wrapped ALSO fails on flowing data, losing MORE steps than _read_normal — there is NO working path for flowing data in either branch; the fix is n_curves-accumulation in the wrapped reader + LAS 3.0 counterpart, NOT a routing flip). W-2 (>=2-one-value-rows arm overrides a correct WRAP=NO header -> column corruption on [3,1,3,1]/[3,1,1,3]; discriminator: a genuine wrapped continuation carries exactly curve_count-1 values, never curve_count). W-B (mid-file depth lines with >1 value warn-and-discard -> corrupted arrays; exact trigger raises F-06 = valid-file rejection is itself a functional bug). Fix: single shared decision core + accumulate by curve_count; content-based (divisibility) detection, not header-trust. Checklist: when a file layout is flowing (all rows full width, WRAP declared YES or absent), no line-shape rule separates wrapped from unwrapped — accumulate to curve_count; every wrap rule arm must be curve_count-aware; verify BOTH reader twins (data_reader.py + _las30_data.py) have a working flowing path.
+
+## [pat-20260803195629-14e483]
+Category: pattern
+Tags: case-insensitive, mnemonic, emitted-name, int64, precision, data-loss, centralized, regression
+Changed: 2026-08-03T19:56:29.006835
+
+case-variant mnemonics bypass exact-case guards → silent data loss; route ALL mnemonic matching through ONE CI helper, and {S} marker membership must test the EMITTED mnemonic. N2b-1 (HIGH, _writer_base.py:344): {S} string marker lost for case-variant string_data keys → silent permanent string-value destruction on write→read; fix upper-casing membership alone is INCOMPLETE because the membership tests curve.mnemonic but the EMITTED mnemonic is _emit_mnem (M-59, :438-446) — a curve with original_mnemonic='LLD' emits markerless with NO case variance; upper-case ALL 4 string_mnemonics set-build sites + the 7-site warning guard (:1368-1408). N1b-1/II-3b (models.py:4802-4805, 5254-5256): {I} integer-dtype preservation lookup exact-case → silent int64→float64 precision loss >2^53; the per-section branch ALSO fails when section_curves absent (ds_section_curves=[] → next() returns '' → float64 branch) — CI lookup cannot fix a missing entry; fall back to top-level curve data_format. N1a-1/N1a-2/N1a-8/N1b-4/N1b-8/N2b-2/N2b-3/II-2: string-format placement, logs↔string_data overlap, case-variant duplicate dedup, data-bearing detection — exact-case at NEW sites every run (9-11 sites this run). Fix: centralized _case_key/_mnem_key helpers consumed by every set-build/membership/lookup on the mnemonic family; {S} membership must test the emitted name. Checklist: grep EVERY exact-case site in the mnemonic family (models, _writer_base, _writer_las30); a fix at one site leaves the same defect at the twins; {I} curves keep int64 through per-section paths with empty section_curves; roundtrip tests cover case-variant AND emitted-name states.
+
+## [got-20260803195633-56712d]
+Category: gotcha
+Tags: header, tokenizer, superset, DLM, phantom-row, pre-scan, reader
+Changed: 2026-08-03T19:56:33.730349
+
+pre-scan/reader header predicates must share ONE SUPERSET tokenizer; DLM-aware splitting misses space-separated headers → phantom rows. H-1 (CONFIRMED, parser.py:1510 + _data_section_reader.py:260-273): a DLM=COMMA file with a space-separated header row (e.g. 'DEPT GR' without commas) is split by the DLM-aware reader into ONE token → the mnemonic-header predicate never fires → phantom all-null first row + one-row data shift; both pre-scan and reader see 1 token. Fix direction: unify on a superset split ([\s,]+) at ALL 3 sites, NOT on _split_data_line. Caveat (II-11): superset splitting creates a NEW narrow data-loss class — a genuine first-row string value containing a space in a COMMA-DLM mixed section would be space-split into mnemonic tokens and skipped as a header (the DLM-aware split protected this class via M-02 guard data_reader.py:902-913) — add a regression test for the space-in-string-first-row collision. Checklist: the tokenizer is part of the header-skip contract; DLM-aware splitting is a latent phantom-row source; superset split needs a regression test for string-first-row-with-space.
+
+## [got-20260803195638-d9e020]
+Category: gotcha
+Tags: performance, quadratic, slicing, accumulation, DoS, data_reader, regression
+Changed: 2026-08-03T19:56:38.524395
+
+accumulation loops must not re-slice a growing pending list per flush — pending = pending[curve_count:] per flush is O(n^2) and DoS-amplifiable on a public API. X-2 (CONFIRMED, Stage-4 regression, data_reader.py:1315-1318): _read_wrapped accumulation rewrite re-sliced the pending buffer per flushed step; crafted wide-line wrapped file: 100K-token line ≈ 6.1s at nc=2, benchmark 4.0x time per 2x tokens (quadratic), ~80min CPU per 500MB crafted file via read_las_file. Fix: index pointer (read_idx) or collections.deque.popleft() — O(1) per step, single trim at EOF (post-fix data_reader.py:1297-1324). MAX_TOKENS_PER_LINE caps per-line cost but attacker scales LINE COUNT. Checklist: grep accumulation loops for list[k:] re-assignment inside the loop; verify scaling on crafted wide inputs; O(n) per flush is the contract — step extraction must be O(1).
+
+## [pat-20260803195643-42cc15]
+Category: pattern
+Tags: dedup, case-insensitive, data-loss, writer, roundtrip, refuse-loudly, regression
+Changed: 2026-08-03T19:56:43.409095
+
+case-insensitive dedup of a duplicate curve must never silently discard the duplicate's DISTINCT data on write→re-read — refuse loudly or preserve, never silently drop. X-1 (CONFIRMED, Stage-4 regression, _writer_base.py:252-269 + warning :1222-1233): the N2b-2 CI-dedup fix made ~C dedup case-insensitive but left the legacy ~A header path exact-case; top-level 'DEPT'+'dept' (distinct data) → ~C deduped to one, ~A emits BOTH columns, re-read DISCARDS dept data with a now-FALSE warning ('a re-read would rename it'; actual behavior = discard). Pre-fix: rename to DEPT_2 + data preserved. Fix: align ~A header dedup with ~C CI-dedup so no undeclared column is emitted, OR raise LASWriteError when a deduped duplicate's data is distinct (LAS 3.0 per-section contract); correct stale warning text; assert data preservation or explicit raise in tests. Checklist: when making a dedup/merge case-insensitive, trace write→re-read for the MERGED-AWAY entry's data — a rename losing to a discard is a regression; distinct-data duplicates must refuse loudly, shared-array duplicates may warn-and-drop; update tests that pass while data is discarded.
+
+## [got-20260803195647-50a74c]
+Category: gotcha
+Tags: testing, differential, key-set, equality, harness, parity
+Changed: 2026-08-03T19:56:47.385436
+
+differential/parity tests comparing two dicts must assert KEY-SET EQUALITY, not just intersection — dropped/added keys are invisible to intersection-only comparison. X-4 (CONFIRMED, test_lasio_differential.py:120-136): _compare_well used common = keys & keys, so deleting the STOP well key or adding BOGUS produced 0 mismatches and test_well_fields_agree passed — the harness's drift-detection purpose was defeated for well-key drops. Fix: hard-assert set(p.keys) == set(las.keys) BEFORE any value comparison. Checklist: any differential comparison of keyed structures needs key-set equality first; mutation-test by deleting a real key and adding a bogus one — the test must fail.
+
+## [pat-20260803195651-8956e2]
+Category: pattern
+Tags: testing, roundtrip, self-consistency, differential, oracle, harness
+Changed: 2026-08-03T19:56:51.945513
+
+roundtrip parse→write→reparse is SELF-CONSISTENT under deterministic reader bugs — the same reader bug applies on both sides, so first==second → PASS with corrupted data; deterministic roundtrips need a DIFFERENTIAL oracle. X-6 (CONFIRMED, test_property_roundtrip.py:52-60,321-327,503-518): wrap/case/header reader regressions are invisible to deterministic roundtrip scenarios because the same (buggy) reader parses both the input and the reparse. Fix: document the limitation + add a lasio-differential corpus (independent parser = correctness oracle) + reader unit tests. Related scenario-blindness (X-5, test_property_roundtrip.py:158-169): a 'mnemonic-header-row' scenario whose content is a plain unwrapped file (inline ~A DEPTH GR) NEVER exercises the claimed predicate — verify fixture layout actually triggers the code path (_is_mnemonic_header_row). Checklist: deterministic roundtrip tests cannot detect reader bugs the reader itself introduces; pair roundtrip with an independent-parser differential; scenario fixtures must actually exercise the claimed drift class.
 

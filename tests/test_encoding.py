@@ -1596,3 +1596,149 @@ class TestM2IrreducibleResidualsXfail:
             f"A-2 residual: cp1252 cluster+uppercase-token+digit misdecoded as {enc!r} (mojibake)"
         )
         assert "\u2026\u2020\u2021" in content
+
+
+# ──────────────────────────────────────────────────────────────
+# C-1 / C-2 / C-3 (encoding, MEDIUM — stage-C discovery F-1/F-2/F-3 +
+# ADV-M3 byte-identity proofs, IMP-4 pins): three NEW provably-irreducible
+# encoding classes, pinned strict-xfail exactly like the M-2/A-2 residuals.
+# Each class is byte-symmetric: the two intended encodings produce
+# byte-identical content that each decodes to plausible text under both
+# codecs, so no local byte-content rule (ratio, run length, set-byte, strong
+# byte) can ever separate the pair — the load-bearing gate that forbids the
+# alternative trade is quoted in each reason.  strict=True: a future pass
+# that changes a trade flips the pin to XPASS and the suite fails.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestEncodingNewIrreducibleResidualsXfail:
+    """C-1 / C-2 / C-3: the irreducible residuals of the encoding fallback
+    chain that stage-C discovery and adversarial verification proved to be
+    byte-identical to their alternative codec interpretations.  Pins only —
+    the detection logic is deliberately NOT changed (no byte-content rule
+    can converge on a byte-identical pair; the fix-regress trap)."""
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "C-1 documented residual (stage-C F-1, ADV-M3 CONFIRMED): bytes "
+            "74 68 65 20 86 87 89 20 33 20 69 74 65 6D 73 = cp1252 "
+            "'the \\u2020\\u2021\\u2030 3 items' (Western dagger / double "
+            "dagger / per-mille cluster + digit) == cp866 'the "
+            "\\u0416\\u0417\\u0419 3 items' (genuine 3-letter Cyrillic word + "
+            "digit).  The digit-follows branch of _is_genuine_word_run fires "
+            "identically on both, so the Western input misdecodes as cp866 "
+            "and no local byte-content rule can separate the pair without "
+            "dropping the load-bearing digit-follows gate "
+            "(test_cp866_test_hyphen_digit_laden_stays_cp866: genuine "
+            "TEST-2 digit-laden no-set word must stay cp866).  Trade kept in "
+            "favor of the genuine Russian-geoscience LAS digit-follows class."
+        ),
+    )
+    def test_cp1252_cluster_digit_direct_stays_cp1252(self, tmp_path: Path) -> None:
+        """C-1 residual pin (stage-C F-1 + ADV-M3): 'the \u2020\u2021\u2030 3
+        items' (cp1252) would decode cp1252, but the digit '3' directly
+        follows the cluster — byte-identical to the genuine cp866
+        digit-follows class 'the \u0416\u0417\u0419 3 items' — so it decodes
+        cp866 and cannot be fixed without dropping the load-bearing TEST-2
+        digit-follows gate.  strict=True guards the trade the same way as
+        the M-2 pin."""
+        text = "the \u2020\u2021\u2030 3 items"
+        test_file = tmp_path / "c1_digit_direct.las"
+        test_file.write_bytes(text.encode("cp1252"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", (
+            f"C-1 residual: cp1252 cluster+digit-direct misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u2020\u2021\u2030" in content
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "C-2 documented residual (stage-C F-2, ADV-M3 CONFIRMED): bytes "
+            "54 48 45 20 57 45 4C 4C 20 82 84 85 20 66 69 65 6C 64 = cp866 "
+            "'THE WELL \\u0412\\u0414\\u0415 field' (genuine no-set Cyrillic "
+            "word + LOWERCASE ASCII follow) == cp1252 'THE WELL \\u201a\\u201e"
+            "\\u2026 field' (Western smart-punct cluster).  The lowercase "
+            "follow fails the _run_has_las_context signal, so the Western "
+            "rescue fires and the genuine cp866 input misdecodes as cp1252; "
+            "the EXACT byte pattern is already pinned PASSING on the Western "
+            "side (test_cp1252_prose_lowquote_cluster_stays_cp1252), so no "
+            "local rule can flip lowercase-follows to cp866 without breaking "
+            "that gate.  This is the loss-side mirror of the M-2 pin (M-2 "
+            "pins the Western loss; C-2 pins the Cyrillic loss)."
+        ),
+    )
+    def test_cp866_no_set_word_lowercase_follow_stays_cp866(self, tmp_path: Path) -> None:
+        """C-2 residual pin (stage-C F-2 + ADV-M3): 'THE WELL VDE field'
+        (cp866) would decode cp866, but the lowercase 'field' fails the
+        LAS-context signal — byte-identical to the Western prose shape
+        pinned PASSING at test_cp1252_prose_lowquote_cluster_stays_cp1252 —
+        so it decodes cp1252 and cannot be fixed without breaking that gate.
+        strict=True guards the trade the same way as the M-2 pin."""
+        raw = b"THE WELL " + "\u0412\u0414\u0415".encode("cp866") + b" field"
+        test_file = tmp_path / "c2_lowercase_follow.las"
+        test_file.write_bytes(raw)
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp866", (
+            f"C-2 residual: cp866 no-set word + lowercase follow misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u0412\u0414\u0415" in content
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "C-3 documented residual (stage-C F-3, ADV-M3 CONFIRMED): bytes "
+            "D1 CA C2 20 31 32 20 46 49 45 4C 44 = cp1251 '\\u0421\\u041a\\u0412 "
+            "12 FIELD' (genuine 3-letter Cyrillic word, skvazhina = well) == "
+            "cp1252 '\\u00d1\\u00ca\\u00c2 12 FIELD' (Western accented "
+            "Latin).  Both decodes have identical word-char ratios (0.833), "
+            "no 4-byte run (_CYRILLIC_RUN_CONFIRM=4), no strong byte, so "
+            "Western wins the ratio tie and the genuine cp1251 input "
+            "misdecodes as cp1252; any threshold-lowering or tie-time "
+            "Cyrillic-run check flips the byte-identical M-57 Spanish gate "
+            "(TestM57SpanishNotMisdetectedAsCp1251: 'Nota\\u00b9 "
+            "\\u00d1\\u00e1\\u00f1ez') to cp1251.  Trade kept in favor of "
+            "the Western M-57 gate."
+        ),
+    )
+    def test_cp1251_short_word_stays_cp1251(self, tmp_path: Path) -> None:
+        """C-3 residual pin (stage-C F-3 + ADV-M3): '\\u0421\\u041a\\u0412 12 "
+        "FIELD' (cp1251) would decode cp1251, but the 3-letter run is below "
+        "the 4-byte Cyrillic-run threshold and the ratio ties — "
+        "byte-identical to the M-57 Spanish '\\u00d1\\u00e1\\u00f1ez' shape "
+        "— so it decodes cp1252 and cannot be fixed without breaking that "
+        "gate.  strict=True guards the trade the same way as the M-2 pin."""
+        raw = "\u0421\u041a\u0412 12 FIELD".encode("cp1251")
+        test_file = tmp_path / "c3_short_word.las"
+        test_file.write_bytes(raw)
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1251", f"C-3 residual: cp1251 short word misdecoded as {enc!r} (mojibake)"
+        assert "\u0421\u041a\u0412" in content

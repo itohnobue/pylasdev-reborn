@@ -56,6 +56,21 @@ def _safe_str(value: Any, default: str = "", max_length: int | None = MAX_FIELD_
     return result
 
 
+def _case_key(s: str) -> str:
+    """Canonical case-insensitive MATCHING key for a mnemonic.
+
+    The codebase convention (lasio ``mnemonic_case="upper"`` parity, the
+    writer's ``_lookup_data_array`` / ``by_upper`` resolution, the
+    ``WL-M1``/``MOD-2``/``MOD-3`` case-variant states) is: uppercased
+    comparison, original-case storage and emission.  This is the single
+    normalization point for the case-normalization migration (N1a/N1b/
+    N2b family): every comparison/lookup site passes BOTH sides through
+    ``_case_key`` while storage and ``to_dict`` keep the original
+    spelling (lossless round-trip).
+    """
+    return s.upper()
+
+
 # M-03: Mnemonic whitelist mirroring the parser's mnemonic grammar
 # (parser.DATA_LINE_PATTERN mnemonic group ``[\w\-]+(?:\[\d+\])?``).
 # The previous model-layer checks blacklisted only spaces/tabs/newlines/dots,
@@ -1140,9 +1155,15 @@ def _check_df_vs_placement(
     logs_keys: set[str] = set()
     string_data_keys: set[str] = set()
     if isinstance(logs, dict):
-        logs_keys = {str(k) for k in logs}
+        # N1a-1: the IF-026 placement guard compared exact-case while every
+        # sibling check in the same from_dict block upper-cases
+        # (F-115/E-F-022 at :1086/:1113).  A case-variant key (curve
+        # mnemonic 'dept' + log key 'DEPT' — a state the codebase blesses
+        # via MOD-3) bypassed the guard and the writer silently emitted the
+        # {S} curve's values as numeric.  Compare via _case_key.
+        logs_keys = {_case_key(str(k)) for k in logs}
     if isinstance(string_data, dict):
-        string_data_keys = {str(k) for k in string_data}
+        string_data_keys = {_case_key(str(k)) for k in string_data}
 
     for i, cd in enumerate(curves):
         if not isinstance(cd, dict):
@@ -1160,7 +1181,7 @@ def _check_df_vs_placement(
         # must be rejected from numeric logs.  {A}-format curves WITH
         # array_info (e.g. NMR[1]) are genuinely numeric (float64) and
         # belong in logs/data.  (F-I2-MD4-02)
-        if mnemonic in logs_keys:
+        if _case_key(mnemonic) in logs_keys:
             if df == "S" or (df == "A" and not cd.get("array_info")):
                 raise ValueError(
                     f"{context} curve '{mnemonic}' (index {i}) has "
@@ -1173,7 +1194,7 @@ def _check_df_vs_placement(
         # The previous guard rejected {A}-format curves in string_data
         # because "A" != "S", breaking the roundtrip path.  Numeric
         # formats (F, E, D) remain correctly rejected from string_data.
-        if df not in ("S", "A") and mnemonic in string_data_keys:
+        if df not in ("S", "A") and _case_key(mnemonic) in string_data_keys:
             raise ValueError(
                 f"{context} curve '{mnemonic}' (index {i}) has "
                 f"data_format='{df}' but is in string_data. "
@@ -1607,6 +1628,26 @@ class WellSection:
     def get(self, key: str, default: str = "") -> str:
         return self.entries.get(key, default)
 
+    def get_ci(self, key: str, default: str = "") -> str:
+        """Case-insensitive lookup of a well entry (N1a-8).
+
+        ``from_dict`` stores well keys verbatim when ``mnem_base`` is None
+        (``_norm_mnem`` identity) and direct construction preserves input
+        case, so a case-variant key like ``"strt"`` survives while every
+        consumer matches case-insensitively (``WellSection.validate``
+        loops, ``LASFile.validate`` mandatory-field check, the writers'
+        ``key.upper() == mandatory`` ordering, and
+        ``data_reader._get_well_entry_ci``).  The public
+        ``__getitem__``/``get``/``__contains__`` stay EXACT-case (their
+        documented contract); this accessor gives callers the same CI
+        lookup the rest of the codebase uses without changing that API.
+        """
+        key_upper = key.upper()
+        for k, v in self.entries.items():
+            if str(k).upper() == key_upper:
+                return v
+        return default
+
 
 @dataclass
 class ArrayElementInfo:
@@ -1919,8 +1960,13 @@ class CurveDefinition:
         # it will not belong to after re-parse.  Warn (mirroring
         # from_dict) rather than raise.
         if self.array_info is not None and "[" in self.mnemonic:
+            # N1a-7 (II-19 sibling): the M-17 cross-check compared the RAW
+            # mnemonic base against array_info.base_name (uppercased at
+            # construction) — a case-variant mnemonic ('nmr[1]' vs
+            # base_name 'NMR') fired a false warning.  Compare via
+            # _case_key.
             _mnem_base = self.mnemonic.split("[", 1)[0]
-            if _mnem_base != self.array_info.base_name:
+            if _case_key(_mnem_base) != _case_key(self.array_info.base_name):
                 warnings.warn(
                     f"CurveDefinition: mnemonic {self.mnemonic!r} uses "
                     f"array notation but array_info.base_name is "
@@ -2497,11 +2543,11 @@ class DataSection:
         # object arrays (exact Python ints for data values, float sentinel
         # for null cells) — exempt them from the numeric-dtype check,
         # mirroring the LASFile.validate exemption for the top-level logs.
-        _fmt_by_mnem = {c.mnemonic: c.data_format for c in self.section_curves}
+        _fmt_by_mnem = {_case_key(c.mnemonic): c.data_format for c in self.section_curves}
         for _k, _arr in self.data.items():
             if not isinstance(_arr, np.ndarray):
                 _arr = self.data[_k] = np.asarray(_arr)
-            if _arr.dtype == object and _fmt_by_mnem.get(_k) == "I":
+            if _arr.dtype == object and _fmt_by_mnem.get(_case_key(_k)) == "I":
                 continue
             if not np.issubdtype(_arr.dtype, np.number):
                 issues.append(
@@ -2536,6 +2582,14 @@ class DataSection:
         # --- uncovered curves ---
         data_keys = set(self.data.keys())
         string_keys = set(self.string_data.keys())
+        # N1a-2: the I2F-06 string-format placement check below compared
+        # exact-case while the sibling orphaned/uncovered/positional checks
+        # upper-case (WL-M1).  Case-variant data keys ('gr' vs section
+        # curve 'GR') bypassed the guard and the writer silently migrated
+        # the {S} column's values to numeric on write→read.  Match via
+        # _case_key like the sibling checks.
+        data_keys_ci = {_case_key(k) for k in data_keys}
+        string_keys_ci = {_case_key(k) for k in string_keys}
         if self.data or self.string_data:
             # WL-M1 (M13 twin of _writer_las30.py:1085-1093): the writer's
             # data-key lookup (_format_data_rows → _lookup_data_array) is
@@ -2627,13 +2681,15 @@ class DataSection:
             _mnem = _sc.mnemonic
             if not _df:
                 continue
-            if _mnem in data_keys and (_df == "S" or (_df == "A" and not _sc.is_array_element)):
+            if _case_key(_mnem) in data_keys_ci and (
+                _df == "S" or (_df == "A" and not _sc.is_array_element)
+            ):
                 issues.append(
                     f"DataSection '{self.name}': curve '{_mnem}' has "
                     f"data_format='{_df}' but is in data (numeric). "
                     f"String-format curves must be in string_data."
                 )
-            if _df not in ("S", "A") and _mnem in string_keys:
+            if _df not in ("S", "A") and _case_key(_mnem) in string_keys_ci:
                 issues.append(
                     f"DataSection '{self.name}': curve '{_mnem}' has "
                     f"data_format='{_df}' but is in string_data. "
@@ -2798,7 +2854,13 @@ class DataSection:
         # re-read section_type silently becomes LOG_DATA.  Normalize at
         # the model so the roundtrip preserves the declared type.
         if self.section_type:
-            _bare = _BARE_SECTION_TYPE_TO_DATA.get(self.section_type)
+            # N1a-4: the M-84 bare-section normalization looked up the raw
+            # section_type case-sensitively, so DataSection(section_type=
+            # 'core') stayed 'core' (writer re-emitted the bare form and
+            # re-read silently became LOG_DATA) while 'CORE' normalized to
+            # 'CORE_DATA'.  Normalize via _case_key like the parser's
+            # uppercase section words.
+            _bare = _BARE_SECTION_TYPE_TO_DATA.get(_case_key(self.section_type))
             if _bare is not None and _bare != self.section_type:
                 self.section_type = _bare
 
@@ -2811,7 +2873,12 @@ class DataSection:
         # must not be falsely rejected here (F-04 roundtrip).  A genuinely
         # distinct key still differs after upper-casing.
         data_keys = set(self.data.keys())
-        orphaned_data = sorted({k for k in data_keys if k.upper() not in _curve_set_upper})
+        # N1a-2/II-2: CI mirrors for the placement and overlap checks below —
+        # the writer's per-section data lookup is case-insensitive
+        # (_lookup_data_array), so a case-variant key ('gr' vs 'GR') is the
+        # same logical curve.
+        data_keys_ci = {_case_key(k): k for k in data_keys}
+        orphaned_data = sorted({k for k in data_keys if _case_key(k) not in _curve_set_upper})
         if orphaned_data:
             raise LASDataError(
                 f"DataSection '{self.name}': data keys not in curves_order: {sorted(orphaned_data)}"
@@ -2819,7 +2886,8 @@ class DataSection:
 
         # string_data keys ⊆ curves_order
         string_keys = set(self.string_data.keys())
-        orphaned_string = sorted({k for k in string_keys if k.upper() not in _curve_set_upper})
+        string_keys_ci = {_case_key(k): k for k in string_keys}
+        orphaned_string = sorted({k for k in string_keys if _case_key(k) not in _curve_set_upper})
         if orphaned_string:
             raise LASDataError(
                 f"DataSection '{self.name}': string_data keys not in "
@@ -2858,8 +2926,16 @@ class DataSection:
 
         # data and string_data must be disjoint — a curve name cannot
         # appear in both collections (writer silently picks one).
-        colliding = data_keys & string_keys
-        if colliding:
+        # II-2: the overlap check compared exact-case, so a case-variant
+        # pair (data={'DEPT'}, string_data={'dept'}) passed construction
+        # while the same-case control raised — the writer then emitted both
+        # logical names for one curve (silent rename/drop on re-read).
+        # Match via _case_key, reporting the ACTUAL keys that collide.
+        _overlap_ci = set(data_keys_ci) & set(string_keys_ci)
+        if _overlap_ci:
+            colliding = sorted(
+                {data_keys_ci[k] for k in _overlap_ci} | {string_keys_ci[k] for k in _overlap_ci}
+            )
             raise LASDataError(
                 f"DataSection '{self.name}': curve(s) {sorted(colliding)} "
                 f"appear in both data and string_data.  Each curve must "
@@ -2932,13 +3008,15 @@ class DataSection:
             if not _df:
                 continue
             # I2F-37: {A} without array_info is string-format, not numeric.
-            if _mnem in data_keys and (_df == "S" or (_df == "A" and not _sc.is_array_element)):
+            if _case_key(_mnem) in data_keys_ci and (
+                _df == "S" or (_df == "A" and not _sc.is_array_element)
+            ):
                 raise LASDataError(
                     f"DataSection '{self.name}': curve '{_mnem}' has "
                     f"data_format='{_df}' but is in data (numeric). "
                     f"String-format curves must be in string_data."
                 )
-            if _df not in ("S", "A") and _mnem in string_keys:
+            if _df not in ("S", "A") and _case_key(_mnem) in string_keys_ci:
                 raise LASDataError(
                     f"DataSection '{self.name}': curve '{_mnem}' has "
                     f"data_format='{_df}' but is in string_data. "
@@ -3272,12 +3350,18 @@ class LASFile:
         if self.curves_order and not self.data_sections:
             _seen: set[str] = set()
             for _n in self.curves_order:
-                if _n in _seen:
+                # N1b-3: duplicate detection compared exact-case — a
+                # case-variant pair ('DEPT'+'dept') passed construction
+                # while the writer resolves definitions FIRST-wins
+                # case-insensitively (by_upper), silently dropping the
+                # second definition's identity.  Reject via _case_key
+                # (validation-consistency migration).
+                if _case_key(_n) in _seen:
                     raise LASDataError(
                         f"LASFile: duplicate curve name {_n!r} in "
                         f"curves_order.  Curve names must be unique."
                     )
-                _seen.add(_n)
+                _seen.add(_case_key(_n))
 
         # --- logs validation (skip when empty — allows incremental
         # construction, e.g. LASFile() then attribute assignment) ---
@@ -3376,8 +3460,18 @@ class LASFile:
         # corrupted — one array overwrites the other's meaning.
         # Per-section DataSection has this guard; top-level lacked it.
         if self.logs and self.string_data:
-            _overlap = set(self.logs.keys()) & set(self.string_data.keys())
-            if _overlap:
+            # N1b-8: the overlap guard compared exact-case, so a case-variant
+            # pair (logs={'DEPT'}, string_data={'dept'}) passed construction
+            # while the same-case control raised — the LAS 2.0 roundtrip then
+            # SILENTLY DROPPED the string column (worse than "emitted twice").
+            # Match via _case_key, reporting the ACTUAL colliding keys.
+            _log_ci = {_case_key(k): k for k in self.logs}
+            _str_ci = {_case_key(k): k for k in self.string_data}
+            _overlap_ci = set(_log_ci) & set(_str_ci)
+            if _overlap_ci:
+                _overlap = sorted(
+                    {_log_ci[k] for k in _overlap_ci} | {_str_ci[k] for k in _overlap_ci}
+                )
                 raise LASDataError(
                     f"LASFile: curves {sorted(_overlap)} appear in "
                     f"both logs and string_data.  Each curve may "
@@ -3477,13 +3571,13 @@ class LASFile:
                 if _ds_curves:
                     _ds_seen: set[str] = set()
                     for _cn in _ds_curves:
-                        if _cn in _ds_seen:
+                        if _case_key(_cn) in _ds_seen:
                             raise LASDataError(
                                 f"LASFile: duplicate curve name {_cn!r} "
                                 f"in data section '{_ds.name}' "
                                 f"curves_order."
                             )
-                        _ds_seen.add(_cn)
+                        _ds_seen.add(_case_key(_cn))
                 # Validate per-section data/string_data keys against
                 # curves_order (orphaned key detection, matching from_dict
                 # lines 1472-1491).
@@ -3592,21 +3686,27 @@ class LASFile:
         # prevent silent data corruption.  from_dict raises via
         # _check_df_vs_placement; DataSection.__post_init__ raises.
         if self.curves and (self.logs or self.string_data):
-            _log_keys = set(self.logs.keys()) if self.logs else set()
-            _str_keys = set(self.string_data.keys()) if self.string_data else set()
+            # N1b-4: CI mirrors for the I2F-08 raise — the exact-case
+            # membership let a case-variant key (curve 'DEPT'/S + log key
+            # 'dept') bypass the guard, silently migrating the {S} column
+            # to numeric on write→read.
+            _log_keys_ci = {_case_key(k) for k in (self.logs or {})}
+            _str_keys_ci = {_case_key(k) for k in (self.string_data or {})}
             for _sc in self.curves:
                 _df = _sc.data_format
                 _mnem = _sc.mnemonic
                 if not _df:
                     continue
-                if _mnem in _log_keys and (_df == "S" or (_df == "A" and not _sc.is_array_element)):
+                if _case_key(_mnem) in _log_keys_ci and (
+                    _df == "S" or (_df == "A" and not _sc.is_array_element)
+                ):
                     raise LASDataError(
                         f"LASFile: curve '{_mnem}' has "
                         f"data_format='{_df}' (string-format) but is "
                         f"in logs (numeric).  String-format curves "
                         f"must be in string_data."
                     )
-                if _df not in ("S", "A") and _mnem in _str_keys:
+                if _df not in ("S", "A") and _case_key(_mnem) in _str_keys_ci:
                     raise LASDataError(
                         f"LASFile: curve '{_mnem}' has "
                         f"data_format='{_df}' (numeric-format) but "
@@ -3707,11 +3807,14 @@ class LASFile:
         # EXT-04: {I} curves with a fractional declared NULL are stored as
         # object arrays (exact Python ints for data values, float sentinel
         # for null cells) — exempt them from the numeric-dtype check.
-        _curve_fmt_by_mnem = {c.mnemonic: c.data_format for c in self.curves}
+        # N1b-4: keyed exact-case, the exemption missed a case-variant
+        # log key ('dept' vs curve 'DEPT') and emitted a false
+        # "non-numeric dtype (object)" issue.  Key via _case_key.
+        _curve_fmt_by_mnem = {_case_key(c.mnemonic): c.data_format for c in self.curves}
         for _k, _arr in self.logs.items():
             if not isinstance(_arr, np.ndarray):
                 _arr = self.logs[_k] = np.asarray(_arr)
-            if _arr.dtype == object and _curve_fmt_by_mnem.get(_k) == "I":
+            if _arr.dtype == object and _curve_fmt_by_mnem.get(_case_key(_k)) == "I":
                 continue
             if not np.issubdtype(_arr.dtype, np.number):
                 issues.append(
@@ -3737,13 +3840,19 @@ class LASFile:
 
         # --- data_format vs placement ---
         if self.curves and (self.logs or self.string_data):
+            # N1b-4: the format-vs-placement diagnostics compared exact-case,
+            # silently skipping case-variant keys (curve 'DEPT'/S + logs key
+            # 'dept') that the writer emits as the numeric column the guard
+            # exists to flag.  Match via _case_key.
+            _log_ci = {_case_key(k) for k in (self.logs or {})}
+            _str_ci = {_case_key(k) for k in (self.string_data or {})}
             for _sc in self.curves:
                 _df = _sc.data_format
                 _mnem = _sc.mnemonic
                 if not _df:
                     continue
                 if _df == "S" or (_df == "A" and not _sc.is_array_element):
-                    if _mnem in self.logs:
+                    if _case_key(_mnem) in _log_ci:
                         issues.append(
                             f"LASFile: curve '{_mnem}' has "
                             f"data_format='{_df}' (string-format) but "
@@ -3751,7 +3860,7 @@ class LASFile:
                             f"curves should be in string_data."
                         )
                 else:
-                    if _mnem in self.string_data:
+                    if _case_key(_mnem) in _str_ci:
                         issues.append(
                             f"LASFile: curve '{_mnem}' has "
                             f"data_format='{_df}' (numeric-format) "
@@ -4454,7 +4563,11 @@ class LASFile:
                         # non-bracket-notation curves like "CORET" with
                         # base_name="CORE" are intentionally skipped.
                         if array_info and "[" in _raw_mnem:
-                            if _raw_mnem.split("[")[0] != array_info.base_name:
+                            # II-19: the M-17 cross-check compared the RAW
+                            # mnemonic base against the UPPERCASED
+                            # array_info.base_name — a case-variant
+                            # mnemonic ('nmr[1]') fired a false warning.
+                            if _raw_mnem.split("[")[0].upper() != array_info.base_name:
                                 warnings.warn(
                                     f"from_dict warning: mnemonic "
                                     f"{_raw_mnem!r} uses array notation but "
@@ -4737,7 +4850,7 @@ class LASFile:
                     # array_info.base_name (per-section curves).  Same logic
                     # as top-level curves above.
                     if sc_array_info and "[" in _sc_raw_mnem:
-                        if _sc_raw_mnem.split("[")[0] != sc_array_info.base_name:
+                        if _sc_raw_mnem.split("[")[0].upper() != sc_array_info.base_name:
                             warnings.warn(
                                 f"from_dict warning: mnemonic "
                                 f"{_sc_raw_mnem!r} uses array notation but "
@@ -4799,10 +4912,37 @@ class LASFile:
                         # integrality guard (below) also prevents the
                         # int64 branch from silently truncating
                         # fractional/NaN data in per-section {I} curves.
+                        # N1b-1: the per-section _fmt lookup compared
+                        # exact-case (sc.mnemonic == k), so a case-variant
+                        # data key ('dept' vs section curve 'DEPT') yielded
+                        # _fmt='' and silently coerced int64→float64
+                        # (>2^53 precision loss).  Match via _case_key.
                         _fmt = next(
-                            (sc.data_format for sc in ds_section_curves if sc.mnemonic == k),
+                            (
+                                sc.data_format
+                                for sc in ds_section_curves
+                                if _case_key(sc.mnemonic) == _case_key(k)
+                            ),
                             "",
                         )
+                        if not _fmt:
+                            # II-3b: when the section carries no
+                            # section_curves (valid LAS 3.0 pattern —
+                            # definitions inherited from the top-level
+                            # curves), `next()` over the empty list
+                            # returned "" and the per-section {I} branch
+                            # fell to float64 even with an EXACT key
+                            # (silent int64→float64 loss >2^53).  Fall
+                            # back to the top-level curve's data_format —
+                            # mirror the :5254-5257 top-level lookup.
+                            _fmt = next(
+                                (
+                                    c.data_format
+                                    for c in las_file.curves
+                                    if _case_key(c.mnemonic) == _case_key(k)
+                                ),
+                                "",
+                            )
                         _declared_null = las_file.well.get("NULL")
                         _null_ok = True
                         if _declared_null is not None:
@@ -4854,8 +4994,21 @@ class LASFile:
                 # Reject the input so callers get a clear error instead of silent
                 # data discard on the roundtrip path.
                 if ds_data and ds_string_data:
-                    _colliding = set(ds_data.keys()) & set(ds_string_data.keys())
-                    if _colliding:
+                    # II-2: the per-section collision check compared
+                    # exact-case, so a case-variant overlap (data={'DEPT'},
+                    # string_data={'dept'}) passed from_dict while the
+                    # same-case control raised — the writer then emitted
+                    # both logical names for one curve (silent rename/drop
+                    # on roundtrip).  Match via _case_key, reporting the
+                    # ACTUAL colliding keys.
+                    _ds_data_ci = {_case_key(k): k for k in ds_data}
+                    _ds_str_ci = {_case_key(k): k for k in ds_string_data}
+                    _ds_overlap_ci = set(_ds_data_ci) & set(_ds_str_ci)
+                    if _ds_overlap_ci:
+                        _colliding = sorted(
+                            {_ds_data_ci[k] for k in _ds_overlap_ci}
+                            | {_ds_str_ci[k] for k in _ds_overlap_ci}
+                        )
                         ds_name = ds_dict.get("name", "<unknown>")
                         raise ValueError(
                             f"Section '{ds_name}': curve(s) {sorted(_colliding)} appear "
@@ -4919,14 +5072,14 @@ class LASFile:
                 if _ds_curves_order:
                     _seen_n: set[str] = set()
                     for _n in _ds_curves_order:
-                        if _n in _seen_n:
+                        if _case_key(_n) in _seen_n:
                             ds_name = ds_dict.get("name", "<unknown>")
                             raise ValueError(
                                 f"Duplicate curve name {_n!r} in section '{ds_name}' "
                                 f"curves_order.  Curve names must be unique within "
                                 f"a data section."
                             )
-                        _seen_n.add(_n)
+                        _seen_n.add(_case_key(_n))
                 # Cross-validate string_data and data keys against
                 # curves_order.  Keys in either dict that do not appear
                 # in curves_order are orphaned — the writer silently
@@ -4997,14 +5150,14 @@ class LASFile:
                     _sc_mnemonics = [sc.mnemonic for sc in ds_section_curves]
                     _seen_m: set[str] = set()
                     for _m in _sc_mnemonics:
-                        if _m in _seen_m:
+                        if _case_key(_m) in _seen_m:
                             ds_name = ds_dict.get("name", "<unknown>")
                             raise ValueError(
                                 f"Duplicate mnemonic {_m!r} in section '{ds_name}' "
                                 f"section_curves.  Curve mnemonics must be unique "
                                 f"within a data section."
                             )
-                        _seen_m.add(_m)
+                        _seen_m.add(_case_key(_m))
                 # F-23: Cross-validate per-section curves_order with section_curves,
                 # matching the top-level cross-validation pattern.  from_dict builds
                 # these from independent dict keys; mismatched input would produce
@@ -5251,8 +5404,17 @@ class LASFile:
                     # NULL (mirroring the reader's `_null_is_integral`
                     # rule) — int64 would truncate a fractional NULL like
                     # -999.25, corrupting every null cell.
+                    # N1b-1: the top-level _fmt lookup compared exact-case
+                    # (c.mnemonic == name), so a case-variant log key
+                    # ('dept' vs curve 'DEPT') yielded _fmt='' and silently
+                    # coerced int64→float64 (>2^53 precision loss).  Match
+                    # via _case_key.
                     _fmt = next(
-                        (c.data_format for c in las_file.curves if c.mnemonic == name),
+                        (
+                            c.data_format
+                            for c in las_file.curves
+                            if _case_key(c.mnemonic) == _case_key(name)
+                        ),
                         "",
                     )
                     _declared_null = las_file.well.get("NULL")
@@ -5296,8 +5458,18 @@ class LASFile:
             # corrupted — one array overwrites the other's meaning.
             # (matches __post_init__ guard at lines 1209-1216)
             if las_file.logs and las_file.string_data:
-                _overlap = set(las_file.logs.keys()) & set(las_file.string_data.keys())
-                if _overlap:
+                # N1b-8: the from_dict overlap guard compared exact-case —
+                # a case-variant pair (logs={'DEPT'}, string_data={'dept'})
+                # passed from_dict and the LAS 2.0 roundtrip SILENTLY
+                # DROPPED the string column.  Match via _case_key, reporting
+                # the ACTUAL colliding keys (mirror of __post_init__).
+                _log_ci = {_case_key(k): k for k in las_file.logs}
+                _str_ci = {_case_key(k): k for k in las_file.string_data}
+                _overlap_ci = set(_log_ci) & set(_str_ci)
+                if _overlap_ci:
+                    _overlap = sorted(
+                        {_log_ci[k] for k in _overlap_ci} | {_str_ci[k] for k in _overlap_ci}
+                    )
                     raise ValueError(
                         f"Curves {sorted(_overlap)} appear in "
                         f"both logs and string_data.  Each curve may "
@@ -5406,12 +5578,12 @@ class LASFile:
             if las_file.curves_order and not las_file.data_sections:
                 _top_seen: set[str] = set()
                 for _n in las_file.curves_order:
-                    if _n in _top_seen:
+                    if _case_key(_n) in _top_seen:
                         raise ValueError(
                             f"Duplicate curve name {_n!r} in top-level "
                             f"curves_order.  Curve names must be unique."
                         )
-                    _top_seen.add(_n)
+                    _top_seen.add(_case_key(_n))
 
             # G-008: Cross-group row count validation between logs and
             # string_data.  Within-group row checks exist (above); this

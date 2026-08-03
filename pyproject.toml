@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pylasdev"
-version = "2.0.4"
+version = "2.0.5"
 description = "Python library for reading and writing LAS (Log ASCII Standard) and DEV (deviation) well log files"
 readme = "README.md"
 license = {text = "BSD-3-Clause"}
@@ -31,6 +31,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
+    "lasio>=0.32",
     "mypy>=1.10",
     "ruff>=0.5.0",
     "bandit>=1.7",

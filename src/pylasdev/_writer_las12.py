@@ -7,6 +7,7 @@ from ._writer_base import (
     _sanitize_las_value,
     _WriterBase,
 )
+from .data_reader import _get_well_entry_ci
 from .models import _MNEMONIC_PATTERN, LASFile
 
 
@@ -93,7 +94,13 @@ class _Las12Writer(_WriterBase):
 
         for key in ordered_keys:
             value = self._las_file.well.entries[key]
-            unit = _sanitize_las_value(self._las_file.well.units.get(key, ""))
+            # II-20 (X-3): well.entries keys and units/descriptions keys can
+            # differ in case (from_dict mnem_base=None / direct construction
+            # store them verbatim), so an exact-case .get(key) silently
+            # dropped the unit/description from the emitted ~W line.  Use the
+            # codebase's CI well lookup (data_reader._get_well_entry_ci),
+            # matching the base writer's fix (II-20 for LAS 2.0/3.0).
+            unit = _sanitize_las_value(_get_well_entry_ci(self._las_file.well.units or {}, key, ""))
             unit_dot = f".{unit}" if unit else "."
             # W-07 (M-28 parity): well values/descriptions are emitted
             # mid-line (never at line start) so a leading '~' must be
@@ -102,7 +109,7 @@ class _Las12Writer(_WriterBase):
             # write→read (WELL='~INCIDENTAL' → 'INCIDENTAL').
             val = _sanitize_las_value(value, preserve_leading_tilde=True)
             desc = _sanitize_las_value(
-                self._las_file.well.descriptions.get(key, ""),
+                _get_well_entry_ci(self._las_file.well.descriptions or {}, key, ""),
                 preserve_leading_tilde=True,
             )
             val = _escape_colons_for_las_value(val)

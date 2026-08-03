@@ -5,6 +5,45 @@ All notable changes to pylasdev will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.5] — 2026-08-03
+
+### Production Check
+
+This is the "ultimate-solution" run — a structural refactor that eliminates the four
+recurring drift-class problem families that reappeared across the v2.0.1–v2.0.4 production
+checks, plus a mechanical enforcement harness and irreducible-class pinning. The regression
+suite now passes 1840 tests (1846 collected, 0 failures, 1 skipped DEV-writer placeholder,
+5 xfail-pinned documented encoding residuals); ruff and mypy are clean.
+
+### Fixed
+
+- **Drift-class structural refactor**: single shared wrap-detection source of truth — the
+  LAS 1.2/2.0 and LAS 3.0 paths now share one gate; flowing-wrapped data (depth + curves on
+  one line) now parses correctly via n_curves-accumulation (was silent depth-step loss);
+  ragged WRAP=NO shapes no longer corrupt or false-reject; single shared mnemonic-header
+  predicate across pre-scan/reader/LAS 3.0; unified sanitize/desanitize helper (`_sanitize.py`)
+  with thread-local state preserved
+- **Case-normalization**: centralized `.upper()` matching at the container/validation layer
+  (single `_case_key`/`_mnem_key` helpers); `{S}` string marker preserved for case-variant
+  and emitted-name mnemonics (was silent string-value destruction); `{I}` int64 precision
+  preserved beyond 2^53 in all paths; case-variant duplicate curves handled consistently
+  (distinct-data refused with accurate error, no silent data loss); `WellSection.get_ci` added
+- **Header/parse hygiene**: superset tokenizer unified across header-skip predicate sites
+  (fixes phantom all-null first row + data shift in DLM=COMMA files); bare ValueErrors from
+  LAS 3.0 spec-form arrays and bracket-array dedup wrapped as LASParseError
+- **Writer**: LAS 1.2 well units/descriptions now looked up case-insensitively; linear-time
+  wrapped reading (eliminated quadratic list-slicing)
+- **Encoding**: three new irreducible classes (Western cluster+digit-direct, cp866 no-set
+  word + lowercase follow, cp1251 short word) pinned as strict-xfail documented residuals
+
+### Added
+
+- Mechanical enforcement harness: property-based roundtrip fuzz (deterministic scenarios +
+  seeded random), lasio differential tests (lasio>=0.32 as oracle, gated with
+  importorskip), LAS 2.0↔3.0 / 1.2↔2.0 cross-version parity tests
+- `lasio>=0.32` added to dev optional-dependencies (needed for the differential harness)
+- Regression tests locking every fixed drift-class behavior
+
 ## [2.0.4] — 2026-08-03
 
 ### Production Check
