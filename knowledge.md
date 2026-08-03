@@ -1,5 +1,5 @@
 # Knowledge Base
-Last updated: 2026-08-02T20:00:07.684819
+Last updated: 2026-08-03T09:22:46.679612
 
 ## [dis-20260620063206-7fc4ae]
 Category: discovery
@@ -1193,13 +1193,6 @@ Changed: 2026-08-02T05:39:43.175885
 
 Whole-container reconcile vs per-key guards: internal whole-container reconciliation (trimming or growing ALL curve arrays to a common length) must NOT trip per-assignment length guards — it needs an explicit bypass path. In pylasdev-reborn, the F-01 fix's F36 whole-container trim (las_file.logs[curve_name] = arr[:current_line]) tripped the M-43 per-key _check_value_length guard -> spurious crash (HIGH F-01); the FIX-CONV-2 G-04 grow uses dict.__setitem__ whole-container growth to preserve the equal-length invariant, mirroring _GuardedDict.trim_all's bypass (models.py:302-303). Design rule: when a guarded container enforces equal-length via per-key validation, whole-container resize operations (trim/grow/sync-all) bypass per-key guards; per-key mutation stays guarded. The invariant (equal-length) and the guard (per-key) must be separated. Checklist: when adding a per-key length guard, verify internal reconcile paths have a bypass; when adding a reconcile, use the bypass not per-key assignment; document the invariant-vs-guard separation; test both trim (overcount) and grow (undercount) directions.
 
-## [pat-20260802053948-f668cb]
-Category: pattern
-Tags: python, numpy, int64, overflow, comparison, allclose, twos-complement
-Changed: 2026-08-02T05:39:48.203459
-
-int64 subtraction overflow in hand-rolled allclose: np.allclose promotes operands to float64 internally, but hand-rolled symmetric-allclose implementations that diff/abs in native dtype WRAP on int64 overflow (two's complement): [-2**63] vs [0] compares EQUAL (diff wraps to -2**63, abs(-2**63) is still -2**63 -> within rtol) when the values are plainly unequal. F-17 (compare.py _allclose_symmetric): int64 subtraction/abs overflow -> wrong True; -2^63 is a common int64 missing-sentinel and {I} int64 curves are produced by the library's own reader. The M-32 symmetric-allclose fix REINTRODUCED this class (np.allclose's implicit promotion was the only thing masking it before). Fix: promote BOTH operands to float64 (astype(np.float64)) BEFORE diff/abs, matching np.allclose semantics; MaskedArray operands must also be promoted (existing filled(np.nan) path). Checklist: in any comparison computing diff = a - b or abs(a - b) on integer dtypes, promote to float64 first; test with [-2**63] vs [0] and [2**63-1] vs [0]; verify symmetric argument swap gives the same answer; re-check when replacing np.allclose with a hand-rolled implementation.
-
 ## [pat-20260802053951-54b7bd]
 Category: pattern
 Tags: python, encoding, cyrillic, detection, mojibake, adjacency, false-positive
@@ -1241,13 +1234,6 @@ Tags: dlm, comma, string
 Changed: 2026-08-02T16:13:21.552543
 
 I2-02 embedded-comma-in-string fix: csv.reader quote-awareness REJECTED (F2-015: writer emits raw delimiter.join(), no CSV quotes; quote parsing breaks writer roundtrips). Chose loud warning at _read_normal extra-columns site + count summary.
-
-## [got-20260802195912-698112]
-Category: gotcha
-Tags: wrap, data_reader, las30, curve-count, regression, parser
-Changed: 2026-08-02T19:59:12.039379
-
-F-07 wrap depth-line rule needs curve_count-aware gate: the 2-curve ambiguity (window[1]==1 after a full first row) is NOT unambiguous for curve_count==2 — the arm MUST be gated (curve_count >= 3 and window[1] == 1) or sum(1 for n in window[1:] if n == 1) >= 2, mirrored identically on BOTH wrap-detection paths (data_reader.py:641-644 AND _las30_data.py:364-367). PF-18 (HIGH regression): the s9 fix mirrored the las30 gate onto data_reader — the unconditional window[1]==1 arm misclassified a 2-curve LAS 1.2/2.0 WRAP=NO file with a short middle row (window [2,1,2]) as WRAPPED -> silent data corruption (genuine values discarded/misaligned). This SUPERSEDES the earlier refinement 'window[1]==1 OR >=2 one-value rows' which was curve_count-blind and regressed [2,1,2] nc=2. The >=2-one-value-rows arm alone catches genuine 2-curve wrapped files. Validated 12 shapes. Checklist: every wrap rule arm must be curve_count-aware; two-path parity is verified by comparing the gate expressions verbatim; regression-test the 2-curve WRAP=NO short-middle-row shape on both LAS 1.2 and LAS 2.0 plus string-padding.
 
 ## [got-20260802195917-35c9c7]
 Category: gotcha
@@ -1297,4 +1283,81 @@ Tags: python, dev-reader, thousands-separator, performance, quadratic, dos
 Changed: 2026-08-02T20:00:07.674857
 
 Thousands-separator recombination must be linear single-pass: re-scanning or pair-restarting inside _recombine_thousands_separators makes it O(n^2) on long token rows. I2-18 (CONFIRMED MEDIUM): clean quadratic benchmark 0.10s -> 27.65s @ 16K tokens, ~18min @ 100K — a crafted file is a DoS. Fix: single linear pass with first-run exact-fit (only the FIRST pair that produces the expected column count is merged per the gate), per-pair warnings on subsequent merges. Complements the corruption-family gotcha (got-20260802054001-11a495): the fix must be BOTH correct (multi-separator/signed/headerless/delimiter-aware) AND linear. Checklist: benchmark recombination on >=16K-token rows after any change; avoid nested loops over the token list; the 'first pair only' gate must not degrade into per-pair restarts.
+
+## [pat-20260803092027-428275]
+Category: pattern
+Tags: encoding, cyrillic, byte-identical, discriminator, convergence, xfail, mirror-symmetric
+Changed: 2026-08-03T09:20:27.394866
+
+Byte-identical input classes: byte-content discriminators provably cannot converge — when two input classes differ only in bytes that are symmetric between two codecs/encodings (0x80-0x9F fully symmetric between genuine cp866 Cyrillic and Western cp1252 smart-punctuation: ВДЕ = 0x82 0x84 0x85 = ‚„…), every byte-content rule is necessary-but-not-sufficient for a sibling class and the fix-regress cycle is STRUCTURAL, not accidental. Evidence: ENC-02(b) Western-vs-Cyrillic rescue took a 6-pass convergence loop (F-01/F-09 -> M4 -> ENC-M1 -> ENC-1 -> F-02 -> E-01 -> M-1/M-2), each pass adding one more byte signal that re-broke the sibling class (14-byte set -> 18-letter complement; digit-in-24B -> Western prices/dates; all-caps-follows -> Western headings/acronyms). Resolution: (1) MOVE the decisive signal OFF the byte-identical bytes onto CONTEXT evidence (LAS digit density / uppercase-mnemonic position / preceding-token structure); (2) accept PROVABLY-IRREDUCIBLE residuals as documented xfail pins with strict=True (M-2: '...IMPORTANT' == 'THE WELL ВДЕ FIELD' structurally — no local rule can separate them; the xfail flips to XPASS if anyone changes the trade); (3) do NOT add another byte-content rule (the fix-regress trap). Checklist: before discriminating two classes, verify their bytes are NOT symmetric (enumerate the byte tables); if symmetric, context is the only separation axis; every new discriminator must be tested against the sibling class (not just the class it fixes); terminal state is pinned residuals, not perfect separation. In pylasdev-reborn: encoding.py _is_genuine_word_run/_run_has_las_context, 6 passes, 10+ CONFIRMED MEDIUM findings.
+
+## [pat-20260803092034-4f8c99]
+Category: pattern
+Tags: parser, data_reader, writer, mirror, asymmetric-fix, regression, las30, contract
+Changed: 2026-08-03T09:20:34.255416
+
+Cross-domain fix-asymmetry: a fix applied to only ONE of two mirrored paths regresses the sibling path — when the same logical rule/predicate/guard exists in multiple copies (wrap-detection data_reader._detect_actual_wrap vs _las30_data._detect_actual_wrap_las30; _# desanitize parser copy vs data_reader copy; header predicates parser pre-scan vs reader; case-insensitive lookup writer_base vs writer_las30; legacy vs LAS 3.0 twin), fixing one copy and not the other leaves the defect live on the sibling path AND creates a divergence where the two paths disagree. Evidence: M11 (F-25 fixed parser desanitize copy only, data_reader copy still blanket-unescapes); M13 (LAS 3.0 section-uncovered warning stayed exact-case while legacy twin fixed); F-32/MOD-1/MOD-2 (case-variant data-key lookup exact-case on one path); M9/DR-M1/DR-M2 (pre-scan mirror vs reader predicate divergence). Checklist: before fixing a duplicated rule, GREP for ALL copies (identical function names, mirrored file pairs like _writer_base vs _writer_las30, parser vs data_reader); the fix must land on every twin in the SAME pass with cross-domain post-fix review; when copies cannot be merged, add a verbatim-mirror contract test that compares the gate expressions (or their behavior on a shared fixture matrix) directly.
+
+## [pat-20260803092040-932ff9]
+Category: pattern
+Tags: models, case-insensitive, curves_order, validate, from_dict, writer, roundtrip, data-loss
+Changed: 2026-08-03T09:20:40.714447
+
+Case-variant curves_order/lookup class: exact-case comparisons vs case-insensitive resolution cause silent data loss or false diagnostics — when curves_order/logs/validate checks are compared with exact-case equality (curves_order=['dept'] vs data keyed 'DEPT') but resolution elsewhere is case-insensitive, the divergence manifests multiple ways: data null-filled / ~A skipped (F-32), false 'will pad' diagnostics while data IS emitted (M13/WL-M1/MOD-1/MOD-2), newly-reachable state that roundtrip rejects (F-04: pass-3 made case-variant state constructible+validated but from_dict exact-case checks still reject it). The case-insensitivity contract must be applied at EVERY mirrored site in ONE pass: validate positional + orphan checks, construction twins, from_dict, DataSection direct construction, writer emission + diagnostics. Evidence: F-32, M13, WL-M1, MOD-1, MOD-2 (s10), F-04 (s11) — 5+ CONFIRMED MEDIUM, 3 consecutive convergence passes. Checklist: grep for ALL exact-case comparison sites in the curves_order/curves/data resolution family (models.py validate + construction + from_dict + writer twins); apply .upper()/casefold normalization consistently at every site; add roundtrip tests (to_dict->from_dict, write->read) for case-variant states; when blessing a case-variant state, verify from_dict and DataSection construction accept it too.
+
+## [pat-20260803092047-11d276]
+Category: pattern
+Tags: dev-reader, thousands, grammar, detection, conversion, regression, data-loss
+Changed: 2026-08-03T09:20:47.764908
+
+Detection/conversion grammar drift: when a token family is recognized by TWO independent regexes/grammars (one for DETECTION, one for CONVERSION/validation), they drift and produce silent data loss — detection says 'this is a thousands-separated number' (widened to decimal/exponent forms by DEV-05) while the conversion gate stays narrow (bare integer only), so '1,234.5'/'1,234,567.8'/'1,234E3' parse as numeric but drop to NaN at conversion with only the generic failure counter (never the specific thousands warning). Evidence: F-06 (CONFIRMED MEDIUM, dev_reader.py:408-419 vs :326); root cause = no single source of truth for 'what is a thousands number and its normalized value'. Fix: ONE shared token-normalization helper consulted by BOTH detection and conversion (and the ambiguity predicate), with a 'never silent' contract — any recognized token is either converted or counted in the specific counter with a loud warning. Checklist: for every token family parsed from text, enumerate the detection grammar and the conversion/validation grammar; they must be the SAME helper; grep for the pair of regexes (_THOUSANDS_NUMBER_RE vs _THOUSANDS_GROUP_RE pattern); a grammar extension must update both sides in the same change; property-test: every token detection accepts must convert or hit the specific warning counter — never a silent NaN.
+
+## [pat-20260803092055-fdd6de]
+Category: pattern
+Tags: parser, data_reader, pre-scan, mirror, predicate, header, phantom-row, regression
+Changed: 2026-08-03T09:20:55.730409
+
+Pre-scan/reader predicate mirror contract: when a parser runs a PRE-SCAN (fast forward pass to count/skip) whose header-skip predicate must mirror the READER's predicate, the mirror must be a VERBATIM copy of the reader's gate expressions — count-equality + all-string exclusion + order-independent mnemonic collection + the SAME lower-bound formula (min(2, curve_count), NOT flat len>=2). Evidence: 3-copy duplication at data_reader._is_mnemonic_header_row / parser._is_standalone_mnemonic_header / parser _pre_scan inline skip produced a 5-pass regression family: F-24 phantom row + data shift (pre-scan missing clauses), M9/DR-M1 overcount warning (strict equality vs reader skip-partial), DR-M2 LAS 3.0 phantom row (predicates disagree), DR-M3 mid-section false positives (header check applied to EVERY line instead of first-line-of-section-only), PSR-1 single-curve phantom row (flat >=2 vs min(2, curve_count)), F-01 pre-scan bound stale after reader gate changed. Each fix aligned ONE copy; the mirror drifted again because it was never the SAME source. Fix: extract ONE shared pure predicate _is_mnemonic_header_tokens(tokens, curve_count, declared, string_curve_count) consumed by BOTH reader and pre-scan (and the LAS 3.0 twin), first-line-of-section-only (current_line==0), bound = min(2, curve_count), dedicated distinct-curve counter (NEVER len(curve_mnems) — it includes original_mnemonic aliases). Checklist: any predicate duplicated between pre-scan and reader must be one function; compare gate expressions verbatim (git diff of the two bodies); every predicate adjustment must land on ALL copies in the same pass; pin the single-curve standalone-header shape AND the 3-curve partial-header shape on BOTH the LAS 3.0 and LAS 1.2/2.0 paths.
+
+## [pat-20260803092102-a5042b]
+Category: pattern
+Tags: models, from_dict, construction, roundtrip, twin, case-insensitive, regression, public-api
+Changed: 2026-08-03T09:21:02.141889
+
+from_dict/construction twin acceptance: when a state is made constructible+validated (direct construction or post-construction mutation), ALL twins must accept it in the SAME change — validate() positional/orphan checks, construction-time checks, from_dict checks, DataSection direct construction, and the public write_las_file(path, dict) API. Evidence: F-04 (CONFIRMED MEDIUM, s11): pass-3 MOD-1/MOD-2 fix blessed the case-variant state (curves_order=['dept','GR']) through construction+validate, but from_dict exact-case checks (models.py:4484/:4903/:4913/:4970) and DataSection direct construction still rejected it — LASFile.from_dict(las.to_dict()) raised LASDataError and write_las_file(path, las.to_dict()) raised LASWriteError. A fix that widens acceptance at one site but leaves rejection at the roundtrip twins creates a NEWLY-REACHABLE state that fails the public API. Checklist: when any fix widens what construction/validate accepts, trace the SAME state through to_dict->from_dict and write->read AND the public dict-write API; grep for every exact-case/exact-equality check on the newly-blessed state's fields; the widen must include the from_dict and DataSection twins or it is incomplete; roundtrip tests (to_dict->from_dict, write_las_file(dict)) are the gate.
+
+## [got-20260803092211-c7cdc7]
+Category: gotcha
+Tags: writer, lookup, curves_order, win-semantics, by_upper, unit, corruption
+Changed: 2026-08-03T09:22:11.997899
+
+Lookup win-semantics must be consistent across paths: when the same resolution is reachable via TWO mechanisms with different collision tiebreakers (by_upper dict build = LAST-wins vs setdefault = FIRST-wins), the first curves_order entry resolves to a DIFFERENT CurveDefinition than a later duplicate — silent unit corruption (M->FT) with zero warnings. F-31 (CONFIRMED MEDIUM, _writer_las30.py:722 vs 678-681): curves_order had two entries resolving to the same uppercase key; by_upper LAST-wins picked the second, setdefault FIRST-wins kept the first — the emitted file used one definition, the model retained the other. Checklist: for every lookup structure with multiple access paths (dict index, by_upper mirror, setdefault fallback, .get()), verify the tiebreaker semantics are IDENTICAL; a LAST-wins index + FIRST-wins dict is a silent-resolution mismatch; add a collision test with two same-uppercase entries and assert the resolved definition.
+
+## [got-20260803092217-289178]
+Category: gotcha
+Tags: models, validation, gate, data-loss, curves_order, regression, write-read
+Changed: 2026-08-03T09:22:17.522696
+
+Guard-widening must not re-open the defect it was widened to avoid: when a validation gate is RELAXED to accept a legitimate state (M14: F-19 gate widened from 'curves_order non-empty' to allow empty top-level curves + populated curves_order + data_sections), the relaxation can re-open the ORIGINAL silent-data-loss defect the gate was built to block (MOD-M1: the widened state constructs+validates silently, then write emits only no-definition warnings and re-read loses ALL data). Fix: when widening a guard, trace the ORIGINAL defect class end-to-end (construct -> validate(complete=True) -> write -> re-read) on the newly-accepted state; the widened gate must verify data_sections[].section_curves ACTUALLY cover curves_order, not just that both are non-empty. Checklist: for every gate relaxation, re-run the original finding's full repro chain on the relaxed state; a state that constructs+validates silently but loses data on write->read is a gate hole, not a feature; coverage verification beats emptiness checks.
+
+## [got-20260803092235-cb554c]
+Category: gotcha
+Tags: parser, data_reader, mnemonic-header, pre-scan, regressing-function, mirror, converged
+Changed: 2026-08-03T09:22:35.213100
+
+Standalone-mnemonic-header predicate duplicated at 3 sites with divergent clauses (F-24 family, resolved in this run): data_reader._is_mnemonic_header_row, parser._is_standalone_mnemonic_header, and the _pre_scan inline skip. The pre-scan mirror lacked the reader's clauses (count-equality, all-string exclusion, order-independent collection) -> F-24 phantom row + data shift. Resolved by extracting a shared pure predicate + two-pass _pre_scan with min(2, curve_count) lower bound (PSR-1: single-curve standalone header must NOT require 2 tokens), first-line-of-section-only (DR-M3: mid-section all-mnemonic rows are data, not headers), dedicated distinct-curve counter (NEVER len(curve_mnems) — includes original_mnemonic aliases like LLD->BFV). VERBATIM-MIRROR CONTRACT: reader and pre-scan must use the SAME gate expression; every predicate adjustment must land on BOTH sides in one pass (DR-M1/DR-M2/PSR-1/F-01 were all one-sided fixes that re-diverged). Checklist: two-pass pre-scan must skip partial mnemonic headers like the reader (2..curve_count clause); bound = min(2, curve_count) not flat >=2; first-line-of-section restriction; compare gate expressions verbatim.
+
+## [pat-20260803092241-235682]
+Category: pattern
+Tags: compare, numpy, int64, uint64, overflow, precision, float64, allclose, regression
+Changed: 2026-08-03T09:22:41.136796
+
+int64/uint64 comparison precision and overflow in hand-rolled allclose: compare.py _allclose_symmetric has TWO distinct failure modes (both confirmed): (1) int64 SUBTRACTION overflow — diff/abs in native dtype WRAPS on two's complement: [-2**63] vs [0] compares EQUAL (F-17). (2) int64/uint64->float64 PROMOTION collapses >2^53: [2**53] vs [2**53+1] -> True (F-07, CONFIRMED MEDIUM) — the float64-promotion fix for (1) creates (2); float64 cannot represent integers >2^53 exactly. Both array and list paths affected; MaskedArray path (filled(np.nan)) must also promote. M2 (s8): masked-vs-NaN path divergence — array path unwraps mask (False), list path retains NaN-fill (True) — both paths must agree on mask semantics. Fix: for integer dtypes, compare exactly (e.g. via int64 arithmetic / object dtype / bit-exact comparison) rather than float64 promotion, or document the >2^53 precision limit and test sentinel values; ensure array/list/masked paths use IDENTICAL comparison semantics. Checklist: any comparison computing diff=a-b on integer dtypes must avoid BOTH overflow-wrap AND float64 precision loss; test [-2**63] vs [0], [2**53] vs [2**53+1], [2**63-1] vs [0]; symmetric argument swap; masked-vs-NaN equivalence on all paths.
+
+## [got-20260803092246-e8c665]
+Category: gotcha
+Tags: wrap, data_reader, las30, curve-count, ragged, regression, parser
+Changed: 2026-08-03T09:22:46.669070
+
+Wrap depth-line rule must be curve_count-aware AND ragged-shape-aware: the [2,1,2] 2-curve ambiguity (window[1]==1 after a full first row) and the [3,1,3] ragged non-wrapped nc>=3 shape (F-02, CONFIRMED MEDIUM) are BOTH misclassified as wrapped by naive arms. Resolved gate: curve_count-aware arms — (curve_count >= 3 and window[1] == 1) OR sum(1 for n in window[1:] if n == 1) >= 2 — mirrored identically on BOTH wrap-detection paths (data_reader.py:641-644 AND _las30_data.py:360-367). F-02 was the [3,1,3] ragged non-wrapped nc>=3 shape with a single short middle row; the >=2-one-value-rows arm alone catches genuine 2-curve wrapped files while the curve_count>=3 && window[1]==1 arm must NOT fire on ragged non-wrapped nc>=3 files with only ONE short row. Validated 12+ shapes. Checklist: every wrap rule arm must be curve_count-aware AND distinguish single-short-row ragged from genuine wrap; two-path parity verified by comparing gate expressions verbatim; regression-test [2,1,2] nc=2 AND [3,1,3] nc=3 WRAP=NO on both LAS 1.2 and LAS 2.0 plus string-padding.
 

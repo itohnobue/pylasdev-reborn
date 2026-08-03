@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from typing import Any
 
@@ -142,6 +143,16 @@ class _Las30Writer(_WriterBase):
         lines.append("~VERSION INFORMATION")
         vers_desc = "CWLS LOG ASCII STANDARD -VERSION 3.0"
         vers = self._las_file.version.vers or "2.0"
+        # F-35: normalize a VERS value the reader cannot round-trip to the
+        # canonical "3.0".  The reader's VERS normalization (parser.py)
+        # accepts "3.0", "3.x" drafts, and \d+\.\d+ — but a bare "3"
+        # (accepted as LAS 3.0 by is_las30 = startswith("3")) matches none
+        # and is downgraded to "2.0" on re-read, silently dropping every
+        # typed data_section.  Draft forms like "3.1beta"/"3.0-draft"
+        # (startswith "3.") are preserved so the documented I2F-02
+        # draft-version roundtrip keeps working.
+        if not (vers.startswith("3.") or re.match(r"^\d+\.\d+$", vers)):
+            vers = "3.0"
         lines.append(f" VERS.   {_sanitize_las_value(vers)}  : {vers_desc}")
 
         actual_wrap = self._las_file.version.wrap.upper() if self._las_file.version.wrap else "NO"
@@ -398,15 +409,20 @@ class _Las30Writer(_WriterBase):
             )
             if not curves_to_emit and not curves_in_definitions:
                 curves_to_emit = list(self._las_file.curves)
-            if not curves_to_emit:
-                if not curves_in_definitions:
-                    import warnings
+            # F-28: when curves_in_definitions (all sections non-LOG_DATA
+            # with section_curves, e.g. CORE-only files), the empty
+            # curves_to_emit is EXPECTED — the section curves live in the
+            # typed ~X_Definition blocks (W-01), so do not warn-and-return;
+            # fall through to the M-79 loop below which still preserves any
+            # metadata-only top-level curves (e.g. a data-free TEMP).
+            if not curves_to_emit and not curves_in_definitions:
+                import warnings
 
-                    warnings.warn(
-                        "No curves to emit for ~C section — skipping",
-                        UserWarning,
-                        stacklevel=3,
-                    )
+                warnings.warn(
+                    "No curves to emit for ~C section — skipping",
+                    UserWarning,
+                    stacklevel=3,
+                )
                 self._main_curves = []
                 lines.append("")
                 return lines
@@ -418,9 +434,14 @@ class _Las30Writer(_WriterBase):
             # data_section contributed curves, permanently losing their
             # metadata on re-read.  Add them to the main block with a
             # warning (they carry no data, but the definition survives).
-            # Skip when curves_in_definitions — the CORE-only fallback
-            # already emits the full top-level list there.
-            if not curves_in_definitions and self._las_file.curves:
+            # F-28: the loop ALSO runs when curves_in_definitions (all
+            # sections non-LOG_DATA with section_curves, e.g. CORE-only
+            # files).  The section-covered curves are skipped below via
+            # _section_mnems, so only genuinely metadata-only top-level
+            # curves are added — the section definitions stay in the typed
+            # ~X_Definition blocks (W-01), avoiding the 2→4 re-read
+            # inflation the full-list fallback would cause.
+            if self._las_file.curves:
                 # I2-22 (PF-21): _section_mnems stores UPPER-CASED keys so a
                 # lowercase curves_order entry ('dept') still marks the
                 # top-level DEPT definition as section-referenced.  Without
@@ -719,7 +740,15 @@ class _Las30Writer(_WriterBase):
         _eff = self._effective_section_curves(section) or []
         pairs: list[tuple[str, CurveDefinition]] = []
         if section.curves_order:
-            by_upper = {c.mnemonic.upper(): c for c in _eff}
+            # F-31: FIRST-wins resolution — consistent with the sibling
+            # _effective_section_curves (setdefault).  A LAST-wins dict
+            # comprehension here made case-variant duplicate mnemonics
+            # (DEPT + dept) resolve the FIRST curves_order entry to the
+            # WRONG definition, silently re-attributing the data column
+            # to the second curve's unit/identity.
+            by_upper: dict[str, CurveDefinition] = {}
+            for c in _eff:
+                by_upper.setdefault(c.mnemonic.upper(), c)
             for entry in section.curves_order:
                 cd = by_upper.get(entry.upper())
                 if cd is None:
@@ -1048,10 +1077,20 @@ class _Las30Writer(_WriterBase):
 
             # Warn about curves in curves_order that have no data,
             # matching the legacy path at _writer_base.py:564-571.
-            _log_keys = set(section.data.keys()) if section.data else set()
-            _str_keys = set(section.string_data.keys()) if section.string_data else set()
-            _order_set = set(section.curves_order)
-            _uncovered = _order_set - _log_keys - _str_keys
+            # M13 (F-32 twin): the DATA-key lookup (_format_data_rows →
+            # _lookup_data_array) is case-insensitive, so a case-variant
+            # curves_order entry ('dept' vs data key 'DEPT') IS emitted,
+            # not null-padded.  Compare upper-cased so the warning does
+            # not falsely claim padding (mirrors _writer_base.py:1565-1573).
+            _log_upper = {k.upper() for k in section.data.keys()} if section.data else set()
+            _str_upper = (
+                {k.upper() for k in section.string_data.keys()} if section.string_data else set()
+            )
+            _uncovered = {
+                _k
+                for _k in section.curves_order
+                if _k.upper() not in _log_upper and _k.upper() not in _str_upper
+            }
             if _uncovered:
                 _warnings_module.warn(
                     f"Curve(s) {sorted(_uncovered)} appear in "

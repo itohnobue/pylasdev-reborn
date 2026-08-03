@@ -203,7 +203,7 @@ def _section_type_to_prefix(section_type: str) -> str:
     return "A"
 
 
-def _emitted_mnemonic(curve: CurveDefinition) -> str:
+def _emitted_mnemonic(curve: CurveDefinition, is_las30: bool = True) -> str:
     """The mnemonic as written to the ~C / Definition line.
 
     Mirrors the emission logic in ``_format_curve_line``:
@@ -221,13 +221,23 @@ def _emitted_mnemonic(curve: CurveDefinition) -> str:
       constructed models (base mnemonic + array_info) consistent with
       parsed models (bracket mnemonic) — without it, NMR[1]/NMR[2]
       collide (M-64).
+
+    F-27 (W-10): the ``[N]`` bracket is appended ONLY when ``is_las30``,
+    mirroring the ``is_las30`` gate in ``_format_curve_line``.  On LAS
+    1.2/2.0 ``_format_curve_line`` never emits the bracket (M-27 drops
+    array_info), so a dedup key that appended ``[N]`` unconditionally
+    diverged from the emitted name: dedup saw ``DEPT`` vs ``DEPT[1]`` as
+    DISTINCT while the emitter wrote ``DEPT`` twice — two identical ~C
+    lines, structurally invalid, silently written.  ``is_las30`` defaults
+    to True so the LAS 3.0 call sites (which DO emit the bracket) are
+    unchanged.
     """
     mnemonic = (
         curve.original_mnemonic
         if curve.original_mnemonic and curve.original_mnemonic != curve.mnemonic
         else curve.mnemonic
     )
-    if curve.array_info is not None and "[" not in mnemonic:
+    if curve.array_info is not None and "[" not in mnemonic and is_las30:
         mnemonic = f"{mnemonic}[{curve.array_info.index}]"
     return mnemonic
 
@@ -258,6 +268,7 @@ def _dedup_by_emitted_mnemonic(curves: list[CurveDefinition]) -> list[CurveDefin
 
 def _emission_plan(
     curves: list[CurveDefinition],
+    is_las30: bool = True,
 ) -> tuple[list[tuple[CurveDefinition, str | None]], list[CurveDefinition]]:
     """Compute collision-free emission names for a ~C / Definition block.
 
@@ -273,6 +284,12 @@ def _emission_plan(
     is ALSO taken the definition is a metadata-only duplicate and is
     dropped (returned in ``dropped`` for the caller to warn about).
 
+    F-27 (W-10): ``is_las30`` is forwarded to ``_emitted_mnemonic`` so
+    the collision candidate matches the name ``_format_curve_line`` will
+    actually emit on every version (the ``[N]`` bracket is only emitted
+    for LAS 3.0).  The LAS 1.2/2.0 ~C block passes ``is_las30=False``;
+    the LAS 3.0 paths use the default.
+
     Returns ``(pairs, dropped)`` where ``pairs`` is an ordered list of
     ``(curve, mnemonic_override)`` — ``mnemonic_override`` is ``None``
     for a normal M-59 emission and ``curve.mnemonic`` for a collision
@@ -282,7 +299,7 @@ def _emission_plan(
     pairs: list[tuple[CurveDefinition, str | None]] = []
     dropped: list[CurveDefinition] = []
     for curve in curves:
-        candidate = _emitted_mnemonic(curve)
+        candidate = _emitted_mnemonic(curve, is_las30)
         if candidate in seen:
             if curve.mnemonic not in seen:
                 pairs.append((curve, curve.mnemonic))
@@ -522,6 +539,41 @@ def _format_parameter_line(param: ParameterEntry, is_las30: bool) -> str:
     return f" {mnemonic}.{unit}  {value}  : {desc}"
 
 
+def _lookup_data_array(
+    name: str,
+    data: dict[str, NDArray[np.float64]],
+    string_data: dict[str, NDArray[np.object_]],
+) -> tuple[NDArray[np.float64] | NDArray[np.object_] | None, bool]:
+    """Resolve a curve name to its data array, case-insensitively.
+
+    F-32 (I2-22 consistency): the ~C definition resolution
+    (``_curves_in_live_order``, ``_effective_section_curves``) is
+    case-insensitive — a lowercase ``'dept'`` in ``curves_order``
+    resolves to the ``DEPT`` definition.  The data-key lookup must use
+    the SAME resolution or a case-variant ``curves_order`` entry
+    resolves the definition but fails the data lookup, null-filling the
+    written column (LAS 3.0 ``_format_data_rows`` path) or skipping the
+    ~A section entirely (legacy Path C gate).  Exact-case matches win
+    (unambiguous); the case-insensitive fallback mirrors the
+    definition-resolution behavior.
+
+    Returns ``(array, is_string)``; ``array`` is None when no key
+    matches (the caller pads the column with the null sentinel).
+    """
+    if name in string_data:
+        return string_data[name], True
+    if name in data:
+        return data[name], False
+    upper = name.upper()
+    for key, arr in string_data.items():
+        if key.upper() == upper:
+            return arr, True
+    for key, num_arr in data.items():
+        if key.upper() == upper:
+            return num_arr, False
+    return None, False
+
+
 def _format_data_rows(
     curve_names: list[str],
     data: dict[str, NDArray[np.float64]],
@@ -538,12 +590,11 @@ def _format_data_rows(
 
     curve_arrays: list[tuple[NDArray[np.float64] | NDArray[np.object_] | None, bool]] = []
     for name in curve_names:
-        if name in string_data:
-            curve_arrays.append((string_data[name], True))
-        elif name in data:
-            curve_arrays.append((data[name], False))
-        else:
-            curve_arrays.append((None, False))
+        # F-32: case-insensitive lookup — the definition resolution is
+        # case-insensitive (I2-22), so the data-key lookup must be too.
+        # Exact-case matches win; the fallback resolves a case-variant
+        # curves_order entry ('dept') to the data stored under 'DEPT'.
+        curve_arrays.append(_lookup_data_array(name, data, string_data))
 
     num_rows = max(
         (len(arr) for arr, _ in curve_arrays if arr is not None),
@@ -1180,7 +1231,13 @@ class _WriterBase:
             # reader-renamed IK_2); only a metadata-only duplicate (own
             # mnemonic also taken) is dropped — warn so the drop is
             # visible.
-            _curve_pairs, _dropped = _emission_plan(curves)
+            # F-27 (W-10): is_las30=False keeps the dedup candidate free
+            # of the [N] bracket — _format_curve_line never emits the
+            # bracket on LAS 1.2/2.0, so the dedup key must match the
+            # emitted name or a reader-renamed array curve (IK_2 with
+            # original_mnemonic='IK' + array_info) would dedup against
+            # 'IK[1]' instead of 'IK' and emit a duplicate IK line.
+            _curve_pairs, _dropped = _emission_plan(curves, is_las30=False)
             for _curve in _dropped:
                 import warnings
 
@@ -1495,12 +1552,25 @@ class _WriterBase:
                 )
 
             if self._las_file.curves_order and (self._las_file.logs or self._las_file.string_data):
-                _log_keys = set(self._las_file.logs.keys()) if self._las_file.logs else set()
-                _str_keys = (
-                    set(self._las_file.string_data.keys()) if self._las_file.string_data else set()
+                _log_upper = (
+                    {k.upper() for k in self._las_file.logs.keys()}
+                    if self._las_file.logs
+                    else set()
                 )
-                _order_set = set(self._las_file.curves_order)
-                _uncovered = _order_set - _log_keys - _str_keys
+                _str_upper = (
+                    {k.upper() for k in self._las_file.string_data.keys()}
+                    if self._las_file.string_data
+                    else set()
+                )
+                # F-32 (I2-22 consistency): the data-key lookup is
+                # case-insensitive; compare upper-cased so a case-variant
+                # curves_order entry ('dept' vs data key 'DEPT') is not
+                # falsely reported as uncovered (it IS emitted, not padded).
+                _uncovered = [
+                    _k
+                    for _k in self._las_file.curves_order
+                    if _k.upper() not in _log_upper and _k.upper() not in _str_upper
+                ]
                 if _uncovered:
                     warnings.warn(
                         f"Curve(s) {sorted(_uncovered)} appear in "
@@ -1512,20 +1582,46 @@ class _WriterBase:
 
         # Path C: Legacy single data section (~A)
         curve_names = self._las_file.curves_order
-        if curve_names and not any(
-            name in self._las_file.logs or name in self._las_file.string_data
-            for name in curve_names
-        ):
+
+        # F-32 (I2-22 consistency): the ~A data-key lookup
+        # (_format_data_rows) and the ~C definition resolution are
+        # case-insensitive.  The gate below must use the SAME resolution
+        # or a case-variant curves_order entry (e.g. 'dept' while the
+        # data is keyed 'DEPT') falsely trips the "none have data"
+        # warning and skips the ~A block entirely.
+        _data_curves = [
+            n
+            for n in curve_names
+            if _lookup_data_array(n, self._las_file.logs, self._las_file.string_data)[0] is not None
+        ]
+        if curve_names and not _data_curves:
             warnings.warn(
                 f"curves_order contains {len(curve_names)} curve(s) "
                 f"but none have data in logs or string_data. "
                 f"No data will be emitted.",
                 stacklevel=3,
             )
-        if any(
-            name in self._las_file.logs or name in self._las_file.string_data
-            for name in curve_names
-        ):
+        if not curve_names and (self._las_file.logs or self._las_file.string_data):
+            # F-36: an EMPTY curves_order with populated logs/string_data
+            # is a user-inconsistent state (direct construction only —
+            # from_dict rejects it, and __post_init__'s consistency
+            # checks skip when curves_order is empty).  The empty-list
+            # short-circuit (`any([])` is False) previously suppressed
+            # the "no data" warning AND skipped the ~A block, so the
+            # data was silently lost with zero diagnostics.  Fire the
+            # warning explicitly so the loss is visible at write time.
+            _data_keys = sorted(
+                set(self._las_file.logs.keys()) | set(self._las_file.string_data.keys())
+            )
+            warnings.warn(
+                f"curves_order is empty but logs/string_data contain "
+                f"data for curve(s) {_data_keys}.  The written file will "
+                f"have no ~A data section and this data will NOT be "
+                f"emitted.  Add the curves to curves_order (and to "
+                f"curves) to write the data.",
+                stacklevel=3,
+            )
+        if _data_curves:
             # M-59: Keep the ~A column-header line consistent with the
             # ~C curve lines.  The ~C section now emits
             # CurveDefinition.original_mnemonic (the vendor-standard name)
@@ -1534,7 +1630,13 @@ class _WriterBase:
             # column-header/curve mismatch (pylasdev routes data
             # positionally by ~C order, so its own roundtrip is
             # unaffected — this is for file-level consistency).
-            _by_mnem = {c.mnemonic: c for c in self._las_file.curves or []}
+            # F-32: resolve the definition case-insensitively (matching
+            # the ~C emission) so a case-variant curves_order entry
+            # ('dept') emits the SAME header name as the ~C block.
+            _by_mnem: dict[str, CurveDefinition] = {}
+            for _c in self._las_file.curves or []:
+                _by_mnem.setdefault(_c.mnemonic, _c)
+                _by_mnem.setdefault(_c.mnemonic.upper(), _c)
 
             # W-10: mirror the ~C emission's collision-free naming.  A
             # reader-renamed duplicate (IK_2 with original_mnemonic='IK')
@@ -1543,11 +1645,11 @@ class _WriterBase:
             _header_seen: set[str] = set()
 
             def _header_name(name: str) -> str:
-                c = _by_mnem.get(name)
+                c = _by_mnem.get(name) or _by_mnem.get(name.upper())
                 candidate = (
                     c.original_mnemonic
                     if c is not None and c.original_mnemonic and c.original_mnemonic != c.mnemonic
-                    else name
+                    else (c.mnemonic if c is not None else name)
                 )
                 if candidate in _header_seen and c is not None:
                     candidate = c.mnemonic
@@ -1569,6 +1671,40 @@ class _WriterBase:
                     f"LAS 1.2/2.0 cannot represent duplicate columns — "
                     f"re-read would silently rename them and alter the "
                     f"model identity."
+                )
+
+            # F-26: warn when the ~C block declares more curves than ~A
+            # will have data columns.  A metadata-only curve (present in
+            # `curves`, absent from `curves_order` — legal per
+            # models.py:2858-2862) is emitted to ~C but gets NO ~A
+            # column; on re-read the reader pads the missing column with
+            # null sentinels, fabricating a data column that did not
+            # exist in the model.  The check is COUNT-based (the ~C
+            # emission set vs the ~A header count) — the names can
+            # legitimately differ for array-info curves (a ~C curve
+            # ``NMR[5]`` backed by the ``NMR`` curves_order column), but
+            # a count divergence always fabricates columns on re-read.
+            _c_pairs, _c_dropped = _emission_plan(
+                self._las_file.curves or [], is_las30=self._spec.is_las30
+            )
+            _c_emitted = [
+                (_o if _o is not None else _emitted_mnemonic(_c, self._spec.is_las30))
+                for _c, _o in _c_pairs
+            ]
+            if len(_c_emitted) > len(_header_names):
+                _header_upper = {h.upper() for h in _header_names}
+                _no_column = [m for m in _c_emitted if m.upper() not in _header_upper]
+                warnings.warn(
+                    f"~C declares {len(_c_emitted)} curve(s) but ~A will "
+                    f"emit only {len(_header_names)} data column(s) from "
+                    f"curves_order.  Curve(s) {sorted(set(_no_column))} "
+                    f"have no data column; on re-read the reader pads "
+                    f"them with null values, fabricating data columns "
+                    f"that do not exist in the model.  Add them to "
+                    f"curves_order to give them a data column, or remove "
+                    f"them from curves.",
+                    UserWarning,
+                    stacklevel=3,
                 )
 
             header_line = "~A  " + "  ".join(_sanitize_las_value(n) for n in _header_names)

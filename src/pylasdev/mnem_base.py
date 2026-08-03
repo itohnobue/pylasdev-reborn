@@ -1236,18 +1236,18 @@ MNEM_BASE: dict[str, str] = {
     "PSocn": "SP",
     "PSyuyoe": "SP",
     "PSyuyoe1": "SP",
-    # I2-19: GZ1 is a terminal canonical, NOT an alias for PZ.  The
+    # I2-19 + F-12: GZ1-GZ5 are terminal canonicals — the gradient-probe
+    # family — NOT aliases for PZ (the potential-probe canonical).  The
     # previous ``"GZ1": "PZ"`` entry re-routed 24 GZ1-targeting keys
-    # (GZ11, GZ110, GZ1A, ...) through GZ1 to PZ, silently renaming a
-    # GZ11 curve to PZ on read with mnem_base=MNEM_BASE (with zero
-    # warnings).  GZ1 is now a canonical like GKST: GZ11 resolves to GZ1
-    # and GZ1 resolves to itself.  The GZ2-GZ5 → PZ mappings are kept —
-    # those keys are direct aliases for PZ, not chain intermediates, and
-    # no other mnemonic targets them.
-    "GZ2": "PZ",
-    "GZ3": "PZ",
-    "GZ4": "PZ",
-    "GZ5": "PZ",
+    # (GZ11, GZ110, GZ1A, ...) through GZ1 to PZ, and the former
+    # ``"GZ2".."GZ5": "PZ"`` entries re-routed another 92 keys (GZ21,
+    # GZ210, ГЗ2, ГЗ3вм, ...) to PZ — silently renaming distinct  # noqa: RUF003
+    # gradient-probe curves to the potential-probe canonical on read with
+    # mnem_base=MNEM_BASE (with zero warnings).  GZ1-GZ5 now resolve to
+    # themselves like GKST: GZ21 → GZ2, ГЗ3 → GZ3, GZ5 → GZ5.  The  # noqa: RUF003
+    # R-variant and deep-spacing keys (GZ1R, GZ3R1, GZ6, GZ8, GZR, ...)
+    # still route to OGZ; PZ keeps its own direct aliases (PZ1..PZ25,
+    # ПЗ*, OPZ, PROX*).
     "PZ-6": "PZ",
     "PZ1": "PZ",
     "PZ10": "PZ",
@@ -1991,7 +1991,12 @@ MNEM_BASE: dict[str, str] = {
     "РПЗ1": "RZP",
     "РПЗ2": "RZP",
     "РПЗ3": "RZP",
-    "РС": "SP",
+    # F-13: РС (Russian resistivity abbreviation, keyboard-adjacent to  # noqa: RUF003
+    # ПС) is the resistivity family — consistent with the other Cyrillic
+    # R-* entries (РД→RD, РЕЗ/РЕЗ1→RS, РП→RP, РПЗ→RZP).  The previous  # noqa: RUF003
+    # ``"РС": "SP"`` silently relabeled a resistivity curve as  # noqa: RUF003
+    # spontaneous potential on read with mnem_base=MNEM_BASE.
+    "РС": "RS",
     "СГЛ": "KGL",
     "СП": "SP",
     "Сгл": "KGL",

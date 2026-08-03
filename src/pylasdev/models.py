@@ -379,7 +379,13 @@ class _GuardedDict(dict[str, Any]):
                 f"value has length {_new}.  All values in a data container "
                 f"must have the same row count."
             )
-        super().__setitem__(key, value)
+        # F-17: copy the caller's array so item-level assignment cannot
+        # alias memory (``las.logs['DUP'] = las.logs['MD']`` previously
+        # stored the SAME object — mutating one silently corrupted the
+        # other, and the corruption survived to_dict/from_dict).  The
+        # construction/wholesale paths deepcopy (N-I-11/F-002); item-level
+        # entry points now do the same.
+        super().__setitem__(key, copy.deepcopy(value))
 
     def _validate_batch(self, items: dict[str, Any]) -> None:
         """MOD-14/MOD-01: validate a whole-container update batch against
@@ -418,7 +424,9 @@ class _GuardedDict(dict[str, Any]):
         for _k in _update_items:
             self._validate_key(_k)
         self._validate_batch(_update_items)
-        super().update(_update_items)
+        # F-17: copy on batch insert (same no-shared-reference contract as
+        # __setitem__ — update() previously stored caller arrays by ref).
+        super().update(copy.deepcopy(_update_items))
 
     def setdefault(self, key: Any, default: Any = None) -> Any:
         # M-01: dict.setdefault bypasses __setitem__.
@@ -427,6 +435,8 @@ class _GuardedDict(dict[str, Any]):
         # inserted — an existing key returns the stored value untouched).
         if key not in self:
             self._check_value_length(default)
+            # F-17: copy on insert (no shared reference with the caller).
+            return super().setdefault(key, copy.deepcopy(default))
         return super().setdefault(key, default)
 
     def __ior__(self, other: Any) -> _GuardedDict:  # type: ignore[misc,override]
@@ -435,7 +445,8 @@ class _GuardedDict(dict[str, Any]):
         for _k in _other:
             self._validate_key(_k)
         self._validate_batch(_other)
-        return super().__ior__(_other)
+        # F-17: copy on |= insert (no shared reference with the caller).
+        return super().__ior__(copy.deepcopy(_other))
 
     def trim_all(self, length: int) -> None:
         """Trim every stored value to *length* rows (whole-container reconcile).
@@ -1315,6 +1326,66 @@ class VersionSection:
         return delimiter_map.get(self.dlm.upper(), " ")
 
 
+class _WellMetaDict(dict[str, str]):
+    """Validating dict for WellSection.units/descriptions (F-15).
+
+    I2F-05 validated units/descriptions ONLY at construction
+    (__post_init__); post-construction item mutation
+    (``well.units['STRT'] = 123``) bypassed the guard and crashed the
+    writer with an opaque LASWriteError ('int' object has no attribute
+    'replace') via ``_sanitize_las_value``.  This dict re-applies the
+    construction guard at every mutation entry point: str keys and str
+    values raise TypeError exactly like __post_init__ does, so the writer
+    never sees a non-str unit/description value.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # M-01: dict.__init__ bypasses __setitem__.  Validate all items
+        # from positional args and keyword args before building.
+        _items = dict(*args, **kwargs)
+        for _k, _v in _items.items():
+            self._validate(_k, _v)
+        super().__init__(_items)
+
+    @staticmethod
+    def _validate(key: Any, value: Any) -> None:
+        if not isinstance(key, str):
+            raise TypeError(
+                f"WellSection: units/descriptions key must be str, "
+                f"got {type(key).__name__} ({key!r})"
+            )
+        if not isinstance(value, str):
+            raise TypeError(
+                f"WellSection: units/descriptions value for key "
+                f"{key!r} must be str, got {type(value).__name__} "
+                f"({value!r})"
+            )
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        self._validate(key, value)
+        super().__setitem__(key, value)
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        # M-01: dict.update bypasses __setitem__.
+        _items = dict(*args, **kwargs)
+        for _k, _v in _items.items():
+            self._validate(_k, _v)
+        super().update(_items)
+
+    def setdefault(self, key: Any, default: Any = None) -> Any:
+        # M-01: dict.setdefault bypasses __setitem__ when inserting.
+        if key not in self:
+            self._validate(key, default)
+        return super().setdefault(key, default)
+
+    def __ior__(self, other: Any) -> _WellMetaDict:  # type: ignore[misc,override]
+        # M-01: dict.__ior__ bypasses __setitem__.
+        _other = dict(other)
+        for _k, _v in _other.items():
+            self._validate(_k, _v)
+        return super().__ior__(_other)
+
+
 @dataclass
 class WellSection:
     """LAS Well Information section (~W).
@@ -1466,6 +1537,34 @@ class WellSection:
                         f"{_dk!r} must be str, "
                         f"got {type(_dv).__name__} ({_dv!r})"
                     )
+        # F-15: Re-wrap units/descriptions through the guarded dict so the
+        # I2F-05 construction guard also applies to post-construction item
+        # mutation (well.units['STRT'] = 123 previously bypassed it and
+        # crashed the writer).  __setattr__ already re-wraps the __init__
+        # path; this covers the default_factory empty-dict case and any
+        # bypass (object.__setattr__ / unpickle restore).
+        if not isinstance(self.units, _WellMetaDict):
+            self.units = _WellMetaDict(self.units)
+        if not isinstance(self.descriptions, _WellMetaDict):
+            self.descriptions = _WellMetaDict(self.descriptions)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """F-15: Re-wrap ``units``/``descriptions`` wholesale assignments
+        through ``_WellMetaDict`` so the I2F-05 value guard cannot be
+        bypassed by ``well.units = {...}`` post-construction (mirrors
+        LASFile.__setattr__ / DevFile.__setattr__).  All other fields pass
+        through untouched."""
+        if name in ("units", "descriptions"):
+            if value is None:
+                super().__setattr__(name, None)
+                return
+            if not isinstance(value, dict):
+                raise TypeError(f"WellSection: {name} must be a dict, got {type(value).__name__}")
+            if not isinstance(value, _WellMetaDict):
+                value = _WellMetaDict(value)
+            super().__setattr__(name, value)
+            return
+        super().__setattr__(name, value)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to legacy dict format, including non-empty units and descriptions."""
@@ -1519,6 +1618,45 @@ class ArrayElementInfo:
     base_name: str = ""  # Base mnemonic without index (e.g., "NMR")
     index: int = 0  # Array index (e.g., 1, 2, 3)
     time_offset: float | None = None  # Time offset from first element (e.g., 0, 5, 10 ms)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """F-38: re-validate leaf fields on post-construction assignment.
+
+        The construction-time __post_init__ guard was bypassable by
+        mutation (``curve.array_info.base_name = 42`` / ``.index = -1`` /
+        ``.time_offset = nan`` silently corrupted writer output).
+        Re-apply the __post_init__ contract at every assignment.
+        """
+        if name == "base_name" and not isinstance(value, str):
+            raise TypeError(f"ArrayElementInfo: base_name must be str, got {type(value).__name__}")
+        if name == "base_name":
+            if not value or not value.strip():
+                raise ValueError(
+                    f"ArrayElementInfo: base_name must not be empty or "
+                    f"whitespace-only, got {value!r}"
+                )
+        elif name == "index":
+            # M-06: Accept numpy integer scalars, mirroring __post_init__.
+            value = _coerce_numpy_scalar(value)
+            if type(value) is not int:
+                raise TypeError(
+                    f"ArrayElementInfo: index must be int, got {type(value).__name__} ({value!r})"
+                )
+            if value < 0:
+                raise ValueError(f"ArrayElementInfo: index must be >= 0, got {value!r}")
+        elif name == "time_offset":
+            if value is not None:
+                value = _coerce_numpy_scalar(value)
+                if not isinstance(value, (int, float)) or (
+                    isinstance(value, float) and not math.isfinite(value)
+                ):
+                    raise ValueError(
+                        f"ArrayElementInfo: time_offset must be a finite "
+                        f"number or None, got {value!r}"
+                    )
+                if value < 0:
+                    raise ValueError(f"ArrayElementInfo: time_offset must be >= 0, got {value!r}")
+        super().__setattr__(name, value)
 
     def validate(self, complete: bool = False) -> list[str]:
         """Validate array element info fields.
@@ -1587,6 +1725,71 @@ class CurveDefinition:
     # LAS 3.0 specific fields
     data_format: str = ""  # F, E, S, or A (from {F}, {E}, {S}, {A:x})
     array_info: ArrayElementInfo | None = None  # For array curves like NMR[1]
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """F-37/F-38: re-validate leaf fields on post-construction
+        assignment.
+
+        The construction-time guards (__post_init__) were bypassable by
+        mutation (``curve.unit = 42`` crashed the writer with an opaque
+        LASWriteError; ``curve.data_format = 'Q'`` emitted structurally
+        invalid LAS 3.0 ``{Q}`` with zero warnings; ``curve.array_info =
+        'x'`` silently corrupted output).  Re-apply the construction
+        contract at every assignment:
+
+        - ``unit``/``api_code``/``description``: warn-and-coerce non-str
+          via ``_safe_str`` and enforce MAX_FIELD_LENGTH (mirrors the
+          M-05 loop in __post_init__).
+        - ``unit``: additionally apply the M-04 ``_UNIT_PATTERN``
+          composition check the constructor runs — a whitespace/#/colon/
+          dot unit is truncated by the parser or produces a ~C line that
+          cannot be re-parsed, silently dropping the curve AND its data
+          column on roundtrip.
+        - ``data_format``: uppercase then validate against the valid set
+          (mirrors the __post_init__ check + MOD-02 normalization).
+        - ``array_info``: must be ArrayElementInfo or None (mirrors M-15).
+        """
+        if name == "data_format" and value is not None:
+            if not isinstance(value, str):
+                raise TypeError(
+                    f"CurveDefinition: data_format must be str, got {type(value).__name__}"
+                )
+            value = value.upper()
+            if value and value not in _VALID_DATA_FORMATS:
+                raise ValueError(
+                    f"CurveDefinition: invalid data_format "
+                    f"'{value}' for curve "
+                    f"{getattr(self, 'mnemonic', '?')!r}. "
+                    f"Valid values: {', '.join(sorted(_VALID_DATA_FORMATS))}"
+                )
+        elif name in ("unit", "api_code", "description"):
+            if not isinstance(value, str):
+                warnings.warn(
+                    f"CurveDefinition '{getattr(self, 'mnemonic', '?')}': "
+                    f"coercing non-str {name} from "
+                    f"{type(value).__name__} to str",
+                    stacklevel=2,
+                )
+                value = _safe_str(value)
+            elif len(value) > MAX_FIELD_LENGTH:
+                raise ValueError(
+                    f"CurveDefinition '{getattr(self, 'mnemonic', '?')}': "
+                    f"{name} length {len(value)} exceeds maximum allowed "
+                    f"({MAX_FIELD_LENGTH})"
+                )
+            if name == "unit" and not _UNIT_PATTERN.fullmatch(value):
+                raise ValueError(
+                    f"CurveDefinition: invalid unit {value!r} for curve "
+                    f"'{getattr(self, 'mnemonic', '?')}'.  Units may only "
+                    f"contain word characters, '-', '/', '.', '%', and "
+                    f"'°' (matching the parser's unit grammar)."
+                )
+        elif name == "array_info" and value is not None and not isinstance(value, ArrayElementInfo):
+            raise TypeError(
+                f"CurveDefinition: array_info must be ArrayElementInfo "
+                f"or None, got {type(value).__name__}"
+            )
+        super().__setattr__(name, value)
 
     def validate(self, complete: bool = False) -> list[str]:
         """Validate curve definition fields.
@@ -1689,6 +1892,12 @@ class CurveDefinition:
                 f"characters, '-', '/', '.', '%', and '°' (matching the "
                 f"parser's unit grammar)."
             )
+        # F-14/MOD-02: Uppercase before validation — mirroring
+        # ParameterEntry.__post_init__ and from_dict's normalization, so
+        # direct construction accepts lowercase 'f' the same way the other
+        # paths do.  (__setattr__ already uppercases on assignment; this
+        # covers any __setattr__-bypassing restore path as well.)
+        self.data_format = self.data_format.upper()
         if self.data_format and self.data_format not in _VALID_DATA_FORMATS:
             raise ValueError(
                 f"CurveDefinition: invalid data_format "
@@ -1906,6 +2115,81 @@ class ParameterEntry:
     # can reconstruct per-section parameter sections on roundtrip.
     # Parameters from a standard ~P/~Parameter section have section_type=None.
     section_type: str | None = None
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """F-37/F-38: re-validate leaf fields on post-construction
+        assignment.
+
+        Construction-time guards (__post_init__) were bypassable by
+        mutation (``param.value = 42`` / ``param.unit = 42`` crashed the
+        writer with an opaque LASWriteError; ``param.data_format = 'Q'``
+        emitted structurally invalid LAS 3.0 ``{Q}`` with zero warnings).
+        Re-apply the construction contract at every assignment:
+
+        - ``value``/``unit``/``description``: warn-and-coerce non-str via
+          ``_safe_str`` (mirrors the F-21 loop in __post_init__).
+        - ``unit``: additionally apply the M-04 ``_UNIT_PATTERN``
+          composition check the constructor runs — a whitespace/#/colon/
+          dot parameter unit is truncated by the parser or produces a ~P
+          line that cannot be re-parsed, silently polluting the value on
+          roundtrip.
+        - ``data_format``: apply the same normalization __post_init__
+          applies (uppercase, truncate Fortran-style extended codes,
+          warn-and-clear invalid/multi-char metadata codes — the MOD-02
+          contract, NOT raise, matching the class's construction behavior).
+        """
+        if name == "data_format" and value is not None:
+            if not isinstance(value, str):
+                raise TypeError(
+                    f"ParameterEntry: data_format must be str, got {type(value).__name__}"
+                )
+            value = value.upper()
+            if value and len(value) > 1:
+                if _EXTENDED_FORMAT_SPEC_RE.match(value):
+                    value = value[0]
+                else:
+                    warnings.warn(
+                        f"Ignoring multi-character data_format "
+                        f"'{value}' for parameter "
+                        f"{getattr(self, 'mnemonic', '?')!r}.  "
+                        f"Only single-letter LAS format codes or "
+                        f"Fortran-style extended codes are valid; "
+                        f"clearing to empty string.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    value = ""
+            if value and len(value) == 1 and value not in _VALID_DATA_FORMATS:
+                warnings.warn(
+                    f"ParameterEntry: invalid data_format "
+                    f"'{value}' for parameter "
+                    f"{getattr(self, 'mnemonic', '?')!r}.  "
+                    f"Valid values: "
+                    f"{', '.join(sorted(_VALID_DATA_FORMATS))}. "
+                    f"Clearing to empty string.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                value = ""
+        elif name in ("value", "unit", "description"):
+            if not isinstance(value, str):
+                warnings.warn(
+                    f"ParameterEntry "
+                    f"'{getattr(self, 'mnemonic', '?')}': coercing "
+                    f"non-str {name} from "
+                    f"{type(value).__name__} to str",
+                    stacklevel=2,
+                )
+                value = _safe_str(value)
+            if name == "unit" and not _UNIT_PATTERN.fullmatch(value):
+                raise ValueError(
+                    f"ParameterEntry: invalid unit {value!r} for "
+                    f"parameter '{getattr(self, 'mnemonic', '?')}'.  "
+                    f"Units may only contain word characters, '-', '/', "
+                    f"'.', '%', and '°' (matching the parser's unit "
+                    f"grammar)."
+                )
+        super().__setattr__(name, value)
 
     def validate(self, complete: bool = False) -> list[str]:
         """Validate parameter entry fields.
@@ -2250,15 +2534,30 @@ class DataSection:
                     )
 
         # --- uncovered curves ---
-        curve_set = set(self.curves_order)
         data_keys = set(self.data.keys())
         string_keys = set(self.string_data.keys())
         if self.data or self.string_data:
-            uncovered = curve_set - data_keys - string_keys
+            # WL-M1 (M13 twin of _writer_las30.py:1085-1093): the writer's
+            # data-key lookup (_format_data_rows → _lookup_data_array) is
+            # case-insensitive, so a case-variant curves_order entry
+            # ('dept' vs data key 'DEPT') IS emitted, not null-padded.
+            # Compare upper-cased so the uncovered/orphaned checks do not
+            # falsely fire on supported case-variant states while still
+            # flagging genuinely uncovered/orphaned curves.
+            curve_set_upper = {c.upper() for c in self.curves_order}
+            data_keys_upper = {k.upper() for k in data_keys}
+            string_keys_upper = {k.upper() for k in string_keys}
+            uncovered = sorted(
+                {
+                    c
+                    for c in self.curves_order
+                    if c.upper() not in data_keys_upper and c.upper() not in string_keys_upper
+                }
+            )
             if uncovered:
                 issues.append(
                     f"DataSection '{self.name}': curve(s) "
-                    f"{sorted(uncovered)} appear in curves_order but "
+                    f"{uncovered} appear in curves_order but "
                     f"have no data in 'data' or 'string_data'.  The "
                     f"writer will pad these curves with null_value."
                 )
@@ -2269,11 +2568,13 @@ class DataSection:
             # post-construction state — previously did not, so a curve
             # whose data survived but whose order entry was removed passed
             # silently and the writer dropped the column.
-            orphaned_data = (data_keys | string_keys) - curve_set
+            orphaned_data = sorted(
+                {k for k in list(data_keys) + list(string_keys) if k.upper() not in curve_set_upper}
+            )
             if orphaned_data:
                 issues.append(
                     f"DataSection '{self.name}': curve(s) "
-                    f"{sorted(orphaned_data)} have data in 'data' or "
+                    f"{orphaned_data} have data in 'data' or "
                     f"'string_data' but are NOT in curves_order.  The "
                     f"writer will not emit these columns."
                 )
@@ -2298,7 +2599,14 @@ class DataSection:
                 for _i, (_order_name, _sc) in enumerate(
                     zip(self.curves_order, self.section_curves, strict=False)
                 ):
-                    if _order_name != _sc.mnemonic:
+                    # MOD-1 (WL-M1 class): the writer resolves per-section
+                    # curves_order vs section_curves case-insensitively
+                    # (_section_emission_pairs by_upper), so compare
+                    # upper-cased — a case-variant entry ('dept' vs
+                    # mnemonic 'DEPT') IS emitted in the right position, not
+                    # a desync.  A genuinely different curve name still
+                    # differs after upper-casing (true positive preserved).
+                    if _order_name.upper() != _sc.mnemonic.upper():
                         issues.append(
                             f"DataSection '{self.name}': curves_order[{_i}] "
                             f"= {_order_name!r} does not match "
@@ -2422,6 +2730,12 @@ class DataSection:
                 )
 
         curve_set = set(self.curves_order)
+        # MOD-3 (WL-M1/F-04 class): upper-cased mirror for the orphaned-key
+        # set-ops below — the writer's data/string_data lookup is
+        # case-insensitive, so case-variant curves_order entries ('dept')
+        # must resolve to uppercase data keys ('DEPT') instead of being
+        # reported as orphans (F-04 roundtrip).
+        _curve_set_upper = {c.upper() for c in curve_set}
 
         # F-105: Reject duplicate curve names in curves_order.
         # The from_dict path has explicit dedup checks (lines 1171-1181),
@@ -2489,8 +2803,15 @@ class DataSection:
                 self.section_type = _bare
 
         # data keys ⊆ curves_order
+        # MOD-3 (WL-M1/F-04 class): the writer's per-section data-key lookup
+        # is case-insensitive (_writer_base.py:542 _lookup_data_array), so
+        # the orphaned-key set-ops must compare upper-cased while reporting
+        # the ACTUAL key casing — a case-variant state (curves_order
+        # ['dept','GR'], data keyed DEPT/GR) is supported by the writer and
+        # must not be falsely rejected here (F-04 roundtrip).  A genuinely
+        # distinct key still differs after upper-casing.
         data_keys = set(self.data.keys())
-        orphaned_data = data_keys - curve_set
+        orphaned_data = sorted({k for k in data_keys if k.upper() not in _curve_set_upper})
         if orphaned_data:
             raise LASDataError(
                 f"DataSection '{self.name}': data keys not in curves_order: {sorted(orphaned_data)}"
@@ -2498,7 +2819,7 @@ class DataSection:
 
         # string_data keys ⊆ curves_order
         string_keys = set(self.string_data.keys())
-        orphaned_string = string_keys - curve_set
+        orphaned_string = sorted({k for k in string_keys if k.upper() not in _curve_set_upper})
         if orphaned_string:
             raise LASDataError(
                 f"DataSection '{self.name}': string_data keys not in "
@@ -2517,11 +2838,16 @@ class DataSection:
         # section_curves and curves_order.  The from_dict path checks
         # this (L1351-1360); direct DataSection construction previously
         # bypassed.  Swapped mnemonics produce silently corrupted output.
+        # MOD-3 (WL-M1/F-04 class): the writer resolves the per-section
+        # order case-insensitively, so compare upper-cased — a case-variant
+        # entry ('dept' vs section_curves mnemonic 'DEPT') is supported,
+        # not a positional desync; a genuinely different curve name still
+        # differs after upper-casing.
         if self.section_curves:
             for _i, (_order_name, _sc) in enumerate(
                 zip(self.curves_order, self.section_curves, strict=True)
             ):
-                if _order_name != _sc.mnemonic:
+                if _order_name.upper() != _sc.mnemonic.upper():
                     raise LASDataError(
                         f"DataSection '{self.name}': "
                         f"curves_order[{_i}] = {_order_name!r} "
@@ -2860,23 +3186,78 @@ class LASFile:
         # at the same position.  Extra definitions (curves beyond
         # curves_order length) are tolerated — they may be LAS 3.0
         # per-section definitions also registered at the top level.
-        if self.curves_order and self.curves:
-            if len(self.curves) < len(self.curves_order):
-                raise LASDataError(
-                    f"LASFile: curves_order has "
-                    f"{len(self.curves_order)} entries but only "
-                    f"{len(self.curves)} curve definitions found"
-                )
-            for _i in range(len(self.curves_order)):
-                if self.curves_order[_i] != self.curves[_i].mnemonic:
+        # F-19: The gate runs whenever curves_order is non-empty — the old
+        # ``and self.curves`` gate let a non-empty curves_order with EMPTY
+        # curves pass (the writer then emitted ~C with no curve headers +
+        # ~A data rows, and the re-read parser discarded all data).
+        # M14/F-19 regression: a legitimate LAS 3.0 per-section
+        # construction stores the curve definitions in
+        # ``data_sections[].section_curves`` with EMPTY top-level curves
+        # (the writer scans section_curves, not top-level curves — the
+        # ~C section is populated from the sections).  Skip the
+        # definition-count/position check only in that state (curves
+        # empty AND data_sections present); the true F-19 silent-loss
+        # state (curves_order set + curves empty + NO data_sections to
+        # hold definitions) is still rejected below.
+        # MOD-M1 (M14 residual): the M14 relaxation used 'data_sections
+        # present' as a proxy for 'definitions exist'.  A DataSection
+        # holding data with EMPTY section_curves (or section_curves
+        # covering only part of curves_order) passed the gate with NO
+        # definition anywhere — the writer emitted ~C with no header for
+        # the uncovered curve and re-read silently lost the data (F-19
+        # class).  Verify the sections' section_curves actually COVER
+        # curves_order before accepting the per-section skip (writer
+        # definition resolution is case-insensitive, mirroring
+        # _writer_las30.py:321-332/348).
+        if self.curves_order:
+            if self.curves or not self.data_sections:
+                if len(self.curves) < len(self.curves_order):
                     raise LASDataError(
-                        f"LASFile: curves_order[{_i}] = "
-                        f"{self.curves_order[_i]!r} does not match "
-                        f"curves[{_i}].mnemonic = "
-                        f"{self.curves[_i].mnemonic!r}"
+                        f"LASFile: curves_order has "
+                        f"{len(self.curves_order)} entries but only "
+                        f"{len(self.curves)} curve definitions found"
+                    )
+                for _i in range(len(self.curves_order)):
+                    # MOD-2 (WL-M1 class): the writer resolves curves_order
+                    # vs curves case-insensitively (_writer_base.py:1554-1581),
+                    # so compare upper-cased — a case-variant entry
+                    # ('dept' vs mnemonic 'DEPT') is supported, not a
+                    # construction error.  A genuinely different curve name
+                    # still differs after upper-casing.
+                    if self.curves_order[_i].upper() != self.curves[_i].mnemonic.upper():
+                        raise LASDataError(
+                            f"LASFile: curves_order[{_i}] = "
+                            f"{self.curves_order[_i]!r} does not match "
+                            f"curves[{_i}].mnemonic = "
+                            f"{self.curves[_i].mnemonic!r}"
+                        )
+            else:
+                _section_defined: set[str] = set()
+                for _ds in self.data_sections:
+                    for _sc in _ds.section_curves:
+                        _section_defined.add(_sc.mnemonic.upper())
+                _undef = sorted(
+                    {_n for _n in self.curves_order if _n.upper() not in _section_defined}
+                )
+                if _undef:
+                    raise LASDataError(
+                        f"LASFile: curves_order entries {_undef} have "
+                        f"no curve definition in 'curves' or any "
+                        f"data_section's section_curves.  The writer "
+                        f"would emit these curves without a header and "
+                        f"the data would be silently lost on re-read.  "
+                        f"Add a section_curves definition for each curve "
+                        f"or populate 'curves'."
                     )
 
         _order_set = set(self.curves_order) if self.curves_order else set()
+        # MOD-2 (WL-M1 class): the writer's curves_order ↔ logs/string_data
+        # data-key lookup is case-insensitive (_writer_base.py:1554-1581,
+        # _lookup_data_array), so the orphaned/missing-key set-ops below must
+        # compare upper-cased while reporting the ACTUAL key casing — a
+        # case-variant state (curves_order=['dept','GR'], logs keyed DEPT/GR)
+        # is supported by the writer and must not be falsely rejected here.
+        _order_set_upper = {c.upper() for c in _order_set}
 
         # M-19: LAS 2.0 first-curve-must-be-index constraint.
         # Now validated by validate() below (called at end of __post_init__).
@@ -2902,7 +3283,8 @@ class LASFile:
         # construction, e.g. LASFile() then attribute assignment) ---
         if self.logs:
             _log_keys = set(self.logs.keys())
-            _orphaned_logs = _log_keys - _order_set
+            _log_keys_upper = {k.upper() for k in _log_keys}
+            _orphaned_logs = {k for k in _log_keys if k.upper() not in _order_set_upper}
             if _orphaned_logs:
                 raise LASDataError(
                     f"LASFile: logs contain keys not in "
@@ -2917,9 +3299,15 @@ class LASFile:
             # string_data covers the missing keys (the curve lives in
             # string_data, not logs).
             if not self.data_sections and self.curves_order:
-                _missing_logs = _order_set - _log_keys
-                _str_keys_for_missing = set(self.string_data.keys()) if self.string_data else set()
-                _missing_logs -= _str_keys_for_missing
+                _str_keys_for_missing_upper = (
+                    {k.upper() for k in self.string_data.keys()} if self.string_data else set()
+                )
+                _missing_logs = {
+                    c
+                    for c in self.curves_order
+                    if c.upper() not in _log_keys_upper
+                    and c.upper() not in _str_keys_for_missing_upper
+                }
                 if _missing_logs:
                     raise LASDataError(
                         f"LASFile: curves_order has keys not found in "
@@ -2929,14 +3317,21 @@ class LASFile:
                         f"for string-format curves)."
                     )
             if len(self.logs) > 1:
-                _log_len = {name: len(arr) for name, arr in self.logs.items()}
+                # F-16/M-18: 0-d arrays (np.array(5.0)) have no len() —
+                # treat them as single-element values, matching
+                # DataSection.__post_init__ and _GuardedDict._value_len.
+                _log_len = {
+                    name: (1 if isinstance(arr, np.ndarray) and arr.ndim == 0 else len(arr))
+                    for name, arr in self.logs.items()
+                }
                 if len(set(_log_len.values())) > 1:
                     raise LASDataError(f"LASFile: logs have inconsistent array lengths: {_log_len}")
 
         # --- string_data validation (same skip-when-empty rule) ---
         if self.string_data:
             _str_keys = set(self.string_data.keys())
-            _orphaned_str = _str_keys - _order_set
+            _str_keys_upper = {k.upper() for k in _str_keys}
+            _orphaned_str = {k for k in _str_keys if k.upper() not in _order_set_upper}
             if _orphaned_str:
                 raise LASDataError(
                     f"LASFile: string_data contain keys not in "
@@ -2948,9 +3343,15 @@ class LASFile:
             # that have no corresponding string_data entry.  Guarded
             # the same way as logs above.
             if not self.data_sections and self.curves_order:
-                _missing_str = _order_set - _str_keys
-                _log_keys_for_missing = set(self.logs.keys()) if self.logs else set()
-                _missing_str -= _log_keys_for_missing
+                _log_keys_for_missing_upper = (
+                    {k.upper() for k in self.logs.keys()} if self.logs else set()
+                )
+                _missing_str = {
+                    c
+                    for c in self.curves_order
+                    if c.upper() not in _str_keys_upper
+                    and c.upper() not in _log_keys_for_missing_upper
+                }
                 if _missing_str:
                     raise LASDataError(
                         f"LASFile: curves_order has keys not found in "
@@ -2959,7 +3360,12 @@ class LASFile:
                         f"corresponding entry."
                     )
             if len(self.string_data) > 1:
-                _str_len = {name: len(arr) for name, arr in self.string_data.items()}
+                # F-16/M-18: 0-d arrays (np.array('x')) have no len() —
+                # treat them as single-element values (DataSection parity).
+                _str_len = {
+                    name: (1 if isinstance(arr, np.ndarray) and arr.ndim == 0 else len(arr))
+                    for name, arr in self.string_data.items()
+                }
                 if len(set(_str_len.values())) > 1:
                     raise LASDataError(
                         f"LASFile: string_data have inconsistent array lengths: {_str_len}"
@@ -2987,8 +3393,20 @@ class LASFile:
             # ``_format_data_rows`` uses ``max()`` across all arrays,
             # so one group's shorter arrays get padded — producing
             # semantically incorrect output.
-            _log_row_count = len(next(iter(self.logs.values())))
-            _str_row_count = len(next(iter(self.string_data.values())))
+            # F-16/M-18: 0-d arrays (np.array(5.0)) have no len() — treat
+            # them as single-element values (DataSection parity).
+            _log_row_count = (
+                1
+                if isinstance(next(iter(self.logs.values())), np.ndarray)
+                and next(iter(self.logs.values())).ndim == 0
+                else len(next(iter(self.logs.values())))
+            )
+            _str_row_count = (
+                1
+                if isinstance(next(iter(self.string_data.values())), np.ndarray)
+                and next(iter(self.string_data.values())).ndim == 0
+                else len(next(iter(self.string_data.values())))
+            )
             if _log_row_count != _str_row_count:
                 raise LASDataError(
                     f"LASFile: logs row count ({_log_row_count}) does "
@@ -3069,24 +3487,32 @@ class LASFile:
                 # Validate per-section data/string_data keys against
                 # curves_order (orphaned key detection, matching from_dict
                 # lines 1472-1491).
-                _ds_order_set = set(_ds_curves) if _ds_curves else set()
+                # MOD-3 (WL-M1/F-04 class): the writer's per-section
+                # data/string_data lookup is case-insensitive, so compare
+                # upper-cased — a case-variant state (section curves_order
+                # ['dept','GR'], data keyed DEPT/GR) is supported, not
+                # orphaned.  A genuinely distinct key still differs after
+                # upper-casing.
+                _ds_order_set = {c.upper() for c in _ds_curves} if _ds_curves else set()
                 if _ds.string_data:
-                    _ds_str_keys = set(_ds.string_data.keys())
-                    _orphaned_str = _ds_str_keys - _ds_order_set
-                    if _orphaned_str:
+                    _ds_orphaned_str = sorted(
+                        {k for k in _ds.string_data.keys() if k.upper() not in _ds_order_set}
+                    )
+                    if _ds_orphaned_str:
                         raise LASDataError(
                             f"LASFile: string_data in section "
                             f"'{_ds.name}' contains keys not in "
-                            f"curves_order: {sorted(_orphaned_str)}."
+                            f"curves_order: {sorted(_ds_orphaned_str)}."
                         )
                 if _ds.data:
-                    _ds_data_keys = set(_ds.data.keys())
-                    _orphaned_data = _ds_data_keys - _ds_order_set
-                    if _orphaned_data:
+                    _ds_orphaned_data = sorted(
+                        {k for k in _ds.data.keys() if k.upper() not in _ds_order_set}
+                    )
+                    if _ds_orphaned_data:
                         raise LASDataError(
                             f"LASFile: data in section '{_ds.name}' "
                             f"contains keys not in curves_order: "
-                            f"{sorted(_orphaned_data)}."
+                            f"{sorted(_ds_orphaned_data)}."
                         )
                 # Validate array length consistency within each section.
                 if len(_ds.data) > 1:
@@ -3355,37 +3781,85 @@ class LASFile:
             # Extra curve definitions (curves beyond curves_order length,
             # LAS 3.0 per-section) are tolerated — only an order entry
             # without a definition and positional mismatches are flagged.
-            if self.curves_order and self.curves:
-                if len(self.curves_order) > len(self.curves):
-                    issues.append(
-                        f"LASFile: curves_order has {len(self.curves_order)} "
-                        f"entries but only {len(self.curves)} curve "
-                        f"definitions.  Post-construction curves_order "
-                        f"mutation may have added an order entry without a "
-                        f"definition."
-                    )
+            # F-19: The gate runs whenever curves_order is non-empty — a
+            # non-empty curves_order with EMPTY curves (e.g. post-
+            # construction ``curves.clear()``) previously passed validate
+            # and the writer emitted ~C with no headers + ~A data rows,
+            # silently losing all data on re-read.
+            # M14/F-19 regression (validate twin of __post_init__): a
+            # legitimate LAS 3.0 per-section state (EMPTY top-level
+            # curves + populated curves_order + data_sections holding the
+            # definitions in section_curves) must not be flagged — the
+            # writer emits the per-section definitions and preserves the
+            # data.  Skip only that state; the true F-19 state (curves
+            # empty + NO data_sections) is still flagged.
+            # MOD-M1 (validate twin): the per-section skip must also
+            # verify the sections' section_curves actually COVER
+            # curves_order — a post-construction mutation that empties a
+            # section's section_curves (or a DataSection built with data
+            # but no definitions) would otherwise pass validate and the
+            # writer would silently drop the uncovered curves' data.
+            if self.curves_order:
+                if self.curves or not self.data_sections:
+                    if len(self.curves_order) > len(self.curves):
+                        issues.append(
+                            f"LASFile: curves_order has {len(self.curves_order)} "
+                            f"entries but only {len(self.curves)} curve "
+                            f"definitions.  Post-construction curves_order "
+                            f"mutation may have added an order entry without a "
+                            f"definition."
+                        )
+                    else:
+                        for _i, (_order_name, _curve) in enumerate(
+                            zip(self.curves_order, self.curves, strict=False)
+                        ):
+                            # MOD-2 (WL-M1 class): the writer resolves
+                            # curves_order vs curves case-insensitively, so
+                            # compare upper-cased — a case-variant entry
+                            # ('dept' vs mnemonic 'DEPT') is NOT a desync;
+                            # a genuinely different curve name still differs
+                            # after upper-casing.
+                            if _order_name.upper() != _curve.mnemonic.upper():
+                                issues.append(
+                                    f"LASFile: curves_order[{_i}] = "
+                                    f"{_order_name!r} does not match "
+                                    f"curves[{_i}].mnemonic = "
+                                    f"{_curve.mnemonic!r}.  Post-construction "
+                                    f"curves_order mutation has desynced the "
+                                    f"column order from the curve definitions."
+                                )
+                                break
                 else:
-                    for _i, (_order_name, _curve) in enumerate(
-                        zip(self.curves_order, self.curves, strict=False)
-                    ):
-                        if _order_name != _curve.mnemonic:
-                            issues.append(
-                                f"LASFile: curves_order[{_i}] = "
-                                f"{_order_name!r} does not match "
-                                f"curves[{_i}].mnemonic = "
-                                f"{_curve.mnemonic!r}.  Post-construction "
-                                f"curves_order mutation has desynced the "
-                                f"column order from the curve definitions."
-                            )
-                            break
+                    _section_defined: set[str] = set()
+                    for _ds in self.data_sections:
+                        for _sc in _ds.section_curves:
+                            _section_defined.add(_sc.mnemonic.upper())
+                    _undef = sorted(
+                        {_n for _n in self.curves_order if _n.upper() not in _section_defined}
+                    )
+                    if _undef:
+                        issues.append(
+                            f"LASFile: curves_order entries {_undef} have "
+                            f"no curve definition in 'curves' or any "
+                            f"data_section's section_curves.  "
+                            f"Post-construction mutation may have removed "
+                            f"the definitions; the writer would emit these "
+                            f"curves without a header and the data would "
+                            f"be silently lost on re-read."
+                        )
             # I2-13: detect data keys curves_order no longer covers after a
             # post-construction mutation (deletion/reorder).  __post_init__
             # validates this at construction; validate() must re-check on
             # post-construction state.
             if self.curves_order and (self.logs or self.string_data):
-                _order_set = set(self.curves_order)
+                # MOD-2 (WL-M1 class): the writer's data-key lookup is
+                # case-insensitive, so compare upper-cased while reporting
+                # the ACTUAL key casing — a case-variant state (curves_order
+                # ['dept','GR'], logs keyed DEPT/GR) is emitted, not orphaned.
+                _order_set_upper = {c.upper() for c in self.curves_order}
                 _all_keys = set(self.logs.keys()) | set(self.string_data.keys())
-                _orphaned = _all_keys - _order_set
+                _all_keys_upper = {k.upper() for k in _all_keys}
+                _orphaned = {k for k in _all_keys if k.upper() not in _order_set_upper}
                 if _orphaned:
                     issues.append(
                         f"LASFile: curve(s) {sorted(_orphaned)} have data "
@@ -4033,7 +4507,14 @@ class LASFile:
             for _i, (_order_name, _curve) in enumerate(
                 zip(las_file.curves_order, las_file.curves, strict=False)
             ):
-                if _order_name != _curve.mnemonic:
+                # MOD-3 (WL-M1/F-04 class): the writer resolves curves_order
+                # vs curves case-insensitively (_writer_base.py:1554-1581),
+                # so compare upper-cased — a case-variant entry ('dept' vs
+                # mnemonic 'DEPT') from the to_dict→from_dict roundtrip of
+                # the supported case-variant state is not a mismatch; a
+                # genuinely different curve name still differs after
+                # upper-casing.
+                if _order_name.upper() != _curve.mnemonic.upper():
                     raise ValueError(
                         f"curves_order[{_i}] = {_order_name!r} does not match "
                         f"curves[{_i}].mnemonic = {_curve.mnemonic!r}"
@@ -4450,9 +4931,19 @@ class LASFile:
                 # curves_order.  Keys in either dict that do not appear
                 # in curves_order are orphaned — the writer silently
                 # drops them, producing data loss on roundtrip.
+                # MOD-3 (WL-M1/F-04 class): the writer's per-section
+                # data/string_data lookup is case-insensitive, so the
+                # orphaned-key set-ops compare upper-cased while reporting
+                # the ACTUAL key casing — the case-variant state from a
+                # to_dict→from_dict roundtrip (curves_order ['dept','GR'],
+                # data keyed DEPT/GR) is supported, not orphaned.  A
+                # genuinely distinct key still differs after upper-casing.
                 _curve_k = set(_ds_curves_order) if _ds_curves_order else set()
+                _curve_k_upper = {c.upper() for c in _curve_k}
                 if ds_string_data:
-                    _str_orphaned = set(ds_string_data.keys()) - _curve_k
+                    _str_orphaned = sorted(
+                        {k for k in ds_string_data.keys() if k.upper() not in _curve_k_upper}
+                    )
                     if _str_orphaned:
                         ds_name = ds_dict.get("name", "<unknown>")
                         raise ValueError(
@@ -4462,7 +4953,9 @@ class LASFile:
                             f"mnemonic."
                         )
                 if ds_data:
-                    _num_orphaned = set(ds_data.keys()) - _curve_k
+                    _num_orphaned = sorted(
+                        {k for k in ds_data.keys() if k.upper() not in _curve_k_upper}
+                    )
                     if _num_orphaned:
                         ds_name = ds_dict.get("name", "<unknown>")
                         raise ValueError(
@@ -4475,10 +4968,21 @@ class LASFile:
                 # but not the reverse (curve_set - data_keys - string_keys).
                 # Uncovered curves are recoverable (writer pads null_value)
                 # so emit a warning rather than raising.
-                _num_keys = set(ds_data.keys()) if ds_data else set()
-                _str_keys = set(ds_string_data.keys()) if ds_string_data else set()
+                # MOD-3 (WL-M1/F-04 class): case-insensitive comparison —
+                # a case-variant curves_order entry backed by an uppercase
+                # data key is covered, not "will pad".
+                _num_keys_upper = {k.upper() for k in ds_data.keys()} if ds_data else set()
+                _str_keys_upper = (
+                    {k.upper() for k in ds_string_data.keys()} if ds_string_data else set()
+                )
                 if _curve_k:
-                    _uncovered = _curve_k - _num_keys - _str_keys
+                    _uncovered = sorted(
+                        {
+                            c
+                            for c in _curve_k
+                            if c.upper() not in _num_keys_upper and c.upper() not in _str_keys_upper
+                        }
+                    )
                     if _uncovered:
                         ds_name = ds_dict.get("name", "<unknown>")
                         warnings.warn(
@@ -4519,7 +5023,13 @@ class LASFile:
                     for _i, (_order_name, _sc) in enumerate(
                         zip(_ds_curves_order, ds_section_curves, strict=True)
                     ):
-                        if _order_name != _sc.mnemonic:
+                        # MOD-3 (WL-M1/F-04 class): the writer resolves the
+                        # per-section order case-insensitively, so compare
+                        # upper-cased — a case-variant entry ('dept' vs
+                        # section_curves mnemonic 'DEPT') is supported, not
+                        # a positional mismatch; a genuinely different curve
+                        # name still differs after upper-casing.
+                        if _order_name.upper() != _sc.mnemonic.upper():
                             ds_name = ds_dict.get("name", "<unknown>")
                             raise ValueError(
                                 f"curves_order[{_i}] = {_order_name!r} in section "
@@ -4690,9 +5200,17 @@ class LASFile:
             # F2-11: Validate string_data keys against curves_order
             # (matching per-section guard at lines 1995-2005).
             # Keys in string_data not in curves_order are orphaned.
+            # MOD-3 (WL-M1/F-04 class): the writer's data-key lookup is
+            # case-insensitive, so compare upper-cased while reporting the
+            # ACTUAL key casing — the case-variant state (curves_order
+            # ['dept','GR'], string_data keyed DEPT/GR) round-trips, not
+            # orphaned.  A genuinely distinct key still differs after
+            # upper-casing.
             if las_file.string_data and las_file.curves_order:
-                _order_s = set(las_file.curves_order)
-                _str_orphaned = set(las_file.string_data.keys()) - _order_s
+                _order_s_upper = {c.upper() for c in las_file.curves_order}
+                _str_orphaned = sorted(
+                    {k for k in las_file.string_data.keys() if k.upper() not in _order_s_upper}
+                )
                 if _str_orphaned:
                     raise ValueError(
                         f"string_data contains keys not in "
@@ -4809,8 +5327,15 @@ class LASFile:
                 # collision-avoidance (a kept-original key like 'LLS' that
                 # is itself a mnem_base entry would re-resolve to 'BFV' and
                 # produce a false "Missing keys" error).
-                _log_keys = set(las_file.logs.keys())
-                _order_keys = set(las_file.curves_order)
+                # MOD-3 (WL-M1/F-04 class): the writer's data-key lookup is
+                # case-insensitive (_writer_base.py:542 _lookup_data_array),
+                # so compare upper-cased while reporting the ACTUAL key
+                # casing — the case-variant state (curves_order ['dept','GR'],
+                # logs keyed DEPT/GR) round-trips, not "Extra keys".  A
+                # genuinely extra/missing curve still differs after
+                # upper-casing.
+                _log_keys_upper = {k.upper() for k in las_file.logs.keys()}
+                _order_keys_upper = {c.upper() for c in las_file.curves_order}
                 # M-28: Subtract string_data keys from the MISSING side
                 # only (stored keys are already normalized — see F-M-013
                 # comment above).  For LAS 1.2/2.0 files (and LAS 3.0 files
@@ -4820,9 +5345,22 @@ class LASFile:
                 # string_data legitimately has no log entry.  The "Extra
                 # keys" direction must NOT subtract: a log key with no
                 # curve definition is always an error.
-                _extra_log_keys = _log_keys - _order_keys
-                _str_data_keys = set(las_file.string_data.keys())
-                _missing_log_keys = _order_keys - _log_keys - _str_data_keys
+                _extra_log_keys = sorted(
+                    {k for k in las_file.logs.keys() if k.upper() not in _order_keys_upper}
+                )
+                _str_data_keys_upper = (
+                    {k.upper() for k in las_file.string_data.keys()}
+                    if las_file.string_data
+                    else set()
+                )
+                _missing_log_keys = sorted(
+                    {
+                        c
+                        for c in las_file.curves_order
+                        if c.upper() not in _log_keys_upper
+                        and c.upper() not in _str_data_keys_upper
+                    }
+                )
                 if _extra_log_keys or _missing_log_keys:
                     raise ValueError(
                         f"Log curve keys do not match curves_order. "
@@ -4998,7 +5536,13 @@ class _DevColumns(dict[str, NDArray[np.float64]]):
         # transposed matrix) would otherwise pass the length guards and
         # crash validate() with a raw IndexError on boolean-mask indexing.
         _check_column_array_like(value, f"DevFile column '{key}'")
-        arr = np.atleast_1d(np.asarray(value, dtype=np.float64))
+        # F-17: .copy() after coercion — np.atleast_1d(np.asarray(...))
+        # returns the SAME object for an already-float64 1-d ndarray, so
+        # ``dev.columns['MD_COPY'] = dev.columns['MD']`` previously aliased
+        # memory and mutating one silently corrupted the other (surviving
+        # to_dict/from_dict).  The wholesale path deepcopies (DevFile.
+        # __setattr__); item-level entry points now copy too.
+        arr = np.atleast_1d(np.asarray(value, dtype=np.float64)).copy()
         # Validate length consistency with existing columns.
         if self:
             existing_len = len(next(iter(self.values())))
@@ -5842,6 +6386,14 @@ class DevFile:
                     f"allowed ({MAX_CURVES})"
                 )
 
+            # F-18: defer an explicit column_order assignment until all
+            # columns are populated.  Assigning during the loop validated
+            # the order against PARTIALLY-populated dev.columns — a
+            # column_order key placed BEFORE the columns it references
+            # raised a spurious LASDataError even though the columns exist
+            # later in the dict (input-order-dependent from_dict).
+            _pending_column_order: list[str] | None = None
+
             for key, value in data.items():
                 # R7F-01 + MOD-11: _meta_ prefix roundtrip.  When to_dict
                 # detects a column name collision with a metadata key
@@ -5863,7 +6415,7 @@ class DevFile:
                         dev.source_file = _safe_str(value)
                     elif real_key == "column_order":
                         if value is None:
-                            dev.column_order = []
+                            _pending_column_order = []
                         elif isinstance(value, (str, bytes)):
                             # F-110: bytes bypasses the str guard in Python 3.
                             if isinstance(value, bytes):
@@ -5882,11 +6434,11 @@ class DevFile:
                                 # 'source_file' vs normalized 'SOURCE_FILE').
                                 _col_order = [_normalize_dev_column(value)]
                                 _actual_keys = {k.upper(): k for k in dev.columns}
-                                dev.column_order = [
+                                _pending_column_order = [
                                     _actual_keys.get(c.upper(), c) for c in _col_order
                                 ]
                             else:
-                                dev.column_order = [value]
+                                _pending_column_order = [value]
                         else:
                             _col_order = list(value)
                             # F2-31: Normalize column_order entries.
@@ -5904,7 +6456,7 @@ class DevFile:
                                     f"column_order has {len(_col_order)} entries, "
                                     f"maximum allowed is {MAX_CURVES - 1}."
                                 )
-                            dev.column_order = _col_order
+                            _pending_column_order = _col_order
                     # Known metadata key — handled above, skip column
                     # processing.
                     continue
@@ -5932,7 +6484,7 @@ class DevFile:
                         dev.source_file = _safe_str(value)
                     elif key == "column_order":
                         if value is None:
-                            dev.column_order = []
+                            _pending_column_order = []
                         elif isinstance(value, (str, bytes)):
                             # F-110: bytes bypasses the str guard in Python 3.
                             if isinstance(value, bytes):
@@ -5951,11 +6503,11 @@ class DevFile:
                                 # 'source_file' vs normalized 'SOURCE_FILE').
                                 _col_order = [_normalize_dev_column(value)]
                                 _actual_keys = {k.upper(): k for k in dev.columns}
-                                dev.column_order = [
+                                _pending_column_order = [
                                     _actual_keys.get(c.upper(), c) for c in _col_order
                                 ]
                             else:
-                                dev.column_order = [value]
+                                _pending_column_order = [value]
                         else:
                             _col_order = list(value)
                             # F2-31: Normalize column_order entries.
@@ -5973,7 +6525,7 @@ class DevFile:
                                     f"column_order has {len(_col_order)} entries, "
                                     f"maximum allowed is {MAX_CURVES - 1}."
                                 )
-                            dev.column_order = _col_order
+                            _pending_column_order = _col_order
                 else:
                     # F-I2-M02: None guard — np.array(None, dtype=np.float64)
                     # silently produces nan, consistent with string data guards.
@@ -6022,6 +6574,30 @@ class DevFile:
                 if len(set(_col_len.values())) > 1:
                     raise ValueError(f"DevFile columns have inconsistent lengths: {_col_len}")
 
+            # F-18: apply an explicit column_order AFTER all columns are
+            # populated — assigning during the loop validated the order
+            # against PARTIALLY-populated dev.columns (a column_order key
+            # before the columns it references raised a spurious
+            # LASDataError even though the columns exist later in the
+            # dict).  _DevColumnOrder's existence check now runs against
+            # the complete columns; genuinely orphaned entries are still
+            # rejected by this assignment AND the F2-32 orphan check below.
+            # M6/F-18 regression: MERGE with the order _DevColumns
+            # __setitem__ built during the loop instead of replacing it.
+            # Replacing dropped columns that were auto-appended after the
+            # explicit order was deferred — a PARTIAL-order dict like
+            # {"MD": [...], "column_order": ["MD"], "GR": [...]}
+            # previously auto-appended 'GR' (sync → ['MD', 'GR']) but the
+            # replacement reverted to ['MD'] and __post_init__ raised
+            # "column_order and columns keys do not match".  Preserve the
+            # pre-fix behavior: explicit entries take their specified
+            # positions; columns not named in the explicit order are
+            # auto-appended in insertion order.
+            if _pending_column_order:
+                _merged_order = list(_pending_column_order) + [
+                    _k for _k in dev.columns if _k not in _pending_column_order
+                ]
+                dev.column_order = _merged_order
             # If column_order wasn't in the dict, infer from Python 3.7+ dict order
             if not dev.column_order:
                 dev.column_order = list(dev.columns.keys())

@@ -44,6 +44,7 @@ from .models import (
     LASFile,
     ParameterEntry,
     ParameterZone,
+    _GuardedList,
 )
 
 logger = logging.getLogger(__name__)
@@ -315,7 +316,12 @@ DATA_LINE_PATTERN = re.compile(
     # sign, and '.' so common real-world LAS units survive roundtrip:
     # "PHIT.%", "TEMP.°C", "RT.ohm.m" (previously the whole curve line
     # failed to match and the curve + data column were silently dropped).
-    r"(?P<unit>[\w\-/.%°]*)"  # unit: optional; letters/digits, -, /, ., %, °
+    # F-23 (b): also accept ':' so colon-in-unit lines parse (lasio
+    # parity: "TIME.hh:mm 23:15 21-JAN-2001 : Time Logger" → unit
+    # 'hh:mm', value '23:15 21-JAN-2001').  The unit→value `\s++` is
+    # possessive, so a ':' in the unit cannot be misread as the colon
+    # separator (the separator requires whitespace before the colon).
+    r"(?P<unit>[\w\-/.%°:]*)"  # unit: optional; letters/digits, -, /, ., %, °, :
     r"\s++"  # whitespace separator (PARS-11: possessive — no backtracking)
     r"(?P<value>.*?)"  # value: non-greedy to find FIRST structurally-valid colon (P-04)
     r"(\s++:\s*+|:(?=\s)|(?<=\s):(?!.*:(?=\s|$))\s*+|:\s*$)"  # colon separator (PARS-11)
@@ -331,11 +337,37 @@ VALUE_ONLY_PATTERN = re.compile(
     r"\."
     # N-I-22: widened unit class (same as DATA_LINE_PATTERN) — accepts %,
     # degree sign, and '.' in units.
-    r"(?P<unit>[\w\-/.%°]*)"
+    r"(?P<unit>[\w\-/.%°:]*)"
     r"\s+"
     r"(?P<value>.+?)"
     r"\s*$"
 )
+
+# F-23 (a): lasio missing-period fallback (lasio name_missing_period_re).
+# Some real-world files omit the dot between mnemonic and colon
+# ("HOLE DIA : 85.7").  lasio's documented behavior: "take everything left
+# of the first colon as the mnemonic and everything right as the value,
+# with empty unit and description" — whitespace inside the mnemonic is
+# preserved ("HOLE DIA").  Only reached after the dot-anchored patterns
+# fail, so well-formed ``MNEM.UNIT VALUE : DESC`` lines are unaffected.
+# N-I-22/colon-in-unit: the unit class in the dot-anchored patterns accepts
+# ':' so ``TIME.hh:mm`` units parse (unit='hh:mm', lasio parity) instead of
+# dropping the whole line.
+NO_PERIOD_PATTERN = re.compile(
+    r"^\s*"
+    r"(?P<mnemonic>[\w\-]+(?:\s+[\w\-]+)*)"  # name may contain spaces (HOLE DIA)
+    r"(?P<unit>)"  # no unit in the missing-period form — empty for caller parity
+    r"\s*:\s*"
+    r"(?P<value>.*?)"  # everything right of the first colon
+    r"\s*$"
+)
+
+# F-23 (a): The mnemonic grammar the CurveDefinition/ParameterEntry models
+# can represent (mirrors DATA_LINE_PATTERN's mnemonic group and
+# models._MNEMONIC_PATTERN).  A missing-period line whose mnemonic fails
+# this (e.g. "HOLE DIA" with a space) is kept out of those models — they
+# reject embedded spaces at construction.
+_MNEMONIC_LINE_RE = re.compile(r"^[\w\-]+(?:\[\d+\])?$")
 
 # I2-10/I2-11 (pre-fix audit F-06): Prefix portion of DATA_LINE_PATTERN
 # used by _manual_colon_scan to locate the unit→value whitespace run.
@@ -348,7 +380,7 @@ _MANUAL_PREFIX_RE = re.compile(
     r"(?P<mnemonic>[\w\-]+(?:\[\d+\])?)"  # mnemonic with optional [N] array index
     r"\s*"  # optional whitespace before dot
     r"\."
-    r"(?P<unit>[\w\-/.%°]*)"  # unit class (same as DATA_LINE_PATTERN)
+    r"(?P<unit>[\w\-/.%°:]*)"  # unit class (same as DATA_LINE_PATTERN, incl. ':')
 )
 
 # LAS 3.0: Array notation pattern (e.g., NMR[1], RUN[2])
@@ -586,6 +618,11 @@ def _desanitize_las_value(value: str) -> str:
     2. ``value.lstrip().startswith("#")`` → writer inserts ``_`` after
        leading whitespace → ``" _#..."`` → reverse: remove the ``_``
        between whitespace and ``#``.
+
+    F-25: Case 2 applies ONLY when the ``_#`` is the first non-whitespace
+    content (preceded exclusively by leading whitespace) — the writer's
+    actual escape scope.  Internal ``" _#"`` content the writer never
+    escapes (e.g. ``"ACME _#Oil Corp"``) is preserved unchanged.
     """
     if not _is_desanitize_enabled():
         return value
@@ -601,9 +638,20 @@ def _desanitize_las_value(value: str) -> str:
     if value.startswith("_~"):
         return value[1:]
     # Case 2: whitespace-prefixed value with sanitized _# (e.g., " _#comment")
-    idx = value.find("_#")
-    if idx > 0 and value[idx - 1].isspace():
-        return value[:idx] + value[idx + 1 :]
+    # F-25: Restrict to the writer's ACTUAL escape scope.  The writer
+    # (_sanitize_las_value, _writer_base.py:122-127) escapes '#' ONLY at
+    # value start (startswith("#")) or after LEADING whitespace
+    # (lstrip().startswith("#")).  The previous blanket
+    # ``value.find("_#") + whitespace-before`` unescaped INTERNAL " _#
+    # content the writer never escapes (e.g. "ACME _#Oil Corp" → "ACME
+    # #Oil Corp") — a silent write→read corruption.  Only an "_#" preceded
+    # exclusively by leading whitespace (the FIRST non-whitespace content)
+    # is a writer escape artifact; mid-value "_#" is preserved, mirroring
+    # _desanitize_other_line's scoped restore.
+    stripped = value.lstrip()
+    if len(stripped) < len(value) and stripped.startswith("_#"):
+        leading = value[: len(value) - len(stripped)]
+        return leading + stripped[1:]
     return value
 
 
@@ -829,6 +877,18 @@ class LASParser:
         # Initialized here (not only in _reset) so tests that monkeypatch
         # _reset() still get the attribute.
         self._section_pipe_targets: list[str | None] = []
+        # DR-M2 (Stage 10): per-section cache of the standalone-mnemonic-
+        # header match set, keyed by (section_curve_start_idx,
+        # section_curve_end_idx, len(las_file.curves)).  The M12/DR-M2
+        # 2..section_count partial-header clause lets short rows through the
+        # count gate, so the O(section_count) slice + mnemonic-set build must
+        # happen ONCE per section, not per data line — otherwise the F-22
+        # count-reject-fast property regresses (a 10-token row against a
+        # 100K-curve scope would pay O(100K) per row → CPU-exhaustion DoS
+        # returns).
+        self._mnemonic_header_scope_cache: dict[
+            tuple[int, int | None, int], tuple[set[str], bool]
+        ] = {}
 
     @property
     def data_line_count(self) -> int:
@@ -904,7 +964,11 @@ class LASParser:
         # F-P06: Re-process well entries parsed before ~V was known.
         # If the version turns out to be LAS 1.2, overwrite buffered
         # entries with the correct value/description swap.
-        self._replay_deferred_well()
+        # F-21: final=True — every section (including a trailing ~C block,
+        # whose range was recorded above) has been processed, so a deferred
+        # bare LOG_DATA group re-queued by a mid-parse flush can now be
+        # resolved against the complete curve list.
+        self._replay_deferred_well(final=True)
 
         # N-I-01: The missing-~V validation must be gated on the ACTUAL
         # parsed source, not `content.strip()`.  When callers pass `lines=`
@@ -1135,7 +1199,40 @@ class LASParser:
                     _dedup_curves.append(self.las_file.curves[_i])
             if len(_dedup_order) != len(self.las_file.curves_order):
                 self.las_file.curves_order = _dedup_order
-                self.las_file.curves = _dedup_curves
+                # F-29: LASFile.__setattr__ re-wraps logs/string_data/
+                # curves_order but NOT curves (models.py:3006-3057), so a
+                # plain-list assignment here permanently strips the
+                # _GuardedList mutation guard installed by __post_init__
+                # (models.py:3506-3510).  Post-parse
+                # las_file.curves.append("bad") would silently succeed and
+                # the writer would fail later with a confusing AttributeError.
+                # Re-wrap through _GuardedList (mirroring _WriterMutationGuard.
+                # _rewrap_guards) so the mutation guard survives the dedup.
+                self.las_file.curves = _GuardedList(
+                    _dedup_curves,
+                    _container_name="LASFile.curves",
+                    _expected_type=CurveDefinition,
+                )
+        elif not self.las_file.version.is_las30:
+            # F-30: Dedupe duplicate curve mnemonics during DIRECT parse for
+            # LAS 1.2/2.0.  _parse_curve appends every ~C line with no
+            # duplicate detection; the full reader path masks this because
+            # read_ascii_data() calls data_reader._deduplicate_curves()
+            # (rename-based: IK → IK_2) before reading data.  The semi-public
+            # LASParser.parse() API therefore produced a model with duplicate
+            # curves_order entries — validate(complete=True) reported 0 issues
+            # (its order checks don't detect duplicates) yet to_dict()→
+            # from_dict() raised LASDataError("Duplicate curve name 'IK'").
+            # Call the SAME rename-based dedup so the direct-parse model is
+            # from_dict-compatible and matches the full-reader model exactly.
+            # Idempotent: the reader's later call is a no-op when curves are
+            # already unique (data_reader.py:416-417).  Runs AFTER
+            # _state.validate() like the EXT-03 block above, so parser-state
+            # checks see the untrimmed curve list.  (LAS 3.0 top-level curves
+            # are handled by EXT-03's collapse semantics; the reader never
+            # renames LAS 3.0 top-level curves either — reader.py only calls
+            # read_ascii_data for non-3.0.)
+            _data_reader._deduplicate_curves(self.las_file, _stacklevel=3)
 
         return self.las_file
 
@@ -1172,6 +1269,20 @@ class LASParser:
         per_block_counts: list[int] = []
         in_curve = False
         curve_mnems: set[str] = set()
+        # F-24 (pre-fix audit A1/A2): dedicated distinct-curve counter —
+        # one per ~C curve-definition line, mirroring the reader's
+        # curve_count (len(las_file.curves_order), data_reader.py:897/912).
+        # NOT len(curve_mnems): that set includes original_mnemonic aliases
+        # (FIX-CONV-2 adds both _resolved and _raw at :1316/:1322), so it
+        # over-counts on mnem_base files (LLD→BFV) and a count guard built
+        # on it would re-introduce the F-24 phantom row.
+        curve_def_count = 0
+        # F-24 (pre-fix audit A4): string-curve counter — ~C lines declaring
+        # {S} or bare {A} (string data), mirroring the reader's all-string
+        # exclusion (len(string_curve_indices) == curve_count, :894-895).
+        # Version-independent per M-35: {S}/{A} classify string curves on
+        # both LAS 1.2/2.0 and 3.0 via _detect_string_curves.
+        string_curve_count = 0
         # FIX-CONV-2 (§4a): dict of first-seen raw mnemonic per RESOLVED
         # name — exact parity with _normalize_curve_mnemonic's
         # _resolved_curve_names (dict-based, not set-based).  The previous
@@ -1303,6 +1414,32 @@ class LASParser:
                         # ("DEPT."), and array suffix ("NMR[1]").
                         _raw = _curve_tokens[0].split(".", 1)[0].split("[", 1)[0].strip().upper()
                         if _raw:
+                            # M9 (F-24 regression): the parser DROPS some
+                            # ~C lines — multi-word no-period mnemonics
+                            # ("HOLE DIA : hole diameter") fail
+                            # _MNEMONIC_LINE_RE in _parse_curve.  Counting
+                            # a dropped line inflates curve_def_count, so
+                            # the F-24 count-equality header-skip predicate
+                            # below fails to skip a genuine full header row
+                            # → spurious "Pre-scan overcount" warning + F36
+                            # trim on valid files.  Mirror _parse_curve's
+                            # acceptance exactly: count only lines that
+                            # survive parsing.
+                            if not self._is_curve_line_accepted(stripped):
+                                continue
+                            # F-24: one distinct curve per definition line.
+                            curve_def_count += 1
+                            # F-24 (pre-fix audit A4): detect string curves
+                            # ({S} / bare {A}) for the all-string exclusion
+                            # via the same description-format extraction the
+                            # parser uses (DATA_LINE_PATTERN + FORMAT_SPEC_PATTERN).
+                            _desc_match = DATA_LINE_PATTERN.match(stripped)
+                            if _desc_match:
+                                _desc_text = _desc_match.group("description") or ""
+                                for _fmt, _off in FORMAT_SPEC_PATTERN.findall(_desc_text):
+                                    if _fmt.upper() == "S" or (_fmt.upper() == "A" and not _off):
+                                        string_curve_count += 1
+                                        break
                             _resolved = self._mnem_base_upper.get(_raw, _raw)
                             _prev_raw = _pre_scan_resolved_raws.get(_resolved)
                             if _prev_raw is not None and _prev_raw != _raw:
@@ -1336,11 +1473,51 @@ class LASParser:
                     # row (every token is a declared curve mnemonic) so it
                     # is NOT counted as a data line — mirroring
                     # data_reader._is_mnemonic_header_row.
+                    # F-24 (pre-fix audit) + DR-M1 (Stage 10, M12 residual):
+                    # mirror the reader's clauses VERBATIM so the two
+                    # predicates can never disagree:
+                    #   (a) token-count BOUNDS (reader :929) — since M12 the
+                    #       reader skips a PARTIAL mnemonic header ("DEPT GR"
+                    #       with 3 declared curves, 2..curve_count tokens).
+                    #       The pre-scan mirror must use the same
+                    #       min(2, curve_def_count)..curve_def_count range;
+                    #       strict equality counted the partial header as a
+                    #       data line → spurious "Pre-scan overcount" warning
+                    #       + F36 trim on valid files (the documented
+                    #       verbatim-mirror contract above was factually
+                    #       false post-M12).  F-01 (Stage 12, PSR-1
+                    #       residual): the lower bound is min(2, ...), NOT a
+                    #       flat 2 — a SINGLE-curve section's 1-token
+                    #       standalone mnemonic header row ("~A\nDEPT\n...")
+                    #       is a header on the reader side (min(2, 1) = 1)
+                    #       but a flat >= 2 gate counted it as data here,
+                    #       overcounting data_line_count by one → spurious
+                    #       "Pre-scan overcount" warning on every valid
+                    #       single-curve LAS 1.2/2.0 read.
+                    #   (b) first-line-of-section restriction (DR-M3: the
+                    #       reader gates its header-skip at current_line == 0).
+                    #       count == 0 here is the per-block analog of the
+                    #       reader's current_line == 0 (both increment only
+                    #       for processed data rows), so a mid-section
+                    #       all-mnemonic row is DATA on both sides — skipping
+                    #       it would silently lose data / shift columns.
+                    #   (c) all-string exclusion (reader :931-932) — rows
+                    #       in an all-string section are never headers.
+                    #       Count uses the dedicated distinct-curve counter
+                    #       (curve_def_count), never len(curve_mnems) —
+                    #       aliases would over-count on mnem_base files.
                     if curve_mnems:
                         _tokens = re.split(r"[\s,]+", stripped)
                         while _tokens and _tokens[-1] == "":
                             _tokens.pop()
-                        if _tokens and all(_tok.upper() in curve_mnems for _tok in _tokens):
+                        if (
+                            count == 0
+                            and _tokens
+                            and len(_tokens) >= min(2, curve_def_count)
+                            and len(_tokens) <= curve_def_count
+                            and string_curve_count != curve_def_count
+                            and all(_tok.upper() in curve_mnems for _tok in _tokens)
+                        ):
                             continue
                     count += 1
 
@@ -1351,6 +1528,27 @@ class LASParser:
         # Use the count from the first contiguous ~A block, matching
         # _read_normal's behavior (processes until first non-~A header).
         self._state.data_line_count = per_block_counts[0] if per_block_counts else 0
+
+    def _is_curve_line_accepted(self, line: str) -> bool:
+        """M9: whether ``_parse_curve`` would accept this ``~C`` line.
+
+        Mirrors the F-23 (a) no-period fallback at ``_parse_curve``'s entry
+        exactly: a dot-anchored match is accepted; a no-period match is
+        accepted only when its mnemonic can be represented by
+        ``CurveDefinition`` (``_MNEMONIC_LINE_RE`` — multi-word mnemonics
+        like "HOLE DIA" are dropped with a warning).  The pre-scan uses
+        this so its ``curve_def_count`` equals the number of curves the
+        parser actually produces — counting dropped lines inflated the
+        count and broke the F-24 header-skip parity (spurious
+        "Pre-scan overcount" warning + F36 trim on valid files).
+        """
+        match = self._match_data_line(line)
+        if match:
+            return True
+        match = self._match_data_line_no_period(line)
+        if match and not _MNEMONIC_LINE_RE.fullmatch(match.group("mnemonic")):
+            return False
+        return match is not None
 
     def _parse_line(self, line: str) -> None:
         """Route a single line to the appropriate section handler."""
@@ -1857,7 +2055,7 @@ class LASParser:
         # Unit is the contiguous unit chars before the first value
         # whitespace.  Value is everything after that whitespace.
         # M-70: Match the unit EXACTLY like the primary DATA_LINE_PATTERN
-        # (unit class `[\w\-/.%°]*` followed by `\s+`) against the
+        # (unit class `[\w\-/.%°:]*` followed by `\s+`) against the
         # UN-STRIPPED tail.  The primary regex sees the space after the dot
         # ("WELL. WELLNAME : d" → unit matches empty, `\s+` eats the space,
         # value = "WELLNAME").  The old letter-start requirement
@@ -1866,7 +2064,7 @@ class LASParser:
         # the value on >2000-char lines.  PD1-01's numeric guard is
         # preserved: a purely numeric tail ("123.45") leaves no whitespace
         # after the unit class, so `\s+` fails and the value falls through.
-        unit_match_result = re.match(r"([\w\-/.%°]*)(\s+)", after_dot)
+        unit_match_result = re.match(r"([\w\-/.%°:]*)(\s+)", after_dot)
         if unit_match_result:
             unit = unit_match_result.group(1)
             value = after_dot[unit_match_result.end() :].strip()
@@ -1899,6 +2097,30 @@ class LASParser:
             self._validate_data_line_fields(match)
             return match
         match = VALUE_ONLY_PATTERN.match(line)
+        if match:
+            self._validate_data_line_fields(match)
+            return match
+        return None
+
+    def _match_data_line_no_period(self, line: str) -> re.Match[str] | None:
+        """F-23 (a): lasio missing-period fallback for header lines.
+
+        Matches ``MNEM : VALUE`` (no dot) when the dot-anchored patterns
+        failed.  lasio's documented missing-period convention takes
+        everything left of the first colon as the mnemonic (spaces
+        preserved, e.g. ``HOLE DIA``) and everything right as the value,
+        with empty unit and description.
+
+        Only the WELL path uses this unconditionally — ``WellSection``
+        accepts multi-word keys via ``__setitem__``.  The CURVE and
+        PARAMETER paths call this and then drop the match when the
+        resulting mnemonic cannot be represented by their models (which
+        reject embedded spaces); dropping preserves the pre-fix behavior
+        instead of raising LASParseError for the whole file.
+        """
+        if len(line) > _SAFE_REGEX_LINE_LENGTH:
+            return None
+        match = NO_PERIOD_PATTERN.match(line)
         if match:
             self._validate_data_line_fields(match)
             return match
@@ -1946,7 +2168,7 @@ class LASParser:
         # value) → the caller emits the "Non-matching ~C line" warning instead
         # of creating a curve with an empty api_code (audit-flagged, acceptable).
         m = re.match(
-            r"^\s*(?P<mnemonic>[\w\-]+(?:\[\d+\])?)\s*\.(?P<unit>[\w\-/.%°]*)\s+(?P<value>.+)$",
+            r"^\s*(?P<mnemonic>[\w\-]+(?:\[\d+\])?)\s*\.(?P<unit>[\w\-/.%°:]*)\s+(?P<value>.+)$",
             line.rstrip(),
         )
         if m:
@@ -2285,6 +2507,7 @@ class LASParser:
         description: str | None,
         is_las12: bool,
         raw_mnemonic: str | None = None,
+        no_period: bool = False,
     ) -> None:
         """Store a well entry with version-appropriate value/description handling.
 
@@ -2295,6 +2518,12 @@ class LASParser:
         (used for PXM-01 collision-aware re-keying).  When None (older
         callers), the resolved *mnemonic* is used as the raw name, so
         collision detection degrades to plain duplicate detection.
+
+        *no_period* marks a line matched by the F-23 (a) missing-period
+        fallback (``MNEM : VALUE``).  In that form the FIRST colon is the
+        MNEM:VALUE separator, so the value must not be re-split by the
+        LAS 1.2 bare-colon CWLS logic below (L24 — a colon inside the
+        value like ``LOC : ACME:OIL`` must stay ``ACME:OIL``).
         """
         # PXM-01: Apply collision-aware well mnemonic resolution BEFORE any
         # storage so entries/units/descriptions all use the same key.  Two
@@ -2323,7 +2552,10 @@ class LASParser:
         # swap logic below (which requires `description is not None`) can
         # trigger.  Timestamp/datetime values like "12:34:56" or
         # "2026-07-19T12:34:56" must NOT be split.
-        if is_las12 and description is None and ":" in value:
+        # L24 (M10 region): a NO-PERIOD match ("LOC : ACME:OIL") already
+        # consumed its first colon as the MNEM:VALUE separator — the value is
+        # everything right of it and must not be re-split here.
+        if is_las12 and description is None and ":" in value and not no_period:
             _is_timestamp = ":" in value and "T" in value and bool(re.search(r"T\d{2}:", value))
             if not _is_timestamp:
                 # F-003: Check the full value for bare hh:mm[:ss]
@@ -2511,7 +2743,7 @@ class LASParser:
         if unit is not None:
             self.las_file.well.units[mnemonic] = unit
 
-    def _replay_deferred_well(self) -> None:
+    def _replay_deferred_well(self, final: bool = False) -> None:
         """Re-process well entries (and data lines) that were parsed before ~V was known.
 
         When ~W appears before ~V, entries are buffered without being stored.
@@ -2520,6 +2752,14 @@ class LASParser:
 
         F-M12: When data sections appear before ~V, data lines are buffered
         and replayed here after the version is known.
+
+        Args:
+            final: True when called at the END of parse() after every section
+                (including a trailing ~C block) has been processed.  When
+                False (a mid-parse flush, e.g. from _flush_ascii_data), a
+                deferred bare LOG_DATA section whose main-curve scope is not
+                yet recorded is RE-QUEUED instead of processed (F-21) — the
+                main ~C block may still appear later in the file.
         """
         if self._state.deferred_well_entries:
             is_las12 = _LASVersionSpec(self.las_file.version.vers).is_las12
@@ -2531,6 +2771,7 @@ class LASParser:
                     description=entry["description"],
                     is_las12=is_las12,
                     raw_mnemonic=entry["raw_mnemonic"],
+                    no_period=entry.get("no_period", "False") == "True",
                 )
             self._state.deferred_well_entries.clear()
 
@@ -2581,6 +2822,13 @@ class LASParser:
                 # caller can diagnose what failed (permanent data-loss
                 # path when clear() was unconditional in finally).
                 replay_successful = False
+                # F-21: Lines re-queued for a LATER replay.  A deferred bare
+                # LOG_DATA section whose main-curve scope is not yet recorded
+                # cannot be resolved against the current partial curve list;
+                # its tuples are moved here so the final replay (parse() →
+                # _replay_deferred_well(final=True), after the trailing ~C
+                # range is recorded) binds them to the COMPLETE curve list.
+                requeued_lines: list[tuple[str, str, int, str, int, int | None]] = []
                 try:
                     # Process each deferred group as its own DataSection.
                     # N-I-03/P-03: Use the per-group STORED section_idx
@@ -2625,6 +2873,35 @@ class LASParser:
                         # deferred path scopes identically to its
                         # non-deferred twin.
                         if curve_end == _DEFERRED_MAIN_CURVE_SCOPE:
+                            # M7 (F-21 incomplete fix): the "| CURVE" scope
+                            # sentinel means the pipe target was unresolved
+                            # at defer time (main curve block not yet
+                            # parsed).  At a MID-PARSE flush the main ~C
+                            # block may STILL not be parsed — resolving NOW
+                            # binds the group to the current PARTIAL curve
+                            # list (e.g. only the CORE_DEFINITION curves),
+                            # silently discarding the section's extra
+                            # columns.  Re-queue like the bare-~A variant
+                            # below; the final replay resolves the sentinel
+                            # against the COMPLETE main curve block once the
+                            # trailing ~C range is recorded.
+                            if (
+                                not final
+                                and "__MAIN__" not in self._state.definition_curve_ranges
+                                and "__MAIN_ALL__" not in self._state.definition_curve_ranges
+                            ):
+                                for _ln in raw_lines:
+                                    requeued_lines.append(
+                                        (
+                                            section_type,
+                                            _section_name,
+                                            section_idx,
+                                            _ln,
+                                            curve_start,
+                                            curve_end,
+                                        )
+                                    )
+                                continue
                             curve_start, curve_end = self._resolve_main_curve_scope()
                         elif curve_end == _DEFERRED_PIPE_SCOPE:
                             _pipe_target = self._deferred_pipe_targets.get(
@@ -2648,6 +2925,35 @@ class LASParser:
                                 curve_start, curve_end = self._state.definition_curve_ranges[
                                     "__MAIN__"
                                 ]
+                            elif (
+                                not final
+                                and "__MAIN__" not in self._state.definition_curve_ranges
+                                and "__MAIN_ALL__" not in self._state.definition_curve_ranges
+                            ):
+                                # F-21: The main ~C block has NOT been parsed
+                                # yet — this is a mid-parse flush (e.g. a
+                                # typed data section that appeared between
+                                # ~V and the main ~C).  Resolving the bare
+                                # LOG_DATA scope NOW would bind it to the
+                                # current PARTIAL curve list (e.g. only the
+                                # CORE_DEFINITION curves), silently discarding
+                                # the section's extra columns.  Re-queue the
+                                # group; the final replay (parse() →
+                                # _replay_deferred_well(final=True)) resolves
+                                # it against the complete curve list once the
+                                # trailing ~C range is recorded.
+                                for _ln in raw_lines:
+                                    requeued_lines.append(
+                                        (
+                                            section_type,
+                                            _section_name,
+                                            section_idx,
+                                            _ln,
+                                            curve_start,
+                                            curve_end,
+                                        )
+                                    )
+                                continue
                             else:
                                 curve_start, curve_end = self._resolve_main_curve_scope()
                         self._state.section_curve_start_idx = curve_start
@@ -2680,7 +2986,14 @@ class LASParser:
                         # all-null first row (PARS-04).
                         _filtered_lines: list[str] = []
                         for _ln in raw_lines:
-                            if self._is_standalone_mnemonic_header(_ln):
+                            # DR-M2/DR-M3 coordination: the same
+                            # first-line-of-section restriction as the
+                            # non-deferred branch — only while no data row
+                            # has been accumulated can a row be a standalone
+                            # mnemonic header.  A mid-section all-mnemonic
+                            # row is DATA (skipping it loses values / shifts
+                            # columns).
+                            if not _filtered_lines and self._is_standalone_mnemonic_header(_ln):
                                 warnings.warn(
                                     f"Standalone curve-mnemonic header row "
                                     f"encountered in deferred (pre-~V) data "
@@ -2733,8 +3046,11 @@ class LASParser:
                     # moved back inside the for loop (one per deferred group).
                     # F-A1: Only clear on success — preserve buffer on
                     # exception so callers can diagnose what failed.
+                    # F-21: Re-queued groups (whose main-curve scope was not
+                    # yet known) survive the successful replay; processed
+                    # groups are dropped.
                     if replay_successful:
-                        self._state.deferred_ascii_data_lines.clear()
+                        self._state.deferred_ascii_data_lines = requeued_lines
             else:
                 # F-021: Non-LAS 3.0 files — clear deferred lines to
                 # prevent false-positive _ParserState.validate() warnings
@@ -2754,6 +3070,29 @@ class LASParser:
         in ``self.las_file.well.units`` for roundtrip fidelity.
         """
         match = self._match_data_line(line)
+        no_period_match = False
+        if not match:
+            # F-23 (a): lasio missing-period lines ("LOC : ACME:OIL") have
+            # no dot; parse them (mnemonic left of first colon, value right,
+            # empty unit/description) instead of silently dropping the entry.
+            # M10 (F-23(a) regression): mirror the curve/param grammar guard
+            # — a multi-word mnemonic ("HOLE DIA") cannot be represented by
+            # WellSection (the writer's N-I-19 key validation rejects
+            # embedded spaces and the parser's ~W regex cannot roundtrip
+            # them), so keep the pre-fix drop-with-warning for those instead
+            # of storing a key the writer would crash on.
+            match = self._match_data_line_no_period(line)
+            if match and not _MNEMONIC_LINE_RE.fullmatch(match.group("mnemonic")):
+                match = None
+            elif match:
+                # L24 (M10 region): the no-period form already consumed the
+                # FIRST colon as the MNEM:VALUE separator — everything right
+                # of it is the value.  The LAS 1.2 bare-colon CWLS split in
+                # _store_well_entry (designed for the DOT-anchored
+                # "MNEM. DESC:VALUE" form) must NOT re-split a colon inside
+                # a no-period value ("LOC : ACME:OIL" → value must stay
+                # "ACME:OIL", not corrupt to "OIL").
+                no_period_match = True
         if not match:
             logger.warning(
                 "Non-matching ~W line in %s: %s",
@@ -2815,6 +3154,9 @@ class LASParser:
                     "unit": unit,
                     "value": value,
                     "description": description,  # type: ignore[dict-item]
+                    # Stored as a string ("True"/"False") because
+                    # _ParserState.deferred_well_entries is a dict[str, str].
+                    "no_period": str(no_period_match),
                 }
             )
             if len(self._state.deferred_well_entries) == 1:
@@ -2833,7 +3175,9 @@ class LASParser:
             # is_las12, once with correct in replay).
             return
 
-        self._store_well_entry(mnemonic, unit, value, description, is_las12, raw_mnemonic)
+        self._store_well_entry(
+            mnemonic, unit, value, description, is_las12, raw_mnemonic, no_period_match
+        )
 
     def _normalize_curve_mnemonic(self, raw_mnemonic: str) -> str:
         """Normalize a curve mnemonic through mnem_base, preserving identity
@@ -2917,6 +3261,15 @@ class LASParser:
         """
         match = self._match_data_line(line)
         if not match:
+            # F-23 (a): lasio missing-period lines ("HOLE DIA : 85.7").
+            # A single-word mnemonic ("GR : GAMMA") can be represented by
+            # CurveDefinition; a multi-word mnemonic ("HOLE DIA") cannot
+            # (models.py rejects embedded spaces) — keep the pre-fix
+            # drop-with-warning for those instead of raising LASParseError.
+            match = self._match_data_line_no_period(line)
+            if match and not _MNEMONIC_LINE_RE.fullmatch(match.group("mnemonic")):
+                match = None
+        if not match:
             logger.warning(
                 "Non-matching ~C line in %s: %s",
                 self.source_file or "<unknown>",
@@ -2931,6 +3284,14 @@ class LASParser:
         _original_cased = match.group("mnemonic").strip()
         raw_mnemonic = _original_cased.upper()
         unit = match.group("unit") or ""
+        # F-23 (b): The parser's unit class now accepts ':' so
+        # colon-in-unit lines ("TIME.hh:mm 23:15 ...") parse instead of
+        # being dropped.  CurveDefinition's unit grammar (models.py
+        # _UNIT_PATTERN) still rejects ':' — the writer never escapes a
+        # mid-unit colon, so a stored ':' unit would crash the model on
+        # write→read.  Strip the colon from the stored unit (the line's
+        # value/description — the data that matters — are preserved).
+        unit = unit.replace(":", "")
         api_code = match.group("value").strip() if match.group("value") else ""
         description = (
             match.group("description").strip()
@@ -3129,13 +3490,26 @@ class LASParser:
         # F-M-026: Wrap CurveDefinition construction to catch ValueError
         # from __post_init__ validation (e.g., empty mnemonic after
         # mnem_base normalization) and re-raise as LASParseError.
+        # F-34: Preserve case-only original mnemonics.  ``normalized`` is
+        # always uppercase (raw_mnemonic = _original_cased.upper(), and
+        # mnem_base resolution is case-insensitive), so comparing the
+        # file's original casing DIRECTLY against it keeps original_mnemonic
+        # whenever the file casing differs in ANY way — mnem_base
+        # normalization ("AK"→"DT") OR case alone ('dept'→'DEPT').  The
+        # previous ``_original_cased.upper() != normalized`` guard erased
+        # the case signal and cleared original_mnemonic for case-only
+        # differences, so the writer re-emitted the canonical casing
+        # instead of the file's (contradicting the F-01 comment above:
+        # "CurveDefinition.original_mnemonic reflects the file's casing").
+        # original_mnemonic is cleared only when it is byte-identical to
+        # the canonical mnemonic.
         try:
             curve = CurveDefinition(
                 mnemonic=normalized,
                 unit=unit,
                 api_code=api_code,
                 description=description,
-                original_mnemonic=_original_cased if _original_cased.upper() != normalized else "",
+                original_mnemonic=_original_cased if _original_cased != normalized else "",
                 data_format=data_format,
                 array_info=array_info,
             )
@@ -3167,6 +3541,13 @@ class LASParser:
         """
         match = self._match_data_line(line)
         if not match:
+            # F-23 (a): lasio missing-period lines ("MUD WT : 10").  Same
+            # grammar guard as _parse_curve — ParameterEntry also rejects
+            # embedded-space mnemonics.
+            match = self._match_data_line_no_period(line)
+            if match and not _MNEMONIC_LINE_RE.fullmatch(match.group("mnemonic")):
+                match = None
+        if not match:
             logger.warning(
                 "Non-matching ~P line in %s: %s",
                 self.source_file or "<unknown>",
@@ -3185,6 +3566,10 @@ class LASParser:
         # curve, parameter) have paired unescape.  Adding this closes the
         # seventh and final gap, ensuring "kg : m" survives write→re-parse.
         unit = _desanitize_las_value(_unescape_colons_for_las_value(unit))
+        # F-23 (b): strip ':' from the stored parameter unit — same model
+        # constraint as _parse_curve (ParameterEntry._UNIT_PATTERN rejects
+        # ':' and the writer never escapes a mid-unit colon).
+        unit = unit.replace(":", "")
         value = match.group("value").strip()
         description = (
             match.group("description").strip()
@@ -3462,13 +3847,21 @@ class LASParser:
         row is NOT data — consuming it produces a phantom all-null first
         row and shifts every value by one position (M-40).
 
-        Detection is deliberately strict to avoid false positives on real
-        data rows: the delimiter-split token count must equal the number
-        of curves in the section's scope AND every token must match one of
-        those curves' mnemonics (mnem_base-normalized or the file's
+        Detection accepts FULL and PARTIAL header rows: the delimiter-split
+        token count must be between min(2, section_count) and the number of
+        curves in the section's scope (min(2, section_count)..section_count
+        — a partial header like "DEPT,GR" with three declared curves is
+        still a header, mirroring the LAS 1.2/2.0 reader's min(2,
+        curve_count)..curve_count clause in
+        data_reader._is_mnemonic_header_row; the 1-token minimum applies
+        only to single-curve sections, PSR-1) AND every token must match one
+        of those curves' mnemonics (mnem_base-normalized or the file's
         original casing).  Numeric data rows fail the mnemonic match; a
         genuine duplicate of the header row is indistinguishable from a
-        header row by design (skipping it is the correct reading).
+        header row by design (skipping it is the correct reading).  The
+        callers restrict this predicate to the section's first line(s), so
+        a mid-section all-mnemonic data row is never skipped (DR-M3
+        coordination).
 
         F-19: An all-string section (every curve is {S} or plain {A}
         string data) is excluded entirely — there every data row is a
@@ -3502,28 +3895,67 @@ class LASParser:
             return False
         start = self._state.section_curve_start_idx
         end = self._state.section_curve_end_idx
+        # F-22: Check the token count against the curve-range SIZE before
+        # slicing.  Slicing first allocated a full CurveDefinition-ref list
+        # per data line (up to 100K refs at MAX_CURVES) for every line whose
+        # token count would reject it — an attacker-controlled 10M-line file
+        # burned ~47 min of CPU before MAX_TOTAL_ELEMENTS fired.  The
+        # count-only check rejects most rows without allocating anything.
         if end is None:
-            section_curves = self.las_file.curves[start:]
+            section_count = len(self.las_file.curves) - start
         else:
-            section_curves = self.las_file.curves[start:end]
-        if len(tokens) != len(section_curves):
+            section_count = end - start
+        # DR-M2 (Stage 10): a PARTIAL mnemonic header (2..section_count
+        # tokens — e.g. "DEPT,GR" with 3 declared curves) is still a header,
+        # mirroring the LAS 1.2/2.0 reader's 2..curve_count clause
+        # (data_reader._is_mnemonic_header_row).  Strict equality consumed
+        # the partial header as a data row → phantom all-null first row +
+        # value shift on the LAS 3.0 path.
+        # PSR-1 (Stage 11): the DR-M2 2-token minimum regressed a section
+        # with EXACTLY ONE curve — a standalone 1-token mnemonic header row
+        # ('DEPT') failed `len(tokens) < 2` and was consumed as data →
+        # phantom all-null first row + value shift (HEAD's strict equality
+        # 1==1 handled it correctly).  The lower bound is min(2,
+        # section_count): a single-curve section still recognizes its
+        # 1-token header, while multi-curve sections keep the 2-token
+        # minimum (M-02 single-token string-data protection — the F-19
+        # all-string exclusion handles the single-curve STRING section, and
+        # a numeric single-curve mnemonic row is unambiguously a header).
+        if len(tokens) < min(2, section_count) or len(tokens) > section_count:
             return False
-        # F-19: Never treat a row as a mnemonic header in an all-string
-        # section.  Every data value there is a string, so a value may
-        # legitimately coincide with a curve mnemonic (e.g. LITH data rows
-        # 'LITH'/'SHALE' in a {S} section).  A mnemonic-coincident row is
-        # indistinguishable from a header row by content alone, and dropping
-        # it destroys genuine data (M-40 regression).  Only a section with at
-        # least one NUMERIC curve is structurally unambiguous — there a
-        # numeric data row can never be all-mnemonic, so mnemonic-coincidence
-        # remains a reliable header signal.
-        if all(_is_string_data_curve(curve) for curve in section_curves):
+        # DR-M2: cache the section's mnemonic match set per scope — the
+        # 2..section_count clause lets short rows through the count gate, so
+        # the O(section_count) slice + set build must happen ONCE per section,
+        # not per data line (preserves the F-22 count-reject-fast property
+        # for 100K-curve scopes: a 10-token row would otherwise pay
+        # O(100K) per row → the CPU-exhaustion DoS F-22 fixed returns).
+        _scope_key = (start, end, len(self.las_file.curves))
+        _cached = self._mnemonic_header_scope_cache.get(_scope_key)
+        if _cached is None:
+            if end is None:
+                section_curves = self.las_file.curves[start:]
+            else:
+                section_curves = self.las_file.curves[start:end]
+            # F-19: Never treat a row as a mnemonic header in an all-string
+            # section.  Every data value there is a string, so a value may
+            # legitimately coincide with a curve mnemonic (e.g. LITH data rows
+            # 'LITH'/'SHALE' in a {S} section).  A mnemonic-coincident row is
+            # indistinguishable from a header row by content alone, and dropping
+            # it destroys genuine data (M-40 regression).  Only a section with at
+            # least one NUMERIC curve is structurally unambiguous — there a
+            # numeric data row can never be all-mnemonic, so mnemonic-coincidence
+            # remains a reliable header signal.
+            _all_string = all(_is_string_data_curve(curve) for curve in section_curves)
+            _expected: set[str] = set()
+            for curve in section_curves:
+                _expected.add(curve.mnemonic.upper())
+                if curve.original_mnemonic:
+                    _expected.add(curve.original_mnemonic.upper())
+            _cached = (_expected, _all_string)
+            self._mnemonic_header_scope_cache[_scope_key] = _cached
+        expected, all_string = _cached
+        if all_string:
             return False
-        expected: set[str] = set()
-        for curve in section_curves:
-            expected.add(curve.mnemonic.upper())
-            if curve.original_mnemonic:
-                expected.add(curve.original_mnemonic.upper())
         return all(tok.upper() in expected for tok in tokens)
 
     def _parse_ascii_data(self, line: str) -> None:
@@ -3614,7 +4046,13 @@ class LASParser:
         # Skipping at accumulation time keeps the LAS 3.0 array sizing
         # (actual_count in _las30_data) correct with no pre-scan impact
         # (data_line_count is only consumed by the LAS 1.2/2.0 reader).
-        if self._is_standalone_mnemonic_header(line):
+        # DR-M2/DR-M3 coordination: the header-skip applies only to the
+        # section's FIRST line(s) — the accumulated list is empty exactly
+        # while no data row has been consumed, mirroring the LAS 1.2/2.0
+        # reader's current_line == 0 gate (data_reader DR-M3).  A
+        # mid-section all-mnemonic row is DATA; skipping it silently
+        # drops values / shifts columns.
+        if not self._state.ascii_data_lines and self._is_standalone_mnemonic_header(line):
             warnings.warn(
                 f"Line {self._line_no}: standalone curve-mnemonic header "
                 f"row encountered inside ~A data section "
@@ -3846,6 +4284,11 @@ class LASParser:
             # (out-of-order group).
             per_type_param_after_def: list[str] = []
 
+            def _def_type_display(_def_type: str) -> str:
+                if _def_type == "__MAIN__":
+                    return "the main curve definition (~C or ~CURVE)"
+                return f"~{_def_type}"
+
             for _seq_idx, label in enumerate(self._state.section_sequence):
                 section_word = label.split(":")[0]
                 is_data = (
@@ -3907,14 +4350,31 @@ class LASParser:
                     else:
                         _def_type = "__MAIN__"
 
-                    if _def_type not in _defs_seen:
-                        _def_display = (
-                            f"~{_def_type}"
-                            if _def_type != "__MAIN__"
-                            else "the main curve definition (~C or ~CURVE)"
+                    # F-20: Mirror the resolver's __MAIN__ fallback for
+                    # BARE (no-pipe) sections.  The resolver (parser.py
+                    # :1579-1591) resolves a bare ~A/~ASCII to
+                    # LOG_DEFINITION only when that _Definition exists;
+                    # otherwise it falls back to __MAIN__ (the H-01 fix).
+                    # The checker previously derived LOG_DEFINITION from
+                    # _SECTION_TYPE_MAP and fired two spurious warnings on
+                    # every valid bare-~A + ~C file ("~A before
+                    # ~LOG_DEFINITION" + "main curve definition has no
+                    # corresponding data section") — the same bare section
+                    # the resolver had already scoped to __MAIN__.  Only
+                    # flag data-before-definition when NEITHER the derived
+                    # definition NOR the main block is available yet (the
+                    # resolver's unbounded fallback).
+                    if _def_type not in _defs_seen and _def_type != "__MAIN__":
+                        if "__MAIN__" in _defs_seen:
+                            _def_type = "__MAIN__"
+                        else:
+                            per_type_data_before_def.append(
+                                f"~{section_word} before {_def_type_display(_def_type)}"
+                            )
+                    elif _def_type not in _defs_seen:
+                        per_type_data_before_def.append(
+                            f"~{section_word} before {_def_type_display(_def_type)}"
                         )
-                        per_type_data_before_def.append(f"~{section_word} before {_def_display}")
-
                     # M-08: Track which definition types have data sections
                     # for forward validation (Definition→Data).
                     _data_types_seen.add(_def_type)

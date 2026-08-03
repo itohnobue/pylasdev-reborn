@@ -5,6 +5,40 @@ All notable changes to pylasdev will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.4] — 2026-08-03
+
+### Production Check
+
+A fourth full production-check audit (34-agent discovery across 11 scopes plus 5
+boundary intersections, adversarial verification, implementation, review, and a 6-pass
+FIX convergence loop) fixed **35 verified defects** plus **27 post-fix convergence
+findings** across the source tree, with additional regression tests. The regression
+suite now passes 1655 tests (0 failures, 1 skipped DEV-writer placeholder, 2
+xfail-pinned documented encoding residuals) at 87% coverage; ruff and mypy are clean.
+
+### Fixed
+
+- **Parser**: lasio-convention line shapes (no-period, colon-in-unit) now parsed;
+  pre-scan/reader header-skip predicates aligned (partial mnemonic headers no longer
+  produce phantom rows or data shift); deferred replay and pipe-scoped sections fixed;
+  CPU-exhaustion slice-before-check eliminated; sanitize `_#` scope corrected;
+  direct-parse duplicate-curve dedup added; guarded-container preservation on EXT-03 dedup
+- **Models**: guarded-dict/deepcopy correctness, 0-d array handling, `data_format`
+  normalization parity, leaf-field mutation guards, `DevFile.from_dict`
+  order-independence, silent data-loss gates, case-insensitive roundtrip parity
+- **DEV reader**: DUG Pattern B sentinel/count-match guards, numeric null sentinels,
+  EW/NS offset semantics, thousands-separator decimal variants
+- **Data reader**: wrap-detection gate corrected on both LAS 2.0/3.0 paths, partial
+  mnemonic-header recognition, `_#` desanitize parity
+- **Writer**: `~C`/`~A` divergence warning, dedup-key parity, case-insensitive data
+  lookup, empty `curves_order` data-loss guard, LAS 3.0 metadata-only curve
+  preservation, FIRST-wins curve resolution, VERS normalization
+- **Encoding**: codec-derived inflator classification, cp866/cp1252
+  Western-vs-Cyrillic rescue corrections, context-based discriminator
+- **Compare**: int64 precision beyond 2^53, masked-vs-NaN path consistency
+- **Mnemonic base**: GZ2-GZ5 chain correction, Cyrillic РС→RS resistivity mapping
+- **LAS 3.0**: spec-form array `{A:N }` tolerance
+
 ## [2.0.3] — 2026-08-02
 
 ### Production Check

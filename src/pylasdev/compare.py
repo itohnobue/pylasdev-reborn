@@ -72,13 +72,51 @@ def _allclose_symmetric(
     NaN is treated as equal to NaN and ``inf`` to ``inf`` (with the same
     sign) — matching ``np.allclose(..., equal_nan=True)`` semantics.
 
-    Integer operands are promoted to float64 before the diff/abs/tol
-    computation (mirroring ``np.isclose``'s own promotion via
-    ``np.result_type(y, 1.)``): native-dtype int64 subtraction/abs wraps
-    in two's complement for large magnitudes (``abs(-2**63)`` stays
-    negative), which would otherwise produce wrong "equal" verdicts for
-    far-apart integer values (F-17).
+    Integer operands are NOT promoted to float64: float64 can represent
+    integers exactly only up to 2^53, so promotion would collapse
+    genuinely different int64/uint64 values above 2^53 (F-07).  When
+    BOTH operands are integer-dtype they are compared exactly (integer
+    values are exact, so rtol/atol are ignored for int-int pairs);
+    promotion to float64 happens only when at least one operand is
+    floating-point, where the float operand already bounds the
+    representable precision (mirroring ``np.isclose``'s own promotion
+    via ``np.result_type(y, 1.)``) and native-dtype int64 subtraction/
+    abs would wrap in two's complement for large magnitudes
+    (``abs(-2**63)`` stays negative) — F-17.
+
+    MaskedArray operands are unwrapped by mask before the numeric
+    comparison: a masked position matches only another masked position
+    (never an unmasked value), and masked positions never participate
+    in the tolerance/value check.  Unwrapping here (rather than
+    converting to float64-filled-NaN) preserves the full integer
+    precision of unmasked data.
     """
+    # Unwrap MaskedArray operands by mask.  Both positions must be
+    # masked (or both unmasked) to match; masked positions are
+    # equal-by-construction and skipped by the value check below.
+    mask1 = np.ma.getmaskarray(arr1) if isinstance(arr1, np.ma.MaskedArray) else None
+    mask2 = np.ma.getmaskarray(arr2) if isinstance(arr2, np.ma.MaskedArray) else None
+    if mask1 is not None:
+        arr1 = np.ma.getdata(arr1)
+    if mask2 is not None:
+        arr2 = np.ma.getdata(arr2)
+    if mask1 is not None or mask2 is not None:
+        m1 = mask1 if mask1 is not None else np.zeros(arr2.shape, dtype=bool)
+        m2 = mask2 if mask2 is not None else np.zeros(arr1.shape, dtype=bool)
+        if not np.array_equal(m1, m2):
+            return False
+        keep = ~m1
+        arr1 = arr1[keep]
+        arr2 = arr2[keep]
+        if arr1.size == 0:
+            return True
+
+    if arr1.dtype.kind in "iu" and arr2.dtype.kind in "iu":
+        # Exact integer comparison: no float64 promotion (collapses
+        # values above 2^53) and no native int64 diff/abs (wraps in
+        # two's complement for far-apart values, F-17).
+        return bool(np.array_equal(arr1, arr2))
+
     if arr1.dtype.kind in "iu":
         arr1 = arr1.astype(np.float64)
     if arr2.dtype.kind in "iu":
@@ -138,12 +176,10 @@ def _compare_arrays(
             logger.warning("Array values mismatch at '%s'", label)
             return False
     else:
-        # MaskedArray IS-A ndarray — convert before np.allclose so masked
-        # values are filled with NaN (not compared at face value).
-        if isinstance(arr1, np.ma.MaskedArray):
-            arr1 = arr1.astype(np.float64).filled(np.nan)  # type: ignore[attr-defined]  # MaskedArray.astype preserves mask
-        if isinstance(arr2, np.ma.MaskedArray):
-            arr2 = arr2.astype(np.float64).filled(np.nan)  # type: ignore[attr-defined]  # MaskedArray.astype preserves mask
+        # MaskedArray IS-A ndarray — masks are unwrapped inside
+        # _allclose_symmetric (masked == masked, masked never matches
+        # an unmasked value), which preserves the full integer precision
+        # of unmasked data (F-07).
         try:
             if not _allclose_symmetric(arr1, arr2, rtol, atol):
                 logger.warning("Array values mismatch at '%s'", label)
@@ -308,9 +344,13 @@ def compare_las_dicts(
 def _has_nan(obj: Any) -> bool:
     """Check if obj or any nested element is NaN or masked.
 
-    Masks are treated as NaN-equivalent because masked values are
-    filled with NaN before comparison (``_compare_arrays``) and then
-    matched via equal_nan=True.
+    Masks are treated as NaN-equivalent: a masked value means "no
+    data", like NaN.  Lists containing either cannot be compared by
+    direct equality (NaN != NaN, and masked comparisons are
+    ambiguous), so callers route them to per-element comparison.
+    Numeric arrays carry masks through to ``_allclose_symmetric``,
+    which unwraps them by mask (a masked position matches only
+    another masked position) instead of NaN-filling (F-07).
     """
     if isinstance(obj, (float, np.floating)):
         return obj != obj
@@ -336,16 +376,25 @@ def _has_nan(obj: Any) -> bool:
 
 
 def _list_to_numeric_array(lst: list[Any]) -> np.ndarray | None:
-    """Convert a homogeneous numeric list to a float64 ndarray.
+    """Convert a homogeneous numeric list to an ndarray.
 
     All elements must be real numbers (int/float/np.number/np.bool_),
     numeric ndarrays, or masked values (filled with NaN).  Returns None
     for empty lists and lists containing non-numeric elements (strings,
     dicts, tuples, None, ragged list-of-arrays, ...) so callers fall
     back to element-wise comparison.
+
+    Integer-only lists are converted to int64 (exact integer
+    comparison) rather than float64, which cannot represent int64 values
+    above 2^53 (F-07).  A single float element forces float64 — the
+    float element bounds the representable precision anyway.  Lists
+    containing masked integer items cannot be represented in an integer
+    array (NaN fill requires a float dtype) and fall back to
+    element-wise comparison instead of crashing.
     """
     if not lst:
         return None
+    all_int = True
     for item in lst:
         if isinstance(item, np.ndarray):
             # MaskedArray IS-A ndarray (including the masked scalar
@@ -353,19 +402,70 @@ def _list_to_numeric_array(lst: list[Any]) -> np.ndarray | None:
             # numeric dtype required either way.
             if item.dtype.kind not in "fiu":
                 return None
-        elif isinstance(item, (int, float, np.integer, np.floating, np.bool_)):
+            if item.dtype.kind in "f":
+                all_int = False
+        elif isinstance(item, (int, np.integer, np.bool_)):
             continue
+        elif isinstance(item, (float, np.floating)):
+            all_int = False
         else:
             return None
-    # Fill masked elements with NaN explicitly (avoids numpy's
-    # "converting a masked element to nan" warning and mirrors the
-    # MaskedArray handling in _compare_arrays).
-    cleaned = [
-        np.ma.filled(item, np.nan) if isinstance(item, np.ma.MaskedArray) else item for item in lst
-    ]
     try:
+        # Fill masked elements with NaN for the plain numeric
+        # conversion (avoids numpy's "converting a masked element to
+        # nan" warning).  This NaN-fill is NOT the comparison
+        # semantics: _compare_lists re-applies the masks via
+        # _list_to_numeric_masked so masked positions are unwrapped by
+        # mask like the array path (masked == masked only) instead of
+        # being conflated with genuine NaN (M-33/F-07).
+        cleaned = [
+            np.ma.filled(item, np.nan) if isinstance(item, np.ma.MaskedArray) else item
+            for item in lst
+        ]
+        if all_int:
+            return np.asarray(cleaned, dtype=np.int64)
         return np.asarray(cleaned, dtype=np.float64)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a Python int beyond the int64 range; TypeError/
+        # ValueError: masked integer items that cannot be NaN-filled into
+        # an integer array.  Fall back to element-wise comparison.
+        return None
+
+
+def _list_to_numeric_masked(lst: list[Any]) -> np.ma.MaskedArray | None:
+    """Convert a homogeneous numeric list with masked items to a MaskedArray.
+
+    ``_list_to_numeric_array`` NaN-fills masked items, which conflates
+    a masked position ("no data") with a genuine NaN value — making
+    masked-vs-NaN compare True while the array path (which unwraps by
+    mask in ``_allclose_symmetric``) says False.  This variant preserves
+    the mask: the returned MaskedArray keeps each item's data and mask,
+    so the mask-unwrap logic applies identically to the list path (a
+    masked position matches only another masked position, never an
+    unmasked value or NaN).
+
+    Returns None when the list has no masked items (callers use the
+    plain ``_list_to_numeric_array`` result) or when the list cannot be
+    converted to a numeric array (non-numeric elements, ragged
+    list-of-arrays, ...) — the caller falls back to element-wise
+    comparison.
+    """
+    if not any(isinstance(item, np.ma.MaskedArray) for item in lst):
+        return None
+    data: list[Any] = []
+    mask: list[Any] = []
+    for item in lst:
+        if isinstance(item, np.ma.MaskedArray):
+            data.append(np.ma.getdata(item))
+            mask.append(np.ma.getmaskarray(item))
+        elif isinstance(item, (int, np.integer, np.bool_, float, np.floating, np.ndarray)):
+            data.append(item)
+            mask.append(False)
+        else:
+            return None
+    try:
+        return np.ma.array(np.asarray(data), mask=np.asarray(mask, dtype=bool))
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -388,6 +488,18 @@ def _compare_lists(
     arr1 = _list_to_numeric_array(l1)
     arr2 = _list_to_numeric_array(l2)
     if arr1 is not None and arr2 is not None:
+        # M-33/F-07: preserve masks from list items so the list path
+        # matches the array path.  _list_to_numeric_array NaN-fills
+        # masked items, which would make masked-vs-NaN compare True
+        # while the array path (mask-unwrap in _allclose_symmetric)
+        # says False.  Re-apply the masks when either list carries
+        # masked items.
+        masked1 = _list_to_numeric_masked(l1)
+        masked2 = _list_to_numeric_masked(l2)
+        if masked1 is not None:
+            arr1 = masked1
+        if masked2 is not None:
+            arr2 = masked2
         return _compare_arrays(arr1, arr2, label, rtol, atol)
 
     try:

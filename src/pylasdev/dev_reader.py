@@ -50,6 +50,27 @@ _DEV_SENTINELS: frozenset[str] = frozenset(
     }
 )
 
+# Numeric null sentinels recognized in DEV data lines — values that
+# indicate missing/absent data rather than real measurements.  The DEV
+# format has NO declared-NULL mechanism (unlike LAS 2.0's NULL well
+# entry), so these industry-standard numeric sentinels are treated like
+# the text sentinels in ``_DEV_SENTINELS``: they map to NaN on read so
+# they do not pollute the trajectory or trigger spurious data-quality
+# warnings (F-04).  Values confirmed by the DEV research report:
+# -999.25 is the LAS 2.0 standard default NULL, with -999/-9999 common
+# plain-integer variants; deviation files inherit them from LAS-based
+# log suites.  Only NEGATIVE values are sentinels — positive magnitudes
+# like "999" are genuine data (extra-column rows use them as real
+# values, e.g. the I2-16 tests).
+_DEV_NUMERIC_SENTINELS: frozenset[float] = frozenset(
+    {
+        -999.0,
+        -999.25,
+        -9999.0,
+        -9999.25,
+    }
+)
+
 # Characters that Python's splitlines() treats as line breaks beyond \n and \r.
 # When present in file content, they cause splitlines() to produce fake section
 # headers and corrupt parsed data.  Matches the full character class used by
@@ -91,10 +112,17 @@ _DEV_ALIASES: dict[str, str] = {
     "AZM": "AZI",  # Petrel azimuth (abbreviated)
     # Easting (X) variants
     "UTMX": "X",
-    "EW": "X",  # Petrel east-west
+    # F-05: EW is Petrel east-west OFFSET footage, not the absolute easting.
+    # Aliasing it to X fabricated X_2 columns with misleading duplicate
+    # warnings on files carrying BOTH absolute coordinates and offsets
+    # ("MD TVD X Y EW NS") and silently reinterpreted small offset values
+    # as absolute UTM coordinates.  Keep it as its own identity, exactly
+    # like the DX/DY offset pair below (M-21).
+    "EW": "EW",  # Petrel east-west offset (distinct from absolute X)
     # Northing (Y) variants
     "UTMY": "Y",
-    "NS": "Y",  # Petrel north-south
+    # F-05: NS is Petrel north-south OFFSET footage (see EW above).
+    "NS": "NS",  # Petrel north-south offset (distinct from absolute Y)
     # Self-mappings — canonical names must map to themselves
     # so that lowercased canonical names (e.g. "md", "azi") are
     # normalised to uppercase rather than silently preserving the
@@ -326,6 +354,33 @@ _THOUSANDS_GROUP_BARE_RE = re.compile(r"^\d{3}$")
 _THOUSANDS_NUMBER_RE = re.compile(r"^[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?(?:[eE][+-]?\d+)?$")
 
 
+def _normalize_thousands_token(token: str) -> str | None:
+    """Return the comma-stripped numeric form of a thousands-separated
+    number token, or ``None`` when the token is not one.
+
+    Single source of truth for "what is a thousands number and what is its
+    normalized value", consulted by BOTH detection (:func:`_is_thousands_number`)
+    and conversion (:func:`_dev_to_finite_float`) so the two grammars can
+    never drift (F-06: DEV-05 widened detection to decimal/exponent variants
+    while conversion stayed bare-integer, silently dropping ``1,234.5`` to
+    NaN with only the generic failure counter).
+
+    The grammar is exactly :data:`_THOUSANDS_NUMBER_RE`: a leading group of
+    1-3 digits (optionally signed), comma groups of exactly three, optional
+    decimal/exponent part (``"1,234"``, ``"12,345.6"``, ``"-1,234,567.8"``,
+    ``"1,234E3"``).  A 4+ digit leading group (``"1000,234.5"``) is NOT a
+    valid thousands format — it is a genuine extra column (F-07) — so it
+    returns ``None``.
+
+    Returns:
+        The token with every comma removed (``"1,234.5"`` → ``"1234.5"``)
+        when it is a full thousands token, otherwise ``None``.
+    """
+    if _THOUSANDS_NUMBER_RE.match(token) is None:
+        return None
+    return token.replace(",", "")
+
+
 def _is_thousands_number(token: str) -> bool:
     """Whether a token is a full thousands-separated number.
 
@@ -334,7 +389,7 @@ def _is_thousands_number(token: str) -> bool:
     A 4+ digit leading group ("1000,234.5") is NOT a valid thousands
     format — it is a genuine extra column (F-07), so it is not matched.
     """
-    return _THOUSANDS_NUMBER_RE.match(token) is not None
+    return _normalize_thousands_token(token) is not None
 
 
 def _convert_comma_decimal(value: str) -> str:
@@ -404,24 +459,65 @@ def _dev_to_finite_float(
     ``_thousands_counter`` so the summary warning fires loudly — never a
     silent locale conversion.  1-2 digit V-07 locale decimals
     (``"1,00"``/``"1,50"``) still convert normally below.
+
+    F-06: The thousands gate now uses the shared token-normalization
+    grammar (:func:`_normalize_thousands_token`) instead of the bare
+    ``_THOUSANDS_GROUP_RE``.  DEV-05 had widened DETECTION to the full
+    decimal/exponent grammar while conversion stayed bare, so
+    ``1,234.5``/``1,234,567.8``/``1,234E3`` were recognized as numeric
+    data but silently dropped to NaN at conversion.  Policy: a
+    thousands token carrying a decimal or exponent part is UNAMBIGUOUS
+    (it cannot be a V-07 locale decimal, which uses 1-2 fractional
+    digits and no dot/exponent) and ALWAYS converts — never NaN — in
+    every delimiter context, counted in ``_thousands_counter`` so the
+    specific thousands warning fires.  The ambiguous BARE form
+    (``"1,234"``) keeps the documented M-25/I2-17 delimiter-aware
+    policy above.  The "never silent" contract is centralized: any
+    token the shared grammar recognizes is either converted to a value
+    or counted in ``_thousands_counter`` with a loud warning — never a
+    silent NaN with only the generic failure counter.
+
+    F-04: Industry-standard numeric null sentinels (``-999``,
+    ``-999.25``, ``-9999``, ``-9999.25``) map to the missing-data value
+    (``null_value``, NaN on every DEV read path) exactly like the text
+    sentinels — they indicate absent data, not real measurements, and
+    leaving them as values pollutes the trajectory and triggers spurious
+    data-quality warnings.
     """
-    if _THOUSANDS_GROUP_RE.match(value_str) is not None:
-        # M-25/I2-17: a 3-digit comma group is a THOUSANDS separator in
-        # EVERY non-comma-delimited file, semicolon included.  Read it as
-        # the thousands value (strip the comma) so a US-locale file is not
-        # silently corrupted 1000x, and count it so the summary warning
-        # fires loudly.
+    normalized = _normalize_thousands_token(value_str)
+    if normalized is not None:
+        # F-06: full thousands token — bare "1,234" AND the decimal/
+        # exponent variants "1,234.5" / "1,234,567.8" / "1,234E3".
+        if _thousands_counter is not None:
+            _thousands_counter[0] += 1
+        if (not _comma_as_thousands) or "." in value_str or "e" in value_str.lower():
+            # Unambiguous forms (decimal/exponent) always convert; the
+            # semicolon delimiter reads the bare thousands value (I2-17).
+            value_str = normalized
+        # else: space/tab bare "1,234" stays unconverted (NaN below) with
+        # the loud M-25 thousands summary warning — never a silent
+        # locale conversion.
+    elif _THOUSANDS_GROUP_RE.match(value_str) is not None:
+        # 4+ digit leading group ("1000,234") matches the legacy bare
+        # gate but NOT the full thousands grammar (F-07: a genuine extra
+        # column).  Preserve the pre-F-06 delimiter-aware behavior
+        # unchanged (counted in _thousands_counter, comma stripped only
+        # in semicolon mode).
         if _thousands_counter is not None:
             _thousands_counter[0] += 1
         if not _comma_as_thousands:
             value_str = value_str.replace(",", "")
     else:
         value_str = _convert_comma_decimal(value_str)
-    return _to_finite_float(
+    result = _to_finite_float(
         value_str,
         null_value,
         _failure_counter=_failure_counter,
     )
+    # F-04: map numeric null sentinels to the missing-data value.
+    if result in _DEV_NUMERIC_SENTINELS:
+        return null_value
+    return result
 
 
 def _is_valid_thousands_leading_group(token: str) -> bool:
@@ -772,6 +868,27 @@ def _pick_headerless_delimiter(hdr: str, max_tokens: int) -> str:
     if best_total < 2:
         return " "
     return best
+
+
+def _looks_like_dev_header(tokens: list[str]) -> bool:
+    """Whether a line's tokens look like DEV column names rather than a
+    descriptive title.
+
+    Column headers are short alphabetic mnemonics (``"MD TVD X Y"``,
+    ``"MDKB TVDSS X Y"``).  Descriptive titles are natural-language
+    prose (``"Deviation survey for Well-1"``) with longer words, digits,
+    or punctuation.  Used to resolve the Pattern B count-match ambiguity
+    (F-03): a real header keeps the V-01/V-03 simple-format contract
+    (all-float third line = ragged data rows), while a TITLE over an
+    all-float third line is a count-prefix headerless file.
+
+    Args:
+        tokens: Whitespace-split tokens of the candidate line.
+
+    Returns:
+        True when every token is alphabetic and at most 6 characters.
+    """
+    return bool(tokens) and all(t.isalpha() and len(t) <= 6 for t in tokens)
 
 
 def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int]:
@@ -1171,10 +1288,48 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 pass
             else:
                 third_tokens = content_entries[2][1].split(maxsplit=_max_tokens)
-                # Primary check — any non-float token in the third line
-                # means it's a header (text column names).
-                if third_tokens and any(not _is_float_token(t) for t in third_tokens):
+                # F-03: Primary check mirrors Pattern A's M-24 sentinel
+                # guard (:1063-1071) — any non-float token means a text
+                # column header, EXCEPT when every non-float token is a
+                # known missing-data sentinel ("na", "null", ...).  A
+                # count-prefix headerless file whose first data row
+                # carries a sentinel (e.g. title + "4" + "1.0 2.0 3.0
+                # na") is DATA with missing values, not a DUG header —
+                # returning DUG consumed that row as fabricated column
+                # names and LOST its values (F-03 1a).  The float
+                # detection is comma-decimal/thousands aware, matching
+                # Pattern A and the rest of detection.
+                _non_float_third = [
+                    t
+                    for t in third_tokens
+                    if not (_is_float_token_comma_decimal(t) or _is_thousands_number(t))
+                ]
+                if _non_float_third and not all(
+                    t.lower().strip() in _DEV_SENTINELS for t in _non_float_third
+                ):
                     return ("dug", 3)
+                # F-03: Count-match heuristic mirroring Pattern A's
+                # I2F-001/N-I-24 count-match branch (:1089).  When the
+                # third line is all-float (or sentinel-bearing data) AND
+                # the count matches the token count AND content[0] is a
+                # descriptive TITLE (not a real column header), the shape
+                # is a count-prefix headerless file with a title line:
+                # return ("headerless", 2) so Pass 2 skips the title and
+                # the count line and derives columns from the first REAL
+                # data line (data-preserving, mirroring Pattern A).
+                # Without this guard a DUG-B with a numeric column line
+                # fell through to ("simple", 1), fabricating the title as
+                # a header and shifting the count/data rows (F-03 1b).
+                # The ``_looks_like_dev_header`` gate preserves the
+                # V-01/V-03 contract: a real header ("MD TVD X Y") over
+                # an all-float third line stays simple (ragged first data
+                # row NaN-filled by Pass 2).
+                if (
+                    len(content_entries) >= 4
+                    and col_count == len(third_tokens)
+                    and not _looks_like_dev_header(first_tokens)
+                ):
+                    return ("headerless", 2)
                 # V-01 / V-03 (G9): An all-float third line is DATA, not a
                 # DUG header.  The F-21 count-match / count-mismatch numeric
                 # column-name heuristics misdetect a normal header file with

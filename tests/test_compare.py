@@ -1310,3 +1310,85 @@ class TestE08DataSectionsSymmetricGuards:
         d1 = {"data_sections": [{"DEPT": np.array([1.0, 2.0])}]}
         d2 = {"data_sections": [{"DEPT": np.array([1.0, 2.0])}]}
         assert compare_las_dicts(d1, d2) is True
+
+
+class TestListToNumericArrayIntDtype:
+    """F-07: _list_to_numeric_array must preserve integer precision.
+
+    Pre-fix every homogeneous numeric list was converted to float64,
+    which cannot represent int64 values above 2^53.  All-integer lists
+    now become int64 (exact); a float element forces float64.
+    """
+
+    def test_all_int_list_converts_to_int64(self) -> None:
+        from pylasdev.compare import _list_to_numeric_array
+
+        arr = _list_to_numeric_array([2**53, 2**53 + 1])
+        assert arr is not None
+        assert arr.dtype.kind == "i"
+        assert arr.tolist() == [2**53, 2**53 + 1]
+
+    def test_mixed_int_float_list_stays_float64(self) -> None:
+        from pylasdev.compare import _list_to_numeric_array
+
+        arr = _list_to_numeric_array([1, 2.5])
+        assert arr is not None
+        assert arr.dtype.kind == "f"
+
+    def test_int_list_overflowing_int64_falls_back(self) -> None:
+        """Python ints beyond int64 range can't be exact in int64; the
+        list falls back to element-wise comparison instead of crashing."""
+        from pylasdev.compare import _list_to_numeric_array
+
+        assert _list_to_numeric_array([2**70]) is None
+        assert compare_las_dicts({"x": [2**70]}, {"x": [2**70]}) is True
+        assert compare_las_dicts({"x": [2**70]}, {"x": [2**70 + 1]}) is False
+
+
+class TestListToNumericMasked:
+    """M2: _list_to_numeric_masked preserves list-item masks so the
+    list path compares masked positions by mask (like the array path)
+    instead of NaN-filling them (which conflates masked with NaN)."""
+
+    def test_no_masked_items_returns_none(self) -> None:
+        from pylasdev.compare import _list_to_numeric_masked
+
+        assert _list_to_numeric_masked([1.0, 2.0]) is None
+
+    def test_masked_item_preserves_mask(self) -> None:
+        from pylasdev.compare import _list_to_numeric_masked
+
+        ma = _list_to_numeric_masked([1.0, np.ma.array(2.0, mask=True)])
+        assert ma is not None
+        assert np.ma.is_masked(ma[1])
+        assert not np.ma.is_masked(ma[0])
+        # The data value is preserved (not NaN-filled) so unmasked
+        # positions keep full precision (F-07).
+        assert ma[0] == 1.0
+
+    def test_masked_int_item_keeps_integer_dtype(self) -> None:
+        from pylasdev.compare import _list_to_numeric_masked
+
+        ma = _list_to_numeric_masked([np.ma.array(5, mask=True), 3])
+        assert ma is not None
+        assert ma.dtype.kind == "i"
+        assert np.ma.is_masked(ma[0])
+
+    def test_non_numeric_item_returns_none(self) -> None:
+        from pylasdev.compare import _list_to_numeric_masked
+
+        assert _list_to_numeric_masked([np.ma.array(2.0, mask=True), "x"]) is None
+
+    def test_compare_lists_masked_vs_nan_false(self) -> None:
+        """The list path agrees with the array path: a masked position
+        never matches a NaN (pre-fix this returned True via NaN-fill)."""
+        assert _compare_lists([np.ma.array(2.0, mask=True)], [np.nan], "test", 1e-7, 0.0) is False
+
+    def test_compare_lists_masked_vs_masked_true(self) -> None:
+        """M-33 preserved at the helper level."""
+        assert (
+            _compare_lists(
+                [np.ma.array(2.0, mask=True)], [np.ma.array(99.0, mask=True)], "test", 1e-7, 0.0
+            )
+            is True
+        )

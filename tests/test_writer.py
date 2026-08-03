@@ -3055,6 +3055,62 @@ class TestG8FixGroup:
         )
         assert "~Core_Definition" in content
 
+    def test_f28_core_only_metadata_only_curve_preserved(self, tmp_path: Path) -> None:
+        """F-28: a metadata-only top-level curve survives in ~C for CORE-only files.
+
+        When ALL data_sections are non-LOG_DATA with section_curves
+        (curves_in_definitions=True), the section curves belong in the
+        typed ~Core_Definition block — but a top-level curve with no data
+        anywhere (e.g. TEMP) must still be written to ~C with a warning.
+        Pre-fix the M-79 loop was gated on `not curves_in_definitions`
+        and ~C was left empty, silently dropping the curve's metadata on
+        re-read with zero warnings.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["CORE_DEPTH", "CORE_VAL"]
+        las.curves.append(CurveDefinition(mnemonic="CORE_DEPTH", unit="M"))
+        las.curves.append(CurveDefinition(mnemonic="CORE_VAL", unit=""))
+        las.curves.append(
+            CurveDefinition(mnemonic="TEMP", unit="degC", description="metadata only")
+        )
+
+        section = DataSection(
+            name="Core[1]",
+            section_type="CORE_DATA",
+            curves_order=["CORE_DEPTH", "CORE_VAL"],
+            section_curves=[
+                CurveDefinition(mnemonic="CORE_DEPTH", unit="M"),
+                CurveDefinition(mnemonic="CORE_VAL", unit=""),
+            ],
+            data={
+                "CORE_DEPTH": np.array([100.0]),
+                "CORE_VAL": np.array([1.5]),
+            },
+        )
+        las.data_sections.append(section)
+
+        out = tmp_path / "f28_core.las"
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+        m79 = [str(w.message) for w in rec if "definition but no data" in str(w.message)]
+        assert len(m79) == 1, f"expected one M-79 warning for TEMP, got: {m79}"
+
+        content = out.read_text(encoding="utf-8")
+        curve_block = content.split("~CURVE INFORMATION", 1)[1].split("~", 1)[0]
+        # Section curves must NOT be duplicated into ~C (W-01).
+        assert "CORE_DEPTH" not in curve_block, f"section curve duplicated in ~C: {curve_block!r}"
+        # The metadata-only curve must survive in ~C.
+        assert "TEMP.degC" in curve_block, f"metadata-only curve missing from ~C: {curve_block!r}"
+        assert "~Core_Definition" in content
+
+        back = read_las_file_as_object(out)
+        back_curve = next((c for c in back.curves if c.mnemonic == "TEMP"), None)
+        assert back_curve is not None, "TEMP metadata lost on re-read"
+        assert back_curve.unit == "degC", f"TEMP unit lost: {back_curve.unit!r}"
+
     # --- N-I-15: ~C fallback must warn for section curves absent from top-level ---
 
     def test_ni15_warns_when_section_curve_absent_from_top_level(self, tmp_path: Path) -> None:
@@ -4182,3 +4238,515 @@ class TestWriterFixBatchW010708101112:
         ds = back.data_sections[0]
         np.testing.assert_allclose(ds.data["DEPT"], [100.0, 110.0])
         np.testing.assert_allclose(ds.data["GR"], [75.0, 80.0])
+
+    # ── F-31: case-variant duplicate resolution must be FIRST-wins ─────
+
+    def test_f31_case_variant_duplicate_first_wins(self, tmp_path: Path) -> None:
+        """F-31: case-variant duplicate mnemonics resolve FIRST-wins.
+
+        _section_emission_pairs built by_upper as a LAST-wins dict
+        comprehension while the sibling _effective_section_curves uses
+        FIRST-wins setdefault.  With section_curves=[DEPT/M, dept/FT] and
+        curves_order=['DEPT','dept'], the FIRST entry resolved to the WRONG
+        definition (dept/FT) pre-fix — the written ~Log_Definition declared
+        the first column dept.FT and re-read silently re-attributed the
+        DEPT data column to the FT-unit curve.  Post-fix the first entry
+        resolves to DEPT/M.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        section = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "dept"],
+            section_curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"),
+                CurveDefinition(mnemonic="dept", unit="FT", data_format="F"),
+            ],
+            data={
+                "DEPT": np.array([100.0, 110.0]),
+            },
+        )
+        las.data_sections.append(section)
+
+        out = tmp_path / "f31_case.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+
+        content = out.read_text(encoding="utf-8")
+        log_def = content.split("~Log_Definition", 1)[1].split("~", 1)[0]
+        first_col = next((ln for ln in log_def.splitlines() if ln.strip()), "")
+        # The first column's definition must be DEPT.M — not dept.FT.
+        assert "DEPT.M" in first_col, f"first column definition wrong: {first_col!r}"
+
+        back = read_las_file_as_object(out)
+        ds = back.data_sections[0]
+        np.testing.assert_allclose(ds.data["DEPT"], [100.0, 110.0], err_msg="DEPT data corrupted")
+        # The surviving section curve keeps the FIRST definition's unit (M).
+        assert ds.section_curves[0].unit == "M", (
+            f"section curve unit corrupted: {ds.section_curves[0].unit!r}"
+        )
+
+
+# ── F-26/F-27/F-32/F-36: writer-base findings ────────────────────────
+
+
+class TestFixWriterBaseF26273236:
+    """Regression tests for writer-base findings:
+    F-26  metadata-only curve → fabricated null column on re-read
+    F-27  dedup key diverges from emitted mnemonic on LAS 1.2/2.0
+    F-32  case-variant curves_order data-key lookup (LAS 3.0 + legacy)
+    F-36  empty curves_order + populated logs → silent full data loss
+    """
+
+    def test_f26_metadata_only_curve_divergence_warns(self, tmp_path: Path) -> None:
+        """F-26: a metadata-only curve (in curves, absent from
+        curves_order — legal per models.py:2858-2862) is emitted to ~C
+        but gets no ~A column; the write must warn that the ~C/~A column
+        counts diverge so re-read will fabricate a null-padded column.
+
+        Pre-fix the write was silent; re-read fabricated
+        METADATA=[-999.25,-999.25] from a file whose ~A never declared it.
+        """
+        las = LASFile(
+            version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+            curves_order=["DEPT", "GR"],
+            curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M"),
+                CurveDefinition(mnemonic="GR", unit="GAPI"),
+                CurveDefinition(mnemonic="METADATA", unit=""),
+            ],
+            logs={
+                "DEPT": np.array([100.0, 101.0]),
+                "GR": np.array([75.0, 80.0]),
+            },
+        )
+        las.well["NULL"] = "-999.25"
+
+        out = tmp_path / "f26_metadata.las"
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+        assert any("have no data column" in str(w.message) for w in rec), (
+            f"no ~C/~A divergence warning: {[str(w.message) for w in rec]}"
+        )
+
+        content = out.read_text(encoding="utf-8")
+        curve_block = content.split("~CURVE INFORMATION", 1)[1].split("~", 1)[0]
+        assert curve_block.count("METADATA.") == 1, f"METADATA missing from ~C: {curve_block!r}"
+        header_line = next(ln for ln in content.splitlines() if ln.startswith("~A"))
+        # "~A DEPT GR" → 3 tokens, i.e. 2 data columns for 3 ~C curves.
+        assert len(header_line.split()) == 3, f"~A should have 2 columns: {header_line!r}"
+
+    def test_f27_legacy_array_curve_dedup_no_duplicate_lines(self, tmp_path: Path) -> None:
+        """F-27: a reader-renamed array curve (IK_2 with
+        original_mnemonic='IK' + array_info) on LAS 2.0 must NOT emit two
+        identical IK lines in ~C.
+
+        Pre-fix the dedup key appended [N] unconditionally (IK vs IK[1])
+        while the emitter wrote IK without the bracket on LAS 1.2/2.0, so
+        both curves emitted 'IK' — duplicate ~C lines, structurally
+        invalid, silently written.
+        """
+        las = LASFile(
+            version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+            curves_order=["IK", "IK_2"],
+            curves=[
+                CurveDefinition(mnemonic="IK", unit="OHMM"),
+                CurveDefinition(
+                    mnemonic="IK_2",
+                    unit="OHMM",
+                    original_mnemonic="IK",
+                    data_format="A",
+                    array_info=ArrayElementInfo(base_name="IK", index=1, time_offset=0.0),
+                ),
+            ],
+            logs={
+                "IK": np.array([1.0, 2.0]),
+                "IK_2": np.array([10.0, 11.0]),
+            },
+        )
+        las.well["NULL"] = "-999.25"
+
+        out = tmp_path / "f27_array_dedup.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+
+        content = out.read_text(encoding="utf-8")
+        curve_block = content.split("~CURVE INFORMATION", 1)[1].split("~", 1)[0]
+        assert curve_block.count("IK.OHMM") == 1, f"duplicate IK lines in ~C: {curve_block!r}"
+        assert "IK_2.OHMM" in curve_block, f"IK_2 missing from ~C: {curve_block!r}"
+
+        back = read_las_file_as_object(out)
+        np.testing.assert_allclose(back.logs["IK"], [1.0, 2.0])
+        np.testing.assert_allclose(back.logs["IK_2"], [10.0, 11.0])
+
+    def test_f32_las30_case_variant_curves_order_data_preserved(self, tmp_path: Path) -> None:
+        """F-32 (LAS 3.0): a lowercase curves_order entry ('dept')
+        resolves the DEPT definition case-insensitively, so the DATA-key
+        lookup must be case-insensitive too.  Pre-fix the written rows
+        null-filled DEPT ('-999.25,75' / '-999.25,80') because 'dept'
+        never matched the 'DEPT' data key.
+        """
+        las = LASFile(
+            version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"),
+            curves_order=["DEPT", "GR"],
+            curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M"),
+                CurveDefinition(mnemonic="GR", unit="GAPI"),
+            ],
+        )
+        las.well["NULL"] = "-999.25"
+        section = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "GR"],
+            data={
+                "DEPT": np.array([100.0, 110.0]),
+                "GR": np.array([75.0, 80.0]),
+            },
+        )
+        las.data_sections.append(section)
+        # POST-CONSTRUCTION mutation: lowercase the first order entry.
+        section.curves_order = ["dept", "GR"]
+
+        out = tmp_path / "f32_30_case.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+
+        back = read_las_file_as_object(out)
+        ds = back.data_sections[0]
+        np.testing.assert_allclose(
+            ds.data["DEPT"], [100.0, 110.0], err_msg="DEPT values null-filled"
+        )
+        np.testing.assert_allclose(ds.data["GR"], [75.0, 80.0])
+
+    def test_m13_las30_case_variant_curves_order_no_false_pad_warning(self, tmp_path: Path) -> None:
+        """M13 (F-32 LAS 3.0 twin): a post-construction lowercase
+        curves_order entry ('dept') whose data is keyed under the
+        uppercase name ('DEPT') is emitted by the writer via the
+        case-insensitive _lookup_data_array, so the section-uncovered
+        'will pad with null_value' warning in _writer_las30.py must NOT
+        fire.  Pre-fix the exact-case set difference compared 'dept'
+        against 'DEPT' and falsely reported the column as uncovered even
+        though the data rows carried real values.
+        """
+        las = LASFile(
+            version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"),
+            curves_order=["DEPT", "GR"],
+            curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M"),
+                CurveDefinition(mnemonic="GR", unit="GAPI"),
+            ],
+        )
+        las.well["NULL"] = "-999.25"
+        section = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "GR"],
+            data={
+                "DEPT": np.array([100.0, 110.0]),
+                "GR": np.array([75.0, 80.0]),
+            },
+        )
+        las.data_sections.append(section)
+        # POST-CONSTRUCTION mutation: lowercase the first order entry.
+        section.curves_order = ["dept", "GR"]
+
+        out = tmp_path / "m13_30_no_pad_warning.las"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+
+        # M13: the LAS 3.0 section-uncovered warning must not fire for a
+        # case-variant entry that IS emitted with real data.  The
+        # _writer_las30.py message is the one containing "for section".
+        false_pads = [
+            str(w.message)
+            for w in caught
+            if "will pad" in str(w.message) and "for section" in str(w.message)
+        ]
+        assert false_pads == [], (
+            f"false 'will pad with null_value' warning fired for case-variant entry: {false_pads}"
+        )
+
+        back = read_las_file_as_object(out)
+        ds = back.data_sections[0]
+        np.testing.assert_allclose(
+            ds.data["DEPT"], [100.0, 110.0], err_msg="DEPT values null-filled"
+        )
+        np.testing.assert_allclose(ds.data["GR"], [75.0, 80.0])
+
+    def test_wl_m1_las30_case_variant_section_validate_no_false_warnings(
+        self, tmp_path: Path
+    ) -> None:
+        """WL-M1 (M13 residual, models side): DataSection.validate's
+        uncovered + orphaned checks were exact-case, so on the M13 state
+        (curves_order=['dept','GR'], data keyed DEPT/GR) write() emitted
+        FALSE 'will pad with null_value' and 'will not emit these columns'
+        diagnostics even though the data IS emitted and preserved.  No
+        pad/orphaned warning of ANY variant (models.py has no 'for
+        section' suffix — the M13 test's narrow discriminator missed it)
+        may fire, and the data must survive write→re-read."""
+        las = LASFile(
+            version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"),
+            curves_order=["DEPT", "GR"],
+            curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M"),
+                CurveDefinition(mnemonic="GR", unit="GAPI"),
+            ],
+        )
+        las.well["NULL"] = "-999.25"
+        section = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "GR"],
+            data={
+                "DEPT": np.array([100.0, 110.0]),
+                "GR": np.array([75.0, 80.0]),
+            },
+        )
+        las.data_sections.append(section)
+        section.curves_order = ["dept", "GR"]
+
+        out = tmp_path / "wl_m1_30_no_false_diags.las"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+
+        false_diags = [
+            str(w.message)
+            for w in caught
+            if "will pad" in str(w.message) or "will not emit" in str(w.message)
+        ]
+        assert false_diags == [], (
+            f"false pad/orphaned diagnostics fired for case-variant entry: {false_diags}"
+        )
+
+        back = read_las_file_as_object(out)
+        ds = back.data_sections[0]
+        np.testing.assert_allclose(
+            ds.data["DEPT"], [100.0, 110.0], err_msg="DEPT values null-filled"
+        )
+        np.testing.assert_allclose(ds.data["GR"], [75.0, 80.0])
+
+    def test_wl_m1_las30_section_genuinely_uncovered_curve_still_warns(
+        self, tmp_path: Path
+    ) -> None:
+        """WL-M1 true-positive preservation (WL-L2 concern): the
+        case-insensitive comparison must NOT mask a genuinely-uncovered
+        curve.  A section whose curves_order names a curve with no data
+        anywhere must still emit the 'will pad with null_value' warning."""
+        las = LASFile(
+            version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"),
+            curves_order=["DEPT", "GR"],
+            curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M"),
+                CurveDefinition(mnemonic="GR", unit="GAPI"),
+            ],
+        )
+        las.well["NULL"] = "-999.25"
+        section = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "GR"],
+            data={"DEPT": np.array([100.0, 110.0])},  # GR genuinely uncovered
+        )
+        las.data_sections.append(section)
+
+        out = tmp_path / "wl_m1_30_true_positive.las"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+
+        pads = [
+            str(w.message)
+            for w in caught
+            if "will pad" in str(w.message) and "GR" in str(w.message)
+        ]
+        assert pads, "genuinely-uncovered curve GR produced no 'will pad' warning"
+
+    def test_f32_legacy_lowercase_curves_order_emits_data(self, tmp_path: Path) -> None:
+        """F-32 (legacy): a post-construction lowercase curves_order entry
+        ('dept') whose data is stored under the uppercase key ('DEPT')
+        must still emit the ~A section.  Pre-fix the exact-case gate
+        concluded 'none have data', skipped ~A entirely, and the data was
+        silently dropped.
+        """
+        las = LASFile(
+            version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+            curves_order=["DEPT"],
+            curves=[CurveDefinition(mnemonic="DEPT", unit="M")],
+            logs={"DEPT": np.array([100.0, 101.0])},
+        )
+        las.well["NULL"] = "-999.25"
+        # POST-CONSTRUCTION mutation: lowercase the order entry.
+        las.curves_order = ["dept"]
+
+        out = tmp_path / "f32_legacy_case.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+
+        content = out.read_text(encoding="utf-8")
+        assert any(ln.startswith("~A") for ln in content.splitlines()), (
+            "~A section skipped for case-variant curves_order entry"
+        )
+        back = read_las_file_as_object(out)
+        np.testing.assert_allclose(back.logs["DEPT"], [100.0, 101.0], err_msg="DEPT data lost")
+
+    def test_f36_empty_curves_order_with_logs_warns(self, tmp_path: Path) -> None:
+        """F-36: an EMPTY curves_order with populated logs is a
+        direct-construction-only inconsistent state — the write must warn
+        that the data will not be emitted.  Pre-fix the empty-list
+        short-circuit (`any([])` is False) suppressed every diagnostic and
+        the data vanished silently with zero warnings.
+        """
+        las = LASFile()
+        las.version = VersionSection(vers="2.0", wrap="NO", dlm="SPACE")
+        las.well["NULL"] = "-999.25"
+        las.well["STRT"] = "100.0"
+        las.well["STOP"] = "101.0"
+        las.well["STEP"] = "1.0"
+        las.logs["DEPT"] = np.array([100.0, 101.0])
+
+        out = tmp_path / "f36_empty_order.las"
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+        assert any("curves_order is empty" in str(w.message) for w in rec), (
+            f"no data-loss warning: {[str(w.message) for w in rec]}"
+        )
+
+        content = out.read_text(encoding="utf-8")
+        assert not any(ln.startswith("~A") for ln in content.splitlines()), (
+            "unexpected ~A section for empty curves_order"
+        )
+        back = read_las_file_as_object(out)
+        assert len(back.logs) == 0, f"re-read fabricated data: {dict(back.logs)}"
+
+    def test_mod2_top_level_case_variant_no_false_write_warnings(self, tmp_path: Path) -> None:
+        """MOD-2 (WL-M1 class, LASFile top level): the validate() twins
+        (:3756 desync, :3791 orphan) compared exact-case, so writing the
+        post-construction case-variant state (curves_order=['dept','GR'],
+        logs keyed DEPT/GR) emitted 4 false warnings (2 desync + 2 orphan)
+        even though the writer resolves case-insensitively and the data is
+        emitted byte-correct.  No desync/orphan warning of any variant may
+        fire, and the data must survive write→re-read."""
+        las = LASFile(
+            version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+            curves_order=["DEPT", "GR"],
+            curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M"),
+                CurveDefinition(mnemonic="GR", unit="GAPI"),
+            ],
+            logs={
+                "DEPT": np.array([100.0, 101.0, 102.0]),
+                "GR": np.array([75.0, 76.0, 77.0]),
+            },
+        )
+        las.well["NULL"] = "-999.25"
+        las.well["STRT"] = "100.0"
+        las.well["STOP"] = "102.0"
+        las.well["STEP"] = "1.0"
+        # POST-CONSTRUCTION mutation: lowercase the order entries.
+        las.curves_order = ["dept", "GR"]
+
+        out = tmp_path / "mod2_top_case.las"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+
+        false_diags = [
+            str(w.message)
+            for w in caught
+            if "desynced" in str(w.message) or "will not emit" in str(w.message)
+        ]
+        assert false_diags == [], f"false desync/orphan warnings: {false_diags}"
+
+        back = read_las_file_as_object(out)
+        np.testing.assert_allclose(back.logs["DEPT"], [100.0, 101.0, 102.0])
+        np.testing.assert_allclose(back.logs["GR"], [75.0, 76.0, 77.0])
+
+
+# ──────────────────────────────────────────────────────────────
+# MOD-3 (MEDIUM, F-04 residual): public dict-write API on the
+# case-variant state.  The pass-3 fix blessed the state, but
+# write_las_file(path, dict) → LASFile.from_dict hard-failed with
+# LASWriteError ("Cannot create LASFile from dict: curves_order[0] =
+# 'dept' does not match curves[0].mnemonic = 'DEPT'").
+# ──────────────────────────────────────────────────────────────
+
+
+class TestMOD3DictWriteCaseVariant:
+    """F-04: write_las_file(path, dict) must accept the to_dict output of
+    the supported case-variant state and emit byte-correct data (pre-fix:
+    LASWriteError wrapping the from_dict rejection)."""
+
+    def test_mod3_write_dict_case_variant_las20(self, tmp_path: Path) -> None:
+        las = LASFile(
+            version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+            curves_order=["dept", "GR"],
+            curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M"),
+                CurveDefinition(mnemonic="GR", unit="GAPI"),
+            ],
+            logs={
+                "DEPT": np.array([100.0, 101.0, 102.0]),
+                "GR": np.array([75.0, 76.0, 77.0]),
+            },
+        )
+        las.well["NULL"] = "-999.25"
+        las.well["STRT"] = "100.0"
+        las.well["STOP"] = "102.0"
+        las.well["STEP"] = "1.0"
+
+        out = tmp_path / "mod3_dict_case_variant.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las.to_dict())
+
+        content = out.read_text(encoding="utf-8")
+        assert "~A  DEPT  GR" in content, f"header not emitted: {content}"
+        back = read_las_file_as_object(out)
+        np.testing.assert_allclose(back.logs["DEPT"], [100.0, 101.0, 102.0])
+        np.testing.assert_allclose(back.logs["GR"], [75.0, 76.0, 77.0])
+
+    def test_mod3_write_dict_case_variant_las30(self, tmp_path: Path) -> None:
+        ds = DataSection(
+            name="Log1",
+            curves_order=["dept", "GR"],
+            section_curves=[
+                CurveDefinition(mnemonic="DEPT", unit="M"),
+                CurveDefinition(mnemonic="GR", unit="GAPI"),
+            ],
+            data={
+                "DEPT": np.array([100.0, 101.0, 102.0]),
+                "GR": np.array([75.0, 76.0, 77.0]),
+            },
+        )
+        las = LASFile(
+            version=VersionSection(vers="3.0", wrap="NO", dlm="SPACE"),
+            curves_order=["dept", "GR"],
+            curves=[],
+            data_sections=[ds],
+        )
+        las.well["NULL"] = "-999.25"
+        las.well["STRT"] = "100.0"
+        las.well["STOP"] = "102.0"
+        las.well["STEP"] = "1.0"
+
+        out = tmp_path / "mod3_dict_case_variant_30.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las.to_dict())
+
+        back = read_las_file_as_object(out)
+        np.testing.assert_allclose(back.data_sections[0].data["DEPT"], [100.0, 101.0, 102.0])
+        np.testing.assert_allclose(back.data_sections[0].data["GR"], [75.0, 76.0, 77.0])

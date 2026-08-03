@@ -109,22 +109,156 @@ _NEAR_TIE_CYRILLIC_MARGIN = 0.04  # 4% relative ratio gap
 # contains 4+ char words).
 _CYRILLIC_RUN_CONFIRM = 4
 _STRONG_RUN_MIN = 3
+# ENC-M1 (M4 regression, FIX pass 2): minimum length of a Cyrillic run in
+# the winning NON-Western candidate's own decode that counts as a "word".
+# A genuine cp866 Cyrillic word (УАЗ, ГАЗ, СКВ, ПЛАСТ, ПРИВЕТ) is at least  # noqa: RUF003
+# 3 letters.  The cp1251 run detector (_has_confirmed_cyrillic_run) cannot
+# see this class: under cp1251 the УАЗ bytes (0x93 0x80 0x87) decode to  # noqa: RUF003
+# "“Ђ‡" — a single Cyrillic code point, no run — so a genuine cp866 file
+# whose short Cyrillic word is mixed into ASCII prose is judged
+# non-Cyrillic and the Western near-tie rescue fires, flipping it to a
+# cp1252 mojibake decode (a NEW regression vs HEAD 82cadce).  The
+# discriminator reads the Cyrillic evidence from the candidate that IS
+# correct — the winning non-Western decode — instead of from cp1251.
+_WORD_LIKE_CYRILLIC_RUN_MIN = 3
+# F-02 (ENC-1 regression, FIX pass 4): bytes that decode to a Cyrillic
+# letter (U+0400-U+04FF) under cp1251.  Within the ambiguous 0x80-0x9F
+# range — the ONLY range rule (2) of _is_genuine_word_run examines, because
+# rule (1) already accepts any byte >= 0xA0 as unambiguous — this set is
+# {0x80, 0x81, 0x83, 0x8A, 0x8C, 0x8D, 0x8E, 0x8F, 0x90, 0x9A, 0x9C, 0x9D,
+# 0x9E, 0x9F}: bytes that cp1252 renders as € ƒ Š Œ Ž š œ ž Ÿ or leaves
+# UNDEFINED.  The Western smart-punctuation class (… † ‡ ‰ ‚ „ – — ' ")  # noqa: RUF003
+# uses bytes that are NOT Cyrillic under cp1251, so a run containing a
+# cp1251-Cyrillic byte is a genuine Cyrillic word rather than a misdecoded
+# symbol cluster.  Derived from the codec table itself (the same source of
+# truth as _alnum_class / _build_cyrillic_run_regexes), not a hand-enumerated
+# list.
+_CP1251_CYRILLIC_BYTES: frozenset[int] = frozenset(
+    b
+    for b in range(0x80, 0x100)
+    if 0x0400 <= ord(bytes([b]).decode("cp1251", errors="replace")) <= 0x04FF
+)
+# E-01 (FIX pass 5): LAS-context window for the context discriminator in
+# _run_has_las_context.  The window is anchored at the first non-whitespace /
+# non-punctuation byte after the all-ambiguous Cyrillic run (parameter *k* of
+# _run_has_las_context), so its EFFECTIVE reach is the skipped whitespace /
+# punctuation plus this many bytes (L-2: the pass-5 comment said "after the
+# run" but the code anchors at k).  Within the window, an ASCII digit whose
+# immediately-preceding token is a full-uppercase ASCII word marks a genuine
+# LAS label ('THE WELL ТЕСТ FIELD 1000.0' places '1000.0' ~8 bytes after the  # noqa: RUF003
+# word, preceded by the uppercase mnemonic FIELD); Western prose digits
+# follow lowercase/mixed tokens ('and 3 more', 'dated 2024') and do NOT mark
+# a label (M-1 pass-6 refinement).  The value was tuned against the full
+# pinned matrix (24/24), the encoding test file, and the full suite; 16-40
+# was the validated range.
+_LAS_DIGIT_CONTEXT_WINDOW = 24
 # F-18: adjacency window for the "№" (0xB9) confirmation rule — a genuine
 # "СКВ №1" places the marker within 1-3 bytes of the run (space/punctuation  # noqa: RUF003
 # + 0xB9), so 8 bytes on either side comfortably covers real-world labels
 # while keeping a far-away footnote marker out of scope.
 _NUMERO_ADJACENCY_WINDOW = 8
 
-# ENC-02: Windows-1252 smart-punctuation byte class (0x91-0x97: ' " " – — …).  # noqa: RUF003
-# These bytes decode to Cyrillic ALPHANUMERICS under cp866 (e.g. 0x96 → 'Ц'),
-# inflating cp866's word-char ratio above a genuine Western page whenever the
-# file contains typographic punctuation — the root of the Western→cp866 flip.
-_SMART_PUNCT_BYTES = bytes((0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97))
+
+# ENC-02: Codec-derived "inflator" byte classes for the Western near-tie
+# rescue (ENC-02(b) below).  A byte is an inflator for the pair
+# (non_western, western) when it decodes to an ALPHANUMERIC under the
+# non-Western encoding but NOT under the Western one — e.g. 0x96 is 'Ц'
+# (alnum) under cp866 but '–' (non-alnum) under cp1252.  Such bytes  # noqa: RUF003
+# inflate the non-Western word-char ratio above a genuine Western page
+# whenever the file contains them — the root of the Western→cp866/cp1251
+# flip.  The class is derived from the codec tables themselves (the same
+# source of truth _build_cyrillic_run_regexes uses), NOT from a
+# hand-enumerated list: the previous 7-byte _SMART_PUNCT_BYTES set
+# (0x91-0x97) could never converge — every sibling byte an audit
+# discovered (0x80 €, the 0x82/0x84-0x87/0x89/0x8B control range, the
+# 0xA1-0xBF/0xD7/0xF7 symbol class) was another hole (F-01/F-09).  The
+# table is per-pair because cp866-over-cp1252 ≠ cp866-over-latin-1 ≠
+# cp1251-over-*: the artifact must be exact for the actual candidate pair.
+def _alnum_class(enc: str) -> frozenset[int]:
+    """Return the single bytes 0x80-0xFF that decode to an alphanumeric
+    under *enc* — the codec's own tables define what counts as a word char."""
+    return frozenset(
+        b for b in range(0x80, 0x100) if bytes([b]).decode(enc, errors="replace").isalnum()
+    )
+
+
+_INFLATORS: dict[tuple[str, str], frozenset[int]] = {
+    (n, w): _alnum_class(n) - _alnum_class(w)
+    for n in ("cp866", "cp1251")
+    for w in ("cp1252", "latin-1")
+}
+
+
+def _printable_inflators(pair: tuple[str, str], inflators: frozenset[int]) -> frozenset[int]:
+    """Return the subset of *inflators* that decode to PRINTABLE characters
+    under the Western member of *pair*.
+
+    M4: the codec-derived table treats every byte that is alnum under the
+    non-Western encoding but NOT under the Western one as a "Western symbol
+    inflator" — but the cp866 Cyrillic uppercase range (0x80-0x9F) decodes to
+    C1 control chars under latin-1 (and 0x8F/0x90/0x9D are UNDEFINED under
+    cp1252).  Such bytes are NOT Western symbols: real Western text never
+    contains C1 controls, so a genuine cp866 Cyrillic word like ПРИВЕТ must  # noqa: RUF002
+    not be "explained away" as Western punctuation.  Only bytes that the
+    Western codec itself renders as printable characters (Euro sign, low
+    quotes, ellipsis, daggers, inverted marks, the multiplication/division
+    signs, the 0xA1-0xBF symbol class, ...) qualify as Western-symbol
+    evidence.
+    """
+    return frozenset(b for b in inflators if _is_printable_byte(pair[1], b))
+
+
+def _is_printable_byte(enc: str, b: int) -> bool:
+    """Return True if byte *b* decodes to a printable character under *enc*.
+
+    Uses an explicit UnicodeDecodeError catch rather than ``errors="replace"``
+    because U+FFFD (REPLACEMENT CHARACTER) reports ``isprintable() == True``,
+    which would wrongly count bytes that are UNDEFINED in the codec (e.g.
+    0x8F/0x90 in cp1252) as Western-symbol evidence.
+    """
+    try:
+        return bytes([b]).decode(enc).isprintable()
+    except UnicodeDecodeError:
+        return False
+
+
+# M4 (F-01/F-09 regression): the Western near-tie rescue may only switch to
+# a Western candidate when the sample contains Western-SYMBOL bytes that are
+# genuinely printable under that candidate (see _printable_inflators) — NOT
+# cp866 Cyrillic letters that merely decode to C1 controls/symbols.
+_PRINTABLE_INFLATORS: dict[tuple[str, str], frozenset[int]] = {
+    pair: _printable_inflators(pair, inflators) for pair, inflators in _INFLATORS.items()
+}
 
 # ENC-02 (a): material-margin for the detected-encoding priority.  Real
 # encoding mismatches produce ratio gaps >10%; a <5% gap is within the
 # near-tie band and the high-confidence chardet answer should be honored.
 _DETECTED_ENCODING_MARGIN = 0.05
+
+# ENC-02 (b): plausibility floor for the Western near-tie rescue.  The
+# rescue may only switch to a Western candidate whose OWN decode looks
+# like plausible text — real files have ~50-80% word characters (see the
+# module docstring), so a Western decode with a word-char ratio below 0.5
+# is garbage.  Without this floor, a genuine short cp866/cp1251 file whose
+# every byte is a codec inflator (e.g. "ПРИВЕТ" in cp866: 0x8F-0x92 all
+# decode to Cyrillic alnum under cp866 but control chars/symbols under
+# latin-1/cp1252) would have its 100% ratio gap fully "explained" by the
+# artifact and be wrongly rescued to a Western mojibake decode.
+_WESTERN_RATIO_FLOOR = 0.5
+
+# M4 (F-01/F-09 regression): minimum ASCII-letter evidence the winning
+# Western candidate must contain for the ENC-02(b) rescue to fire.  Genuine
+# cp866 files whose short Cyrillic words map to PRINTABLE symbols under
+# cp1252 (e.g. "УАЗ" -> 0x93 0x80 0x87 -> "“€‡") pass the printable-inflator  # noqa: RUF003
+# filter, so the artifact fully "explains" the ratio gap even though the
+# file is real Cyrillic data.  Such files are digit-heavy LAS data (mnemonic
+# + numeric blocks) with an isolated Cyrillic well name — their Western
+# decode contains almost no ASCII letters.  Genuine Western files carrying
+# €/smart-punct/symbols are prose or description text with real ASCII words
+# ("Well: 1234 € 5678 prix 50€ total 123€" = 13 letters).  Requiring 8 ASCII
+# letters separates the two classes with margin while preserving every
+# documented F-01/F-09 rescue case (all ≥ 13 letters).
+_WESTERN_MIN_ASCII_LETTERS = 8
 
 
 def _build_cyrillic_run_regexes() -> tuple[re.Pattern[bytes], re.Pattern[bytes], re.Pattern[bytes]]:
@@ -213,6 +347,220 @@ def _has_confirmed_cyrillic_run(data: bytes) -> bool:
         if len(match.group()) >= _STRONG_RUN_MIN:
             return True
     return False
+
+
+def _has_word_like_cyrillic_run(decoded: str, raw: bytes | None = None) -> bool:
+    """Return True if *decoded* contains a run of Cyrillic letters that reads
+    as a GENUINE Cyrillic word.
+
+    A run of ``_WORD_LIKE_CYRILLIC_RUN_MIN`` or more consecutive Cyrillic
+    code points (U+0400-U+04FF) is "word-like" when it is a genuine Cyrillic
+    word rather than a single-byte misdecode of Western typographic
+    punctuation.  Two evidence rules distinguish the classes when *raw* (the
+    byte string corresponding to *decoded*, for single-byte decodes) is
+    supplied:
+
+    (1) Unambiguous-alphabet rule: a run containing a character whose source
+        byte is NOT in the ambiguous 0x80-0x9F range (lowercase Cyrillic
+        0xA0-0xAF/0xE0-0xEF, Ё/ё and the 0xF0-0xF7 extras) is unambiguously
+        genuine — Western smart punctuation occupies only 0x80-0x9F, which
+        decodes to UPPERCASE А-Я under cp866.  # noqa: RUF003
+    (2) Boundary rule: an all-ambiguous run is word-like unless it is
+        Western prose punctuation.  The byte after the run (after optional
+        whitespace / ASCII punctuation) decides: digits/hyphens/№ or the  # noqa: RUF003
+        end of the sample mark a genuine LAS Cyrillic label (УАЗ-469,  # noqa: RUF003
+        СКВ №1); an ASCII letter is ambiguous — genuine cp866 words are  # noqa: RUF003
+        ALSO followed by a space + ASCII word (УАЗ FIELD), so the run is  # noqa: RUF003
+        then judged by its byte content (F-02: a byte that is Cyrillic
+        under cp1251 marks a genuine word, see _is_genuine_word_run).
+
+    ENC-M1 (M4 regression, FIX pass 2): this is the discriminator that
+    distinguishes genuine cp866 Cyrillic (0x80-0x9F range, all bytes
+    printable under cp1252) from genuine Western symbols.  The cp1251 run
+    detector cannot see the УАЗ class (under cp1251 those bytes decode to  # noqa: RUF003
+    "“Ђ‡" — no Cyrillic run), so the Western near-tie rescue fired on it
+    and flipped genuine cp866 files to cp1252 mojibake.  Reading the run
+    evidence from the winning NON-Western decode (where the Cyrillic word
+    IS visible) restores HEAD parity for the prose+УАЗ class while keeping
+    the F-09 Western symbol rescues (their cp866 misreads are embedded, so
+    the rescue still fires).
+
+    ENC-1 (FIX pass 3): the pass-2 discriminator classified STANDALONE
+    typographic-symbol clusters (…†‡, †‡‰, ‚„…, –—… — space/punct-bounded  # noqa: RUF003
+    runs of 3+ Cyrillic code points in the cp866 decode) as word-like, so  # noqa: RUF003
+    genuine cp1252 files carrying them decoded cp866 mojibake (a NEW
+    regression vs the v2.0.3 release).  Rule (2) now distinguishes them:
+    prose punctuation is followed by ASCII words, while genuine LAS Cyrillic
+    labels are followed by digits/hyphens.
+    F-02 (FIX pass 4): rule (2)'s "followed by an ASCII word" test over-
+    corrected — a genuine cp866 Cyrillic word is ALSO followed by a space +
+    ASCII word (the most natural prose form, 'THE WELL УАЗ FIELD 1000.0'),  # noqa: RUF003
+    so the pass-3 rule flipped the space-separated genuine class to cp1252
+    mojibake.  The ASCII-letter-follows case is now decided by the run's
+    own bytes: a byte that is Cyrillic under cp1251 (_CP1251_CYRILLIC_BYTES)
+    marks a genuine word; the Western smart-punctuation clusters use bytes
+    that are not Cyrillic under cp1251 and stay prose punctuation.
+
+    When *raw* is None (multi-byte decode, e.g. utf-8), every Cyrillic run
+    is genuine and the original standalone-token rule applies: the run is
+    word-like when it is NOT embedded between ASCII letters.
+    """  # noqa: RUF002
+    i = 0
+    n = len(decoded)
+    while i < n:
+        if 0x0400 <= ord(decoded[i]) <= 0x04FF:
+            j = i + 1
+            while j < n and 0x0400 <= ord(decoded[j]) <= 0x04FF:
+                j += 1
+            if j - i >= _WORD_LIKE_CYRILLIC_RUN_MIN:
+                if raw is not None:
+                    if _is_genuine_word_run(decoded, raw, i, j):
+                        return True
+                else:
+                    before = decoded[i - 1] if i > 0 else ""
+                    after = decoded[j] if j < n else ""
+                    if not (
+                        (before and before.isascii() and before.isalpha())
+                        or (after and after.isascii() and after.isalpha())
+                    ):
+                        return True
+            i = j
+        else:
+            i += 1
+    return False
+
+
+def _is_genuine_word_run(decoded: str, raw: bytes, i: int, j: int) -> bool:
+    """Return True when the single-byte Cyrillic run ``decoded[i:j]`` (with
+    corresponding raw bytes ``raw[i:j]``) reads as a genuine Cyrillic word
+    rather than a cp866/cp1251 misdecode of Western typographic punctuation.
+
+    Applies the two evidence rules documented in
+    :func:`_has_word_like_cyrillic_run`: rule (1) the unambiguous-alphabet
+    evidence, and rule (2) the boundary evidence.
+    """
+    # Rule (1): a character whose source byte is NOT in the ambiguous
+    # 0x80-0x9F smart-punctuation range (lowercase Cyrillic 0xA0-0xAF /
+    # 0xE0-0xEF, the 0xF0-0xF7 extras) is unambiguously genuine Cyrillic.
+    for k in range(i, j):
+        if k >= len(raw) or raw[k] >= 0xA0:
+            return True
+    # Rule (2): for an all-ambiguous run, examine the byte after the run
+    # (after optional whitespace / ASCII punctuation).
+    k = j
+    while k < len(raw):
+        b = raw[k]
+        if b in (0x09, 0x0A, 0x0D, 0x20):
+            k += 1
+        elif 0x21 <= b <= 0x2F or 0x3A <= b <= 0x40 or 0x5B <= b <= 0x60 or 0x7B <= b <= 0x7E:
+            k += 1
+        else:
+            break
+    if k >= len(raw):
+        # End of the sample — a genuine LAS Cyrillic label (УАЗ at EOF,  # noqa: RUF003
+        # СКВ №1 tail).  # noqa: RUF003
+        return True
+    b = raw[k]
+    if 0x41 <= b <= 0x5A or 0x61 <= b <= 0x7A:
+        # An ASCII letter follows (…†‡ and more; УАЗ FIELD).  F-02: a  # noqa: RUF003
+        # genuine cp866 Cyrillic word is ALSO followed by a space + ASCII
+        # word — the most natural prose form ('THE WELL УАЗ FIELD 1000.0')  # noqa: RUF003
+        # — so "ASCII letter follows" alone is NOT conclusive Western-prose
+        # evidence.  First distinguish by the run's byte content: a byte that
+        # is a Cyrillic letter under cp1251 (_CP1251_CYRILLIC_BYTES — e.g. УАЗ  # noqa: RUF003
+        # = 0x93 0x80 0x87 contains 0x80 = Ђ) marks a genuine Cyrillic
+        # word, while the Western smart-punctuation class (…†‡‰‚„–—'")  # noqa: RUF003
+        # uses bytes that are NOT Cyrillic under cp1251 and stays Western
+        # prose punctuation.
+        if any(raw[t] in _CP1251_CYRILLIC_BYTES for t in range(i, j)):
+            return True
+        # E-01 (FIX pass 5): the byte-content set above recognizes only 14
+        # of the 32 cp866 uppercase letters in the ambiguous 0x80-0x9F
+        # range — the 18-letter complement (В Д Е Ж З И Й Л С Т У Ф Х Ц Ч  # noqa: RUF003
+        # Ш Щ Ы — e.g. ТЕСТ/ЗИЛ/ВДЕ) carries NO set byte and is  # noqa: RUF003
+        # byte-identical under cp866 to the Western punctuation clusters
+        # (ВДЕ == ‚„…), so the run's own bytes cannot separate the  # noqa: RUF003
+        # classes.  Decide the no-set-byte ASCII-follows case by
+        # LAS-CONTEXT evidence instead: an ASCII digit within
+        # _LAS_DIGIT_CONTEXT_WINDOW bytes of the first non-ws/non-punct
+        # byte whose immediately-preceding token is a full-uppercase ASCII
+        # word (LAS mnemonic + value: 'THE WELL ТЕСТ FIELD 1000.0'), or an  # noqa: RUF003
+        # UPPERCASE ASCII word following the run (LAS mnemonics are
+        # uppercase: FIELD, DEPT, GR), marks a genuine LAS label; Western
+        # prose clusters are followed by lowercase words in digit-free
+        # prose (M-1 pass-6 refinement: the digit must follow an uppercase
+        # token — 'and 3 more', 'dated 2024' are ordinary Western prose,
+        # not LAS labels).
+        return _run_has_las_context(raw, k)
+    # Any other non-letter byte (digit, hyphen + digit tail, №, symbol)
+    # marks a genuine LAS Cyrillic label (УАЗ-469, СКВ №1).  Note the  # noqa: RUF003
+    # hyphen itself is ASCII punctuation and was skipped above — what
+    # matters is the digit that follows it (УАЗ-469), not the hyphen.  # noqa: RUF003
+    return True
+
+
+def _run_has_las_context(raw: bytes, k: int) -> bool:
+    """Return True when the bytes at/after *k* (the first non-whitespace /
+    non-punctuation byte after an all-ambiguous Cyrillic run) show
+    LAS-context evidence of a genuine label.
+
+    E-01 (FIX pass 5): the 0x80-0x9F byte space is symmetric — a genuine
+    cp866 no-set-byte word (ВДЕ = 0x82 0x84 0x85) is byte-identical to the
+    Western smart-punctuation cluster with the same bytes (‚„…), so the
+    run's own bytes carry zero class information.  Two LAS-structural
+    signals separate the pinned genuine harness shapes from Western prose:
+    - an ASCII digit within _LAS_DIGIT_CONTEXT_WINDOW bytes of *k* whose
+      immediately-preceding token is a full-uppercase ASCII word (LAS
+      mnemonic + value: 'THE WELL ТЕСТ FIELD 1000.0' puts '1000.0' ~8
+      bytes after the mnemonic FIELD).  M-1 (FIX pass 6): the pass-5
+      "any digit in the window" form was sufficient-but-not-necessary —
+      Western prose prices/counts/dates also put digits in the window and
+      flipped whole files to cp866 mojibake — so the digit is evidence
+      only when the token immediately before it is full-uppercase (a LAS
+      mnemonic), not lowercase/mixed prose ('and 3', 'dated 2024',
+      'over 100').
+    - an UPPERCASE ASCII word following the run (LAS mnemonics are
+      uppercase: FIELD, DEPT, GR); Western prose clusters are followed by
+      lowercase words.
+    """  # noqa: RUF002
+    # (a) ASCII digit within the window whose immediately-preceding token is
+    # a full-uppercase ASCII word (LAS mnemonic + value: 'THE WELL ТЕСТ  # noqa: RUF003
+    # FIELD 1000.0' — the '1' of '1000.0' is preceded by the uppercase
+    # mnemonic FIELD).  M-1 (FIX pass 6): the pass-5 "any digit in the
+    # window" signal was sufficient-but-not-necessary — Western prose
+    # prices/counts/dates ('…†‡ and 3 more', '…†‡ dated 2024', '‚„… over  # noqa: RUF003
+    # 100') also put a digit in the window, flipping whole files to cp866
+    # mojibake.  Digits preceded by lowercase/mixed tokens are ordinary
+    # Western prose and do NOT mark a LAS label.  This is still context
+    # evidence (not a byte-content rule), so the 0x80-0x9F symmetry root
+    # cause stays addressed.
+    end = min(len(raw), k + _LAS_DIGIT_CONTEXT_WINDOW)
+    for pos in range(k, end):
+        if not (0x30 <= raw[pos] <= 0x39):
+            continue
+        t = pos - 1
+        while t >= k and (
+            raw[t] in (0x09, 0x0A, 0x0D, 0x20)
+            or 0x21 <= raw[t] <= 0x2F
+            or 0x3A <= raw[t] <= 0x40
+            or 0x5B <= raw[t] <= 0x60
+            or 0x7B <= raw[t] <= 0x7E
+        ):
+            t -= 1
+        s = t
+        while s >= k and (0x41 <= raw[s] <= 0x5A or 0x61 <= raw[s] <= 0x7A):
+            s -= 1
+        if s < t and all(0x41 <= raw[i] <= 0x5A for i in range(s + 1, t + 1)):
+            return True
+    # (b) UPPERCASE ASCII word follows the run — the FULL word is uppercase
+    # (FIELD, DEPT, GR), NOT a sentence-initial capital in Western prose
+    # ('And more' — 'A' followed by lowercase — stays Western).
+    t = k
+    while t < len(raw) and 0x41 <= raw[t] <= 0x5A:
+        t += 1
+    if t == k:
+        return False
+    return t >= len(raw) or not (0x61 <= raw[t] <= 0x7A)
 
 
 def detect_encoding(file_path: Path) -> str:
@@ -425,15 +773,46 @@ def _decode_best_quality(
 
     # ENC-02 (b): Western near-tie rescue — the symmetric completion of
     # E-06.  When the content is judged NON-Cyrillic and the winning
-    # candidate is NOT a Western encoding, a genuine Western file with
-    # Windows-1252 smart punctuation (0x91-0x97) is being misdecoded:
-    # those bytes are Cyrillic alphanumerics under cp866 (e.g. 0x96 →
-    # 'Ц') but punctuation under cp1252/latin-1, so cp866's word-char
-    # ratio is inflated above the correct Western page.  Prefer the best
-    # Western candidate when the ratio gap — minus the smart-punct
-    # artifact (each such byte inflates the non-Western ratio by exactly
-    # K/N) — is within the near-tie margin, mirroring the M-81 №-artifact
-    # subtraction.
+    # candidate is NOT a Western encoding, a genuine Western file is being
+    # misdecoded: bytes that are alphanumerics under the winning
+    # non-Western encoding (cp866/cp1251) but punctuation under the
+    # Western encodings (e.g. 0x96 → 'Ц' under cp866, '–' under cp1252)  # noqa: RUF003
+    # inflate the non-Western word-char ratio above the correct Western
+    # page.  Prefer the best Western candidate when the ratio gap — minus
+    # the codec-derived inflator artifact for the ACTUAL (best_enc,
+    # _west_enc) pair (each such byte inflates the non-Western ratio by
+    # exactly K/N) — is within the near-tie margin, mirroring the M-81
+    # №-artifact subtraction.  F-01/F-09: the byte class comes from
+    # _INFLATORS (the codec tables), not a hand-enumerated subset — the
+    # old 7-byte set missed the Euro (0x80), its control-range siblings,
+    # and the symbol class → mojibake.  The rescue additionally requires
+    # the Western candidate to be plausible text (_WESTERN_RATIO_FLOOR)
+    # so a genuine short cp866/cp1251 file whose every byte is an
+    # inflator is not wrongly rescued to a garbage Western decode.
+    # M4: the codec-derived table alone OVER-explain: every cp866 Cyrillic
+    # letter (0x80-0x9F) is an "inflator", so a genuine cp866 short-word
+    # file mixed into ≥50% ASCII has its whole ratio gap explained and is
+    # flipped to a Western mojibake decode.  Two additional evidence
+    # requirements gate the rescue: (1) the artifact only counts inflator
+    # bytes that are PRINTABLE under the actual Western candidate
+    # (_PRINTABLE_INFLATORS) — cp866 Cyrillic bytes decode to C1 controls
+    # under latin-1 and are undefined under cp1252, so they are never
+    # "Western symbols"; (2) the Western candidate's decode must contain
+    # real ASCII-letter evidence (_WESTERN_MIN_ASCII_LETTERS) — a genuine
+    # cp866 file is digit-heavy LAS data whose Cyrillic word maps to a
+    # printable symbol blob under cp1252 (e.g. "УАЗ" -> "“€‡") with almost  # noqa: RUF003
+    # no ASCII letters, while genuine Western files carrying such symbols
+    # are prose with real words.
+    # ENC-M1 (M4 regression, FIX pass 2): (2) alone is not enough — a
+    # genuine cp866 file with a short Cyrillic word whose bytes are ALL
+    # printable under cp1252 (УАЗ/ГАЗ/МАЗ/СКВ-class) PLUS ASCII prose  # noqa: RUF003
+    # (≥8 letters) still passes (1)+(2) and is flipped to cp1252 mojibake
+    # (a NEW regression vs HEAD 82cadce).  The winning NON-Western
+    # candidate's own decode carries the missing evidence: genuine cp866
+    # Cyrillic words are standalone Cyrillic runs there, while Western
+    # symbol clusters are embedded punctuation attached to ASCII words.
+    # (3) the rescue is blocked when the winning candidate's decode
+    # contains a word-like Cyrillic run (_has_word_like_cyrillic_run).
     if not _is_cyrillic and best_enc not in _WESTERN:
         _best_western: tuple[str, str, float] | None = None
         for _cand in candidates:
@@ -443,12 +822,26 @@ def _decode_best_quality(
         if _best_western is not None:
             _west_enc, _west_sample, _west_ratio = _best_western
             _ratio_window = raw_bytes[:_MIN_VALIDATION_CHARS]
-            _smart_punct_artifact = sum(_ratio_window.count(b) for b in _SMART_PUNCT_BYTES) / max(
+            _inflators = _PRINTABLE_INFLATORS.get((best_enc, _west_enc), frozenset())
+            _smart_punct_artifact = sum(1 for b in _ratio_window if b in _inflators) / max(
                 len(_ratio_window), 1
             )
+            _west_ascii_letters = sum(1 for c in _west_sample if c.isascii() and c.isalpha())
+            # ENC-1 (FIX pass 3): pass the raw bytes corresponding to the
+            # winning candidate's sample so the discriminator can examine the
+            # run boundaries.  Only single-byte decodes (cp866/cp1251) map
+            # decoded[i] -> raw[i] positionally; for multi-byte decodes
+            # (utf-8) every Cyrillic run is genuine and the simple
+            # standalone-token rule applies.
+            _best_sample_raw = (
+                raw_bytes[: len(_best_sample)] if best_enc in ("cp866", "cp1251") else None
+            )
             if (
-                best_ratio - _west_ratio - _smart_punct_artifact
+                _west_ascii_letters >= _WESTERN_MIN_ASCII_LETTERS
+                and _west_ratio >= _WESTERN_RATIO_FLOOR
+                and best_ratio - _west_ratio - _smart_punct_artifact
                 <= _NEAR_TIE_CYRILLIC_MARGIN * best_ratio
+                and not _has_word_like_cyrillic_run(_best_sample, _best_sample_raw)
             ):
                 best_enc = _west_enc
                 _best_sample = _west_sample

@@ -330,35 +330,33 @@ def _detect_actual_wrap_las30(
     # exactly 1 value:
     #   - declared WRAP=YES → wrapped (I2-04: [3,3,1,1] — two full
     #     leading rows no longer beat the declaration + depth evidence)
-    #   - first line full AND the depth evidence is unambiguous → wrapped
-    #     (DR-01 / I2-03: mixed-wrap / mnemonic-header masquerade
+    #   - first line full AND at least TWO 1-value rows in the window →
+    #     wrapped (DR-01 / I2-03: mixed-wrap / mnemonic-header masquerade
     #     [3,1,1] / [3,1,2,1] with WRAP=NO or absent — content outranks a
-    #     NO header).  "Unambiguous" = a 1-value row immediately after
-    #     the full first row, OR at least two 1-value rows in the window.
-    #     A single trailing 1-value row after short rows ([3,2,1]) is a
-    #     ragged non-wrapped row and must stay non-wrapped (graceful
-    #     short-row null-fill) — do NOT classify it wrapped.
-    #     REFINEMENT vs data_reader (L30-I2-03, contract divergence fixed
-    #     here): for n_curves == 2 a 1-value row is AMBIGUOUS — a wrapped
-    #     continuation line also carries curve_count-1 == 1 value, so a
-    #     single 1-value row right after the full first row ([2,1,2], a
-    #     string-padding file where the second row has one missing
-    #     column) must NOT be treated as unambiguous depth evidence.  The
-    #     ≥2-one-value-rows arm still catches genuine 2-curve wrapped
-    #     files ([2,1,1,1] mixed-wrap: depth + continuation pairs).
-    #     For n_curves >= 3 a 1-value row can ONLY be a depth line
-    #     (continuations carry >= 2 values) → the window[1]==1 arm is
-    #     unambiguous there.  The data_reader twin mirrors this n_curves
-    #     >= 3 gate (data_reader.py:641-644), and the 2-curve short-row
-    #     shape is covered by TestPF18DataReaderTwoCurveWrapGate.
+    #     NO header).
+    # A SINGLE 1-value row — wherever it sits — is NOT unambiguous
+    # depth evidence: a ragged non-wrapped row missing 2+ columns also
+    # yields exactly 1 value, and it must stay non-wrapped (graceful
+    # short-row null-fill).  This covers the trailing case ([3,2,1]) AND
+    # the middle-row cases [3,1,3] / [3,1,2] (F-02 — pre-fix the
+    # n_curves>=3 window[1]==1 arm fired for ANY single 1-value row after
+    # a full first row, silently column-shifting the ragged file).  The
+    # ≥2-one-value-rows arm is strictly safer: every documented wrapped
+    # shape ([3,1,1] masquerade, [3,1,2,1] mixed-wrap, [2,1,1,1] genuine
+    # 2-curve wrapped) carries at least two 1-value rows, and a genuine
+    # wrapped file declares WRAP=YES (caught by the declaration arm).
+    # For n_curves == 2 a single 1-value row was already AMBIGUOUS (a
+    # wrapped continuation line also carries n_curves-1 == 1 value) —
+    # the 2-curve short-row shape is covered by
+    # TestPF18DataReaderTwoCurveWrapGate.  This arm is byte-identical to
+    # the data_reader twin (two-path wrap contract — any gating change
+    # must be mirrored on both paths).
     # Otherwise fall through to the existing rules unchanged.
     depth_later = len(window) > 1 and any(n == 1 for n in window[1:])
     if depth_later:
         if declared_wrap is not None and declared_wrap.upper() == "YES":
             return True
-        if _is_full(window[0]) and (
-            (n_curves >= 3 and window[1] == 1) or sum(1 for n in window[1:] if n == 1) >= 2
-        ):
+        if _is_full(window[0]) and sum(1 for n in window[1:] if n == 1) >= 2:
             return True
 
     # First line full → non-wrapped (wrapped first line is always depth).
@@ -426,7 +424,14 @@ def _detect_actual_wrap_las30(
 # structure and spacing metadata.  Detect the repeated-plain-mnemonic
 # pattern and synthesize ``array_info`` so the channel routes to numeric
 # arrays exactly like bracket-notation.
-_SPEC_FORM_ARRAY_RE = re.compile(r"\{A:(?P<offset>[-\d.]*)\}")
+# F-11: tolerate whitespace before the closing brace ({A:0 } — the
+# official CWLS sample form, e.g. 'NMR Echo Array {A:0 }').  The parser
+# preserves the marker verbatim in the description (parser.py:3074-3080)
+# and FORMAT_SPEC_PATTERN already accepts \s{0,64} before '}'; the
+# synthesis regex must accept the same form or time_offset is silently
+# lost and the marker stays in the description (doubled '{A:0 }  {A}'
+# artifact on write).
+_SPEC_FORM_ARRAY_RE = re.compile(r"\{A:(?P<offset>[-\d.]*)\s{0,64}\}")
 
 
 def _spec_form_group_data_is_numeric(

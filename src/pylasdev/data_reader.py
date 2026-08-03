@@ -131,6 +131,23 @@ def _desanitize_las_value(value: str, _enabled: bool | None = None) -> str:
 
     Defined locally in data_reader to avoid circular import from parser.
 
+    Two cases (matching writer's ``_sanitize_las_value``):
+
+    1. ``value.startswith("#")`` → writer prepends ``_`` → ``"_#..."``
+       → reverse: strip the leading ``_``.
+    2. ``value.lstrip().startswith("#")`` → writer inserts ``_`` after
+       leading whitespace → ``" _#..."`` → reverse: remove the ``_``
+       between whitespace and ``#``.
+
+    M11 (mirrors the parser's F-25 fix, parser.py): Case 2 applies ONLY
+    when the ``_#`` is the first non-whitespace content (preceded
+    exclusively by leading whitespace) — the writer's actual escape
+    scope.  Internal ``" _#"`` content the writer never escapes (e.g.
+    ``"ACME _#Oil Corp"``) is preserved unchanged.  The previous blanket
+    ``value.find("_#") + whitespace-before`` unescaped INTERNAL content
+    on the flagship LAS 1.2/2.0 string-data path, silently corrupting
+    write→read roundtrips and external files.
+
     IT3-F-01 (perf): *enabled* hoists the ``_DESANITIZE_ENABLED`` flag
     lookup.  ``read_ascii_data`` caches the thread-local flag once per
     read (it is constant for the duration of the read — E-04 sets it at
@@ -148,9 +165,21 @@ def _desanitize_las_value(value: str, _enabled: bool | None = None) -> str:
         return value
     if value.startswith("_#"):
         return value[1:]
-    idx = value.find("_#")
-    if idx > 0 and value[idx - 1].isspace():
-        return value[:idx] + value[idx + 1 :]
+    # M11: restrict to the writer's ACTUAL escape scope.  The writer
+    # (_sanitize_las_value, _writer_base.py:122-127) escapes '#' ONLY at
+    # value start (startswith("#")) or after LEADING whitespace
+    # (lstrip().startswith("#")).  The previous blanket
+    # ``value.find("_#") + whitespace-before`` unescaped INTERNAL " _#
+    # content the writer never escapes (e.g. "ACME _#Oil Corp" → "ACME
+    # #Oil Corp") — a silent corruption on the string-data path.  Only an
+    # "_#" preceded exclusively by leading whitespace (the FIRST
+    # non-whitespace content) is a writer escape artifact; mid-value "_#"
+    # is preserved, mirroring parser._desanitize_las_value's scoped
+    # restore (F-25).
+    stripped = value.lstrip()
+    if len(stripped) < len(value) and stripped.startswith("_#"):
+        leading = value[: len(value) - len(stripped)]
+        return leading + stripped[1:]
     return value
 
 
@@ -618,33 +647,28 @@ def _detect_actual_wrap(
     # later window line carries exactly 1 value:
     #   - declared WRAP=YES → wrapped (I2-04: [3,3,1,1] — two full
     #     leading rows no longer beat the declaration + depth evidence)
-    #   - first line full AND the depth evidence is unambiguous → wrapped
-    #     (DR-01 both triggers: mixed-wrap / mnemonic-header masquerade
-    #     [3,1,1] / [3,1,2,1] with WRAP=NO or absent — content outranks a
-    #     NO header).  "Unambiguous" means a 1-value row immediately
-    #     after the full first row, OR at least two 1-value rows in the
-    #     window — a single trailing 1-value row after short rows
-    #     ([3,2,1]) is a ragged non-wrapped row and must stay non-wrapped
-    #     (graceful short-row null-fill).
-    #     REFINEMENT (mirrors _las30_data.py, I2-03 contract divergence):
-    #     for curve_count == 2 a 1-value row is AMBIGUOUS — a wrapped
-    #     continuation line also carries curve_count-1 == 1 value, so a
-    #     single 1-value row right after the full first row ([2,1,2], a
-    #     string-padding file where the second row has one missing column)
-    #     must NOT be treated as unambiguous depth evidence.  The
-    #     ≥2-one-value-rows arm still catches genuine 2-curve wrapped
-    #     files ([2,1,1,1] mixed-wrap: depth + continuation pairs).  For
-    #     curve_count >= 3 a 1-value row can ONLY be a depth line
-    #     (continuations carry >= 2 values) → the window[1]==1 arm is
-    #     unambiguous there.
+    #   - first line full AND at least TWO 1-value rows in the window →
+    #     wrapped (DR-01 both triggers: mixed-wrap / mnemonic-header
+    #     masquerade [3,1,1] / [3,1,2,1] with WRAP=NO or absent —
+    #     content outranks a NO header).
+    # A SINGLE 1-value row — wherever it sits — is NOT unambiguous
+    # depth evidence: a ragged non-wrapped row missing 2+ columns also
+    # yields exactly 1 value, and it must stay non-wrapped (graceful
+    # short-row null-fill).  This covers the trailing case ([3,2,1],
+    # documented below) AND the middle-row cases [3,1,3] / [3,1,2]
+    # (F-02 — pre-fix the window[1]==1 arm fired for ANY single 1-value
+    # row after a full first row when curve_count >= 3, silently
+    # column-shifting the ragged file).  The ≥2-one-value-rows arm is
+    # strictly safer: every documented wrapped shape ([3,1,1]
+    # masquerade, [3,1,2,1] / [3,1,1,2] mixed-wrap, [2,1,1,1] genuine
+    # 2-curve wrapped) carries at least two 1-value rows, and a genuine
+    # wrapped file declares WRAP=YES (caught by the declaration arm).
     # Otherwise fall through to the existing rules unchanged.
     depth_later = len(window) > 1 and any(n == 1 for n in window[1:])
     if depth_later:
         if declared_wrap is not None and declared_wrap.upper() == "YES":
             return True
-        if _is_full(window[0]) and (
-            (curve_count >= 3 and window[1] == 1) or sum(1 for n in window[1:] if n == 1) >= 2
-        ):
+        if _is_full(window[0]) and sum(1 for n in window[1:] if n == 1) >= 2:
             return True
 
     # First line full → non-wrapped (wrapped first line is always depth).
@@ -863,7 +887,7 @@ def _is_mnemonic_header_row(
     *,
     declared: set[str] | None = None,
 ) -> bool:
-    """M-37/FIX-CONV-2: True when *values* are exactly the declared curve mnemonics.
+    """M-37/FIX-CONV-2: True when *values* are declared curve mnemonics.
 
     LAS 2.0 places curve mnemonics ON the ~A line, but some real-world
     files emit them as a standalone header row immediately after ~A
@@ -875,11 +899,25 @@ def _is_mnemonic_header_row(
     ``parser._is_standalone_mnemonic_header`` (parser.py:2991-3009) for the
     LAS 1.2/2.0 whole-file scope, with three clauses:
 
-    1. **Token-count equality** (parser.py:2991 analog): ``len(values)``
-       must equal ``curve_count``.  A wrapped-mode continuation row carries
-       fewer tokens and can never be a full header signature — without this,
-       a string value that coincides with a curve mnemonic (e.g. ``LITH``)
-       would be wrongly skipped as a header (M-02).
+    1. **Token-count bounds** (parser.py:2991 analog): ``min(2, curve_count)
+       <= len(values) <= curve_count``.  A wrapped-mode continuation row
+       carries fewer tokens and can never be a full header signature; the
+       2-token minimum keeps a single-token short/ragged data row that
+       happens to equal a mnemonic (e.g. a string value ``LITH``) from
+       being wrongly skipped as a header (M-02).  For a SINGLE-curve
+       section the lower bound drops to 1 (``min(2, 1)``) so its 1-token
+       standalone mnemonic header row ("~A\\nDEPT\\n...") is still
+       recognized — the flat ``< 2`` gate consumed it as data, producing a
+       phantom all-null first row + value shift (PSR-1, Stage 11); the
+       all-string exclusion (clause 2) keeps single-curve STRING sections
+       safe.
+       M12 (F-24 headline defect): the previous STRICT equality
+       (``len(values) == curve_count``) rejected a PARTIAL mnemonic
+       header — a subset of the declared curves (e.g. ``DEPT GR`` when
+       three curves are declared) — so the reader consumed the header row
+       as data: the mnemonic tokens failed numeric conversion to the null
+       sentinel, producing a phantom all-null first row and shifting every
+       subsequent value.  A partial all-mnemonic row is still a header.
     2. **All-string exclusion** (parser.py:3002 analog): when every curve in
        the section is a string curve, every data value is a string, so a
        mnemonic-coincident value is indistinguishable from a header row by
@@ -889,12 +927,35 @@ def _is_mnemonic_header_row(
        (parser.py:3004-3008 analog), so mnem_base-normalized header rows
        written in raw vendor mnemonics are recognized (M-01).
 
+    **DR-M3 (first-line-of-section contract):** the predicate is a HEADER
+    detector, so callers MUST gate it on the section's first line(s) — the
+    only position where a standalone mnemonic header can legitimately
+    appear.  ``_read_normal`` calls it only when ``current_line == 0`` and
+    ``_read_wrapped`` only when ``total_elements == 0``.  Applying it to
+    every line misclassifies mid-section all-mnemonic data rows as headers
+    (silent data loss / wrapped column shift).  The M12 partial-header
+    relaxation makes this gate mandatory: with ``min(2, curve_count) <=
+    len(values)`` the predicate matches far more rows than the original
+    strict equality.
+
     *declared* is the precomputed match set from :func:`_mnemonic_header_declared`;
     when omitted it is built on demand.  Callers on the hot path hoist it.
     """
     if not values:
         return False
-    if len(values) != curve_count:
+    # PSR-1 (Stage 11): the lower bound is min(2, curve_count), NOT a flat
+    # 2.  A SINGLE-curve section's standalone mnemonic header row is a
+    # single token ("~A\nDEPT\n1670.0\n...") — the DR-M2 `< 2` gate
+    # rejected it, consuming the header as data and producing a phantom
+    # all-null first row + value shift (regression vs HEAD 82cadce,
+    # adversarially verified on both sides).  For curve_count >= 2 the
+    # bound is unchanged: the 2-token minimum keeps a single-token
+    # short/ragged data row from being wrongly skipped as a header (M-02),
+    # and a 1-token row in a multi-curve section can never be a full
+    # header signature.  Single-curve STRING sections are excluded by the
+    # all-string clause below (M-03/F-19): their mnemonic-coincident
+    # values stay data.
+    if len(values) < min(2, curve_count) or len(values) > curve_count:
         return False
     if len(string_curve_indices) == curve_count:
         return False
@@ -1028,7 +1089,13 @@ def _read_normal(
         # first row.  Consuming it as a data row produced a phantom
         # all-null first row and shifted every value by one column.  Skip
         # it so it is not counted as a data row.
-        if _is_mnemonic_header_row(
+        # DR-M3: the header check applies ONLY to the first line(s) of the
+        # section (current_line == 0).  A standalone mnemonic header can
+        # only legitimately appear at the top of the ~A section; applying
+        # the predicate to every line made the M12 partial-header
+        # relaxation misclassify mid-section all-mnemonic rows (e.g. a
+        # ragged "GR ZONE" row) as headers, silently dropping real data.
+        if current_line == 0 and _is_mnemonic_header_row(
             values,
             las_file,
             curve_count,
@@ -1446,7 +1513,14 @@ def _read_wrapped(
         # shifted every value by one column.  The M-38 WRAP=YES
         # fall-through routes such files into the wrapped path, so the
         # skip is required here (not just in _read_normal).
-        if _is_mnemonic_header_row(
+        # DR-M3: the header check applies ONLY to the first line(s) of the
+        # section (total_elements == 0).  A mid-section packed
+        # continuation row whose values happen to be all declared
+        # mnemonics (e.g. "LITH ZONE" for string curves LITH/ZONE) is
+        # DATA, not a header — skipping it without resetting the
+        # depth_line/counter state machine silently column-shifted every
+        # later depth step (depth values leaked into string curves).
+        if total_elements == 0 and _is_mnemonic_header_row(
             values,
             las_file,
             curve_count,

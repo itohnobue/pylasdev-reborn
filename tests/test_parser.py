@@ -14,6 +14,7 @@ import pytest
 
 from pylasdev import CurveDefinition, DataSection, read_las_file
 from pylasdev.exceptions import LASParseError
+from pylasdev.models import LASFile, _GuardedList
 from pylasdev.parser import (
     LASParser,
     _is_indexed_data_section,
@@ -3890,6 +3891,94 @@ class TestP05NoSpacePipeAsciiHeader:
 
 
 # ──────────────────────────────────────────────────────────────
+# F-01 (parser, MEDIUM, Stage 12): pre-scan mirror asymmetry — the
+# pre-scan's mnemonic-header skip (parser.py:1507) used a flat
+# `len(_tokens) >= 2` while the reader gate (data_reader.py:958) uses
+# `min(2, curve_count)`.  A SINGLE-curve section's 1-token standalone
+# header ("~A\nDEPT\n...") was skipped by the reader but counted by the
+# pre-scan → data_line_count = 4 vs 3 consumed → spurious "Pre-scan
+# overcount" warning on every valid single-curve LAS 1.2/2.0 read.
+# The mirror now carries the identical min(2, curve_def_count) bound.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestS12F01PreScanMirrorMinBound:
+    """F-01: the pre-scan mirror must skip a single-curve section's
+    1-token standalone mnemonic header exactly like the reader
+    (min(2, curve_def_count) lower bound) — the pre-scan's own
+    data_line_count must equal the reader's actual consumption (3),
+    not 4 (pre-fix overcount)."""
+
+    _CONTENT_TEMPLATE = (
+        "~VERSION INFORMATION\n"
+        " VERS.   {vers}  : CWLS LOG ASCII STANDARD\n"
+        " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+        "~WELL INFORMATION\n"
+        " NULL.    -999.25 : NULL VALUE\n"
+        "~CURVE INFORMATION\n"
+        " DEPT.M   :  Depth\n"
+        "~A\n"
+        "DEPT\n"
+        "1670.0\n"
+        "1669.0\n"
+        "1668.0\n"
+    )
+
+    def test_single_curve_las20_standalone_header_not_counted(self) -> None:
+        """Pre-fix: the flat >= 2 gate counted the 1-token 'DEPT' header
+        as a data line → data_line_count == 4 (reader consumes 3) →
+        spurious 'Pre-scan overcount' warning.  Post-fix: 3."""
+        parser = LASParser()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            parser.parse(self._CONTENT_TEMPLATE.format(vers="2.0"))
+        assert parser.data_line_count == 3, (
+            f"F-01: pre-scan must skip the single-curve standalone header, "
+            f"data_line_count={parser.data_line_count}"
+        )
+
+    def test_single_curve_las12_standalone_header_not_counted(self) -> None:
+        """LAS 1.2 twin: same mirror bound must hold for LAS 1.2."""
+        parser = LASParser()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            parser.parse(self._CONTENT_TEMPLATE.format(vers="1.2"))
+        assert parser.data_line_count == 3, (
+            f"F-01: pre-scan must skip the LAS 1.2 single-curve standalone "
+            f"header, data_line_count={parser.data_line_count}"
+        )
+
+    def test_multi_curve_partial_header_still_not_counted(self) -> None:
+        """DR-M1 pin: the partial all-mnemonic header (2..curve_def_count
+        tokens) must STILL be skipped — the min(2, ...) lower bound does
+        not weaken the multi-curve partial-header skip."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            " RHOB.K/M3:  Density\n"
+            "~A\n"
+            "DEPT GR\n"
+            "1000.0 10.0 2.50\n"
+            "1001.0 11.0 2.51\n"
+            "1002.0 12.0 2.52\n"
+        )
+        parser = LASParser()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            parser.parse(content)
+        assert parser.data_line_count == 3, (
+            f"DR-M1: pre-scan must still skip the partial header, "
+            f"data_line_count={parser.data_line_count}"
+        )
+
+
+# ──────────────────────────────────────────────────────────────
 # G2 (N-I-22 / N-I-01 / N-I-04): parser iter-2 new findings
 # ──────────────────────────────────────────────────────────────
 
@@ -4557,6 +4646,84 @@ class TestS8PARS04DeferredMnemonicHeader:
         # No phantom all-null first row.
         np.testing.assert_array_almost_equal(ds.data["DEPT"], [1000.0, 1001.0])
         np.testing.assert_array_almost_equal(ds.data["GR"], [50.0, 55.0])
+
+
+class TestS11PSR1SingleCurveHeaderScope:
+    """PSR-1 (MEDIUM): the DR-M2 partial-header gate
+    (``len(tokens) < 2 or len(tokens) > section_count``) regressed
+    single-curve sections — a 1-token mnemonic header row failed the
+    ``< 2`` gate and was consumed as data.  The lower bound is now
+    ``min(2, section_count)`` so a 1-curve scope recognizes its 1-token
+    header while a multi-curve scope keeps the 2-token minimum."""
+
+    @staticmethod
+    def _parser_with_scope(curves: list[CurveDefinition]) -> LASParser:
+        parser = LASParser()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            parser.parse(
+                "~VERSION INFORMATION\n"
+                " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+                "~CURVE INFORMATION\n"
+            )
+        parser.las_file.curves = curves
+        return parser
+
+    def test_single_curve_scope_accepts_one_token_header(self) -> None:
+        parser = self._parser_with_scope([CurveDefinition(mnemonic="DEPT", unit="M")])
+        parser._state.section_curve_start_idx = 0
+        parser._state.section_curve_end_idx = 1  # scope = [DEPT]
+        # The 1-token standalone mnemonic header IS a header in a
+        # single-curve section (pre-fix: rejected by the < 2 gate).
+        assert parser._is_standalone_mnemonic_header("DEPT") is True
+        # A numeric data row is never a header.
+        assert parser._is_standalone_mnemonic_header("1670.0") is False
+        # A 1-token NON-mnemonic row is data, not a header.
+        assert parser._is_standalone_mnemonic_header("GR") is False
+        # 2 tokens exceed a 1-curve scope — never a header.
+        assert parser._is_standalone_mnemonic_header("DEPT GR") is False
+
+    def test_multi_curve_scope_keeps_two_token_minimum(self) -> None:
+        parser = self._parser_with_scope(
+            [
+                CurveDefinition(mnemonic="DEPT", unit="M"),
+                CurveDefinition(mnemonic="GR", unit="GAPI"),
+            ]
+        )
+        parser._state.section_curve_start_idx = 0
+        parser._state.section_curve_end_idx = 2  # scope = [DEPT, GR]
+        # Full 2-token header recognized (M-37/M-40 behavior preserved).
+        assert parser._is_standalone_mnemonic_header("DEPT GR") is True
+        # 1-token row in a MULTI-curve scope stays data (M-02 2-token minimum).
+        assert parser._is_standalone_mnemonic_header("DEPT") is False
+        # 1-token non-mnemonic row is data.
+        assert parser._is_standalone_mnemonic_header("1670.0") is False
+
+    def test_pre_v_deferred_single_curve_header_no_phantom_row(self) -> None:
+        """The deferred (pre-~V) replay path applies the same header-skip
+        predicate — a single-curve pre-~V section with a standalone 1-token
+        header must NOT produce a phantom all-null first row."""
+        content = (
+            "~ASCII\n"
+            "DEPT\n"
+            "1000.0\n"
+            "1001.0\n"
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        assert len(las.data_sections) == 1
+        ds = las.data_sections[0]
+        # No phantom all-null first row, no shift — values start at 1000.
+        np.testing.assert_array_almost_equal(ds.data["DEPT"], [1000.0, 1001.0])
 
 
 class TestS8PARS05NonDeferredDataBeforeCurves:
@@ -5236,3 +5403,142 @@ class TestS8L3001SpecFormArrayTimeOffset:
         }
         assert offsets2.get("NMR[1]") == 0.0, offsets2
         assert offsets2.get("NMR[2]") == 5.0, offsets2
+
+
+class TestS6F29Ext03KeepsGuardedCurves:
+    """F-29 (parser x models boundary, MEDIUM): the EXT-03 top-level curve
+    dedup for LAS 3.0 files with data sections must NOT strip the
+    _GuardedList mutation guard from ``las_file.curves``.
+
+    LASFile.__setattr__ re-wraps logs/string_data/curves_order on wholesale
+    reassignment but deliberately passes ``curves`` through unwrapped
+    (models.py:3006-3057).  The EXT-03 block assigned a plain Python list,
+    so post-parse ``las.curves.append("bad")`` silently succeeded and the
+    writer failed later with a confusing AttributeError instead of the clean
+    TypeError at the mutation point.  The fix re-wraps the deduped list
+    through _GuardedList, mirroring _WriterMutationGuard._rewrap_guards.
+    """
+
+    _CONTENT = (
+        "~VERSION INFORMATION\n"
+        " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+        " WRAP.   NO   :\n"
+        " DLM.   COMMA :\n"
+        "~WELL INFORMATION\n"
+        " STRT.M  1670.0 : START DEPTH\n"
+        " STOP.M  713.0 : STOP DEPTH\n"
+        " STEP.M  -0.125 : STEP\n"
+        " NULL.   -999.25 : NULL VALUE\n"
+        " WELL.   W1 : WELL\n"
+        "~CURVE INFORMATION\n"
+        " DEPT.M       : DEPTH  {F}\n"
+        " GR.API       : GAMMA  {F}\n"
+        "~LOG_DEFINITION\n"
+        " DEPT.M       : DEPTH  {F}\n"
+        " GR.API       : GAMMA  {F}\n"
+        "~LOG_DATA\n"
+        "100,50\n"
+        "101,51\n"
+    )
+
+    def test_ext03_dedup_keeps_guarded_curves(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(self._CONTENT)
+        # EXT-03 must have fired: ~C + ~Log_Definition duplicates collapse
+        # to unique top-level mnemonics.
+        assert las.curves_order == ["DEPT", "GR"], las.curves_order
+        assert len(las.curves) == 2
+        # The mutation guard must survive the dedup reassignment.
+        assert isinstance(las.curves, _GuardedList), (
+            f"F-29: EXT-03 stripped _GuardedList guard; got {type(las.curves).__name__}"
+        )
+        with pytest.raises(TypeError, match="items must be CurveDefinition"):
+            las.curves.append("bad")
+
+    def test_guarded_curves_survive_full_reader_path(self, test_data_dir: Path) -> None:
+        """The real shipped LAS 3.0 spec file (DEPT re-declared in ~C and
+        ~Drilling_Definition) must also retain the guard through the full
+        read_las_file_as_object path."""
+        spec_file = test_data_dir / "sample_las3.0_spec.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(spec_file)
+        assert isinstance(las.curves, _GuardedList), (
+            f"F-29: reader path stripped _GuardedList guard; got {type(las.curves).__name__}"
+        )
+        with pytest.raises(TypeError, match="items must be CurveDefinition"):
+            las.curves.append("bad")
+
+
+class TestS6F30DirectParseDeduplicatesLegacyCurves:
+    """F-30 (parser x models boundary, MEDIUM): direct ``LASParser.parse()`` on
+    a LAS 1.2/2.0 file with duplicate curve mnemonics (e.g. two ``IK`` lines in
+    4ALS.las) must deduplicate so the produced model is from_dict-compatible.
+
+    The full reader path masked duplicates because read_ascii_data() calls
+    data_reader._deduplicate_curves() (rename-based: IK → IK_2) before reading
+    data; the semi-public parse() API did not, so its output had duplicate
+    curves_order entries: validate(complete=True) reported 0 issues yet
+    to_dict()→from_dict() raised LASDataError("Duplicate curve name 'IK'").
+    """
+
+    _CONTENT = (
+        "~VERSION INFORMATION\n"
+        " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+        " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+        "~WELL INFORMATION\n"
+        " STRT.M   1670.0 : START DEPTH\n"
+        " STOP.M   1660.0 : STOP DEPTH\n"
+        " STEP.M   -0.125 : STEP\n"
+        " NULL.    -999.25 : NULL VALUE\n"
+        " COMP.    Company : COMPANY\n"
+        " WELL.    Well #1 : WELL NAME\n"
+        " FLD.     Field : FIELD\n"
+        " LOC.     Location : LOCATION\n"
+        " SRVC.    Service : SERVICE\n"
+        " DATE.    2026-01-01 : DATE\n"
+        "~CURVE INFORMATION\n"
+        " DEPT.M   :  Depth\n"
+        " IK.MS/M  :  Laterolog 1\n"
+        " IK.OHMM  :  Laterolog 2\n"
+        "~A  DEPT  IK  IK\n"
+        "100.0  10.0  20.0\n"
+        "101.0  11.0  21.0\n"
+    )
+
+    def test_direct_parse_dedups_duplicate_mnemonics(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(self._CONTENT)
+        # Duplicate IK must be renamed IK → IK_2 (data_reader semantics),
+        # keeping both curve definitions distinct and positionally aligned.
+        assert las.curves_order == ["DEPT", "IK", "IK_2"], las.curves_order
+        assert [c.mnemonic for c in las.curves] == ["DEPT", "IK", "IK_2"]
+        # validate() must report no issues on the deduped model.
+        assert las.validate(complete=True) == []
+
+    def test_direct_parse_model_from_dict_roundtrip(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(self._CONTENT)
+        # The direct-parse model must survive to_dict()→from_dict() without
+        # LASDataError (duplicate curve name).
+        data = las.to_dict()
+        restored = LASFile.from_dict(data)
+        assert restored.curves_order == ["DEPT", "IK", "IK_2"], restored.curves_order
+
+    def test_real_4als_file_direct_parse_roundtrips(self, test_data_dir: Path) -> None:
+        """The exact trigger from the finding: direct parse of the shipped
+        4ALS.las (duplicate IK in ~C) must produce a from_dict-compatible
+        model — previously to_dict→from_dict raised LASDataError."""
+        als_file = test_data_dir / "4ALS.las"
+        content = als_file.read_text(encoding="utf-8", errors="replace")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        assert las.curves_order.count("IK") == 1, las.curves_order
+        assert "IK_2" in las.curves_order, las.curves_order
+        data = las.to_dict()
+        restored = LASFile.from_dict(data)
+        assert restored.curves_order == las.curves_order

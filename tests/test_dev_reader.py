@@ -3506,3 +3506,189 @@ class TestFixI2_16HeaderedThousandsNoFalseMerge:
         assert len(thousands_warnings) == 0, (
             f"No thousands warning expected (no merge), got: {thousands_warnings}"
         )
+
+
+class TestF03DugPatternBDataPreservingGuards:
+    """F-03 (CONFIRMED MEDIUM): DUG Pattern B lacks Pattern A's guards.
+
+    Pattern A (:1068-1070, :1089) guards a count-prefix headerless file
+    against DUG misdetection: the M-24 sentinel guard (a second line whose
+    non-float tokens are all missing-data sentinels is DATA, not a header)
+    and the count-match heuristic (all-float second line with a matching
+    count is a count-prefix headerless file).  Pattern B had neither:
+
+    - (1a) title + count + ``1.0 2.0 3.0 na`` (sentinel first data row)
+      was detected ("dug", 3): the first data row became fabricated column
+      names ('1.0','2.0','3.0','NA') and its VALUES were LOST.
+    - (1b) title + count + ``100 200 300 400`` (numeric line) fell through
+      to ("simple", 1): the title was fabricated as a header and the
+      count/data rows shifted.
+
+    After the fix both shapes are ("headerless", 2) — title and count are
+    skipped, columns derive from the first REAL data line, and every value
+    survives.  FAILS on pre-fix code, PASSES on post-fix.
+    """
+
+    def test_sentinel_first_data_row_values_preserved(self, tmp_path: Path) -> None:
+        """F-03 (1a): sentinel-bearing first data row is data, not a header."""
+        content = (
+            "Deviation survey for Well-1\n4\n1.0 2.0 3.0 na\n5.0 6.0 7.0 8.0\n9.0 10.0 11.0 12.0\n"
+        )
+        test_file = tmp_path / "f03_sentinel_b.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+
+        # 4 headerless columns derived from the first real data line —
+        # NOT fabricated column names '1.0','2.0','3.0','NA'.
+        assert list(data.keys()) == ["col_0", "col_1", "col_2", "col_3"], (
+            f"Expected 4 headerless columns, got {list(data.keys())}"
+        )
+        # First data row VALUES are preserved (the pre-fix code lost them
+        # as fabricated column names).
+        np.testing.assert_array_equal(data["col_0"], [1.0, 5.0, 9.0])
+        np.testing.assert_array_equal(data["col_1"], [2.0, 6.0, 10.0])
+        np.testing.assert_array_equal(data["col_2"], [3.0, 7.0, 11.0])
+        # The 'na' sentinel maps to NaN (missing data), not a column name.
+        np.testing.assert_array_equal(data["col_3"], [np.nan, 8.0, 12.0])
+
+    def test_numeric_column_line_headerless(self, tmp_path: Path) -> None:
+        """F-03 (1b): all-float third line under a TITLE is count-prefix
+        headerless, not simple-with-title-header."""
+        content = "Deviation survey for Well-1\n4\n100 200 300 400\n5.0 6.0 7.0 8.0\n"
+        test_file = tmp_path / "f03_numeric_b.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+
+        # Headerless: title + count skipped, columns derive from the first
+        # real data line.  The pre-fix code fabricated the title
+        # ('DEVIATION','SURVEY','FOR','WELL-1') as a header.
+        assert list(data.keys()) == ["col_0", "col_1", "col_2", "col_3"], (
+            f"Expected 4 headerless columns, got {list(data.keys())}"
+        )
+        # Numeric line is the first DATA row, not numeric column names.
+        np.testing.assert_array_equal(data["col_0"], [100.0, 5.0])
+        np.testing.assert_array_equal(data["col_1"], [200.0, 6.0])
+        np.testing.assert_array_equal(data["col_2"], [300.0, 7.0])
+        np.testing.assert_array_equal(data["col_3"], [400.0, 8.0])
+
+    def test_real_header_over_all_float_third_line_stays_simple(self, tmp_path: Path) -> None:
+        """F-03 control: the V-03 contract is preserved — a real column
+        header ("MD TVD X Y") over an all-float third line stays SIMPLE
+        (ragged data rows), it is NOT reinterpreted as a title."""
+        content = (
+            "MD TVD X Y\n4\n0.0 0.0 0.0 0.0\n100.0 1000.0 100.0 200.0\n200.0 1100.0 150.0 250.0\n"
+        )
+        test_file = tmp_path / "f03_v03_control.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["MD", "TVD", "X", "Y"], (
+            f"Expected real column names, got {list(data.keys())}"
+        )
+        np.testing.assert_array_equal(data["MD"], [4.0, 0.0, 100.0, 200.0])
+
+
+class TestF04NumericNullSentinels:
+    """F-04 (CONFIRMED MEDIUM): numeric null sentinels map to NaN.
+
+    The DEV format has no declared-NULL mechanism; the reader hardcodes
+    np.nan.  Text sentinels ("na", "null", ...) already map to NaN, but
+    the industry-standard numeric sentinels (-999, -999.25, -9999) were
+    parsed as REAL values — polluting the trajectory and triggering
+    spurious "TVD decreases" validation warnings.  After the fix they map
+    to NaN like text sentinels.  FAILS on pre-fix code, PASSES on post-fix.
+    """
+
+    def test_minus_999_25_maps_to_nan_no_tvd_warning(self, tmp_path: Path) -> None:
+        """The finding's exact repro: TVD=[90, -999.25, 290] must read as
+        [90, NaN, 290] with NO spurious 'TVD decreases' warning."""
+        content = (
+            "MD TVD X Y\n100.0 90.0 10.0 20.0\n200.0 -999.25 30.0 40.0\n300.0 290.0 50.0 60.0\n"
+        )
+        test_file = tmp_path / "f04_sentinel_tvd.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        # Sentinel maps to NaN (missing data), not a real -999.25 value.
+        np.testing.assert_array_equal(data["TVD"], [90.0, np.nan, 290.0])
+        np.testing.assert_array_equal(data["MD"], [100.0, 200.0, 300.0])
+        # No spurious TVD-decreases warning from the sentinel polluting
+        # the trajectory.
+        tvd_decrease_warnings = [
+            str(x.message) for x in w if "TVD" in str(x.message) and "decrease" in str(x.message)
+        ]
+        assert len(tvd_decrease_warnings) == 0, (
+            f"Sentinel must not trigger TVD-decrease warning, got: {tvd_decrease_warnings}"
+        )
+
+    def test_minus_999_and_minus_9999_map_to_nan(self, tmp_path: Path) -> None:
+        """Integer sentinel variants also map to NaN in every column."""
+        content = "MD TVD X Y\n100.0 -999 10.0 20.0\n200.0 -9999 30.0 40.0\n"
+        test_file = tmp_path / "f04_int_sentinels.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+
+        np.testing.assert_array_equal(data["MD"], [100.0, 200.0])
+        np.testing.assert_array_equal(data["TVD"], [np.nan, np.nan])
+        np.testing.assert_array_equal(data["X"], [10.0, 30.0])
+        np.testing.assert_array_equal(data["Y"], [20.0, 40.0])
+
+
+class TestF05EwNsOffsetSemantics:
+    """F-05 (CONFIRMED MEDIUM): EW/NS are OFFSET columns, not absolute X/Y.
+
+    Petra documents EW/NS as offset footage — the same semantic class as
+    the DX/DY pair M-21 already excluded from the absolute X/Y alias.  The
+    old EW→X / NS→Y aliases fabricated X_2/Y_2 columns with misleading
+    "Duplicate DEV column name" warnings on files carrying BOTH absolute
+    coordinates and offsets ("MD TVD X Y EW NS"), silently reinterpreting
+    small offset values as absolute UTM coordinates.  After the fix EW/NS
+    keep their own identities.  FAILS on pre-fix code, PASSES on post-fix.
+    """
+
+    def test_ew_ns_coexist_with_absolute_xy(self, tmp_path: Path) -> None:
+        """The finding's exact repro: MD TVD X Y EW NS → 6 clean columns,
+        no fabricated X_2/Y_2, no duplicate warnings, offsets stored as-is."""
+        content = (
+            "MD TVD X Y EW NS\n"
+            "100.0 90.0 47707.0 41152.0 10.0 20.0\n"
+            "200.0 190.0 47717.0 41162.0 15.0 25.0\n"
+        )
+        test_file = tmp_path / "f05_ew_ns.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        # All six columns coexist under their own names — no fabricated
+        # X_2/Y_2 (pre-fix: X_2 held the EW offsets, Y_2 held NS).
+        assert list(data.keys()) == ["MD", "TVD", "X", "Y", "EW", "NS"], (
+            f"Expected ['MD','TVD','X','Y','EW','NS'], got {list(data.keys())}"
+        )
+        # Absolute coordinates and offsets stay distinct.
+        np.testing.assert_array_equal(data["X"], [47707.0, 47717.0])
+        np.testing.assert_array_equal(data["Y"], [41152.0, 41162.0])
+        np.testing.assert_array_equal(data["EW"], [10.0, 15.0])
+        np.testing.assert_array_equal(data["NS"], [20.0, 25.0])
+        # No misleading duplicate warnings (pre-fix: "Duplicate DEV column
+        # name 'X' renamed to 'X_2'").
+        duplicate_warnings = [str(x.message) for x in w if "Duplicate" in str(x.message)]
+        assert len(duplicate_warnings) == 0, (
+            f"No duplicate warnings expected, got: {duplicate_warnings}"
+        )

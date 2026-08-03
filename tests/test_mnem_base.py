@@ -329,3 +329,45 @@ class TestMnemBaseDualLaterologCollision:
         assert data["curves_order"] == ["DEPT", "BFV", "LLS"]
         # Data survives under the normalized names.
         assert "BFV" in data["logs"]
+
+
+class TestGzFamilyTerminalCanonicals:
+    """F-12: the former GZ2-GZ5 → PZ entries silently renamed 92 keys
+    (GZ21, GZ210, ГЗ2, ...) to PZ — the I2-19 comment/test claim that "no
+    other mnemonic targets them" was false.  GZ2-GZ5 are terminal canonicals
+    like GZ1: GZ21 → GZ2, ГЗ3 → GZ3, never PZ."""  # noqa: RUF002
+
+    def test_gz2_gz5_resolve_to_self(self) -> None:
+        uppered = _build_uppercased_first_wins(MNEM_BASE)
+        assert resolve_mnemonic(uppered, "GZ2") == "GZ2"
+        assert resolve_mnemonic(uppered, "GZ3") == "GZ3"
+        assert resolve_mnemonic(uppered, "GZ4") == "GZ4"
+        assert resolve_mnemonic(uppered, "GZ5") == "GZ5"
+
+    def test_gz_family_keys_resolve_to_own_canonical_not_pz(self) -> None:
+        uppered = _build_uppercased_first_wins(MNEM_BASE)
+        assert resolve_mnemonic(uppered, "GZ21") == "GZ2"
+        assert resolve_mnemonic(uppered, "GZ31") == "GZ3"
+        assert resolve_mnemonic(uppered, "ГЗ2") == "GZ2"  # noqa: RUF001
+        assert resolve_mnemonic(uppered, "ГЗ3вм") == "GZ3"  # noqa: RUF001
+        assert resolve_mnemonic(uppered, "GZ4") != "PZ"
+        assert resolve_mnemonic(uppered, "GZ5") != "PZ"
+
+
+class TestCyrillicRsResistivity:
+    """F-13: 'РС':'SP' was the only Cyrillic R-* entry breaking the
+    R-*→R-* pattern (РД→RD, РЕЗ→RS, РП→RP, РПЗ→RZP).  РС is the Russian
+    resistivity abbreviation — corrected to RS."""  # noqa: RUF002
+
+    def test_rs_maps_to_resistivity_not_sp(self) -> None:
+        uppered = _build_uppercased_first_wins(MNEM_BASE)
+        assert resolve_mnemonic(uppered, "РС") == "RS"  # noqa: RUF001
+
+    def test_all_cyrillic_r_keys_follow_r_family(self) -> None:
+        uppered = _build_uppercased_first_wins(MNEM_BASE)
+        for key in uppered:
+            if key.startswith("Р"):  # noqa: RUF001
+                assert uppered[key].startswith("R"), (
+                    f"Cyrillic Р-* key {key!r} resolves to {uppered[key]!r}, "  # noqa: RUF001
+                    "breaking the R-*→R-* pattern"
+                )

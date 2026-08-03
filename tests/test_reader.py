@@ -11,7 +11,7 @@ import pytest
 
 from pylasdev import read_dev_file, read_las_file, read_las_file_as_object
 from pylasdev.exceptions import LASParseError, LASReadError
-from pylasdev.models import LASFile
+from pylasdev.models import CurveDefinition, LASFile
 from pylasdev.parser import LASParser
 
 
@@ -3044,7 +3044,8 @@ class TestG6DataReaderFixes:
 
     def test_it3f01_desanitize_flag_hoist_semantics(self) -> None:
         """IT3-F-01: the hoisted desanitize flag must preserve the exact
-        _# escape semantics (start-of-value and after-whitespace unescape)."""
+        _# escape semantics (value-start and leading-whitespace unescape;
+        M11: internal " _#" content is preserved, mirroring F-25)."""
         from pylasdev import parser as _parser_mod
         from pylasdev.data_reader import _desanitize_las_value
 
@@ -3053,8 +3054,13 @@ class TestG6DataReaderFixes:
         try:
             assert _desanitize_las_value("_#comment") == "#comment"
             assert _desanitize_las_value("_#comment", False) == "_#comment"
-            assert _desanitize_las_value("abc _#def", True) == "abc #def"
+            # M11: the data_reader copy mirrors the parser's F-25 scope —
+            # the writer escapes '#' ONLY at value start / after LEADING
+            # whitespace, so an internal mid-value " _#" is preserved, while
+            # a leading-whitespace writer escape is still restored.
+            assert _desanitize_las_value("abc _#def", True) == "abc _#def"
             assert _desanitize_las_value("abc _#def", False) == "abc _#def"
+            assert _desanitize_las_value(" _#comment", True) == " #comment"
             assert _desanitize_las_value("plain", True) == "plain"
             # None (no cache) falls back to the module flag
             assert _desanitize_las_value("_#x") == "#x"
@@ -3468,3 +3474,221 @@ class TestENC03SizeLimitErrorContract:
         test_file.write_bytes("Caf\u00e9 r\u00e9sum\u00e9".encode("cp1252"))
         with pytest.raises(LASEncodingError, match="Failed to decode"):
             read_las_file(test_file, encoding="utf-8")
+
+
+# ──────────────────────────────────────────────────────────────
+# F-02 (data_reader, MEDIUM, REGRESSION): the F-07 depth-line
+# evidence rule's ``window[1] == 1`` arm fired for ANY single
+# 1-value row after a full first row when curve_count >= 3,
+# misclassifying a ragged NON-wrapped nc>=3 file with a single
+# 1-value middle row ([3,1,3] / [3,1,2]) as WRAPPED → silent
+# column-shift corruption (the genuine depth value swallowed into
+# curve 1, trailing values discarded).  A single 1-value row is
+# ragged-row evidence (graceful short-row null-fill), not
+# unambiguous depth evidence — only TWO+ 1-value rows trigger the
+# wrapped arm.  Mirrored on the LAS 3.0 path (_las30_data.py) and
+# covered there by TestF02Las30RaggedMiddleRowNotWrapped.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestF02ThreeCurveShortMiddleRowNotWrapped:
+    """F-02: 3-curve WRAP=NO files with a single 1-value middle row must
+    NOT be classified wrapped (regression — pre-fix the nc>=3
+    window[1]==1 arm silently column-shifted the file)."""
+
+    def test_las20_three_curve_short_middle_row_not_wrapped(self, tmp_path: Path) -> None:
+        """3-curve LAS 2.0 WRAP=NO `100.0 50.0 30.0 / 101.0 / 102.0 60.0 40.0`
+        (window [3,1,3]): DEPT=[100,101,102], C1=[50,-999.25,60],
+        C2=[30,-999.25,40].  Pre-fix: WRAPPED=True → DEPT=[100,101],
+        C1=[50,102], C2=[30,60] — the depth value 102.0 swallowed into
+        C1 and the genuine 40.0 discarded."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " C1.GAPI  :  Curve 1\n"
+            " C2.K/M3  :  Curve 2\n"
+            "~A DEPT C1 C2\n"
+            "100.0 50.0 30.0\n"
+            "101.0\n"
+            "102.0 60.0 40.0\n"
+        )
+        test_file = tmp_path / "f02_las20_three_curve_short_middle.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 101.0, 102.0])
+        np.testing.assert_allclose(data["logs"]["C1"], [50.0, -999.25, 60.0])
+        np.testing.assert_allclose(data["logs"]["C2"], [30.0, -999.25, 40.0])
+
+    def test_las20_three_curve_short_middle_two_value_row_not_wrapped(self, tmp_path: Path) -> None:
+        """[3,1,2] shape: `100.0 50.0 30.0 / 101.0 / 102.0 60.0` — the
+        single 1-value middle row must stay ragged (non-wrapped):
+        DEPT=[100,101,102], C1=[50,-999.25,60], C2=[30,-999.25,-999.25].
+        Pre-fix this silently produced DEPT=[100,101], C1=[50,102],
+        C2=[30,60] with no warning at all."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " C1.GAPI  :  Curve 1\n"
+            " C2.K/M3  :  Curve 2\n"
+            "~A DEPT C1 C2\n"
+            "100.0 50.0 30.0\n"
+            "101.0\n"
+            "102.0 60.0\n"
+        )
+        test_file = tmp_path / "f02_las20_three_curve_short_middle2.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 101.0, 102.0])
+        np.testing.assert_allclose(data["logs"]["C1"], [50.0, -999.25, 60.0])
+        np.testing.assert_allclose(data["logs"]["C2"], [30.0, -999.25, -999.25])
+
+    def test_las20_three_curve_wrap_yes_short_middle_row_still_wrapped(
+        self, tmp_path: Path
+    ) -> None:
+        """Control: the [3,1,3] shape with WRAP=YES declared must STILL
+        be classified wrapped (declared-YES + depth evidence → wrapped;
+        the gate must not regress genuine wrapped detection)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " C1.GAPI  :  Curve 1\n"
+            " C2.K/M3  :  Curve 2\n"
+            "~A DEPT C1 C2\n"
+            "100.0 50.0 30.0\n"
+            "101.0\n"
+            "102.0 60.0 40.0\n"
+        )
+        test_file = tmp_path / "f02_las20_three_curve_wrap_yes.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(test_file)
+        # Wrapped parse: DEPT holds the depth-line values only.
+        np.testing.assert_allclose(data["logs"]["DEPT"], [100.0, 101.0])
+        np.testing.assert_allclose(data["logs"]["C1"], [50.0, 102.0])
+        np.testing.assert_allclose(data["logs"]["C2"], [30.0, 60.0])
+
+    def test_detector_single_one_value_row_never_wrapped(self) -> None:
+        """Detector-level audit: a SINGLE 1-value row (in any window
+        position) after a full first row is ragged — never wrapped.
+        Two+ 1-value rows (masquerade/mixed-wrap) stay wrapped."""
+        from pylasdev.data_reader import _detect_actual_wrap
+
+        def lines_from_window(window: list[int]) -> list[str]:
+            out = ["~A DEPT GR RHOB"]
+            for n in window:
+                out.append(" ".join(str(i) for i in range(1, n + 1)))
+            return out
+
+        # (window, curve_count, declared_wrap, expected_wrapped)
+        shapes = [
+            ([3, 1, 3], 3, "NO", False),  # F-02: ragged single middle 1-value row
+            ([3, 1, 2], 3, "NO", False),  # F-02: ragged single middle 1-value row
+            ([3, 1, 3], 3, None, False),  # absent declaration behaves like NO
+            ([3, 1, 2], 3, None, False),  # absent declaration behaves like NO
+            ([3, 1, 1], 3, "NO", True),  # mnemonic-header masquerade (2 one-value rows)
+            ([3, 1, 2, 1], 3, "NO", True),  # I2-03 mixed-wrap (2 one-value rows)
+            ([3, 1, 2, 1], 3, None, True),  # mixed-wrap without declaration
+            ([3, 1, 3], 3, "YES", True),  # declared YES stays wrapped
+            ([3, 2, 1], 3, "NO", False),  # ragged trailing 1-value row (unchanged)
+        ]
+        for window, nc, decl, expected in shapes:
+            got = _detect_actual_wrap(lines_from_window(window), nc, " ", declared_wrap=decl)
+            assert got is expected, (
+                f"window={window} nc={nc} decl={decl}: expected wrapped={expected}, got {got}"
+            )
+
+
+class TestIsMnemonicHeaderRowSingleCurve:
+    """PSR-1 (Stage 11): _is_mnemonic_header_row's token-count gate must
+    use min(2, curve_count), not a flat 2.  A SINGLE-curve section must
+    still recognize its 1-token standalone mnemonic header row
+    ("~A\\nDEPT\\n1670.0\\n...") — the DR-M2 `< 2` gate consumed it as
+    data, producing a phantom all-null first row + value shift.  The
+    2-token minimum is preserved for multi-curve sections (M-02), and the
+    all-string exclusion still protects single-curve STRING sections
+    (M-03/F-19)."""
+
+    @staticmethod
+    def _las(mnemonics: list[str]) -> LASFile:
+        las = LASFile()
+        las.curves_order = list(mnemonics)
+        for name in mnemonics:
+            las.curves.append(CurveDefinition(mnemonic=name, unit="M"))
+        return las
+
+    def test_single_curve_one_token_mnemonic_is_header(self) -> None:
+        """PSR-1: a 1-token row equal to the sole curve's mnemonic is a
+        header in a single-curve section (pre-fix `< 2` returned False —
+        the phantom-row defect)."""
+        from pylasdev.data_reader import _is_mnemonic_header_row
+
+        las = self._las(["DEPT"])
+        assert _is_mnemonic_header_row(["DEPT"], las, 1, set()) is True
+
+    def test_single_curve_one_token_non_mnemonic_is_data(self) -> None:
+        """A 1-token numeric data row is not a header."""
+        from pylasdev.data_reader import _is_mnemonic_header_row
+
+        las = self._las(["DEPT"])
+        assert _is_mnemonic_header_row(["1670.0"], las, 1, set()) is False
+
+    def test_single_curve_two_tokens_not_header(self) -> None:
+        """A 2-token row in a 1-curve section exceeds curve_count — it is
+        an extra-column data row, never a header."""
+        from pylasdev.data_reader import _is_mnemonic_header_row
+
+        las = self._las(["DEPT"])
+        assert _is_mnemonic_header_row(["DEPT", "GR"], las, 1, set()) is False
+
+    def test_two_curve_one_token_not_header(self) -> None:
+        """M-02: the 2-token minimum stays intact for multi-curve
+        sections — a 1-token row cannot be a full header signature."""
+        from pylasdev.data_reader import _is_mnemonic_header_row
+
+        las = self._las(["DEPT", "GR"])
+        assert _is_mnemonic_header_row(["DEPT"], las, 2, set()) is False
+
+    def test_single_curve_string_section_one_token_not_header(self) -> None:
+        """M-03/F-19: in a single-curve all-STRING section the all-string
+        exclusion fires — a mnemonic-coincident value is data, not a
+        header (min(2, 1) alone must NOT turn string sections into header
+        droppers)."""
+        from pylasdev.data_reader import _is_mnemonic_header_row
+
+        las = self._las(["LITH"])
+        assert _is_mnemonic_header_row(["LITH"], las, 1, {0}) is False
+
+    def test_multi_curve_partial_header_still_header(self) -> None:
+        """M12/DR-M2: the partial-header relaxation (2..curve_count) stays
+        intact — "DEPT GR" with 3 declared curves is still a header."""
+        from pylasdev.data_reader import _is_mnemonic_header_row
+
+        las = self._las(["DEPT", "GR", "RHOB"])
+        assert _is_mnemonic_header_row(["DEPT", "GR"], las, 3, set()) is True
+
+    def test_multi_curve_full_header_still_header(self) -> None:
+        """The full-width header remains a header."""
+        from pylasdev.data_reader import _is_mnemonic_header_row
+
+        las = self._las(["DEPT", "GR", "RHOB"])
+        assert _is_mnemonic_header_row(["DEPT", "GR", "RHOB"], las, 3, set()) is True
