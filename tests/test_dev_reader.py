@@ -2057,21 +2057,33 @@ class TestProductionCheckDevReaderFixes:
 
     # === F-042: MD NaN/Inf validation ===
 
-    def test_single_nan_md_triggers_nan_inf_warning(self, tmp_path: Path) -> None:
-        """F-042: Single NaN in MD triggers NaN/Inf warning via __post_init__.
+    def test_single_nan_md_suppressed_on_read(self, tmp_path: Path) -> None:
+        """F-042/M-01: NaN in MD does NOT trigger the non-finite
+        corruption warning on the READ path.
 
-        F-041/F-047: __post_init__ calls validate(complete=True) which
-        checks NaN/Inf for all columns.  The duplicate NaN/Inf check in
-        _validate_dev_data was removed (F-047).  A single NaN in MD
-        (below the 50% NaN density threshold) is caught by the validate()
-        NaN/Inf check in __post_init__.
+        M-01: NaN is the reader's OWN designed missing-data
+        representation (conversion of the ``nan`` token via
+        ``_dev_to_finite_float`` with null_value=NaN).  The reader marks
+        its DevFile with ``_designed_nan=True``, so the read-path
+        non-finite check suppresses NaN (Inf would still warn — the
+        reader never produces Inf).  Pre-fix: the NaN/Inf check in
+        _validate_dev_data warned unconditionally, firing a false
+        "corruption" warning on every sentinel-bearing file.
         """
         content = "MD,AZIM\n100.0,10.0\nnan,20.0\n200.0,30.0\n300.0,40.0\n"
         test_file = tmp_path / "single_nan_md.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        with pytest.warns(UserWarning, match="non-finite values"):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             read_dev_file_as_object(test_file)
+
+        non_finite = [x for x in w if "non-finite values" in str(x.message)]
+        assert len(non_finite) == 0, (
+            f"Designed NaN on the read path must NOT fire the non-finite "
+            f"corruption warning, got {len(non_finite)}: "
+            f"{[str(x.message) for x in w]}"
+        )
 
     # === F-043: Case-insensitive column lookups ===
 
@@ -2153,13 +2165,16 @@ class TestProductionCheckDevReaderFixes:
 
     # === F-041: DevFile __post_init__ called after reader construction ===
 
-    def test_read_dev_file_as_object_runs_post_init_validation(self, tmp_path: Path) -> None:
-        """F-041: read_dev_file_as_object calls __post_init__ after construction.
+    def test_read_dev_file_as_object_suppresses_designed_nan(self, tmp_path: Path) -> None:
+        """F-041/M-01: read_dev_file_as_object runs the post-construction
+        pass, but the reader-designed NaN it produces (NaN in INC here)
+        must NOT fire the non-finite corruption warning.
 
-        __post_init__ runs validate(complete=True) which checks NaN/Inf
-        for all columns.  A file with NaN values in non-MD columns
-        should trigger the validate() NaN/Inf warning in addition to
-        _validate_dev_data warnings.
+        M-01: the reader marks its DevFile with ``_designed_nan=True``;
+        the read-path non-finite check suppresses NaN (Inf would still
+        warn — the reader never produces Inf).  Pre-fix: the NaN/Inf
+        check warned unconditionally, firing a false "corruption"
+        warning on every file with NaN missing-data cells.
         """
         content = "MD,AZI,INC\n100.0,45.0,nan\n200.0,90.0,30.0\n"
         test_file = tmp_path / "nan_post_init.dev"
@@ -2168,14 +2183,15 @@ class TestProductionCheckDevReaderFixes:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             dev = read_dev_file_as_object(test_file)
-        # __post_init__ runs validate(complete=True) which warns about
-        # NaN in INC column
-        inc_nan_warnings = [x for x in w if "DevFile: column 'INC'" in str(x.message)]
-        assert len(inc_nan_warnings) >= 1, (
-            f"Expected __post_init__ validate() warning for INC NaN, got {len(inc_nan_warnings)}"
+        inc_nan_warnings = [x for x in w if "non-finite values" in str(x.message)]
+        assert len(inc_nan_warnings) == 0, (
+            f"Designed NaN in INC must NOT fire the non-finite corruption "
+            f"warning on read, got {len(inc_nan_warnings)}: "
+            f"{[str(x.message) for x in w]}"
         )
         # Data should be parsed correctly
         assert dev.columns["MD"][0] == 100.0
+        assert np.isnan(dev.columns["INC"][0])
 
     # === F-046: Semicolon-only auto-detection ===
 
@@ -3692,3 +3708,586 @@ class TestF05EwNsOffsetSemantics:
         assert len(duplicate_warnings) == 0, (
             f"No duplicate warnings expected, got: {duplicate_warnings}"
         )
+
+
+class TestE23DugMinColumnWarning:
+    """E-23 (CONFIRMED MEDIUM): DUG files with FEWER than 4 columns were
+    silently accepted, but the DUG specification requires at least four
+    columns to tie MD, TVD, X, and Y.  The read now warns loudly while
+    still parsing (3-column MD/INC/AZI DUG files are legitimate real-world
+    directional survey exports).  FAILS on pre-fix code (no warning),
+    PASSES on post-fix code."""
+
+    def test_three_column_dug_warns_loudly(self, tmp_path: Path) -> None:
+        content = "Well-42 Survey\n3\nMD INC AZI\n0.00 0.00 0.00\n100.00 1.50 45.00\n"
+        test_file = tmp_path / "e23_dug_3col.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        min_col_warnings = [x for x in w if "at least four columns" in str(x.message)]
+        assert len(min_col_warnings) == 1, (
+            f"Expected exactly 1 min-column warning, got: {[str(x.message) for x in w]}"
+        )
+        assert "3" in str(min_col_warnings[0].message)
+        # The file still parses (warn loudly, do not destroy the data).
+        assert list(data.keys()) == ["MD", "INC", "AZI"]
+        np.testing.assert_array_equal(data["MD"], [0.0, 100.0])
+
+    def test_four_column_dug_no_warning(self, tmp_path: Path) -> None:
+        content = (
+            "Deviation survey for Well-1\n4\nMDKB TVDSS X Y\n"
+            "0.00 -20.06 39844.56 24589.34\n1000.00 1020.02 39844.47 24588.95\n"
+        )
+        test_file = tmp_path / "e23_dug_4col.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            read_dev_file(test_file)
+
+        min_col_warnings = [x for x in w if "at least four columns" in str(x.message)]
+        assert len(min_col_warnings) == 0, (
+            f"4-column DUG must not warn, got: {[str(x.message) for x in w]}"
+        )
+
+    def test_alias_variants_count_toward_minimum(self, tmp_path: Path) -> None:
+        """E-23: the guard runs after alias normalization — MDKB/TVDSS/
+        UTMX/UTMY normalise to MD/TVD/X/Y (4 columns) and must NOT warn."""
+        content = "4\nMDKB TVDSS UTMX UTMY\n0.0 0.0 100.0 200.0\n100.0 99.0 101.0 201.0\n"
+        test_file = tmp_path / "e23_dug_aliases.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        min_col_warnings = [x for x in w if "at least four columns" in str(x.message)]
+        assert len(min_col_warnings) == 0, (
+            f"Alias-normalised 4-column DUG must not warn, got: "
+            f"{[str(x.message) for x in w]}"
+        )
+        assert list(data.keys()) == ["MD", "TVD", "X", "Y"]
+
+
+class TestE24EqualCountThousandsRecombination:
+    """E-24 / F-30b (CONFIRMED MEDIUM): comma-delimited rows whose split
+    token count EQUALS the declared columns were never recombined
+    (``len(values) <= expected`` early return), so a thousands value
+    silently column-shifted ("1,234.5,3" in a 3-column file read MD=1.0,
+    TVD=234.5).  The recombination gate now fires on equal-count rows with
+    a 1-2 digit leading group; the shorter recombined row is NaN-filled.
+    FAILS on pre-fix code (shift), PASSES on post-fix code."""
+
+    def test_equal_count_three_columns(self, tmp_path: Path) -> None:
+        content = "MD,TVD,X\n1,234.5,3.0\n2.0,3.0,4.0\n"
+        test_file = tmp_path / "e24_equal_3col.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        # Pre-fix: MD=1.0, TVD=234.5, X=3.0 (silent shift).
+        assert data["MD"][0] == 1234.5, f"MD must be 1234.5, got {data['MD'][0]}"
+        assert data["TVD"][0] == 3.0, f"TVD must be 3.0, got {data['TVD'][0]}"
+        assert np.isnan(data["X"][0]), "X must be NaN (short row)"
+        thousands_warnings = [x for x in w if "thousands separator" in str(x.message)]
+        assert len(thousands_warnings) >= 1, (
+            f"Equal-count recombination must fire the V-08 warning, got: "
+            f"{[str(x.message) for x in w]}"
+        )
+
+    def test_equal_count_two_columns(self, tmp_path: Path) -> None:
+        content = "MD,TVD\n1,234.5\n2.0,3.0\n"
+        test_file = tmp_path / "e24_equal_2col.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        assert data["MD"][0] == 1234.5, f"MD must be 1234.5, got {data['MD'][0]}"
+        assert np.isnan(data["TVD"][0]), "TVD must be NaN (short row)"
+
+    def test_equal_count_multi_group(self, tmp_path: Path) -> None:
+        """1,234,567.8 splits into 3 tokens == 3 declared columns."""
+        content = "MD,TVD,X\n1,234,567.8\n2.0,3.0,4.0\n"
+        test_file = tmp_path / "e24_equal_multi.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        assert data["MD"][0] == 1234567.8, f"MD must be 1234567.8, got {data['MD'][0]}"
+        assert np.isnan(data["TVD"][0])
+        assert np.isnan(data["X"][0])
+        thousands_warnings = [x for x in w if "thousands separator" in str(x.message)]
+        assert len(thousands_warnings) >= 1
+
+    def test_bare_fragment_equal_count_not_merged(self, tmp_path: Path) -> None:
+        """M-23 control: a bare 3-digit fragment ("1,234" → "1","234") is
+        ambiguous with genuine columns and must NOT merge even at equal
+        count."""
+        content = "MD,TVD\n1,234\n2.0,3.0\n"
+        test_file = tmp_path / "e24_equal_bare.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        assert data["MD"][0] == 1.0, f"Bare fragment must stay split, got {data['MD'][0]}"
+        assert data["TVD"][0] == 234.0
+        thousands_warnings = [x for x in w if "thousands separator" in str(x.message)]
+        assert len(thousands_warnings) == 0, (
+            f"Bare fragments must not be reported as thousands, got: "
+            f"{[str(x.message) for x in w]}"
+        )
+
+    def test_three_digit_leading_equal_count_not_merged(self, tmp_path: Path) -> None:
+        """DEV-02 control: a 3-digit leading group at equal count is a
+        genuine ragged column ("101,201,301.5,401,501"), not thousands."""
+        content = "MD,TVD,X,Y,Z\n101,201,301.5,401,501\n"
+        test_file = tmp_path / "e24_equal_3digit.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        np.testing.assert_array_equal(data["MD"], [101.0])
+        np.testing.assert_array_equal(data["TVD"], [201.0])
+        np.testing.assert_array_equal(data["X"], [301.5])
+        thousands_warnings = [x for x in w if "thousands separator" in str(x.message)]
+        assert len(thousands_warnings) == 0
+
+
+class TestE34ReadSingleValidationPass:
+    """E-34 (CONFIRMED MEDIUM): every DEV read double-warned —
+    __post_init__ ran validate(complete=True) AND _validate_dev_data ran
+    the same check classes (MD monotonicity, AZI/INC range, TVD).  The
+    read path now runs _validate_dev_data as the SINGLE data-quality pass.
+    FAILS on pre-fix code (2 warnings per issue), PASSES on post-fix code
+    (1 warning per issue)."""
+
+    def test_one_warning_per_issue_on_read(self, tmp_path: Path) -> None:
+        content = "MD,TVD,AZI,INC\n100.0,100.0,450.0,30.0\n50.0,50.0,45.0,30.0\n"
+        test_file = tmp_path / "e34_double_warn.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            read_dev_file_as_object(test_file)
+
+        mono = [x for x in w if "not monotonically increasing" in str(x.message)]
+        azi = [x for x in w if "Azimuth column" in str(x.message)]
+        assert len(mono) == 1, (
+            f"MD monotonicity must warn exactly once, got {len(mono)}: "
+            f"{[str(x.message) for x in w]}"
+        )
+        assert len(azi) == 1, (
+            f"AZI range must warn exactly once, got {len(azi)}: "
+            f"{[str(x.message) for x in w]}"
+        )
+
+    def test_designed_nan_suppressed_on_read(self, tmp_path: Path) -> None:
+        """M-01: the read-path non-finite check must NOT fire for the
+        reader's OWN designed missing-data NaN.
+
+        M-25 coordination: the NaN/Inf check lives in _validate_dev_data
+        (the SINGLE data-quality pass on the read path).  M-01 gates its
+        NaN half on ``_designed_nan`` — the reader marks the DevFile it
+        constructs, so NaN (sentinel/short-row fills) is suppressed;
+        genuinely corrupt non-finite user data (marker unset, e.g. direct
+        construction or DevFile.from_dict) still warns.  Inf is flagged
+        in both modes (the reader never produces Inf).
+        Pre-fix: this test pinned the FALSE POSITIVE — the warning fired
+        on every reader-designed NaN.
+        """
+        content = "MD,AZIM\n100.0,10.0\nnan,20.0\n200.0,30.0\n300.0,40.0\n"
+        test_file = tmp_path / "e34_nan_survives.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            read_dev_file_as_object(test_file)
+
+        non_finite = [x for x in w if "non-finite values" in str(x.message)]
+        assert len(non_finite) == 0, (
+            f"Designed NaN on the read path must NOT fire the non-finite "
+            f"corruption warning, got {len(non_finite)}: "
+            f"{[str(x.message) for x in w]}"
+        )
+
+
+class TestE35TextSentinelsNotConversionFailures:
+    """E-35 (CONFIRMED MEDIUM): _DEV_SENTINELS text tokens ("na", "null",
+    "err", "-", ...) fell through to _to_finite_float, were counted in the
+    conversion-failure counter, and fired the misleading "may indicate
+    string data, corrupt values" warning on legitimate sentinel files.
+    They now map to NaN before the failure path (F-04 docstring promise).
+    FAILS on pre-fix code (failure counter incremented), PASSES on
+    post-fix code."""
+
+    def test_sentinel_tokens_do_not_increment_failure_counter(self) -> None:
+        from pylasdev.dev_reader import _dev_to_finite_float
+
+        for token in ("na", "NA", "Null", "err", "-", "n/a", "nil", "missing"):
+            fc: list[int] = [0]
+            tc: list[int] = [0]
+            result = _dev_to_finite_float(
+                token,
+                np.nan,
+                _failure_counter=fc,
+                _thousands_counter=tc,
+            )
+            assert np.isnan(result), f"{token!r} must map to NaN"
+            assert fc[0] == 0, (
+                f"{token!r} is a sentinel, not a conversion failure (fc={fc[0]})"
+            )
+
+    def test_corrupt_token_still_counts_as_failure(self) -> None:
+        from pylasdev.dev_reader import _dev_to_finite_float
+
+        fc: list[int] = [0]
+        tc: list[int] = [0]
+        result = _dev_to_finite_float(
+            "XYZ",
+            np.nan,
+            _failure_counter=fc,
+            _thousands_counter=tc,
+        )
+        assert np.isnan(result)
+        assert fc[0] == 1, f"Genuinely corrupt tokens must still count (fc={fc[0]})"
+
+    def test_sentinel_file_no_conversion_failure_warning(self, tmp_path: Path) -> None:
+        content = "MD,TVD,X,Y\n100.0,na,200.0,-\n200.0,50.0,null,60.0\n"
+        test_file = tmp_path / "e35_sentinel_file.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        # Values parsed with NaN for the sentinel cells.
+        np.testing.assert_array_equal(data["MD"], [100.0, 200.0])
+        assert np.isnan(data["TVD"][0])
+        assert np.isnan(data["Y"][0])
+        # No misleading "string data / corrupt values" failure warning.
+        failure_warnings = [
+            x for x in w if "could not be converted to finite float" in str(x.message)
+        ]
+        assert len(failure_warnings) == 0, (
+            f"Sentinel file must not fire conversion-failure warnings, got: "
+            f"{[str(x.message) for x in w]}"
+        )
+
+    def test_corrupt_file_still_fires_failure_warning(self, tmp_path: Path) -> None:
+        content = "MD,TVD,X,Y\n100.0,BAD,200.0,XYZ\n200.0,50.0,60.0,70.0\n"
+        test_file = tmp_path / "e35_corrupt_file.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        assert np.isnan(data["TVD"][0])
+        failure_warnings = [
+            x for x in w if "could not be converted to finite float" in str(x.message)
+        ]
+        assert len(failure_warnings) == 1, (
+            f"Corrupt tokens must fire the conversion-failure warning, got: "
+            f"{[str(x.message) for x in w]}"
+        )
+
+
+class TestM09DugCountHeaderMismatch:
+    """M-09 (CONFIRMED MEDIUM): the DUG declared column count was never
+    validated against the column-name line's token count.  ``4\\nMDKB
+    TVDSS X`` parsed 3 columns silently (or worse, a count mismatch with
+    4+ header tokens parsed the header's layout with ZERO warnings).  The
+    DUG paths now warn loudly on a declared-count/header-token mismatch
+    (Pattern A and Pattern B, delimiter-aware token counting).
+    FAILS on pre-fix code (no warning), PASSES on post-fix code."""
+
+    def test_pattern_a_count_mismatch_warns(self, tmp_path: Path) -> None:
+        content = "4\nMDKB TVDSS X\n0.0 0.0 100.0\n100.0 99.0 101.0\n"
+        test_file = tmp_path / "m09_pat_a.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        # The file still parses (warn loudly, do not destroy the data).
+        assert list(data.keys()) == ["MD", "TVD", "X"]
+        mismatch = [x for x in w if "declared column count does not match" in str(x.message)]
+        assert len(mismatch) == 1, (
+            f"Declared-count mismatch must warn exactly once, got: {[str(x.message) for x in w]}"
+        )
+        assert "4" in str(mismatch[0].message)
+        assert "3" in str(mismatch[0].message)
+
+    def test_pattern_b_count_mismatch_warns(self, tmp_path: Path) -> None:
+        content = "Title\n4\nMDKB TVDSS X\n0.0 0.0 100.0\n100.0 99.0 101.0\n"
+        test_file = tmp_path / "m09_pat_b.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["MD", "TVD", "X"]
+        mismatch = [x for x in w if "declared column count does not match" in str(x.message)]
+        assert len(mismatch) == 1, (
+            f"Pattern B mismatch must warn exactly once, got: {[str(x.message) for x in w]}"
+        )
+
+    def test_count_mismatch_with_four_plus_header_tokens_warns(self, tmp_path: Path) -> None:
+        """Declared 5 vs header 4: the E-23 min-column guard (3 < 4) does
+        NOT cover this shape — pre-fix it parsed silently with zero
+        warnings."""
+        content = "5\nMDKB TVDSS X Y\n0.0 0.0 100.0 200.0\n100.0 99.0 101.0 201.0\n"
+        test_file = tmp_path / "m09_five_vs_four.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["MD", "TVD", "X", "Y"]
+        mismatch = [x for x in w if "declared column count does not match" in str(x.message)]
+        assert len(mismatch) == 1, (
+            f"5-vs-4 mismatch must warn exactly once, got: {[str(x.message) for x in w]}"
+        )
+
+    def test_comma_header_count_match_no_warning(self, tmp_path: Path) -> None:
+        """Control: a comma-delimited DUG header whose token count matches
+        the declared count must NOT warn (delimiter-aware counting must
+        not mis-count comma headers)."""
+        content = "4\nMD, TVD, X, Y\n0.0, 0.0, 100.0, 200.0\n100.0, 99.0, 101.0, 201.0\n"
+        test_file = tmp_path / "m09_comma_match.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["MD", "TVD", "X", "Y"]
+        mismatch = [x for x in w if "declared column count does not match" in str(x.message)]
+        assert len(mismatch) == 0, (
+            f"Matching comma header must not warn, got: {[str(x.message) for x in w]}"
+        )
+
+
+class TestM24ThousandsNotGenericFailures:
+    """M-24 (CONFIRMED MEDIUM): a bare thousands token (``1,234`` in a
+    space/tab file) was counted in BOTH ``_thousands_counter`` AND
+    ``_failure_counter`` — 2-3 misleading warnings for one token (the
+    generic "could not be converted" warning + the dedicated thousands
+    summary).  Tokens already classified as thousands skip the generic
+    failure accounting.
+    FAILS on pre-fix code (fc incremented), PASSES on post-fix code."""
+
+    def test_bare_thousands_skips_failure_counter(self) -> None:
+        from pylasdev.dev_reader import _dev_to_finite_float
+
+        fc: list[int] = [0]
+        tc: list[int] = [0]
+        result = _dev_to_finite_float(
+            "1,234",
+            np.nan,
+            _failure_counter=fc,
+            _thousands_counter=tc,
+            _comma_as_thousands=True,
+        )
+        assert np.isnan(result)  # documented M-25 policy: NaN in space mode
+        assert tc[0] == 1, f"Thousands token must count in _thousands_counter (tc={tc[0]})"
+        assert fc[0] == 0, (
+            f"Thousands token must NOT count as a generic failure (fc={fc[0]})"
+        )
+
+    def test_legacy_gate_thousands_skips_failure_counter(self) -> None:
+        """``1000,234`` (4+ digit leading group, legacy gate) also skips
+        the generic failure counter in space mode."""
+        from pylasdev.dev_reader import _dev_to_finite_float
+
+        fc: list[int] = [0]
+        tc: list[int] = [0]
+        result = _dev_to_finite_float(
+            "1000,234",
+            np.nan,
+            _failure_counter=fc,
+            _thousands_counter=tc,
+            _comma_as_thousands=True,
+        )
+        assert np.isnan(result)
+        assert tc[0] == 1, f"Legacy-gate token must count as thousands (tc={tc[0]})"
+        assert fc[0] == 0, f"Legacy-gate token must not count as failure (fc={fc[0]})"
+
+    def test_corrupt_token_still_counts_failure(self) -> None:
+        """Control: genuinely corrupt tokens still increment the generic
+        failure counter (only thousands-classified tokens skip it)."""
+        from pylasdev.dev_reader import _dev_to_finite_float
+
+        fc: list[int] = [0]
+        tc: list[int] = [0]
+        _dev_to_finite_float(
+            "XYZ",
+            np.nan,
+            _failure_counter=fc,
+            _thousands_counter=tc,
+        )
+        assert fc[0] == 1, f"Corrupt token must still count as failure (fc={fc[0]})"
+        assert tc[0] == 0
+
+    def test_space_thousands_file_no_generic_failure_warning(self, tmp_path: Path) -> None:
+        """End-to-end: a bare-thousands space file fires the dedicated
+        thousands warning but NOT the generic conversion-failure warning."""
+        content = "1,234 5,678\n9,000 10,456\n"
+        test_file = tmp_path / "m24_space_thousands.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        assert all(np.isnan(v) for v in data["col_0"])
+        thousands_warnings = [x for x in w if "thousands separators" in str(x.message)]
+        assert len(thousands_warnings) >= 1, (
+            f"Dedicated thousands warning must fire, got: {[str(x.message) for x in w]}"
+        )
+        failure_warnings = [
+            x for x in w if "could not be converted to finite float" in str(x.message)
+        ]
+        assert len(failure_warnings) == 0, (
+            f"Thousands tokens must not fire the generic failure warning, got: "
+            f"{[str(x.message) for x in w]}"
+        )
+
+
+class TestM26SemicolonSentinelHeaderless:
+    """M-26 (CONFIRMED MEDIUM): the semicolon headerless pre-check lacked
+    the sentinel guard both sibling paths have (comma pre-check F-023,
+    whitespace F-021).  A headerless semicolon file with a text sentinel
+    in the first data row (``1.0;2.0;na``) fell through to whitespace
+    detection and the first station was consumed as fabricated column
+    names ('1.0','2.0','NA').
+    FAILS on pre-fix code (fabricated header, first station lost),
+    PASSES on post-fix code."""
+
+    def test_sentinel_first_row_stays_data(self, tmp_path: Path) -> None:
+        content = "1.0;2.0;na\n4.0;5.0;6.0\n7.0;8.0;9.0\n"
+        test_file = tmp_path / "m26_semi_sentinel.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        # Headerless columns derived from the first data row — NOT
+        # fabricated names '1.0','2.0','NA'.
+        assert list(data.keys()) == ["col_0", "col_1", "col_2"], (
+            f"Expected headerless columns, got {list(data.keys())}"
+        )
+        np.testing.assert_array_equal(data["col_0"], [1.0, 4.0, 7.0])
+        np.testing.assert_array_equal(data["col_1"], [2.0, 5.0, 8.0])
+        # The 'na' sentinel maps to NaN (missing data).
+        np.testing.assert_array_equal(data["col_2"], [np.nan, 6.0, 9.0])
+
+    def test_semicolon_count_prefix_with_sentinel(self, tmp_path: Path) -> None:
+        """Count-prefix semicolon file whose first data row carries a
+        sentinel: count line skipped, columns from the first real line."""
+        content = "3\n1.0;2.0;na\n4.0;5.0;6.0\n7.0;8.0;9.0\n"
+        test_file = tmp_path / "m26_semi_prefix_sentinel.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["col_0", "col_1", "col_2"], (
+            f"Expected 3 headerless columns, got {list(data.keys())}"
+        )
+        np.testing.assert_array_equal(data["col_0"], [1.0, 4.0, 7.0])
+        np.testing.assert_array_equal(data["col_2"], [np.nan, 6.0, 9.0])
+
+
+class TestN19DugTitleCountDelimitedHeaderless:
+    """N-19 (CONFIRMED MEDIUM): DUG title + count + COMMA/SEMICOLON
+    headerless data — the first data row was consumed as fabricated
+    column names (['1.0','2.0','3.0','4.0']), the first station was
+    LOST, and the columns were misnamed.  Pattern B's count-match now
+    counts tokens by the DETECTED delimiter (comma/semicolon/space):
+    when the declared count equals the delimited token count the line
+    is data (headerless), not a header.
+    FAILS on pre-fix code (fabricated columns, first station lost),
+    PASSES on post-fix code."""
+
+    def test_comma_delimited_headerless(self, tmp_path: Path) -> None:
+        content = (
+            "Deviation survey for Well-1\n4\n"
+            "1.0,2.0,3.0,4.0\n5.0,6.0,7.0,8.0\n9.0,10.0,11.0,12.0\n"
+        )
+        test_file = tmp_path / "n19_comma.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["col_0", "col_1", "col_2", "col_3"], (
+            f"Expected 4 headerless columns, got {list(data.keys())}"
+        )
+        # All three rows preserved — the first station is NOT lost.
+        np.testing.assert_array_equal(data["col_0"], [1.0, 5.0, 9.0])
+        np.testing.assert_array_equal(data["col_1"], [2.0, 6.0, 10.0])
+        np.testing.assert_array_equal(data["col_2"], [3.0, 7.0, 11.0])
+        np.testing.assert_array_equal(data["col_3"], [4.0, 8.0, 12.0])
+        # The file is headerless data, NOT a DUG parse — no DUG-format
+        # warnings may fire (pre-fix the row was consumed as a DUG header).
+        dug_warnings = [x for x in w if "DUG-format" in str(x.message)]
+        assert len(dug_warnings) == 0, (
+            f"Delimiter-delimited headerless data must not be parsed as DUG, "
+            f"got: {[str(x.message) for x in w]}"
+        )
+
+    def test_semicolon_delimited_headerless(self, tmp_path: Path) -> None:
+        content = (
+            "Deviation survey for Well-1\n4\n"
+            "1.0;2.0;3.0;4.0\n5.0;6.0;7.0;8.0\n9.0;10.0;11.0;12.0\n"
+        )
+        test_file = tmp_path / "n19_semicolon.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["col_0", "col_1", "col_2", "col_3"], (
+            f"Expected 4 headerless columns, got {list(data.keys())}"
+        )
+        np.testing.assert_array_equal(data["col_0"], [1.0, 5.0, 9.0])
+        np.testing.assert_array_equal(data["col_3"], [4.0, 8.0, 12.0])
+
+    def test_space_delimited_control_unchanged(self, tmp_path: Path) -> None:
+        """Control: the existing whitespace Pattern B count-match behavior
+        is unchanged (all rows preserved as headerless)."""
+        content = (
+            "Deviation survey for Well-1\n4\n"
+            "1.0 2.0 3.0 4.0\n5.0 6.0 7.0 8.0\n"
+        )
+        test_file = tmp_path / "n19_space.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+
+        assert list(data.keys()) == ["col_0", "col_1", "col_2", "col_3"]
+        np.testing.assert_array_equal(data["col_0"], [1.0, 5.0])
+        np.testing.assert_array_equal(data["col_3"], [4.0, 8.0])

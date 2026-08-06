@@ -1228,41 +1228,31 @@ class TestWriteLASFile:
         # The second data line is clean
         assert "101" in data_lines[1]
 
-    # --- M-13: LAS 3.0 ~Other deprecation warning test ---
+    # --- E-18: LAS 3.0 ~Other deprecation refusal test ---
     def test_las30_other_section_deprecation_warning(self, tmp_path: Path) -> None:
-        """Test that LAS 3.0 files with ~Other content emit a deprecation warning.
+        """Test that LAS 3.0 files with ~Other content are REFUSED.
 
         LAS 3.0 deprecates the ~Other section — content must go into
-        user-defined Parameter or Column Data sections instead.  When
-        writing a LAS 3.0 file with other content, a UserWarning is
-        emitted and the ~Other section is NOT written to the output.
+        user-defined Parameter or Column Data sections instead.  The
+        parser rejects ~O on LAS 3.0 reads; for a directly-constructed
+        3.0 model the writer REFUSES (LASWriteError) instead of the old
+        warn+drop, which silently discarded user content (E-18).
         """
-        import warnings
-
         las = LASFile()
         las.version = VersionSection(vers="3.0", wrap="NO", dlm="SPACE")
         las.well["NULL"] = "-999.25"
-        las.other = "This content should trigger a deprecation warning.\n"
+        las.other = "This content should trigger a deprecation refusal.\n"
         las.curves_order = ["DEPT"]
         las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
         las.logs["DEPT"] = np.array([100.0])
 
         temp_file = tmp_path / "las30_other.las"
 
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
+        with pytest.raises(LASWriteError, match="~Other content cannot be written"):
             write_las_file(temp_file, las)
-            other_warnings = [
-                x for x in w if "~Other" in str(x.message) and "deprecates" in str(x.message)
-            ]
-            assert len(other_warnings) >= 1, (
-                "Expected deprecation warning about ~Other section in LAS 3.0"
-            )
 
-        # ~Other section must NOT appear in the written file
-        content = temp_file.read_text()
-        assert "~OTHER" not in content
-        assert "~Other" not in content
+        # The refused write must not have produced an output file.
+        assert not temp_file.exists()
 
     # --- F-26: Well section mandatory field ordering ---
     def test_well_section_mandatory_field_ordering(self, tmp_path: Path) -> None:
@@ -3114,8 +3104,10 @@ class TestG8FixGroup:
     # --- N-I-15: ~C fallback must warn for section curves absent from top-level ---
 
     def test_ni15_warns_when_section_curve_absent_from_top_level(self, tmp_path: Path) -> None:
-        """N-I-15: a LOG_DATA section curve absent from top-level curves
-        triggers a write-time warning instead of silent data loss."""
+        """E-30: a LOG_DATA section curve absent from top-level curves that
+        CARRIES DATA is refused with LASWriteError (the old behavior
+        warned and silently dropped the column, and re-read relabeled
+        the values onto another curve — W-11)."""
         las = LASFile()
         las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
         las.well["NULL"] = "-999.25"
@@ -3135,13 +3127,8 @@ class TestG8FixGroup:
         las.data_sections.append(section)
 
         temp_file = tmp_path / "ni15_missing.las"
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
+        with pytest.raises(LASWriteError, match=r"'GR' .* no definition"):
             write_las_file(temp_file, las)
-            messages = [str(x.message) for x in w]
-        assert any("GR" in m and "no definition" in m for m in messages), (
-            f"Expected warning about GR missing definition, got: {messages}"
-        )
 
     # --- N-I-16: 256-char line-limit gaps ---
 
@@ -3660,11 +3647,14 @@ class TestWriterFixBatchW010708101112:
     # ── W-11: undefined section curve must not relabel data ──────────
 
     def test_w11_undefined_curve_data_dropped_not_relabeled(self, tmp_path: Path) -> None:
-        """W-11: section [DEPT, X, GR] with undefined X — X's data is
-        dropped with a loud warning; GR/DEPT values are NOT relabeled.
+        """E-30: section [DEPT, X, GR] with undefined X that CARRIES data
+        is REFUSED with LASWriteError.
 
         Pre-fix the writer emitted X's column against a 2-curve scope, so
-        X's values landed in GR and the genuine GR data was discarded.
+        X's values landed in GR and the genuine GR data was discarded; the
+        warn-only interim fix dropped X's column, but the ~C-side promise
+        is a REFUSAL (E-30) — a data-bearing column with no definition
+        cannot be represented and the write must not proceed.
         """
         las = LASFile()
         las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
@@ -3685,18 +3675,8 @@ class TestWriterFixBatchW010708101112:
         las.data_sections.append(section)
 
         out = tmp_path / "w11_undef.las"
-        with warnings.catch_warnings(record=True) as rec:
-            warnings.simplefilter("always")
+        with pytest.raises(LASWriteError, match=r"'X' .* carries data"):
             write_las_file(out, las)
-        assert any("'X'" in str(w.message) and "DATA is dropped" in str(w.message) for w in rec), (
-            f"no loud drop warning: {[str(w.message) for w in rec]}"
-        )
-
-        back = read_las_file_as_object(out)
-        ds = back.data_sections[0]
-        np.testing.assert_allclose(ds.data["GR"], [75.0, 80.0], err_msg="GR relabeled")
-        np.testing.assert_allclose(ds.data["DEPT"], [100.0, 110.0])
-        assert ds.data.get("X") is None
 
     def test_w11_undefined_curve_no_data_dropped(self, tmp_path: Path) -> None:
         """W-11: an undefined curve WITHOUT data is dropped with a
@@ -4967,9 +4947,10 @@ class TestCaseNormalizationWriterRegression:
         )
 
     def test_n2b3_w11_case_variant_data_dropped_warns_data(self, tmp_path: Path) -> None:
-        """N2b-3 (W-11): an unresolvable curve whose data sits under a
-        case-variant key must fire the 'DATA is dropped' warning — never
-        the false 'no values are lost' message while the data vanishes."""
+        """E-30 (N2b-3 W-11): an unresolvable curve whose data sits under a
+        case-variant key is REFUSED with LASWriteError — the data-bearing
+        unresolved column can no longer be silently dropped (the pre-fix
+        'DATA is dropped' warning left the data out of the file)."""
         las = LASFile()
         las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
         las.well["NULL"] = "-999.25"
@@ -4987,14 +4968,8 @@ class TestCaseNormalizationWriterRegression:
         las.data_sections.append(section)
 
         out = tmp_path / "n2b3_w11.las"
-        with warnings.catch_warnings(record=True) as rec:
-            warnings.simplefilter("always")
+        with pytest.raises(LASWriteError, match=r"'GHOST' .* carries data"):
             write_las_file(out, las)
-
-        data_dropped = [str(w.message) for w in rec if "DATA is dropped" in str(w.message)]
-        false_assurance = [str(w.message) for w in rec if "no values are lost" in str(w.message)]
-        assert data_dropped, "expected the 'DATA is dropped' warning"
-        assert false_assurance == [], f"false assurance fired: {false_assurance}"
 
     def test_n2b1_m77_warning_fires_for_emitted_name_loss(self, tmp_path: Path) -> None:
         """N2b-1 (II-7c): the M-77 warning guard must fire when the
@@ -5087,3 +5062,512 @@ class TestCaseNormalizationWriterRegression:
         strt_line = next((ln for ln in well_block.splitlines() if "strt" in ln.lower()), "")
         assert ".m" in strt_line, f"unit silently dropped on LAS 1.2: {strt_line!r}"
         assert "START DEPTH" in strt_line, f"description silently dropped on LAS 1.2: {strt_line!r}"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# E-16 / E-19 / E-30 / E-31 / E-32 / E-36 / E-40 / E-44 / M-27 / M-29 /
+# N-04 / N-09 — fix-writer regression tests (stage-7 verified findings)
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestFixWriterE16ZeroDimArrays:
+    """E-16: a 0-d numpy array in logs/string_data must not crash the
+    write — the M-18 convention treats it as a single-element value."""
+
+    def test_e16_zero_dim_logs_array_writes_one_row(self, tmp_path: Path) -> None:
+        las = LASFile(version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"))
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array(100.0)  # 0-d array
+
+        out = tmp_path / "e16_zerod.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+
+        data_lines = [
+            ln for ln in out.read_text(encoding="utf-8").splitlines() if ln.strip() == "100"
+        ]
+        assert len(data_lines) == 1, f"0-d array must emit exactly 1 row, got: {data_lines}"
+
+    def test_e16_zero_dim_string_data_writes_one_row(self, tmp_path: Path) -> None:
+        las = LASFile(version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"))
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["TAG"]
+        las.curves.append(CurveDefinition(mnemonic="TAG", unit="", data_format="S"))
+        las.string_data["TAG"] = np.array("sandstone")  # 0-d object array
+
+        out = tmp_path / "e16_zerod_str.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+
+        content = out.read_text(encoding="utf-8")
+        assert "sandstone" in content, "0-d string value not emitted"
+
+
+class TestFixWriterE19TildeEscapeRestore:
+    """E-19: the M-85 '_~' escape is emitted on ALL versions to keep the
+    row parseable; the LAS 1.2/2.0 read path now restores it for the
+    first-column string token (position-scoped, like the 3.0 path)."""
+
+    def test_e19_las20_first_column_tilde_escape_keeps_row(self, tmp_path: Path) -> None:
+        """A first-column string value '~3D' on LAS 2.0 is escaped to
+        '_~3D' so the row is not misread as a section header; the row
+        (and the numeric columns) survive the roundtrip, and the warning
+        is ACCURATE (pre-fix it falsely promised a full restore — string
+        values are lossy on 1.2/2.0 by design, M-29)."""
+        las = LASFile(version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"))
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["TAG", "DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="TAG", unit=""))
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.string_data["TAG"] = np.array(["~3D", "plain"], dtype=object)
+        las.logs["DEPT"] = np.array([100.0, 101.0])
+
+        out = tmp_path / "e19_las20.las"
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+
+        content = out.read_text(encoding="utf-8")
+        # The escape is emitted (row preserved) — NOT the raw '~3D' line.
+        assert "_~3D" in content, f"no '_~' escape emitted: {content!r}"
+        # E-19: the warning must be accurate for 1.2/2.0 — the escape is
+        # restored for a first-column string token, but string values do
+        # not round-trip by design (M-29).
+        assert any("do not round-trip by design" in str(w.message) for w in rec), (
+            f"inaccurate tilde-escape warning: {[str(w.message) for w in rec]}"
+        )
+        # Re-read: the row is NOT dropped (pre-fix the reader skipped the
+        # raw '~'-prefixed row entirely, losing the DEPT value).
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            back = read_las_file_as_object(out)
+        np.testing.assert_allclose(back.logs["DEPT"], [100.0, 101.0], err_msg="row dropped")
+
+    def test_e19_las20_first_column_restore_position_scoped(self, tmp_path: Path) -> None:
+        """A LAS 2.0 file with {S} markers: the writer's '_~' escape is
+        restored ONLY for the first-column token ('_~3D' → '~3D'); a
+        genuine '_~DEPT' first-column value (never writer-escaped —
+        '~'+letter) and a genuine '_~3D' in a NON-first column survive
+        verbatim."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA:\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " TAG.         : TAG  {S}\n"
+            " LITHO.       : LITHOLOGY  {S}\n"
+            " DEPT.M       : DEPTH\n"
+            "~A  TAG  LITHO  DEPT\n"
+            "_~3D,_~3D,100\n"
+            "_~DEPT,plain,101\n"
+        )
+        f = tmp_path / "e19_restore.las"
+        f.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(f)
+        # First-column '_~3D' is the writer escape → restored to '~3D'.
+        assert las.string_data["TAG"].tolist() == ["~3D", "_~DEPT"], (
+            las.string_data["TAG"].tolist()
+        )
+        # Non-first-column '_~3D' is genuine content → preserved verbatim.
+        assert las.string_data["LITHO"].tolist() == ["_~3D", "plain"], (
+            las.string_data["LITHO"].tolist()
+        )
+
+
+class TestFixWriterE31WellKeyCIVariants:
+    """E-31: case-variant duplicate well keys are deduped at emission —
+    refused loudly when the values differ, warned when identical."""
+
+    def test_e31_case_variant_well_keys_distinct_values_refused(self, tmp_path: Path) -> None:
+        las = LASFile(version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"))
+        las.well["NULL"] = "-999.25"
+        las.well["null"] = "0"  # case-variant with a DIFFERENT value
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([1.0])
+
+        out = tmp_path / "e31_refuse.las"
+        with pytest.raises(LASWriteError, match="differ only in case"):
+            write_las_file(out, las)
+
+    def test_e31_case_variant_well_keys_identical_warn_single_emission(self, tmp_path: Path) -> None:
+        las = LASFile(version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"))
+        las.well["NULL"] = "-999.25"
+        las.well["null"] = "-999.25"  # case-variant with the SAME value
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([1.0])
+
+        out = tmp_path / "e31_warn.las"
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+        assert any("differ only in case" in str(w.message) for w in rec), (
+            "no case-variant duplicate warning"
+        )
+        well_block = out.read_text(encoding="utf-8").split("~WELL INFORMATION", 1)[1].split("~", 1)[0]
+        assert well_block.count("NULL.") == 1, f"duplicate ~W lines emitted: {well_block!r}"
+
+    def test_e31_single_key_no_spurious_warning(self, tmp_path: Path) -> None:
+        """A plain single-casing well entry must not trigger the E-31
+        duplicate path (regression guard for the mandatory-order loop)."""
+        las = LASFile(version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"))
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([1.0])
+
+        out = tmp_path / "e31_single.las"
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+        assert not any("differ only in case" in str(w.message) for w in rec), (
+            f"spurious E-31 warning: {[str(w.message) for w in rec]}"
+        )
+
+
+class TestFixWriterE32DeletedKeyWarning:
+    """E-32: a post-construction deletion of a logs/string_data key must
+    warn loudly at emission instead of silently null-padding the orphaned
+    curves_order column (re-read fabricates a -999.25 column)."""
+
+    def test_e32_deleted_logs_key_warns(self, tmp_path: Path) -> None:
+        las = LASFile(version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"))
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "GR"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.curves.append(CurveDefinition(mnemonic="GR", unit="GAPI"))
+        las.logs["DEPT"] = np.array([1.0])
+        las.logs["GR"] = np.array([2.0])
+        del las.logs["GR"]  # _GuardedDict has no deletion override
+
+        out = tmp_path / "e32_deleted.las"
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+        assert any("'GR'" in str(w.message) and "no data in 'logs' or 'string_data'" in str(w.message)
+                   for w in rec), f"no missing-data warning: {[str(w.message) for w in rec]}"
+
+
+class TestFixWriterE36WellUnitValidation:
+    """E-36: a well unit that cannot round-trip through the parser's ~W
+    unit grammar (e.g. whitespace-colon 'kg : m') is refused at emission
+    instead of truncating the unit and destroying the entry value."""
+
+    def _model_with_unit(self, unit: str, vers: str = "2.0") -> LASFile:
+        las = LASFile(version=VersionSection(vers=vers, wrap="NO", dlm="SPACE"))
+        las.well["NULL"] = "-999.25"
+        las.well.units["NULL"] = unit
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.logs["DEPT"] = np.array([1.0])
+        return las
+
+    def test_e36_whitespace_colon_unit_refused_las20(self, tmp_path: Path) -> None:
+        with pytest.raises(LASWriteError, match="unit grammar"):
+            write_las_file(tmp_path / "e36_20.las", self._model_with_unit("kg : m"))
+
+    def test_e36_whitespace_colon_unit_refused_las12(self, tmp_path: Path) -> None:
+        with pytest.raises(LASWriteError, match="unit grammar"):
+            write_las_file(tmp_path / "e36_12.las", self._model_with_unit("kg : m", vers="1.2"))
+
+    def test_e36_valid_colon_unit_still_writes(self, tmp_path: Path) -> None:
+        """A colon-containing unit that IS in the parser's grammar
+        ('kg:m') remains representable and writes fine."""
+        las = self._model_with_unit("kg:m")
+        out = tmp_path / "e36_ok.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+        assert ".kg:m" in out.read_text(encoding="utf-8"), "valid colon unit not emitted"
+
+
+class TestFixWriterE40OffsetCap:
+    """E-40: {A:N} time_offset fields must fit the parser's 64-char
+    offset group — offsets >= 1e64 (integral or non-integral) are
+    refused instead of emitting a spec the parser drops (whole curve
+    absent on re-read)."""
+
+    def _model(self, offset: float) -> LASFile:
+        las = LASFile(version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"))
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["NMR"]
+        las.curves.append(
+            CurveDefinition(
+                mnemonic="NMR",
+                unit="",
+                data_format="A",
+                array_info=ArrayElementInfo(base_name="NMR", index=1, time_offset=offset),
+            )
+        )
+        las.logs["NMR"] = np.array([1.0])
+        return las
+
+    def test_e40_integral_offset_ge_1e64_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(LASWriteError, match="cannot be represented in the \\{A:N\\}"):
+            write_las_file(tmp_path / "e40_int.las", self._model(1e64))
+
+    def test_e40_non_integral_huge_offset_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(LASWriteError, match="cannot be represented in the \\{A:N\\}"):
+            write_las_file(tmp_path / "e40_frac.las", self._model(1.5e100))
+
+    def test_e40_representable_offset_still_emitted(self, tmp_path: Path) -> None:
+        las = self._model(1e20)
+        out = tmp_path / "e40_ok.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+        assert "A:100000000000000000000" in out.read_text(encoding="utf-8"), (
+            "representable {A:N} spec not emitted"
+        )
+
+
+class TestFixWriterE44EmptySectionWarning:
+    """E-44: a LAS 3.0 data section with ZERO data rows is emitted
+    header-only and its metadata is lost on re-read — warn loudly at
+    write time."""
+
+    def test_e44_zero_data_row_section_warns(self, tmp_path: Path) -> None:
+        las = LASFile(version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"))
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.data_sections.append(
+            DataSection(
+                name="LOG",
+                section_type="LOG_DATA",
+                curves_order=["DEPT"],
+                data={"DEPT": np.array([])},
+            )
+        )
+        out = tmp_path / "e44_empty.las"
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+        assert any("NO data rows" in str(w.message) for w in rec), (
+            f"no empty-section warning: {[str(w.message) for w in rec]}"
+        )
+
+
+class TestFixWriterM27SingleValidation:
+    """M-27: write() must run validate(complete=True) exactly ONCE —
+    the _WriterMutationGuard re-validation double-warned every issue."""
+
+    def test_m27_string_data_on_las20_warned_once(self, tmp_path: Path) -> None:
+        las = LASFile(version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"))
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "TAG"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
+        las.curves.append(CurveDefinition(mnemonic="TAG", unit=""))
+        las.logs["DEPT"] = np.array([1.0])
+        las.string_data["TAG"] = np.array(["a"], dtype=object)
+
+        out = tmp_path / "m27_once.las"
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+        m29 = [w for w in rec if "string_data is present" in str(w.message)]
+        assert len(m29) == 1, f"expected exactly 1 M-29 validation warning, got {len(m29)}"
+
+
+class TestFixWriterM29StringAwareDefinitionDedup:
+    """M-29: the per-section Definition dedup signature must include
+    string-ness — two sections with identical curve definitions but
+    different string placement must get SEPARATE Definitions, or the
+    shared {S} marker null-fills the other section's values (and the
+    iter-3 variant produced a SELF-UNREADABLE file)."""
+
+    def _two_section_model(self) -> LASFile:
+        las = LASFile(version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"))
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "GR"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
+        las.curves.append(CurveDefinition(mnemonic="GR", unit="GAPI", data_format=""))
+        las.data_sections.append(
+            DataSection(
+                name="LOG1",
+                section_type="LOG_DATA",
+                curves_order=["DEPT", "GR"],
+                data={"DEPT": np.array([100.0, 101.0])},
+                string_data={"GR": np.array(["sand", "shale"], dtype=object)},
+            )
+        )
+        las.data_sections.append(
+            DataSection(
+                name="LOG2",
+                section_type="LOG_DATA",
+                curves_order=["DEPT", "GR"],
+                data={"DEPT": np.array([200.0, 201.0]), "GR": np.array([75.0, 80.0])},
+            )
+        )
+        return las
+
+    def test_m29_string_and_numeric_sections_get_separate_definitions(
+        self, tmp_path: Path,
+    ) -> None:
+        las = self._two_section_model()
+        out = tmp_path / "m29_defs.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+
+        content = out.read_text(encoding="utf-8")
+        assert content.count("_Definition") == 2, (
+            f"expected 2 Definitions (string vs numeric), got {content.count('_Definition')}: "
+            f"{[ln for ln in content.splitlines() if 'Definition' in ln]}"
+        )
+        # The write→read roundtrip MUST succeed (pre-fix it raised
+        # LASParseError — self-unreadable file) and preserve each
+        # section's placement.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            back = read_las_file_as_object(out)
+        assert len(back.data_sections) == 2
+        assert back.data_sections[0].string_data.get("GR", None) is not None, (
+            "section 1 GR not string"
+        )
+        np.testing.assert_allclose(
+            back.data_sections[1].data["GR"], [75.0, 80.0], err_msg="numeric GR null-filled"
+        )
+
+
+class TestFixWriterN04UnionForcedMarkerAware:
+    """N-04: the main ~C union-forced {S} marker must not reclassify a
+    NUMERIC section's column as string — a section whose curve is
+    numeric here gets its own Definition instead of piping | CURVE."""
+
+    def test_n04_numeric_section_not_reclassified_by_union_marker(self, tmp_path: Path) -> None:
+        las = LASFile(version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"))
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT", "GR"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
+        las.curves.append(CurveDefinition(mnemonic="GR", unit="GAPI", data_format=""))
+        las.data_sections.append(
+            DataSection(
+                name="LOGA",
+                section_type="LOG_DATA",
+                curves_order=["DEPT", "GR"],
+                data={"DEPT": np.array([100.0, 101.0])},
+                string_data={"GR": np.array(["sand", "shale"], dtype=object)},
+            )
+        )
+        las.data_sections.append(
+            DataSection(
+                name="LOGB",
+                section_type="LOG_DATA",
+                curves_order=["DEPT", "GR"],
+                data={"DEPT": np.array([200.0, 201.0]), "GR": np.array([75.0, 80.0])},
+            )
+        )
+        out = tmp_path / "n04_marker.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+
+        content = out.read_text(encoding="utf-8")
+        # The numeric section must pipe to its OWN Definition, not | CURVE
+        # (whose main-block GR carries the union-forced {S}).
+        assert "~A LOGB | Log_Definition" in content, content
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            back = read_las_file_as_object(out)
+        np.testing.assert_allclose(
+            back.data_sections[1].data["GR"], [75.0, 80.0],
+            err_msg="numeric GR re-read as string",
+        )
+
+
+class TestFixWriterN09DescriptionBraceTokens:
+    """N-09: a user description containing a valid format token in braces
+    ("Gamma {S} ray") must round-trip unchanged — the writer escapes
+    braces and the parser strips only the trailing writer-appended token."""
+
+    def test_n09_curve_description_brace_token_roundtrips(self, tmp_path: Path) -> None:
+        las = LASFile(version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"))
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["GR"]
+        las.curves.append(
+            CurveDefinition(
+                mnemonic="GR", unit="GAPI", data_format="S", description="Gamma {S} ray"
+            )
+        )
+        las.string_data["GR"] = np.array(["a", "b"], dtype=object)
+
+        out = tmp_path / "n09_curve.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+
+        content = out.read_text(encoding="utf-8")
+        # The user's brace token is escaped in the output (the parser's
+        # FORMAT_SPEC_PATTERN cannot strip it).
+        assert r"Gamma \{S\} ray" in content, content
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            back = read_las_file_as_object(out)
+        cd = next(c for c in back.curves if c.mnemonic == "GR")
+        assert cd.description == "Gamma {S} ray", f"description destroyed: {cd.description!r}"
+        assert cd.data_format == "S", f"data_format lost: {cd.data_format!r}"
+
+    def test_n09_curve_description_no_fabricated_format(self, tmp_path: Path) -> None:
+        """A numeric curve with a mid-description {S} token and EMPTY
+        data_format must not be re-routed to string_data (the pre-fix
+        amplification: fabricated 'S' reclassified the column)."""
+        las = LASFile(version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"))
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["GR"]
+        las.curves.append(
+            CurveDefinition(
+                mnemonic="GR", unit="GAPI", data_format="", description="Gamma {S} ray"
+            )
+        )
+        las.logs["GR"] = np.array([75.0, 80.0])
+
+        out = tmp_path / "n09_nofmt.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            back = read_las_file_as_object(out)
+        cd = next(c for c in back.curves if c.mnemonic == "GR")
+        assert cd.description == "Gamma {S} ray", f"description destroyed: {cd.description!r}"
+        assert cd.data_format == "", f"data_format fabricated: {cd.data_format!r}"
+        np.testing.assert_allclose(back.logs["GR"], [75.0, 80.0], err_msg="column reclassified")
+
+    def test_n09_parameter_description_brace_token_with_zone(self, tmp_path: Path) -> None:
+        las = LASFile(version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"))
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
+        las.logs["DEPT"] = np.array([1.0])
+        las.parameters.append(
+            ParameterEntry(
+                mnemonic="MUD",
+                unit="",
+                value="x",
+                description="Mud {S} in hole",
+                data_format="E",
+                zone=ParameterZone(zone_name="MAIN", zone_index=1),
+            )
+        )
+        out = tmp_path / "n09_param.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            back = read_las_file_as_object(out)
+        pm = next(p for p in back.parameters if p.mnemonic == "MUD")
+        assert pm.description == "Mud {S} in hole", f"description destroyed: {pm.description!r}"
+        assert pm.data_format == "E", f"data_format lost: {pm.data_format!r}"
+        assert pm.zone is not None and pm.zone.zone_name == "MAIN", f"zone lost: {pm.zone!r}"

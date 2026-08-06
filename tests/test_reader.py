@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import warnings
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -4203,3 +4204,493 @@ class TestHeaderTildeRoundtrip:
         assert back.well["WELL"] == "_~Acme", (
             f"F-02: '_~' header escape wrongly restored, got {back.well['WELL']!r}"
         )
+
+
+class TestE20WrappedPendingBufferBounded:
+    """E-20 (CONFIRMED MEDIUM): _read_wrapped's pending buffer retained
+    every consumed token string until EOF (~58 GB on crafted WRAP=YES
+    files before the MAX_TOTAL_ELEMENTS guard fires).  The fix trims the
+    consumed prefix once read_idx crosses _PENDING_TRIM_THRESHOLD
+    (amortized O(1) per token) while keeping the O(1)-per-step
+    extraction and the N-I-08 trailing-step diagnostic."""
+
+    @staticmethod
+    def _wrapped_content(n_steps: int) -> str:
+        rows = []
+        for i in range(n_steps):
+            rows.append(f"{1000.0 + i:.1f}")
+            rows.append(f"{50.0 + 5 * i:.1f} {1.0 + i:.1f}")
+        return (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            " RHOB.K/M3 :  Density\n"
+            "~A\n"
+            + "\n".join(rows)
+            + "\n"
+        )
+
+    def test_trim_preserves_exact_values(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A wrapped file crossing the trim threshold many times must parse
+        to exactly the same values as an untrimmed read (the trim must not
+        shift, drop, or duplicate buffered values)."""
+        from pylasdev import data_reader as dr
+
+        # Force a trim every few tokens so the test exercises many trims.
+        monkeypatch.setattr(dr, "_PENDING_TRIM_THRESHOLD", 8)
+        n_steps = 40
+        test_file = _write_las(tmp_path, "e20_trim.las", self._wrapped_content(n_steps))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        np.testing.assert_allclose(
+            las.logs["DEPT"], [1000.0 + i for i in range(n_steps)]
+        )
+        np.testing.assert_allclose(
+            las.logs["GR"], [50.0 + 5 * i for i in range(n_steps)]
+        )
+        np.testing.assert_allclose(
+            las.logs["RHOB"], [1.0 + i for i in range(n_steps)]
+        )
+
+    def test_pending_retention_bounded(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """E-20/M-10: consumed tokens must not stay alive until EOF.  With
+        the pre-fix code every token string from _split_data_line stays
+        referenced by `pending` (a 12K-token file retains ~600 KB of token
+        objects at peak); post-fix the buffer holds only the unconsumed
+        tail.  Retention is measured DURING parse via the
+        _read_wrapped_trace_hook seam (while `pending` is still live) — a
+        snapshot AFTER _read_wrapped returns sees the freed list and
+        cannot distinguish trimmed from untrimmed behavior (M-10: the old
+        post-parse snapshot passed both ways, so removing the E-20 trim
+        went undetected by CI)."""
+        import tracemalloc
+
+        from pylasdev import data_reader as dr
+
+        monkeypatch.setattr(dr, "_PENDING_TRIM_THRESHOLD", 64)
+        n_steps = 4000  # 12_000 tokens — pre-fix retains every one of them
+        test_file = _write_las(tmp_path, "e20_retention.las", self._wrapped_content(n_steps))
+
+        snapshots: list[Any] = []
+        calls = 0
+
+        def _trace_hook(_pending: list[str]) -> None:
+            nonlocal calls
+            calls += 1
+            # Sample every 128th line (~62 snapshots for 8_000 lines) —
+            # tracemalloc.take_snapshot is too expensive for every line.
+            if calls % 128 == 1:
+                snapshots.append(tracemalloc.take_snapshot())
+
+        monkeypatch.setattr(dr, "_read_wrapped_trace_hook", _trace_hook)
+
+        tracemalloc.start()
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                las = read_las_file_as_object(test_file)
+        finally:
+            tracemalloc.stop()
+
+        # Sanity: the file parsed completely.
+        np.testing.assert_allclose(las.logs["DEPT"][-1], 1000.0 + n_steps - 1)
+
+        def _retained(snapshot: Any) -> int:
+            retained = 0
+            for stat in snapshot.statistics("lineno"):
+                fname = str(stat.traceback[0].filename)
+                if "_data_section_reader" in fname or "data_reader" in fname:
+                    retained += stat.size
+            return retained
+
+        assert snapshots, "M-10: trace hook never fired — the seam is not being invoked"
+        peak = max(_retained(s) for s in snapshots)
+        # Pre-fix (no trim): at peak `pending` holds all ~12_000 tokens
+        # (~600 KB).  Post-fix: the buffer holds only the unconsumed tail
+        # (< threshold + one line) at every sampled point of the parse.
+        assert peak < 200_000, (
+            f"E-20: {peak} bytes of token objects still retained during "
+            f"parse — the pending buffer is not being trimmed"
+        )
+
+
+class TestE41WrapDetectorHeaderRowNotCounted:
+    """E-41 (CONFIRMED MEDIUM): _detect_actual_wrap's 4-line window counts
+    the standalone mnemonic header row as a full data line, flipping
+    genuinely wrapped >=3-curve data to non-wrapped → silent column shift
+    of the whole depth log.  The fix skips mnemonic-header rows while the
+    window is empty.  MUST NOT regress test_regression.py:2377
+    ([3,1,2,1] wrapped lock)."""
+
+    @staticmethod
+    def _content(with_header: bool, wrap: str = "NO") -> str:
+        header_row = "DEPT  GR  RHOB\n" if with_header else ""
+        return (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            f" WRAP.   {wrap}  : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            " RHOB.K/M3 :  Density\n"
+            "~A\n"
+            + header_row
+            # Data: continuation lines of 2 values + depth lines of 1 value.
+            # Window WITHOUT the header row: [2,2,1,2] → partial majority →
+            # wrapped.  WITH the header row counted: [3,2,2,1] → first-line
+            # full + WRAP=NO → non-wrapped (pre-fix silent shift).
+            + "50.0 1.0\n"
+            + "1000.0\n"
+            + "55.0 2.0\n"
+            + "1001.0\n"
+            + "60.0 3.0\n"
+            + "1002.0\n"
+        )
+
+    def test_wrapped_with_header_parses_identically_to_without(
+        self, tmp_path: Path
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with_header = read_las_file_as_object(
+                _write_las(tmp_path, "e41_with_header.las", self._content(True))
+            )
+            without_header = read_las_file_as_object(
+                _write_las(tmp_path, "e41_without_header.las", self._content(False))
+            )
+        # Pre-fix: the header row (full width) + WRAP=NO → non-wrapped →
+        # DEPT=[50,1000,55,1001,60,1002] (silent shift).  Post-fix both
+        # variants are wrapped and identical.
+        np.testing.assert_allclose(with_header.logs["DEPT"], [50.0, 55.0, 60.0])
+        np.testing.assert_allclose(with_header.logs["GR"], [1.0, 2.0, 3.0])
+        np.testing.assert_allclose(with_header.logs["RHOB"], [1000.0, 1001.0, 1002.0])
+        np.testing.assert_allclose(without_header.logs["DEPT"], with_header.logs["DEPT"])
+        np.testing.assert_allclose(without_header.logs["GR"], with_header.logs["GR"])
+        np.testing.assert_allclose(without_header.logs["RHOB"], with_header.logs["RHOB"])
+
+    def test_comma_dlm_space_header_not_flipped_to_wrapped(self, tmp_path: Path) -> None:
+        """E-41 iter-3 NEW TRIGGER VARIANT: DLM=COMMA + space-separated
+        header row → the comma split sees ONE token ("DEPT GR RHOB NPHI")
+        → the window starts [1,3,3,3] which is NOT uniform (the header's
+        1-token entry breaks the H-02 shape) → partial majority → WRAPPED
+        verdict (pre-fix) → silent column shift of every row.  Post-fix
+        the header row is not counted → window [3,3,3] → H-02 uniform-short
+        → non-wrapped → graceful short-row null-fill."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " DLM.    COMMA :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            " RHOB.K/M3 :  Density\n"
+            " NPHI.V/V :  Porosity\n"
+            "~A\n"
+            "DEPT  GR  RHOB  NPHI\n"
+            "1000.0,50.0,1.0\n"
+            "1001.0,55.0,2.0\n"
+            "1002.0,60.0,3.0\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(_write_las(tmp_path, "e41_comma.las", content))
+        # Pre-fix: wrapped verdict → 4-value steps from 3-token rows →
+        # DEPT=[1000,50,1] (silent shift).  Post-fix: non-wrapped →
+        # short-row null-fill preserves every genuine value.
+        np.testing.assert_allclose(las.logs["DEPT"], [1000.0, 1001.0, 1002.0])
+        np.testing.assert_allclose(las.logs["GR"], [50.0, 55.0, 60.0])
+        np.testing.assert_allclose(las.logs["RHOB"], [1.0, 2.0, 3.0])
+        np.testing.assert_allclose(las.logs["NPHI"], [-999.25, -999.25, -999.25])
+
+
+class TestE42WrappedHeaderGateClosesAfterFirstDataLine:
+    """E-42 (CONFIRMED MEDIUM): _read_wrapped's header-skip gate was keyed
+    to step completion (total_elements == 0), staying open across multiple
+    lines in depth-first wrapped layouts — a string continuation value
+    coinciding with a mnemonic on line 2+ was silently dropped as a
+    "header" (data loss + column shift).  The gate is now keyed to the
+    line position (current_line == 0), like _read_normal."""
+
+    def test_string_continuation_on_line_two_not_dropped(self, tmp_path: Path) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " LITH.    :  Lithology {S}\n"
+            " GR.GAPI  :  Gamma\n"
+            "~A\n"
+            "DEPT LITH GR\n"
+            "1000.0\n"
+            "LITH GR\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(_write_las(tmp_path, "e42_gate.las", content))
+        # The second data line "LITH GR" is a genuine wrapped continuation
+        # (LITH string value + GR value) that coincides with the curve
+        # mnemonics.  Pre-fix: the gate (total_elements == 0) is still open
+        # → the row is skipped as a "header" → the step never completes →
+        # DEPT=[] (all values lost).  Post-fix: gate closed after the first
+        # data line → the continuation is consumed → one complete step.
+        np.testing.assert_allclose(las.logs["DEPT"], [1000.0])
+        np.testing.assert_array_equal(
+            las.string_data["LITH"], np.array(["LITH"], dtype=object)
+        )
+
+
+class TestM13UnitsRowAfterMnemonicHeaderSkipped:
+    """M-13 (CONFIRMED MEDIUM): a units row emitted directly after the
+    standalone mnemonic header row inside ~A ("~A\\nDEPT GR\\nM GAPI\\n...")
+    was consumed as a DATA row → phantom all-null first row + one-row shift
+    of the whole depth log.  The fix skips an optional units row (all
+    letters-only tokens, shared is_units_header_row predicate) on the
+    first data line only, gated on a mnemonic header row having been
+    skipped."""
+
+    def test_units_row_skipped(self, tmp_path: Path) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            "~A\n"
+            "DEPT GR\n"
+            "M GAPI\n"
+            "1000.0 50.0\n"
+            "1001.0 51.0\n"
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            las = read_las_file_as_object(_write_las(tmp_path, "m13_units.las", content))
+        # Pre-fix: "M GAPI" consumed as the first data row →
+        # DEPT=[-999.25, 1000.0, 1001.0] (phantom all-null first row).
+        np.testing.assert_allclose(las.logs["DEPT"], [1000.0, 1001.0])
+        np.testing.assert_allclose(las.logs["GR"], [50.0, 51.0])
+        # M-02 pin: the parser pre-scan subtracts the units row itself via
+        # the shared is_units_header_row predicate, so NO spurious
+        # "Pre-scan overcount" warning may fire on an M-13 file (pre-fix
+        # the pre-scan counted the units row → declared 3 data lines for 2
+        # actual → spurious warning; the old simplefilter("ignore") mask
+        # hid it from the test).
+        pre_scan_msgs = [
+            str(w.message) for w in caught if "Pre-scan overcount" in str(w.message)
+        ]
+        assert not pre_scan_msgs, (
+            f"M-02: spurious pre-scan overcount warning on M-13 file: {pre_scan_msgs}"
+        )
+
+    def test_units_row_skipped_wrapped(self, tmp_path: Path) -> None:
+        """M-03: the M-13 units-row skip must also apply in WRAP=YES
+        (wrapped) mode.  Pre-fix the wrapped path skipped the mnemonic
+        header row but consumed the units row as a data step → phantom
+        all-null first step + one-step depth shift
+        (DEPT=[-999.25, 1000.0, 1001.0, 1002.0])."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            "~A\n"
+            "DEPT GR\n"
+            "M GAPI\n"
+            "1000.0\n"
+            "50.0\n"
+            "1001.0\n"
+            "55.0\n"
+            "1002.0\n"
+            "60.0\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(
+                _write_las(tmp_path, "m13_units_wrapped.las", content)
+            )
+        np.testing.assert_allclose(las.logs["DEPT"], [1000.0, 1001.0, 1002.0])
+        np.testing.assert_allclose(las.logs["GR"], [50.0, 55.0, 60.0])
+
+    def test_units_like_first_data_row_not_skipped_without_header(
+        self, tmp_path: Path
+    ) -> None:
+        """Control: without a preceding mnemonic header row, a first row of
+        letters-only tokens is DATA (an all-string section), never a units
+        row — the skip requires the mnemonic header to have been seen first
+        (position gate).  The all-string exclusion already stops the header
+        skip; the units skip must not fire either."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " LITH.    :  Lithology {S}\n"
+            " FORM.    :  Formation {S}\n"
+            "~A\n"
+            "ACME SAND\n"
+            "SHALE GRN\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(_write_las(tmp_path, "m13_control.las", content))
+        # Both letters-only rows are genuine data rows: no mnemonic header
+        # row precedes them, so nothing may be skipped as a units row.
+        np.testing.assert_array_equal(
+            las.string_data["LITH"], np.array(["ACME", "SHALE"], dtype=object)
+        )
+        np.testing.assert_array_equal(
+            las.string_data["FORM"], np.array(["SAND", "GRN"], dtype=object)
+        )
+
+
+class TestM30CommaThousandsRecombined:
+    """M-30 (CONFIRMED MEDIUM): LAS DLM=COMMA data lines with
+    comma-grouped thousands ("1,234.5") split into fragments that silently
+    mis-assign every subsequent column when the token count matches
+    curve_count (zero warnings).  The LAS path now ports the DEV reader's
+    recombination with the same loud per-pair warnings, including the
+    equal-token-count case (E-24's hole)."""
+
+    @staticmethod
+    def _content(rows: str) -> str:
+        return (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " RHOB.K/M3 :  Density\n"
+            " NPHI.V/V :  Porosity\n"
+            "~A DEPT RHOB NPHI\n"
+            + rows
+        )
+
+    def test_equal_token_count_recombined_with_warning(self, tmp_path: Path) -> None:
+        """Equal-token-count case (the E-24 hole): 3 tokens == 3 curves with
+        a comma-grouped DEPT.  Pre-fix: DEPT=[1.0,5.0], RHOB=[234.5,60.0],
+        NPHI=[50.0,0.2] with ZERO warnings.  Post-fix: recombined with a
+        loud warning → DEPT=[1234.5,5.0], RHOB=[50.0,60.0], NPHI null-filled
+        (short row)."""
+        test_file = _write_las(
+            tmp_path, "m30_equal.las", self._content("1,234.5,50\n5,60,0.2\n")
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            las = read_las_file_as_object(test_file)
+        thousands_msgs = [
+            str(w.message) for w in caught if "thousands separator" in str(w.message)
+        ]
+        assert thousands_msgs, "M-30: no thousands-separator recombination warning"
+        np.testing.assert_allclose(las.logs["DEPT"], [1234.5, 5.0])
+        np.testing.assert_allclose(las.logs["RHOB"], [50.0, 60.0])
+        np.testing.assert_allclose(las.logs["NPHI"], [-999.25, 0.2])
+
+    def test_surplus_tokens_recombined(self, tmp_path: Path) -> None:
+        """Surplus case: 4 tokens vs 3 curves — the run merges when the
+        recombined count exactly satisfies the declared columns.  Pre-fix:
+        DEPT=[1.0,5.0] with the 60 discarded as an extra column."""
+        test_file = _write_las(
+            tmp_path, "m30_surplus.las", self._content("1,234.5,50,60\n5,60,0.2\n")
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        np.testing.assert_allclose(las.logs["DEPT"], [1234.5, 5.0])
+        np.testing.assert_allclose(las.logs["RHOB"], [50.0, 60.0])
+        np.testing.assert_allclose(las.logs["NPHI"], [60.0, 0.2])
+
+    def test_bare_fragment_row_not_false_recombined(self, tmp_path: Path) -> None:
+        """M-23 control: a row of bare 3-digit fragments ("100,450") is a
+        genuine multi-column row, never thousands — no merge, no warning
+        (protects the equal-count widening from over-merging)."""
+        test_file = _write_las(
+            tmp_path, "m30_bare.las", self._content("100,450,20\n5,60,0.2\n")
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            las = read_las_file_as_object(test_file)
+        thousands_msgs = [
+            str(w.message) for w in caught if "thousands separator" in str(w.message)
+        ]
+        assert not thousands_msgs, "M-30: bare fragment row must not recombine"
+        np.testing.assert_allclose(las.logs["DEPT"], [100.0, 5.0])
+        np.testing.assert_allclose(las.logs["RHOB"], [450.0, 60.0])
+        np.testing.assert_allclose(las.logs["NPHI"], [20.0, 0.2])
+
+    def test_three_digit_leading_equal_count_not_false_recombined(
+        self, tmp_path: Path
+    ) -> None:
+        """Widening control: at equal token count a THREE-digit leading
+        group ("100,234.5,50" for 3 curves) stays ambiguous with genuine
+        columns (DEPT=100, GR=234.5, RHOB=50 is plausible) — the merge is
+        limited to 1-2 digit leading groups.  No merge, no warning."""
+        test_file = _write_las(
+            tmp_path, "m30_leading3.las", self._content("100,234.5,50\n5,60,0.2\n")
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            las = read_las_file_as_object(test_file)
+        thousands_msgs = [
+            str(w.message) for w in caught if "thousands separator" in str(w.message)
+        ]
+        assert not thousands_msgs, "M-30: 3-digit leading group must not recombine"
+        np.testing.assert_allclose(las.logs["DEPT"], [100.0, 5.0])
+        np.testing.assert_allclose(las.logs["RHOB"], [234.5, 60.0])
+        np.testing.assert_allclose(las.logs["NPHI"], [50.0, 0.2])
+
+    def test_wrapped_comma_continuation_recombined(self, tmp_path: Path) -> None:
+        """M-30 in wrapped mode: a comma-DLM WRAP=YES file whose
+        continuation line carries a comma-grouped thousands value
+        ("1,234.5,5.0" = GR 1234.5 + RHOB 5.0 for step 1).  Pre-fix the
+        split fragments enter the step buffer as [1,234.5,5.0] → a full
+        step of WRONG values (DEPT=1, GR=234.5, RHOB=5.0).  Post-fix the
+        recombination restores the true step alignment."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            " DLM.    COMMA :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            " RHOB.K/M3 :  Density\n"
+            "~A DEPT GR RHOB\n"
+            "1000.0\n"
+            "1,234.5,5.0\n"
+            "1001.0\n"
+            "55.0,2.0\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(
+                _write_las(tmp_path, "m30_wrapped.las", content)
+            )
+        np.testing.assert_allclose(las.logs["DEPT"], [1000.0, 1001.0])
+        np.testing.assert_allclose(las.logs["GR"], [1234.5, 55.0])
+        np.testing.assert_allclose(las.logs["RHOB"], [5.0, 2.0])

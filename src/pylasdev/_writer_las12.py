@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from ._writer_base import (
+    _WELL_UNIT_PATTERN,
     _escape_colons_for_las_value,
     _sanitize_las_value,
     _WriterBase,
 )
 from .data_reader import _get_well_entry_ci
+from .exceptions import LASWriteError
 from .models import _MNEMONIC_PATTERN, LASFile
 
 
@@ -83,14 +85,50 @@ class _Las12Writer(_WriterBase):
 
         mandatory_order = ["STRT", "STOP", "STEP", "NULL"]
         ordered_keys: list[str] = []
+        _seen_upper: set[str] = set()
         for mandatory in mandatory_order:
             for key in self._las_file.well.entries:
-                if key.upper() == mandatory and key not in ordered_keys:
+                if key.upper() == mandatory and key.upper() not in _seen_upper:
                     ordered_keys.append(key)
+                    _seen_upper.add(key.upper())
                     break
         for key in self._las_file.well.entries:
-            if key not in ordered_keys:
+            if key in ordered_keys:
+                # Already emitted by the mandatory-order loop above — not
+                # a duplicate, skip.
+                continue
+            if key.upper() not in _seen_upper:
                 ordered_keys.append(key)
+                _seen_upper.add(key.upper())
+                continue
+            # E-31: case-variant duplicate well key (mirrors the base
+            # writer) — the parser's re-read identity is
+            # case-insensitive (well mnemonics are uppercased at read),
+            # so emitting BOTH variants writes two ~W lines for the same
+            # logical key and the re-read last-wins — one value is
+            # silently lost.  Dedup at emission: refuse loudly when the
+            # values differ, warn when identical.
+            _kept = next(_k for _k in ordered_keys if _k.upper() == key.upper())
+            if self._las_file.well.entries[_kept] != self._las_file.well.entries[key]:
+                raise LASWriteError(
+                    f"Well entry keys {_kept!r} and {key!r} differ only in "
+                    f"case but hold DIFFERENT values "
+                    f"({self._las_file.well.entries[_kept]!r} vs "
+                    f"{self._las_file.well.entries[key]!r}).  The LAS "
+                    f"parser treats well mnemonics case-insensitively — "
+                    f"only one would survive a write→read roundtrip, "
+                    f"silently losing the other.  Rename or remove one "
+                    f"of the entries."
+                )
+            import warnings
+
+            warnings.warn(
+                f"Well entry keys {_kept!r} and {key!r} differ only in case "
+                f"and hold the same value; emitting {_kept!r} only — the "
+                f"case-variant duplicate is dropped.",
+                UserWarning,
+                stacklevel=3,
+            )
 
         for key in ordered_keys:
             value = self._las_file.well.entries[key]
@@ -101,6 +139,20 @@ class _Las12Writer(_WriterBase):
             # codebase's CI well lookup (data_reader._get_well_entry_ci),
             # matching the base writer's fix (II-20 for LAS 2.0/3.0).
             unit = _sanitize_las_value(_get_well_entry_ci(self._las_file.well.units or {}, key, ""))
+            # E-36: validate the emitted unit against the parser's ~W
+            # unit grammar (DATA_LINE_PATTERN unit group) — mirrors the
+            # base writer.  A unit containing characters outside
+            # ``[\w\-/.%°:]`` truncates on re-read and destroys the
+            # entry value.
+            if unit and not _WELL_UNIT_PATTERN.fullmatch(unit):
+                raise LASWriteError(
+                    f"Well entry '{key}' unit {unit!r} cannot be "
+                    f"represented in the ~W section: the LAS parser's "
+                    f"unit grammar accepts only word characters, '-', "
+                    f"'/', '.', '%', '°', and ':' — any other character "
+                    f"(including whitespace) truncates the unit and "
+                    f"destroys the entry value on write→read roundtrip."
+                )
             unit_dot = f".{unit}" if unit else "."
             # W-07 (M-28 parity): well values/descriptions are emitted
             # mid-line (never at line start) so a leading '~' must be

@@ -245,6 +245,7 @@ def _iter_ascii_data_lines(
 def _split_data_line(
     stripped: str,
     delimiter: str,
+    expected: int | None = None,
 ) -> list[str]:
     """Split a data line into tokens using delimiter-aware logic.
 
@@ -252,8 +253,18 @@ def _split_data_line(
     - Space delimiter: str.split(maxsplit=MAX_TOKENS)
     - Non-space delimiter: str.split(delimiter, maxsplit=MAX_TOKENS)
     - Trailing empty string stripping for non-space delimiters
+    - M-30: thousands-separator recombination on the comma branch when
+      *expected* (declared column count) is supplied
     - F-WXP-06: All types use str.split (no csv.reader)
     - F-DR-01: Bounded allocation via maxsplit parameter
+
+    *expected* is the declared curve/column count for the section.  When
+    it is given and *delimiter* is a comma, tokens matching the thousands
+    pattern (``"1,234.5"`` split into ``"1"``/``"234.5"``) are recombined
+    with a loud warning so a comma-grouped value cannot silently shift or
+    mis-assign columns (M-30, mirroring the DEV reader's
+    ``_recombine_thousands_separators``).  Callers that must see raw
+    token counts (``_detect_actual_wrap``, the LAS 3.0 twin) omit it.
 
     Also used by _detect_actual_wrap, _read_normal, and _read_wrapped.
     """
@@ -269,6 +280,27 @@ def _split_data_line(
     # fields represent legitimate sparse data values that must be preserved.
     while values and values[-1] == "":
         values.pop()
+
+    # M-30: comma-delimited rows carrying comma-grouped thousands
+    # (``1,234.5``) split into fragments that silently shift/mis-assign
+    # every subsequent column.  Recombine with a loud per-pair warning
+    # (DEV-03 semantics), exactly like the DEV reader's comma path.
+    if expected is not None and delimiter == "," and len(values) >= 2:
+        _recombined = _recombine_las_thousands_separators(values, expected)
+        if _recombined is not None:
+            _merged_vals, _recombine_pairs = _recombined
+            for _original_frag, _merged_value in _recombine_pairs:
+                warnings.warn(
+                    f"Data value '{_original_frag}' contains a "
+                    f"thousands separator, which is not natively "
+                    f"supported in comma-delimited LAS data; "
+                    f"recombined to '{_merged_value}' for column "
+                    f"mapping. Review the data line if this row has "
+                    f"genuine extra columns.",
+                    UserWarning,
+                    stacklevel=3,
+                )
+            values = _merged_vals
 
     return values
 
@@ -560,3 +592,168 @@ def is_mnemonic_header_row(
     if all_string:
         return False
     return all(tok.upper() in declared for tok in tokens)
+
+
+# ---------------------------------------------------------------------------
+# M-13: shared units-row predicate (single source of truth)
+# ---------------------------------------------------------------------------
+
+_UNITS_TOKEN_RE = re.compile(r"[A-Za-z]+")
+
+
+def is_units_header_row(tokens: Sequence[str]) -> bool:
+    """Pure predicate: True when *tokens* form an optional units row.
+
+    Some real-world LAS 1.2/2.0 files emit a units row immediately after
+    the standalone mnemonic header row inside ``~A`` (``~A\\nDEPT GR\\nM
+    GAPI\\n1000.0 50.0\\n...``).  Consuming it as a data row produces a
+    phantom all-null first row and shifts the whole depth log by one row
+    (M-13).
+
+    The predicate is deliberately NARROW (letters-only tokens, M-13 scope):
+    a units row is skipped only when every token is a plain letter string
+    (``"M"``, ``"GAPI"``).  Units containing digits or punctuation
+    (``"K/M3"``, ``"us/ft"``) are not recognized — the narrow match keeps
+    a genuine first data row (e.g. a string value ``"SHALE"`` in a mixed
+    section) from being misclassified as units.  Callers MUST gate the
+    skip on (a) a mnemonic header row having just been skipped and (b)
+    first-line-of-section — the only position where the row can appear.
+
+    Shared predicate contract (M-13): the parser pre-scan
+    (parser._finalize_pre_scan) subtracts the units row itself using the
+    same predicate, so both sides agree on which rows are header/units vs
+    data.
+    """
+    if not tokens:
+        return False
+    return all(_UNITS_TOKEN_RE.fullmatch(tok) is not None for tok in tokens)
+
+
+# ---------------------------------------------------------------------------
+# M-30: thousands-separator recombination (LAS port of dev_reader's
+# _recombine_thousands_separators — same grammar, same loud warnings)
+# ---------------------------------------------------------------------------
+
+
+def _is_valid_thousands_leading_group(token: str) -> bool:
+    """Whether a token is a valid leading group of a thousands-separated number.
+
+    Thousands grouping separates digits into groups of three from the right,
+    so the leading group holds 1-3 digits (``"1"``, ``"12"``, ``"123"``).  A
+    4+ digit leading group before a comma (``"1000"`` in ``"1000,250.5"``) is
+    NOT a valid thousands format — it is a genuine extra column in a
+    multi-column row.
+    """
+    body = token[1:] if token[:1] in "+-" else token
+    return body.isdigit() and len(body) <= 3
+
+
+# A bare 3-digit group between comma groups (e.g. "234" in "1,234,567.8").
+_THOUSANDS_GROUP_BARE_RE = re.compile(r"^\d{3}$")
+# A final 3-digit group carrying the decimal/exponent part ("234.5", "234E2").
+_THOUSANDS_FRAG_RE = re.compile(r"^\d{3}(?:\.\d+|[eE][+-]?\d+)$")
+
+
+def _recombine_las_thousands_separators(
+    values: list[str], expected: int
+) -> tuple[list[str], list[tuple[str, str]]] | None:
+    """Recombine comma-split thousands-separator fragments in a data row.
+
+    LAS port of the DEV reader's :func:`pylasdev.dev_reader._recombine_thousands_separators`
+    (dev_reader.py:543-669) with the E-24/M-30 equal-token-count widening.
+
+    In comma-delimited files a value like ``1,234.5`` is split by the
+    delimiter into two tokens (``"1"`` and ``"234.5"``), silently
+    mis-assigning every subsequent column (M-30).  Consecutive tokens
+    matching the thousands pattern (a valid leading group + 3-digit groups
+    with the final one carrying a decimal/exponent part) are recombined
+    into a single value with the commas removed (``"1,234.5"`` →
+    ``"1234.5"``).
+
+    Gates (identical to the DEV twin except the equal-count widening):
+
+    - Entry: fires only when ``len(values) >= expected`` (surplus rows AND
+      the equal-token-count case).  Short rows are left to the existing
+      short-row null-fill + warning path.
+    - M-23: a run without a closing decimal/exponent fragment (e.g.
+      ``"100,450"``) is a genuine multi-column row — nothing merges and
+      the run is LOCKED (single left-to-right pass, I2-18 — no O(n²)
+      re-scan).
+    - F-07: a 4+ digit leading group is never thousands — no merge.
+    - DEV-02 first-run gate: a 3-digit leading group (or a 1-2 digit
+      leading group with a single comma group) is ambiguous with genuine
+      columns on SURPLUS rows — only merge when the recombined count
+      exactly satisfies *expected*.
+    - E-24/M-30 equal-count widening: when ``len(values) == expected`` a
+      valid run with a 1-2 digit leading group merges unconditionally —
+      the alternative is a silent column mis-assignment with ZERO
+      diagnostics (the pre-fix hole).  The resulting short row is handled
+      loudly (short-row warning + null-fill).  3-digit leading groups at
+      equal count stay under the DEV-02 exact-fit gate (``100,234.5`` is
+      as likely to be two genuine columns).
+
+    Returns:
+        Tuple of ``(recombined_token_list, [(original_fragment, merged_value),
+        ...])`` when at least one recombination applies, or ``None`` when
+        none does.
+    """
+    if len(values) < expected:
+        return None
+    out: list[str] = []
+    pairs: list[tuple[str, str]] = []
+    i = 0
+    n = len(values)
+    while i < n:
+        token = values[i]
+        if not _is_valid_thousands_leading_group(token):
+            out.append(token)
+            i += 1
+            continue
+        # Merge the whole consecutive run: valid leading group + zero or
+        # more bare 3-digit groups + a final 3-digit group carrying a
+        # decimal or exponent part.  Without a closing decimal/exponent
+        # fragment the bare groups are genuine columns, not thousands
+        # fragments (M-23).
+        merged = token
+        j = i + 1
+        while j < n and _THOUSANDS_GROUP_BARE_RE.match(values[j]):
+            merged += values[j]
+            j += 1
+        if j < n and _THOUSANDS_FRAG_RE.match(values[j]):
+            merged += values[j]
+            j += 1
+        else:
+            # M-23 / I2-18: no closing decimal/exponent fragment — the
+            # scanned bare 3-digit groups are genuine extra columns.
+            # Emit ALL scanned tokens [i:j) as separate columns and LOCK
+            # the run (linear, output-identical, no O(n²) re-scan).
+            out.extend(values[i:j])
+            i = j
+            continue
+        run_len = j - i
+        post_count = len(out) + 1 + (n - j)
+        _body = token[1:] if token[:1] in "+-" else token
+        if len(values) == expected:
+            # E-24/M-30 equal-count widening: a 1-2 digit leading group at
+            # exactly the declared count is the canonical thousands shape
+            # ("1,234.5" → "1234.5"); keep it merged so the row degrades
+            # into a LOUD short row instead of a silent mis-assignment.
+            # 3-digit leading groups stay ambiguous — apply the DEV-02
+            # exact-fit gate to them.
+            if len(_body) > 2 and post_count != expected:
+                out.extend(values[i:j])
+                i = j
+                continue
+        elif not (len(_body) <= 2 and run_len >= 3) and post_count != expected:
+            # DEV-02 first-run gate on surplus rows: only merge when the
+            # recombined row exactly satisfies the declared columns (or the
+            # run is an unambiguous multi-group M-76 shape).
+            out.extend(values[i:j])
+            i = j
+            continue
+        pairs.append((",".join(values[i:j]), merged))
+        out.append(merged)
+        i = j
+    if not pairs:
+        return None
+    return (out, pairs)

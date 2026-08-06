@@ -24,6 +24,9 @@ from ._sanitize import (
     _LEADING_SECTION_RE as _LEADING_SECTION_RE,
 )
 from ._sanitize import (
+    _escape_braces_for_las_value as _escape_braces_for_las_value,
+)
+from ._sanitize import (
     _escape_colons_for_las_value as _escape_colons_for_las_value,
 )
 from ._sanitize import (
@@ -86,6 +89,14 @@ _SECTION_TYPE_TO_DEFINITION_PREFIX: dict[str, str] = {
     "TEST_DATA": "Test",
     "PERFORATIONS_DATA": "Perforations",
 }
+
+# E-36: the parser's ~W unit grammar — DATA_LINE_PATTERN's unit group
+# (parser.py:318 ``[\w\-/.%°:]*``).  A well unit containing any other
+# character cannot round-trip: the ~W line truncates at the first
+# out-of-class character and the entry VALUE is absorbed into the
+# description (destroyed on write→read).  The writer rejects such units
+# at emission instead of silently corrupting the file.
+_WELL_UNIT_PATTERN = re.compile(r"^[\w\-/.%°:]*$")
 
 
 # ── Module-level utility functions ──────────────────────────────────────
@@ -303,6 +314,17 @@ def _format_curve_line(
     unit = _sanitize_las_value(curve.unit) if curve.unit else ""
     unit = _escape_colons_for_las_value(unit) if unit else ""
     desc = curve.description if curve.description else ""
+    # N-09: escape literal braces in the user description BEFORE any
+    # format token is appended.  The parser strips a VALID format token
+    # ({S}, {F}, {A:N}...) from the trailing position of a curve line and
+    # fabricates data_format from it — user text like "Gamma {S} ray" was
+    # destroyed and the numeric column re-routed to string_data on
+    # write→read.  Escaped braces (\{) cannot match FORMAT_SPEC_PATTERN;
+    # the writer's OWN appended token below stays unescaped so the parser
+    # still recognizes it.  The parser reverses the escape at the
+    # format-strip site (parser.py:3355) with
+    # _unescape_braces_for_las_value.
+    desc = _escape_braces_for_las_value(desc)
 
     # M-59: Emit the vendor-standard mnemonic when the model records one.
     # The reader's mnem_base rename (e.g. LLD→BFV) preserves the original
@@ -374,13 +396,33 @@ def _format_curve_line(
             offset = curve.array_info.time_offset
             if math.isfinite(offset):
                 if offset == int(offset):
+                    # E-40: the emitted offset field must fit the parser's
+                    # 64-character offset group (FORMAT_SPEC_PATTERN
+                    # ``[-\d.]{0,64}``).  An integral offset >= 1e64
+                    # formats to a 65+ digit decimal — the whole {A:N}
+                    # spec then fails to parse and data_format AND
+                    # time_offset are lost (the curve is re-read with a
+                    # different format).  Reject loudly: the offset cannot
+                    # be represented in the field at all (even rounded, a
+                    # 64-char decimal of 1e64 would be meaningless).
+                    _int_str = str(int(offset))
+                    if len(_int_str) > 64:
+                        raise LASWriteError(
+                            f"Curve '{curve.mnemonic}' time_offset "
+                            f"{offset!r} cannot be represented in the "
+                            f"{{A:N}} format specifier: the decimal field "
+                            f"({len(_int_str)} characters) exceeds the "
+                            f"parser's 64-character offset-group cap, and "
+                            f"the spec (and the curve's data_format) would "
+                            f"be lost on write→read roundtrip."
+                        )
                     # IEEE 754 negative zero: int(-0.0) == 0 loses the sign.
                     # Use float formatting to preserve "-0" in the output,
                     # matching the copysign guard in _format_number.
                     if offset == 0 and math.copysign(1.0, offset) < 0:
                         format_str += f":{offset}"
                     else:
-                        format_str += f":{int(offset)}"
+                        format_str += f":{_int_str}"
                 else:
                     format_str += f":{_format_offset_plain(offset)}"
         format_str += "}"
@@ -446,6 +488,14 @@ def _format_parameter_line(param: ParameterEntry, is_las30: bool) -> str:
     # zone associations appended below remain unescaped so the parser's
     # ZONE_ASSOC_PATTERN still recognizes them.
     desc = _escape_pipes_for_las_value(desc)
+    # N-09: escape literal braces in the user description BEFORE any
+    # format token is appended (mirrors _format_curve_line).  The parser
+    # strips a valid format token from the trailing position of a ~P line
+    # and fabricates param_data_format from user text; escaped braces
+    # (\{) cannot match FORMAT_SPEC_PATTERN.  The parser reverses the
+    # escape at the format-strip site (parser.py:3610) with
+    # _unescape_braces_for_las_value.
+    desc = _escape_braces_for_las_value(desc)
 
     if is_las30 and param.data_format:
         # N-I-21: Always emit the braced {…} form.  Previously
@@ -569,7 +619,16 @@ def _format_data_rows(
         # case-insensitive (I2-22), so the data-key lookup must be too.
         # Exact-case matches win; the fallback resolves a case-variant
         # curves_order entry ('dept') to the data stored under 'DEPT'.
-        curve_arrays.append(_lookup_data_array(name, data, string_data))
+        _arr, _is_string = _lookup_data_array(name, data, string_data)
+        # E-16: a 0-d numpy array (accepted by _check_column_array_like —
+        # the M-18 convention treats it as a single-element value, see
+        # models._GuardedDict._value_len) has no len() and is not
+        # indexable by position; both crashed the write with an opaque
+        # TypeError wrapped into LASWriteError.  Normalize to a 1-element
+        # 1-D view so the row-count and per-row access below work.
+        if isinstance(_arr, np.ndarray) and _arr.ndim == 0:
+            _arr = _arr.reshape(1)
+        curve_arrays.append((_arr, _is_string))
 
     num_rows = max(
         (len(arr) for arr, _ in curve_arrays if arr is not None),
@@ -714,25 +773,52 @@ def _format_data_rows(
                     # survive _sanitize_las_value, so the emitted data row
                     # would BEGIN with '~' — and the parser/reader skip
                     # '~'-prefixed lines as section-header noise
-                    # (parser.py F-83 / _data_section_reader.py), silently
-                    # dropping the ENTIRE row to `other` with zero
-                    # warnings.  Escape the leading '~' as '_~' (mirroring
-                    # the existing '#'-prefix escape) so the line never
-                    # starts with '~'; the parser's
-                    # _desanitize_las_value restores '_~' → '~' on re-read.
+                    # (parser.py F-83 / _data_section_reader.py
+                    # _iter_ascii_data_lines), silently dropping the
+                    # ENTIRE row with zero warnings.  Escape the leading
+                    # '~' as '_~' (mirroring the existing '#'-prefix
+                    # escape) so the line never starts with '~'; the read
+                    # side restores '_~' → '~' for the first-column token
+                    # (restore_tilde on both the LAS 3.0 path
+                    # _las30_data.py:1195 and the LAS 1.2/2.0 path
+                    # data_reader._read_normal/_read_wrapped — E-19).
                     val = "_" + val.lstrip()
                     if not warned_tilde_str:
                         import warnings
 
-                        warnings.warn(
-                            "String curve value in the first data column "
-                            "begins with '~' followed by a non-letter; the "
-                            "emitted row would be misread as a LAS section "
-                            "header and silently dropped on re-read.  The "
-                            "leading '~' was escaped as '_~' (restored on "
-                            "re-read) to keep the row in the file.",
-                            stacklevel=4,
-                        )
+                        if is_las12:
+                            # E-19: on LAS 1.2/2.0 the escape IS restored
+                            # for a first-column string token on re-read,
+                            # but string curves are lossy there by design
+                            # (M-29 — no {S} marker, the column re-reads
+                            # as numeric and null-fills).  The ROW (and
+                            # the other columns' values) survive; the
+                            # string VALUE itself does not round-trip.
+                            warnings.warn(
+                                "String curve value in the first data "
+                                "column begins with '~' followed by a "
+                                "non-letter; the emitted row would be "
+                                "misread as a LAS section header and "
+                                "silently dropped on re-read.  The "
+                                "leading '~' was escaped as '_~' so the "
+                                "row stays in the file; on LAS 1.2/2.0 "
+                                "the escape is restored for a first-column "
+                                "string token but string values do not "
+                                "round-trip by design (M-29).",
+                                stacklevel=4,
+                            )
+                        else:
+                            warnings.warn(
+                                "String curve value in the first data "
+                                "column begins with '~' followed by a "
+                                "non-letter; the emitted row would be "
+                                "misread as a LAS section header and "
+                                "silently dropped on re-read.  The "
+                                "leading '~' was escaped as '_~' and is "
+                                "restored on re-read for the first-column "
+                                "token, so the value round-trips.",
+                                stacklevel=4,
+                            )
                         warned_tilde_str = True
                 row_values.append(val)
             else:
@@ -882,7 +968,28 @@ def _format_offset_plain(offset: float) -> str:
     sig_digits = len(mantissa.replace(".", "").replace("-", ""))
     magnitude = math.floor(math.log10(abs(offset)))
     decimal_places = sig_digits + max(0, (-magnitude) - 1)
-    if decimal_places > _MAX_OFFSET_FIXED_DECIMALS:
+    # E-40: the fixed-point field's TOTAL length must fit the parser's
+    # 64-character offset group (FORMAT_SPEC_PATTERN ``[-\d.]{0,64}``).
+    # The decimal_places clamp below bounds only the FRACTION — a large
+    # non-integral offset (e.g. 1.5e100) still emits a 100+ character
+    # field (101 integer digits), the whole {A:N} spec fails to parse,
+    # and data_format + time_offset are lost on re-read.  Bound the
+    # integer part first: sign (1) + integer digits + dot (1) +
+    # decimal_places must fit in 64.
+    _int_digits = len(str(int(abs(offset))))
+    if _int_digits > 63:
+        # Sign + integer digits alone already exceed the 64-char cap.
+        # Even a fully rounded value cannot be represented — reject
+        # loudly instead of emitting a spec the parser will drop.
+        raise LASWriteError(
+            f"time_offset {offset!r} cannot be represented in the "
+            f"{{A:N}} offset field: the integer part ({_int_digits} "
+            f"digits) exceeds the parser's 64-character offset-group "
+            f"cap, and the spec (and the curve's data_format) would be "
+            f"lost on write→read roundtrip."
+        )
+    _max_decimals_for_total = 63 - _int_digits
+    if decimal_places > _MAX_OFFSET_FIXED_DECIMALS or decimal_places > _max_decimals_for_total:
         import warnings
 
         warnings.warn(
@@ -894,7 +1001,9 @@ def _format_offset_plain(offset: float) -> str:
             UserWarning,
             stacklevel=3,
         )
-        decimal_places = _MAX_OFFSET_FIXED_DECIMALS
+        decimal_places = min(
+            decimal_places, _MAX_OFFSET_FIXED_DECIMALS, _max_decimals_for_total
+        )
     return format(offset, f".{decimal_places}f")
 
 
@@ -948,8 +1057,22 @@ class _WriterMutationGuard:
     after a write (success or failure).
     """
 
-    def __init__(self, las_file: LASFile) -> None:
+    def __init__(
+        self,
+        las_file: LASFile,
+        *,
+        suppress_validate: bool = False,
+    ) -> None:
         self._las_file = las_file
+        # M-27: write() runs validate(complete=True) itself (and warns on
+        # every issue); re-running it in __exit__ double-warned every
+        # issue on every write.  write_las_file passes suppress_validate
+        # so the __exit__ re-validation is skipped (the pre-write
+        # validation already covered the same model state — the writers
+        # restore their container snapshots, so the post-write state
+        # cannot introduce NEW validate issues beyond the wrap/dlm
+        # normalization the write itself performed).
+        self._suppress_validate = suppress_validate
         self._saved_wrap: str = las_file.version.wrap
         self._saved_dlm: str = las_file.version.dlm
         self._saved_logs = dict(las_file.logs)
@@ -1003,7 +1126,9 @@ class _WriterMutationGuard:
             # W-07: failure path — restore the saved state so the caller's
             # model is not left partially mutated by the failed write.
             self._restore_saved_state()
-        else:
+        elif not self._suppress_validate:
+            # M-27: skipped when write() already ran
+            # validate(complete=True) — see __init__.
             try:
                 issues = self._las_file.validate(complete=True)
                 for msg in issues:
@@ -1125,14 +1250,53 @@ class _WriterBase:
 
         mandatory_order = ["STRT", "STOP", "STEP", "NULL"]
         ordered_keys: list[str] = []
+        _seen_upper: set[str] = set()
         for mandatory in mandatory_order:
             for key in self._las_file.well.entries:
-                if key.upper() == mandatory and key not in ordered_keys:
+                if key.upper() == mandatory and key.upper() not in _seen_upper:
                     ordered_keys.append(key)
+                    _seen_upper.add(key.upper())
                     break
         for key in self._las_file.well.entries:
-            if key not in ordered_keys:
+            if key in ordered_keys:
+                # Already emitted by the mandatory-order loop above — not
+                # a duplicate, skip.
+                continue
+            if key.upper() not in _seen_upper:
                 ordered_keys.append(key)
+                _seen_upper.add(key.upper())
+                continue
+            # E-31: case-variant duplicate well key.  The parser's re-read
+            # identity is case-insensitive (well mnemonics are uppercased
+            # at read, parser.py:3018), so emitting BOTH variants writes
+            # two ~W lines for the same logical key and the re-read
+            # last-wins — one value is silently lost, and a NULL-variant
+            # pair (e.g. "NULL"=-999.25 plus "null"=0) can even break the
+            # fill sentinel (data_reader._get_null_value is
+            # case-insensitive).  Dedup at emission like the curve block
+            # does (_emission_plan): refuse loudly when the values differ,
+            # warn when identical.
+            _kept = next(_k for _k in ordered_keys if _k.upper() == key.upper())
+            if self._las_file.well.entries[_kept] != self._las_file.well.entries[key]:
+                raise LASWriteError(
+                    f"Well entry keys {_kept!r} and {key!r} differ only in "
+                    f"case but hold DIFFERENT values "
+                    f"({self._las_file.well.entries[_kept]!r} vs "
+                    f"{self._las_file.well.entries[key]!r}).  The LAS "
+                    f"parser treats well mnemonics case-insensitively — "
+                    f"only one would survive a write→read roundtrip, "
+                    f"silently losing the other.  Rename or remove one "
+                    f"of the entries."
+                )
+            import warnings
+
+            warnings.warn(
+                f"Well entry keys {_kept!r} and {key!r} differ only in case "
+                f"and hold the same value; emitting {_kept!r} only — the "
+                f"case-variant duplicate is dropped.",
+                UserWarning,
+                stacklevel=3,
+            )
 
         for key in ordered_keys:
             value = self._las_file.well.entries[key]
@@ -1144,6 +1308,23 @@ class _WriterBase:
             # (data_reader._get_well_entry_ci), matching the mandatory-
             # field ordering's key.upper() convention.
             unit = _sanitize_las_value(_get_well_entry_ci(self._las_file.well.units or {}, key, ""))
+            # E-36: validate the emitted unit against the parser's ~W
+            # unit grammar (DATA_LINE_PATTERN unit group,
+            # parser.py:318: ``[\w\-/.%°:]*``).  A unit containing any
+            # other character (e.g. the whitespace in "kg : m") truncates
+            # at the first out-of-class character on re-read — the unit
+            # is silently shortened AND the entry VALUE is absorbed into
+            # the description, destroying it on write→read.  Reject
+            # loudly rather than emit metadata that cannot round-trip.
+            if unit and not _WELL_UNIT_PATTERN.fullmatch(unit):
+                raise LASWriteError(
+                    f"Well entry '{key}' unit {unit!r} cannot be "
+                    f"represented in the ~W section: the LAS parser's "
+                    f"unit grammar accepts only word characters, '-', "
+                    f"'/', '.', '%', '°', and ':' — any other character "
+                    f"(including whitespace) truncates the unit and "
+                    f"destroys the entry value on write→read roundtrip."
+                )
             unit_dot = f".{unit}" if unit else "."
             # M-28: well values/descriptions are emitted mid-line (never at
             # line start) so a leading '~' must be preserved, not stripped.
@@ -1613,6 +1794,29 @@ class _WriterBase:
                 f"No data will be emitted.",
                 stacklevel=3,
             )
+        elif curve_names and len(_data_curves) < len(curve_names):
+            # E-32: SOME curves have data but others do not (e.g. a
+            # post-construction `del las.logs['GR']` — _GuardedDict has
+            # no deletion overrides, so the curves_order entry survives
+            # without data).  The previous code only warned when NONE
+            # had data; the partial case was silently null-padded and
+            # the re-read FABRICATED a -999.25 column that never existed
+            # in the model.  Warn loudly at emission time so the
+            # fabrication is visible.
+            _missing = sorted(
+                n
+                for n in curve_names
+                if _lookup_data_array(n, self._las_file.logs, self._las_file.string_data)[0]
+                is None
+            )
+            warnings.warn(
+                f"curves_order entries {_missing} have no data in "
+                f"'logs' or 'string_data'.  The writer will null-pad "
+                f"these columns with null_value; on re-read the padded "
+                f"columns fabricate null rows that do not exist in the "
+                f"model.",
+                stacklevel=3,
+            )
         if not curve_names and (self._las_file.logs or self._las_file.string_data):
             # F-36: an EMPTY curves_order with populated logs/string_data
             # is a user-inconsistent state (direct construction only —
@@ -1885,7 +2089,7 @@ def write_las_file(
             f"Supported versions are LAS 1.2, 2.0, and 3.0."
         )
 
-    with _WriterMutationGuard(las_file):
+    with _WriterMutationGuard(las_file, suppress_validate=True):
         try:
             content = writer.write()
         except (ValueError, TypeError, KeyError, AttributeError, OverflowError, PylasdevError) as e:

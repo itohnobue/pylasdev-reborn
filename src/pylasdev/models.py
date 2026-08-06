@@ -1096,11 +1096,77 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
 
         # F-115: Detect ambiguous curve placement — logs vs
         # data_sections.
+        # M-28: The F-115 check must distinguish a canonical-copy from a
+        # genuine conflict.  For LAS 3.0, the parser populates BOTH the
+        # top-level logs/string_data convenience views AND the owning
+        # DataSection's data/string_data with the SAME values by design
+        # (defensive copies, _las30_data.py:1345/1370) — every canonical
+        # parse→to_dict→from_dict roundtrip therefore contains the
+        # overlap, and warning on it hard-fails warnings-as-errors
+        # automation on the library's own standard roundtrip.  Warn only
+        # when a section's value genuinely diverges from the top-level
+        # logs value for the same curve (a manual dict that really would
+        # lose data on write).
+        def _array_values_equal(a: Any, b: Any) -> bool:
+            """Value equality for F-115 overlap resolution.
+
+            The canonical roundtrip carries the same curve values in
+            ``logs`` and the owning section's ``data``/``string_data``
+            (separate array objects, identical values, possible NaN
+            cells from null fills).  Compares values — not references —
+            and treats NaN as equal so a canonical copy with null cells
+            is not mistaken for a conflict.  Object/str arrays compare
+            exactly (no NaN concept there).
+            """
+            try:
+                _a = np.asarray(a)
+                _b = np.asarray(b)
+            except Exception:
+                # Non-array-convertible values: fall back to identity or
+                # Python equality (bool() for the mypy bool contract).
+                return bool(a is b or a == b)
+            if _a.shape != _b.shape:
+                return False
+            if _a.dtype.kind in ("O", "U", "S") or _b.dtype.kind in ("O", "U", "S"):
+                return bool(np.array_equal(_a, _b))
+            return bool(np.array_equal(_a, _b, equal_nan=True))
+
         _logs_raw = data.get("logs")
         if isinstance(_logs_raw, dict) and _logs_raw:
             _log_curve_names = {str(k).upper() for k in _logs_raw.keys()}
             _overlap = _log_curve_names & _ds_curve_names
-            if _overlap:
+            # Build name → section values so the canonical-copy
+            # discrimination can compare actual values.
+            _ds_values_by_upper: dict[str, list[Any]] = {}
+            for _ds in data_sections:
+                if not isinstance(_ds, dict):
+                    continue
+                _ds_data = _ds.get("data")
+                if isinstance(_ds_data, dict):
+                    for _k, _v in _ds_data.items():
+                        _ds_values_by_upper.setdefault(str(_k).upper(), []).append(_v)
+                _ds_str = _ds.get("string_data")
+                if isinstance(_ds_str, dict):
+                    for _k, _v in _ds_str.items():
+                        _ds_values_by_upper.setdefault(str(_k).upper(), []).append(_v)
+            # Warn only on genuine divergence: a curve whose top-level
+            # logs value differs from at least one section value.  A
+            # name declared in a section's curves_order but carrying no
+            # data anywhere is the "uncovered curve" class (flagged by
+            # DataSection.validate), not an F-115 value conflict — no
+            # comparison is possible, so no warning here.
+            _genuine_overlap: list[str] = []
+            for _u in sorted(_overlap):
+                _log_vals = [_logs_raw[_k] for _k in _logs_raw if str(_k).upper() == _u]
+                _section_vals = _ds_values_by_upper.get(_u, [])
+                if not _section_vals:
+                    continue
+                if any(
+                    not all(_array_values_equal(_lv, _sv) for _lv in _log_vals)
+                    for _sv in _section_vals
+                ):
+                    _genuine_overlap.append(_u)
+            if _genuine_overlap:
                 # F-115: Warn rather than reject — the parser roundtrip
                 # legitimately produces both logs and data_sections with
                 # overlapping curve names (same data, different storage).
@@ -1108,12 +1174,12 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
                 # alerts users to potential silent data discard when
                 # manually constructed dicts conflict.
                 warnings.warn(
-                    f"Curve(s) {sorted(_overlap)} appear in both "
-                    f"'logs' and 'data_sections'.  The writer uses "
-                    f"data_sections when both are present, ignoring "
-                    f"the logs values for these curves.  Place each "
-                    f"curve in exactly one location to avoid data "
-                    f"loss.",
+                    f"Curve(s) {_genuine_overlap} appear in both "
+                    f"'logs' and 'data_sections' with differing "
+                    f"values.  The writer uses data_sections when "
+                    f"both are present, ignoring the logs values for "
+                    f"these curves.  Place each curve in exactly one "
+                    f"location to avoid data loss.",
                     stacklevel=2,
                 )
 
@@ -1237,6 +1303,25 @@ class VersionSection:
                     f"VersionSection: Unrecognized VERS value "
                     f"{self.vers!r}. Expected 1.2, 2.0, or 3.0."
                 )
+        # E-04: Re-check WRAP/DLM VALUES on post-construction state.
+        # __setattr__ re-validates on assignment; validate() — which the
+        # writer runs before emitting — must catch state that bypassed
+        # __setattr__ (e.g. direct __dict__ manipulation).  WRAP was the
+        # ONLY ~V field never re-checked anywhere: an invalid WRAP value
+        # also silently disables the writer's 256-char line-limit
+        # enforcement (_writer_base._check_line_lengths consults
+        # line_length_limit_for_wrap), so a mutated WRAP must be flagged
+        # here even though the value set is validated at construction.
+        if self.wrap and self.wrap.upper() not in {"YES", "NO"}:
+            issues.append(
+                f"VersionSection: invalid WRAP value {self.wrap!r}.  "
+                f"Expected YES or NO."
+            )
+        if self.dlm and self.dlm.upper() not in {"SPACE", "TAB", "COMMA"}:
+            issues.append(
+                f"VersionSection: invalid DLM value {self.dlm!r}.  "
+                f"Expected SPACE, TAB, or COMMA."
+            )
         # DLM: warn about non-SPACE DLM on LAS 1.2.
         if complete and self.dlm:
             _dlm = self.dlm.upper()
@@ -1248,6 +1333,70 @@ class VersionSection:
                     f"SPACE delimiter on write."
                 )
         return issues
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """E-04: re-validate WRAP/DLM/VERS on post-construction assignment.
+
+        The construction-time __post_init__ guards were bypassable by
+        mutation (``vs.wrap = "MAYBE"`` / ``vs.dlm = "FOO"`` passed and
+        the writer emitted a ~V line the parser cannot re-read — and an
+        invalid WRAP silently disabled the 256-char line-limit
+        enforcement).  Re-apply the construction contract at every
+        assignment, mirroring __post_init__ exactly (empty strings stay
+        "not specified"; None stays rejected; values are uppercased like
+        construction does).
+        """
+        if name == "vers":
+            if value is None:
+                raise ValueError("VersionSection: VERS cannot be None")
+            if not isinstance(value, str):
+                raise TypeError(
+                    f"VersionSection: VERS must be str, got {type(value).__name__}"
+                )
+            value = value.strip()
+            if len(value) > MAX_FIELD_LENGTH:
+                raise ValueError(
+                    f"VersionSection: VERS length {len(value)} exceeds "
+                    f"maximum allowed ({MAX_FIELD_LENGTH})"
+                )
+        elif name == "wrap":
+            if value is None:
+                raise ValueError("VersionSection: WRAP cannot be None")
+            if not isinstance(value, str):
+                raise TypeError(
+                    f"VersionSection: WRAP must be str, got {type(value).__name__}"
+                )
+            value = value.upper()
+            if len(value) > MAX_FIELD_LENGTH:
+                raise ValueError(
+                    f"VersionSection: WRAP length {len(value)} exceeds "
+                    f"maximum allowed ({MAX_FIELD_LENGTH})"
+                )
+            if value and value not in {"YES", "NO"}:
+                raise ValueError(
+                    f"VersionSection: invalid WRAP value {value!r}.  Expected YES or NO."
+                )
+        elif name == "dlm":
+            if value is None:
+                raise ValueError("VersionSection: DLM cannot be None")
+            if not isinstance(value, str):
+                raise TypeError(
+                    f"VersionSection: DLM must be str, got {type(value).__name__}"
+                )
+            # F-018: the value is case-PRESERVED (test lock — 'space'
+            # stays 'space'), so validate against the uppercased form
+            # but store the caller's casing like __post_init__ does.
+            if len(value) > MAX_FIELD_LENGTH:
+                raise ValueError(
+                    f"VersionSection: DLM length {len(value)} exceeds "
+                    f"maximum allowed ({MAX_FIELD_LENGTH})"
+                )
+            if value and value.upper() not in {"SPACE", "TAB", "COMMA"}:
+                raise ValueError(
+                    f"VersionSection: invalid DLM value "
+                    f"{value!r}.  Expected SPACE, TAB, or COMMA."
+                )
+        super().__setattr__(name, value)
 
     def __post_init__(self) -> None:
         """Validate VERS, WRAP, and DLM after construction.
@@ -1275,9 +1424,28 @@ class VersionSection:
                 stacklevel=2,
             )
             self.vers = "2.0"
+        # M-32: MAX_FIELD_LENGTH on VERS.  An over-long VERS is only
+        # WARNED as "unrecognized" (it is not in {1.2, 2.0, 3.0}) yet
+        # still emitted — producing a ~V line the parser cannot re-read
+        # (self-unreadable output).
+        if len(self.vers) > MAX_FIELD_LENGTH:
+            raise ValueError(
+                f"VersionSection: VERS length {len(self.vers)} exceeds "
+                f"maximum allowed ({MAX_FIELD_LENGTH})"
+            )
         # WRAP: reject None before any string operations.
         if self.wrap is None:
             raise ValueError("VersionSection: WRAP cannot be None")
+        # M-32: MAX_FIELD_LENGTH on the WRAP field.  A 200k-char wrap is
+        # emitted as a ~V line the parser cannot re-read (its own
+        # MAX_FIELD_LENGTH guard) — the library would write a file it
+        # cannot read back.  Length is checked before the YES/NO value
+        # check so the diagnostic names the real problem.
+        if len(self.wrap) > MAX_FIELD_LENGTH:
+            raise ValueError(
+                f"VersionSection: WRAP length {len(self.wrap)} exceeds "
+                f"maximum allowed ({MAX_FIELD_LENGTH})"
+            )
         # WRAP: validate non-empty values against YES/NO
         # (matching parser.py:1097-1108).  Empty string = not specified.
         if self.wrap:
@@ -1292,6 +1460,13 @@ class VersionSection:
         # Empty string = not specified.
         if self.dlm is None:
             raise ValueError("VersionSection: DLM cannot be None")
+        # M-32: MAX_FIELD_LENGTH on the DLM field (same self-unreadable
+        # rationale as WRAP above; checked before the value validation).
+        if len(self.dlm) > MAX_FIELD_LENGTH:
+            raise ValueError(
+                f"VersionSection: DLM length {len(self.dlm)} exceeds "
+                f"maximum allowed ({MAX_FIELD_LENGTH})"
+            )
         if self.dlm:
             _dlm = self.dlm.upper()
             # F-I2-MD3-01: Validate DLM value first, then check LAS
@@ -1381,6 +1556,24 @@ class _WellMetaDict(dict[str, str]):
                 f"{key!r} must be str, got {type(value).__name__} "
                 f"({value!r})"
             )
+        # M-31: MAX_FIELD_LENGTH on BOTH key and value.  A 200k-char unit
+        # (or key) is emitted by the writer and then fails the parser's
+        # own MAX_FIELD_LENGTH guard on re-read — the library writes a
+        # file it cannot read back (self-unreadable LASParseError).  The
+        # writer's generic 256-char header warning is NOT duplicated here;
+        # this is the real length validation, matching the parser's limit.
+        if len(key) > MAX_FIELD_LENGTH:
+            raise ValueError(
+                f"WellSection: units/descriptions key length {len(key)} "
+                f"for key {key[:32]!r}... exceeds maximum allowed "
+                f"({MAX_FIELD_LENGTH})"
+            )
+        if len(value) > MAX_FIELD_LENGTH:
+            raise ValueError(
+                f"WellSection: units/descriptions value length "
+                f"{len(value)} for key {key!r} exceeds maximum allowed "
+                f"({MAX_FIELD_LENGTH})"
+            )
 
     def __setitem__(self, key: Any, value: Any) -> None:
         self._validate(key, value)
@@ -1405,6 +1598,96 @@ class _WellMetaDict(dict[str, str]):
         for _k, _v in _other.items():
             self._validate(_k, _v)
         return super().__ior__(_other)
+
+
+class _WellEntriesDict(dict[str, str]):
+    """Validating dict for ``WellSection.entries`` (E-03).
+
+    The ``__post_init__`` N-I-19 guard (str keys matching
+    ``_MNEMONIC_PATTERN`` + ``MAX_FIELD_LENGTH`` values) and the
+    ``__setitem__`` F-002/F-006 guard (str keys, value coercion) applied
+    ONLY at construction and through ``well[key] = value`` — direct item
+    mutation (``well.entries['STRT'] = 123``), wholesale reassignment
+    (``well.entries = {...}``) and ``update()`` all bypassed both and
+    either crashed the writer with an opaque AttributeError (non-str
+    value) or silently dropped the entry on re-read (non-roundtrippable
+    key).  This dict re-applies the construction contract at every
+    mutation entry point, mirroring the sibling ``_WellMetaDict``
+    (units/descriptions) guard:
+
+    - keys must be str AND match ``_MNEMONIC_PATTERN`` (N-I-19 —
+      punctuation keys are emitted by the writer and then fail the ~W
+      line regex on re-read, silently dropping the entry);
+    - non-str values are coerced via ``_safe_str`` with the M-14
+      warning (matching ``__post_init__``'s coercion contract);
+    - ``MAX_FIELD_LENGTH`` is enforced on already-str values (F-001).
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # M-01: dict.__init__ bypasses __setitem__.  Validate all items
+        # from positional args and keyword args before building.
+        _items = dict(*args, **kwargs)
+        _coerced: dict[str, str] = {}
+        for _k, _v in _items.items():
+            self._validate(_k, _v)
+            _coerced[_k] = _v if isinstance(_v, str) else _safe_str(_v)
+        super().__init__(_coerced)
+
+    @staticmethod
+    def _validate(key: Any, value: Any) -> None:
+        if not isinstance(key, str):
+            raise TypeError(
+                f"WellSection: entry key must be str, got {type(key).__name__} ({key!r})"
+            )
+        if not _MNEMONIC_PATTERN.fullmatch(key):
+            raise ValueError(
+                f"WellSection: entry key {key!r} contains "
+                f"characters the LAS parser cannot roundtrip.  "
+                f"Well keys must match {_MNEMONIC_PATTERN.pattern!r} "
+                f"(no dots, spaces, colons, or other punctuation)."
+            )
+        if not isinstance(value, str):
+            warnings.warn(
+                f"WellSection: coercing non-str value for key "
+                f"{key!r} from {type(value).__name__} to str",
+                stacklevel=2,
+            )
+            return
+        if len(value) > MAX_FIELD_LENGTH:
+            raise ValueError(
+                f"WellSection: value length {len(value)} for key "
+                f"{key!r} exceeds maximum allowed ({MAX_FIELD_LENGTH})"
+            )
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        self._validate(key, value)
+        if not isinstance(value, str):
+            value = _safe_str(value)
+        super().__setitem__(key, value)
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        # M-01: dict.update bypasses __setitem__.
+        _items = dict(*args, **kwargs)
+        for _k, _v in _items.items():
+            self._validate(_k, _v)
+        super().update({_k: (_v if isinstance(_v, str) else _safe_str(_v)) for _k, _v in _items.items()})
+
+    def setdefault(self, key: Any, default: Any = None) -> Any:
+        # M-01: dict.setdefault bypasses __setitem__ when inserting.
+        if key not in self:
+            self._validate(key, default)
+            if not isinstance(default, str):
+                default = _safe_str(default)
+        return super().setdefault(key, default)
+
+    def __ior__(self, other: Any) -> _WellEntriesDict:  # type: ignore[misc,override]
+        # M-01: dict.__ior__ bypasses __setitem__.
+        _other = dict(other)
+        for _k, _v in _other.items():
+            self._validate(_k, _v)
+        return super().__ior__(
+            {_k: (_v if isinstance(_v, str) else _safe_str(_v)) for _k, _v in _other.items()}
+        )
 
 
 @dataclass
@@ -1558,6 +1841,22 @@ class WellSection:
                         f"{_dk!r} must be str, "
                         f"got {type(_dv).__name__} ({_dv!r})"
                     )
+                # M-31: MAX_FIELD_LENGTH on BOTH key and value at direct
+                # construction (the _WellMetaDict re-wrap below also
+                # enforces it; this gives the same guard to the
+                # default_factory empty-dict / pre-wrap path).
+                if len(_dk) > MAX_FIELD_LENGTH:
+                    raise ValueError(
+                        f"WellSection: {_dict_name} key length {len(_dk)} "
+                        f"for key {_dk[:32]!r}... exceeds maximum allowed "
+                        f"({MAX_FIELD_LENGTH})"
+                    )
+                if len(_dv) > MAX_FIELD_LENGTH:
+                    raise ValueError(
+                        f"WellSection: {_dict_name} value length "
+                        f"{len(_dv)} for key {_dk!r} exceeds maximum "
+                        f"allowed ({MAX_FIELD_LENGTH})"
+                    )
         # F-15: Re-wrap units/descriptions through the guarded dict so the
         # I2F-05 construction guard also applies to post-construction item
         # mutation (well.units['STRT'] = 123 previously bypassed it and
@@ -1568,13 +1867,25 @@ class WellSection:
             self.units = _WellMetaDict(self.units)
         if not isinstance(self.descriptions, _WellMetaDict):
             self.descriptions = _WellMetaDict(self.descriptions)
+        # E-03: Re-wrap entries through the guarded dict so the N-I-19
+        # key-content guard and the F-001/F-006 value guards also apply
+        # to post-construction item mutation (well.entries['STRT'] = 123
+        # previously stored the raw value and crashed the writer with an
+        # opaque AttributeError).  __setattr__ already re-wraps the
+        # __init__ path; this covers the default_factory empty-dict case
+        # and any bypass (object.__setattr__ / unpickle restore).
+        if not isinstance(self.entries, _WellEntriesDict):
+            self.entries = _WellEntriesDict(self.entries)
 
     def __setattr__(self, name: str, value: Any) -> None:
-        """F-15: Re-wrap ``units``/``descriptions`` wholesale assignments
-        through ``_WellMetaDict`` so the I2F-05 value guard cannot be
-        bypassed by ``well.units = {...}`` post-construction (mirrors
-        LASFile.__setattr__ / DevFile.__setattr__).  All other fields pass
-        through untouched."""
+        """F-15/E-03: Re-wrap ``units``/``descriptions`` wholesale
+        assignments through ``_WellMetaDict`` so the I2F-05 value guard
+        cannot be bypassed by ``well.units = {...}`` post-construction,
+        and re-wrap ``entries`` through ``_WellEntriesDict`` so the
+        N-I-19 key-content guard and the F-001/F-006 value guards cannot
+        be bypassed by ``well.entries = {...}`` wholesale assignment
+        (mirrors LASFile.__setattr__ / DevFile.__setattr__).  All other
+        fields pass through untouched."""
         if name in ("units", "descriptions"):
             if value is None:
                 super().__setattr__(name, None)
@@ -1583,6 +1894,16 @@ class WellSection:
                 raise TypeError(f"WellSection: {name} must be a dict, got {type(value).__name__}")
             if not isinstance(value, _WellMetaDict):
                 value = _WellMetaDict(value)
+            super().__setattr__(name, value)
+            return
+        if name == "entries":
+            if value is None:
+                super().__setattr__(name, None)
+                return
+            if not isinstance(value, dict):
+                raise TypeError(f"WellSection: entries must be a dict, got {type(value).__name__}")
+            if not isinstance(value, _WellEntriesDict):
+                value = _WellEntriesDict(value)
             super().__setattr__(name, value)
             return
         super().__setattr__(name, value)
@@ -1683,8 +2004,18 @@ class ArrayElementInfo:
                 raise TypeError(
                     f"ArrayElementInfo: index must be int, got {type(value).__name__} ({value!r})"
                 )
-            if value < 0:
-                raise ValueError(f"ArrayElementInfo: index must be >= 0, got {value!r}")
+            # N-01: LAS 3.0 array indices are 1-BASED — index 0 is
+            # invalid per spec (the read side rejects it for
+            # ≥2-element groups at _las30_data.py:767-779; this closes
+            # the single-element/metadata-only silent path).  The
+            # message keeps the "starts at index N" phrasing so the
+            # read-side rejection contract (test lock) is preserved.
+            if value < 1:
+                raise ValueError(
+                    f"ArrayElementInfo: index must be >= 1, got {value!r} "
+                    f"— array starts at index {value}; LAS 3.0 requires "
+                    f"1-based array indices ([1]→[n])"
+                )
         elif name == "time_offset":
             if value is not None:
                 value = _coerce_numpy_scalar(value)
@@ -1730,8 +2061,17 @@ class ArrayElementInfo:
                 f"ArrayElementInfo: index must be int, got "
                 f"{type(self.index).__name__} ({self.index!r})"
             )
-        if self.index < 0:
-            raise ValueError(f"ArrayElementInfo: index must be >= 0, got {self.index!r}")
+        # N-01: LAS 3.0 array indices are 1-BASED — index 0 is invalid
+        # per spec (the read side rejects it for ≥2-element groups at
+        # _las30_data.py:767-779; this closes the single-element /
+        # metadata-only silent path, and makes from_dict's missing-key
+        # default (0) an explicit error instead of silent acceptance).
+        if self.index < 1:
+            raise ValueError(
+                f"ArrayElementInfo: index must be >= 1, got "
+                f"{self.index!r} — array starts at index {self.index}; "
+                f"LAS 3.0 requires 1-based array indices ([1]→[n])"
+            )
         # M-06: Accept numpy float scalars for time_offset (np.float32 is
         # not an instance of Python float).
         if self.time_offset is not None:
@@ -1789,13 +2129,59 @@ class CurveDefinition:
         - ``data_format``: uppercase then validate against the valid set
           (mirrors the __post_init__ check + MOD-02 normalization).
         - ``array_info``: must be ArrayElementInfo or None (mirrors M-15).
+        - ``mnemonic`` (E-06): re-apply the __post_init__ mnemonic
+          contract — str type, no empty/whitespace/spaces/tabs/newlines/
+          dots, the _MNEMONIC_PATTERN whitelist and MAX_FIELD_LENGTH.
+          Pre-fix ``curve.mnemonic = "GR:1"`` passed and the writer
+          emitted a ~C line the parser cannot match, silently dropping
+          the curve AND its data column on roundtrip.
         """
-        if name == "data_format" and value is not None:
+        if name == "mnemonic":
+            if not isinstance(value, str):
+                raise TypeError(
+                    f"CurveDefinition: mnemonic must be str, got {type(value).__name__}"
+                )
+            if (
+                not value
+                or not value.strip()
+                or value != value.strip()
+                or " " in value.strip()
+                or "\t" in value.strip()
+                or "\n" in value
+                or "\r" in value
+                or "." in value
+            ):
+                raise ValueError(
+                    f"CurveDefinition: mnemonic must not be empty, "
+                    f"whitespace-only, or contain spaces/tabs/newlines/dots, "
+                    f"got {value!r}"
+                )
+            if not _MNEMONIC_PATTERN.fullmatch(value):
+                raise ValueError(
+                    f"CurveDefinition: mnemonic {value!r} contains "
+                    f"characters the LAS parser cannot roundtrip.  Mnemonics "
+                    f"must match {_MNEMONIC_PATTERN.pattern!r}."
+                )
+            if len(value) > MAX_FIELD_LENGTH:
+                raise ValueError(
+                    f"CurveDefinition: mnemonic length {len(value)} exceeds "
+                    f"maximum allowed ({MAX_FIELD_LENGTH})"
+                )
+        elif name == "data_format" and value is not None:
             if not isinstance(value, str):
                 raise TypeError(
                     f"CurveDefinition: data_format must be str, got {type(value).__name__}"
                 )
             value = value.upper()
+            # E-46: truncate extended Fortran-style codes (F8.3 → F,
+            # E10.2 → E) — ParameterEntry.__setattr__ (MOD-02), from_dict
+            # (F-M-012) and the parser (parser.py:3274) all normalize
+            # these; CurveDefinition.__setattr__ was the sole site that
+            # raised on them.  Non-extended multi-char values still raise
+            # (single-char invalid codes like 'Q' keep the F-37 raise
+            # contract).
+            if value and len(value) > 1 and _EXTENDED_FORMAT_SPEC_RE.match(value):
+                value = value[0]
             if value and value not in _VALID_DATA_FORMATS:
                 raise ValueError(
                     f"CurveDefinition: invalid data_format "
@@ -1897,6 +2283,18 @@ class CurveDefinition:
                 f"characters the LAS parser cannot roundtrip.  Mnemonics "
                 f"must match {_MNEMONIC_PATTERN.pattern!r}."
             )
+        # E-09: MAX_FIELD_LENGTH on the mnemonic.  A 200k-char mnemonic
+        # passes the pattern whitelist (it is all word characters) yet is
+        # emitted as a ~C line the parser's own MAX_FIELD_LENGTH guard
+        # rejects on re-read — the library would write a file it cannot
+        # read back (self-unreadable).  Mirrors the sibling length checks
+        # on unit/api_code/description and the __setattr__ mnemonic
+        # branch (E-06).
+        if len(self.mnemonic) > MAX_FIELD_LENGTH:
+            raise ValueError(
+                f"CurveDefinition: mnemonic length {len(self.mnemonic)} "
+                f"exceeds maximum allowed ({MAX_FIELD_LENGTH})"
+            )
         # M-05: Coerce non-str unit/api_code/description to str, mirroring
         # ParameterEntry.__post_init__.  Previously non-str values passed
         # construction and crashed the writer (_sanitize_las_value(123) →
@@ -1939,6 +2337,17 @@ class CurveDefinition:
         # paths do.  (__setattr__ already uppercases on assignment; this
         # covers any __setattr__-bypassing restore path as well.)
         self.data_format = self.data_format.upper()
+        # E-46: truncate extended Fortran-style codes (F8.3 → F, E10.2 →
+        # E) — ParameterEntry.__post_init__ (MOD-02), from_dict (F-M-012)
+        # and the parser (parser.py:3274) all normalize these; direct
+        # CurveDefinition construction raised ValueError on them while
+        # every other construction path accepted the same input.
+        if (
+            self.data_format
+            and len(self.data_format) > 1
+            and _EXTENDED_FORMAT_SPEC_RE.match(self.data_format)
+        ):
+            self.data_format = self.data_format[0]
         if self.data_format and self.data_format not in _VALID_DATA_FORMATS:
             raise ValueError(
                 f"CurveDefinition: invalid data_format "
@@ -1972,6 +2381,28 @@ class CurveDefinition:
                     f"array notation but array_info.base_name is "
                     f"{self.array_info.base_name!r}.  Cross-check "
                     f"mismatch may indicate malformed input.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            # M-18: Cross-check the bracket-notation INDEX against
+            # array_info.index (the M-42 twin of ParameterEntry's
+            # check — the M-17 check above only covers base_name).  A
+            # curve ``NMR[1]`` with array_info.index=2 is accepted, the
+            # writer emits the mnemonic's bracket index, and re-parse
+            # reconstructs array_info.index from the bracket — a silent
+            # field divergence on roundtrip.  Warn (mirroring
+            # ParameterEntry M-42 and the from_dict F-17 pattern)
+            # rather than raise, so internally-consistent pairs stay
+            # silent.
+            _mnem_index = self.mnemonic.split("[", 1)[1].rstrip("]")
+            if _mnem_index.isdigit() and int(_mnem_index) != self.array_info.index:
+                warnings.warn(
+                    f"CurveDefinition: mnemonic {self.mnemonic!r} uses "
+                    f"array notation with index {_mnem_index} but "
+                    f"array_info.index is {self.array_info.index!r}.  "
+                    f"The writer emits the mnemonic's bracket index; "
+                    f"the array_info.index field will diverge on "
+                    f"re-parse.",
                     UserWarning,
                     stacklevel=2,
                 )
@@ -2090,43 +2521,68 @@ class ParameterZone:
             raise ValueError(f"ParameterZone: zone_index must be >= 0, got {self.zone_index!r}")
         # M-12/M-65/L-124: Validate zone_name against the parser's zone
         # grammar so a zone association survives write→read roundtrip.
-        # - A pipe ('|') in zone_name is escaped by the writer (\|) and
-        #   unescaped by the parser, so it roundtrips — but warn loudly
-        #   that it is non-standard.
-        # - Characters outside the roundtrip grammar (colon, semicolon,
-        #   dot, slash, brackets, etc.) previously made the ENTIRE
-        #   '| Zone[N]' association unparseable on re-read: the zone was
-        #   silently dropped and the raw '| Zone[N]' text leaked into the
-        #   parameter description.  The parser's zone grammar is now
-        #   tolerant of the M-65 punctuation class ([:;./] + escaped
-        #   pipes), so those roundtrip; warn loudly for characters that
-        #   STILL cannot roundtrip (brackets '['/']' conflict with the
-        #   zone index notation, and any other stray punctuation).
-        # - Trailing whitespace (L-124) breaks the '$'-anchored zone
-        #   pattern; normalize it away with a warning.
-        if isinstance(self.zone_name, str):
-            _normalized = self.zone_name.strip()
-            if _normalized != self.zone_name:
+        # (E-07: the normalization + warnings below now live in
+        # __setattr__ — dataclass __init__ assigns fields through
+        # __setattr__ BEFORE __post_init__ runs, so keeping the warning
+        # block here would double-warn every construction.  __setattr__
+        # applies the exact same contract to post-construction mutation.)
+        # Run warning-producing checks via validate().
+        for issue in self.validate(complete=False):
+            warnings.warn(issue, stacklevel=2)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """E-07: re-validate zone fields on post-construction assignment.
+
+        The construction-time __post_init__ guard was bypassable by
+        mutation (``pz.zone_index = -1`` passed and the writer emitted a
+        zone association the parser cannot re-read, silently dropping
+        the zone; ``pz.zone_name = "Bad[Name]"`` leaked raw bracket text
+        into the parameter description).  Re-apply the __post_init__
+        contract at every assignment, mirroring it exactly:
+
+        - ``zone_index``: strict int-or-None (numpy scalar coerced) and
+          >= 0;
+        - ``zone_name``: str normalization with the same warnings as
+          __post_init__ (strip, pipe, non-roundtrip characters).
+
+        All other fields pass through untouched.
+        """
+        if name == "zone_index":
+            if value is not None:
+                value = _coerce_numpy_scalar(value)
+                if type(value) is not int:
+                    raise TypeError(
+                        f"ParameterZone: zone_index must be int or None, "
+                        f"got {type(value).__name__} "
+                        f"({value!r})"
+                    )
+                if value < 0:
+                    raise ValueError(
+                        f"ParameterZone: zone_index must be >= 0, got {value!r}"
+                    )
+        elif name == "zone_name" and isinstance(value, str):
+            _normalized = value.strip()
+            if _normalized != value:
                 warnings.warn(
-                    f"ParameterZone: zone_name {self.zone_name!r} has "
+                    f"ParameterZone: zone_name {value!r} has "
                     f"leading/trailing whitespace.  Normalizing to "
                     f"{_normalized!r} so the zone association "
                     f"roundtrips.",
                     stacklevel=2,
                 )
-                self.zone_name = _normalized
-            if "|" in self.zone_name:
+                value = _normalized
+            if "|" in value:
                 warnings.warn(
-                    f"ParameterZone: zone_name {self.zone_name!r} contains "
+                    f"ParameterZone: zone_name {value!r} contains "
                     f"a pipe ('|').  The writer escapes it and the parser "
                     f"restores it, so the zone roundtrips, but a pipe in a "
                     f"zone name is non-standard.",
                     stacklevel=2,
                 )
-            _non_roundtrip = re.findall(r"[^A-Za-z0-9_\-.:;/ ]", self.zone_name)
+            _non_roundtrip = re.findall(r"[^A-Za-z0-9_\-.:;/ ]", value)
             if _non_roundtrip:
                 warnings.warn(
-                    f"ParameterZone: zone_name {self.zone_name!r} contains "
+                    f"ParameterZone: zone_name {value!r} contains "
                     f"characters {sorted(set(_non_roundtrip))} that the "
                     f"LAS 3.0 zone grammar cannot roundtrip (brackets "
                     f"'['/']' conflict with the zone index notation).  "
@@ -2134,9 +2590,7 @@ class ParameterZone:
                     f"write→read roundtrip.",
                     stacklevel=2,
                 )
-        # Run warning-producing checks via validate().
-        for issue in self.validate(complete=False):
-            warnings.warn(issue, stacklevel=2)
+        super().__setattr__(name, value)
 
 
 @dataclass
@@ -2183,8 +2637,45 @@ class ParameterEntry:
           applies (uppercase, truncate Fortran-style extended codes,
           warn-and-clear invalid/multi-char metadata codes — the MOD-02
           contract, NOT raise, matching the class's construction behavior).
+        - ``mnemonic`` (E-06): re-apply the __post_init__ mnemonic
+          contract — str type, no empty/whitespace/spaces/tabs/newlines/
+          dots, the _MNEMONIC_PATTERN whitelist and MAX_FIELD_LENGTH.
+          Pre-fix ``param.mnemonic = "GR:1"`` passed and the writer
+          emitted a ~P line the parser cannot match, silently dropping
+          the parameter on roundtrip.
         """
-        if name == "data_format" and value is not None:
+        if name == "mnemonic":
+            if not isinstance(value, str):
+                raise TypeError(
+                    f"ParameterEntry: mnemonic must be str, got {type(value).__name__}"
+                )
+            if (
+                not value
+                or not value.strip()
+                or value != value.strip()
+                or " " in value.strip()
+                or "\t" in value.strip()
+                or "\n" in value
+                or "\r" in value
+                or "." in value
+            ):
+                raise ValueError(
+                    f"ParameterEntry: mnemonic must not be empty, "
+                    f"whitespace-only, or contain spaces/tabs/newlines/dots, "
+                    f"got {value!r}"
+                )
+            if not _MNEMONIC_PATTERN.fullmatch(value):
+                raise ValueError(
+                    f"ParameterEntry: mnemonic {value!r} contains "
+                    f"characters the LAS parser cannot roundtrip.  Mnemonics "
+                    f"must match {_MNEMONIC_PATTERN.pattern!r}."
+                )
+            if len(value) > MAX_FIELD_LENGTH:
+                raise ValueError(
+                    f"ParameterEntry: mnemonic length {len(value)} exceeds "
+                    f"maximum allowed ({MAX_FIELD_LENGTH})"
+                )
+        elif name == "data_format" and value is not None:
             if not isinstance(value, str):
                 raise TypeError(
                     f"ParameterEntry: data_format must be str, got {type(value).__name__}"
@@ -2227,6 +2718,18 @@ class ParameterEntry:
                     stacklevel=2,
                 )
                 value = _safe_str(value)
+            # E-09: MAX_FIELD_LENGTH on already-str values.  The
+            # warn-and-coerce branch above routes non-str values through
+            # _safe_str (which enforces the limit), but an already-str
+            # value bypassed it — an over-long value was emitted and then
+            # failed the parser's own MAX_FIELD_LENGTH guard on re-read
+            # (self-unreadable).  Mirrors the CurveDefinition elif branch.
+            elif len(value) > MAX_FIELD_LENGTH:
+                raise ValueError(
+                    f"ParameterEntry '{getattr(self, 'mnemonic', '?')}': "
+                    f"{name} length {len(value)} exceeds maximum allowed "
+                    f"({MAX_FIELD_LENGTH})"
+                )
             if name == "unit" and not _UNIT_PATTERN.fullmatch(value):
                 raise ValueError(
                     f"ParameterEntry: invalid unit {value!r} for "
@@ -2235,6 +2738,61 @@ class ParameterEntry:
                     f"'.', '%', and '°' (matching the parser's unit "
                     f"grammar)."
                 )
+        # M-02: Re-validate the remaining leaf fields on post-construction
+        # assignment, mirroring the __post_init__ contract for each:
+        # - zone: ParameterZone instance or None (F-005).  Pre-fix a raw
+        #   str/object assignment passed silently and the writer crashed
+        #   with an opaque LASWriteError.
+        # - array_index: strict int (numpy scalar coerced) or None, >= 0
+        #   (F-005/M-41/M-06).  Pre-fix ``array_index=-1`` passed and the
+        #   parameter was silently DROPPED on write→read (the parser's
+        #   mnemonic grammar cannot match a negative bracket index).
+        # - section_type: str-or-None with the M-27 grammar (no
+        #   whitespace/pipe/newline/tilde; whitespace-only → None).
+        #   Pre-fix ``section_type="MY CORE"`` passed and the writer
+        #   emitted a ``~MY CORE_Parameter`` header the parser misroutes
+        #   to ~Other — the parameter silently vanished.
+        elif name == "zone":
+            if value is not None and not isinstance(value, ParameterZone):
+                raise TypeError(
+                    f"ParameterEntry: zone must be ParameterZone or None, "
+                    f"got {type(value).__name__}"
+                )
+        elif name == "array_index":
+            if value is not None:
+                value = _coerce_numpy_scalar(value)
+                if type(value) is not int:
+                    raise TypeError(
+                        f"ParameterEntry.array_index must be int or None, "
+                        f"got {type(value).__name__}"
+                    )
+                if value < 0:
+                    raise ValueError(
+                        f"ParameterEntry.array_index must be >= 0, "
+                        f"got {value!r}"
+                    )
+        elif name == "section_type":
+            if value is not None:
+                if not isinstance(value, str):
+                    value = _safe_str(value)
+                _stripped = value.strip()
+                if not _stripped:
+                    value = None
+                else:
+                    value = _stripped
+                    if (
+                        "\n" in value
+                        or "\r" in value
+                        or "~" in value
+                        or " " in value
+                        or "\t" in value
+                        or "|" in value
+                    ):
+                        raise ValueError(
+                            f"ParameterEntry.section_type contains invalid "
+                            f"characters (whitespace, newline, tilde, or "
+                            f"pipe): {value!r}"
+                        )
         super().__setattr__(name, value)
 
     def validate(self, complete: bool = False) -> list[str]:
@@ -2293,6 +2851,18 @@ class ParameterEntry:
                 f"characters the LAS parser cannot roundtrip.  Mnemonics "
                 f"must match {_MNEMONIC_PATTERN.pattern!r}."
             )
+        # E-09: MAX_FIELD_LENGTH on the mnemonic.  A 200k-char mnemonic
+        # passes the pattern whitelist (it is all word characters) yet is
+        # emitted as a ~P line the parser's own MAX_FIELD_LENGTH guard
+        # rejects on re-read — the library would write a file it cannot
+        # read back (self-unreadable).  Mirrors the sibling length checks
+        # on unit/value/description and the __setattr__ mnemonic branch
+        # (E-06).
+        if len(self.mnemonic) > MAX_FIELD_LENGTH:
+            raise ValueError(
+                f"ParameterEntry: mnemonic length {len(self.mnemonic)} "
+                f"exceeds maximum allowed ({MAX_FIELD_LENGTH})"
+            )
         # F-21: Validate that unit, value, and description are strings.
         # Non-str values (int, float, None) pass silently at construction
         # and crash downstream on .upper() or .strip() calls.  Warn and
@@ -2310,6 +2880,18 @@ class ParameterEntry:
                     stacklevel=2,
                 )
                 setattr(self, _attr_name, _safe_str(_attr_val))
+            # E-09: MAX_FIELD_LENGTH on already-str values.  The coercion
+            # branch above routes non-str values through _safe_str (which
+            # enforces the limit), but an already-str value bypassed it —
+            # an over-long value was emitted and then failed the parser's
+            # own MAX_FIELD_LENGTH guard on re-read (self-unreadable).
+            # Mirrors the CurveDefinition elif branch in its M-05 loop.
+            elif len(_attr_val) > MAX_FIELD_LENGTH:
+                raise ValueError(
+                    f"ParameterEntry '{self.mnemonic}': {_attr_name} "
+                    f"length {len(_attr_val)} exceeds maximum allowed "
+                    f"({MAX_FIELD_LENGTH})"
+                )
         # M-04: Validate unit composition (after F-21 coercion above so
         # the unit is always a str here).  A parameter unit with
         # whitespace/colon/#/dot is truncated by the parser or produces a
@@ -2566,10 +3148,76 @@ class DataSection:
                     f"'string_data' has numeric dtype ({_sarr.dtype}).  "
                     f"'string_data' arrays must be non-numeric."
                 )
+            # E-39: reject bytes/bytearray elements (same rationale as
+            # the LASFile.validate check — repr-literal corruption).
+            if _sarr.dtype.kind in ("S", "V") or (
+                _sarr.dtype.kind == "O"
+                and any(isinstance(_e, (bytes, bytearray)) for _e in _sarr.flat)
+            ):
+                issues.append(
+                    f"DataSection '{self.name}': curve '{_sk}' in "
+                    f"'string_data' contains bytes/bytearray values "
+                    f"(dtype {_sarr.dtype}).  'string_data' arrays must "
+                    f"hold text (str); bytes are written as repr "
+                    f"literals and corrupt the output."
+                )
 
         # --- NaN/Inf validation for numeric data arrays (complete only) ---
         if not complete:
             return issues
+
+        # M-03: Re-validate section_type on post-construction state.
+        # __setattr__ re-validates on assignment; validate() — which the
+        # writer runs before emitting — must catch state that bypassed
+        # __setattr__ (e.g. direct __dict__ manipulation or section
+        # construction before the M-27 rules existed).  A section_type
+        # with whitespace/pipe produces a broken ``~MY CORE_Data``
+        # header the parser misroutes to ~O, silently discarding the
+        # whole section's data.
+        if self.section_type is not None and self.section_type.strip():
+            _st = str(self.section_type)
+            if (
+                "\n" in _st
+                or "\r" in _st
+                or "~" in _st
+                or " " in _st
+                or "\t" in _st
+                or "|" in _st
+            ):
+                issues.append(
+                    f"DataSection '{self.name}': section_type contains "
+                    f"invalid characters (whitespace, newline, tilde, or "
+                    f"pipe): {self.section_type!r}.  section_type must be "
+                    f"a LAS identifier (alphanumeric + underscore)."
+                )
+
+        # M-01: Re-validate cross-element data_format consistency for
+        # array groups on post-construction state.  __post_init__ (via
+        # _validate_array_continuity) checks this at construction;
+        # validate() must catch post-construction mutations (a section
+        # curve's data_format reassigned to a different code after
+        # construction).  Mirrors the read-side "Inconsistent
+        # data_format" LASParseError (_las30_data.py:790-794).
+        # (_fmt_by_mnem is already built above for the dtype checks.)
+        _ARRAY_MNEMONIC_RE = re.compile(r"^(?P<base>[\w\-]+)\[(?P<index>\d+)\]$")
+        _fmt_base_groups: dict[str, set[str]] = {}
+        for _order_name in self.curves_order:
+            _m = _ARRAY_MNEMONIC_RE.match(_order_name)
+            if _m is None:
+                continue
+            _fmt = (_fmt_by_mnem.get(_case_key(_order_name)) or "").upper()
+            if not _fmt:
+                continue
+            _fmt_base_groups.setdefault(_m.group("base"), set()).add(_fmt)
+        for _base, _fmts in _fmt_base_groups.items():
+            if len(_fmts) > 1:
+                issues.append(
+                    f"DataSection '{self.name}': array '{_base}' has "
+                    f"inconsistent data_format values "
+                    f"{sorted(_fmts)}.  All channels of a 3D array "
+                    f"must share the same format specifier (the "
+                    f"reader rejects mixed formats on re-read)."
+                )
 
         for _k, _arr in self.data.items():
             if isinstance(_arr, np.ndarray) and _arr.dtype.kind in ("f", "c"):
@@ -2582,6 +3230,33 @@ class DataSection:
         # --- uncovered curves ---
         data_keys = set(self.data.keys())
         string_keys = set(self.string_data.keys())
+        # N-12: cross-group row-count re-check (twin of the F-M22
+        # construction check in __post_init__).  Post-construction
+        # replacement of the ONLY key in a group (e.g.
+        # ``ds.data['DEPT'] = np.array([0.])`` while string_data still
+        # holds 3 rows) bypasses the construction raise — the writer
+        # then max()-null-pads the shorter group SILENTLY and the
+        # re-read fabricates null rows.  validate(complete=True) runs
+        # on post-construction state (the writer calls it before
+        # emitting), so the invariant must be re-checked here as an
+        # issue instead of relying on construction-time enforcement.
+        if self.data and self.string_data:
+            _data_rows = max(
+                (1 if isinstance(arr, np.ndarray) and arr.ndim == 0 else len(arr))
+                for arr in self.data.values()
+            )
+            _string_rows = max(
+                (1 if isinstance(arr, np.ndarray) and arr.ndim == 0 else len(arr))
+                for arr in self.string_data.values()
+            )
+            if _data_rows != _string_rows:
+                issues.append(
+                    f"DataSection '{self.name}': data row count "
+                    f"({_data_rows}) does not match string_data "
+                    f"row count ({_string_rows}).  The writer will "
+                    f"null-pad the shorter group and the re-read will "
+                    f"fabricate null rows."
+                )
         # N1a-2: the I2F-06 string-format placement check below compared
         # exact-case while the sibling orphaned/uncovered/positional checks
         # upper-case (WL-M1).  Case-variant data keys ('gr' vs section
@@ -2590,6 +3265,29 @@ class DataSection:
         # _case_key like the sibling checks.
         data_keys_ci = {_case_key(k) for k in data_keys}
         string_keys_ci = {_case_key(k) for k in string_keys}
+
+        # E-13: within-container case-insensitive duplicate re-check
+        # (twin of the construction raises in __post_init__).  Post-
+        # construction mutation (``ds.data['gr'] = ...`` added next to an
+        # existing 'GR' key) bypasses the construction raise; the writer's
+        # per-section data lookup emits ONE column and silently drops the
+        # other's data.  Flag it here so the loss is not silent.
+        for _container_name, _container in (("data", self.data), ("string_data", self.string_data)):
+            if _container:
+                _sec_seen_ci: dict[str, str] = {}
+                for _k in _container:
+                    _ck = _case_key(_k)
+                    if _ck in _sec_seen_ci:
+                        issues.append(
+                            f"DataSection '{self.name}': {_container_name} "
+                            f"contains case-variant duplicate keys "
+                            f"{_sec_seen_ci[_ck]!r} and {_k!r}.  The "
+                            f"writer will emit one column and silently "
+                            f"drop the other's data."
+                        )
+                        break
+                    _sec_seen_ci[_ck] = _k
+
         if self.data or self.string_data:
             # WL-M1 (M13 twin of _writer_las30.py:1085-1093): the writer's
             # data-key lookup (_format_data_rows → _lookup_data_array) is
@@ -2747,6 +3445,46 @@ class DataSection:
                 )
             super().__setattr__(name, value)
             return
+        # M-03: Re-validate section_type on post-construction assignment,
+        # mirroring the __post_init__ F-M06/F-M09/M-27 contract
+        # (lines 2818-2846).  Pre-fix, ``ds.section_type = "MY CORE"``
+        # passed __setattr__ and the writer emitted a broken
+        # ``~MY CORE_Data`` header that the parser misroutes to ~Other —
+        # the whole section's data silently lost.  Normalize like
+        # __post_init__ (whitespace-only → "") and reject
+        # whitespace/pipe/newline/tilde characters.
+        if name == "section_type":
+            if value is None:
+                super().__setattr__(name, value)
+                return
+            if not isinstance(value, str):
+                raise TypeError(
+                    f"DataSection: section_type must be str or None, "
+                    f"got {type(value).__name__}"
+                )
+            _stripped = value.strip()
+            if not _stripped:
+                super().__setattr__(name, "")
+                return
+            if (
+                "\n" in _stripped
+                or "\r" in _stripped
+                or "~" in _stripped
+                or " " in _stripped
+                or "\t" in _stripped
+                or "|" in _stripped
+            ):
+                from .exceptions import LASDataError
+
+                raise LASDataError(
+                    f"DataSection '{getattr(self, 'name', '?')}': "
+                    f"section_type contains invalid characters "
+                    f"(whitespace, newline, tilde, or pipe): "
+                    f"{value!r}.  section_type must be a LAS "
+                    f"identifier (alphanumeric + underscore)."
+                )
+            super().__setattr__(name, _stripped)
+            return
         super().__setattr__(name, value)
 
     def __post_init__(self) -> None:
@@ -2873,6 +3611,24 @@ class DataSection:
         # must not be falsely rejected here (F-04 roundtrip).  A genuinely
         # distinct key still differs after upper-casing.
         data_keys = set(self.data.keys())
+        # E-13: within-container case-insensitive duplicate detection.
+        # data={'GR': ..., 'gr': ...} — both keys pass the orphaned-key
+        # check (each maps into curves_order case-insensitively), but the
+        # writer's per-section data lookup emits ONE column and silently
+        # drops the other's data.  Reject the ambiguous state at
+        # construction (mirror of the II-2 cross-container overlap guard,
+        # applied WITHIN the container).
+        _data_ci_check: dict[str, str] = {}
+        for _dk in data_keys:
+            _dk_ck = _case_key(_dk)
+            if _dk_ck in _data_ci_check:
+                raise LASDataError(
+                    f"DataSection '{self.name}': data contains "
+                    f"case-variant duplicate keys "
+                    f"{_data_ci_check[_dk_ck]!r} and {_dk!r}.  Each "
+                    f"curve may only be stored once in data."
+                )
+            _data_ci_check[_dk_ck] = _dk
         # N1a-2/II-2: CI mirrors for the placement and overlap checks below —
         # the writer's per-section data lookup is case-insensitive
         # (_lookup_data_array), so a case-variant key ('gr' vs 'GR') is the
@@ -2886,6 +3642,19 @@ class DataSection:
 
         # string_data keys ⊆ curves_order
         string_keys = set(self.string_data.keys())
+        # E-13: within-container case-insensitive duplicate detection
+        # (same rationale as the data block above).
+        _str_ci_check: dict[str, str] = {}
+        for _sk in string_keys:
+            _sk_ck = _case_key(_sk)
+            if _sk_ck in _str_ci_check:
+                raise LASDataError(
+                    f"DataSection '{self.name}': string_data contains "
+                    f"case-variant duplicate keys "
+                    f"{_str_ci_check[_sk_ck]!r} and {_sk!r}.  Each "
+                    f"curve may only be stored once in string_data."
+                )
+            _str_ci_check[_sk_ck] = _sk
         string_keys_ci = {_case_key(k): k for k in string_keys}
         orphaned_string = sorted({k for k in string_keys if _case_key(k) not in _curve_set_upper})
         if orphaned_string:
@@ -3060,7 +3829,11 @@ class DataSection:
             )
 
 
-def _validate_array_continuity(curves_order: list[str], context: str) -> None:
+def _validate_array_continuity(
+    curves_order: list[str],
+    context: str,
+    data_formats: dict[str, str] | None = None,
+) -> None:
     """Validate LAS 3.0 array-curve contiguity within a curve order list (F-10 / N-I-13).
 
     "Channels that are members of a 3D array must occur sequentially from
@@ -3071,11 +3844,23 @@ def _validate_array_continuity(curves_order: list[str], context: str) -> None:
     interleaved) and indexed sequentially starting at [1].  Raises
     ``LASDataError`` when either invariant is violated.
 
+    M-01: when *data_formats* is provided (a mnemonic → data_format
+    mapping, matched case-insensitively), also enforces the read-side
+    data_format-consistency contract for multi-element arrays — the
+    reader rejects a group whose channels declare different format
+    specifiers ("Inconsistent data_format for array", _las30_data.py:
+    790-794).  The model must reject the same state at construction so
+    the writer cannot emit a file its own reader refuses.
+
     Args:
         curves_order: The ordered curve name list to validate.
         context: Human-readable description of where the list lives
             (e.g. ``"top-level curves_order"`` or ``"section 'Log1'"``)
             for the error message.
+        data_formats: Optional case-insensitive mapping from curve
+            mnemonic to data_format.  When given, array groups whose
+            members declare differing (non-empty) formats are rejected.
+            Empty formats do not participate (matching the read side).
 
     Raises:
         LASDataError: If array curves are non-contiguous or non-sequential.
@@ -3087,18 +3872,47 @@ def _validate_array_continuity(curves_order: list[str], context: str) -> None:
         return
     # Group array curves by base name, tracking position and index to
     # validate contiguity and sequential order.
+    # E-08: group by _case_key(base) — the codebase's case-insensitive
+    # matching convention (writer's by_upper lookup, the parser's
+    # unconditional uppercasing, the data_formats lookup above).  The
+    # pre-fix exact-case grouping let a case-variant interleaved pair
+    # ('NMR[1]', 'nmr[2]' with a non-array curve between) pass as two
+    # separate single-element groups, and the writer then emitted the
+    # file the library's own reader rejects — self-unreadable output.
     _base_groups: dict[str, list[tuple[int, int]]] = {}
     for _pos, _name in enumerate(curves_order):
         _m = _ARRAY_MNEMONIC_RE.match(_name)
         if _m is None:
             continue
-        _base = _m.group("base")
+        _base = _case_key(_m.group("base"))
         _idx = int(_m.group("index"))
         _base_groups.setdefault(_base, []).append((_pos, _idx))
     for _base, _entries in _base_groups.items():
         # Must have at least 2 entries to be an "array."
         if len(_entries) < 2:
             continue
+        # M-01: Cross-element data_format consistency — the read-side
+        # twin (_las30_data.py:790-794) rejects arrays whose channels
+        # declare differing format specifiers.  Mirror it here so a
+        # model with inconsistent formats cannot be constructed (or
+        # survive post-construction mutation) and written into a file
+        # the library's own reader refuses.  Only non-empty formats
+        # participate, matching the reader's ``if _fmt and _ref_fmt``
+        # gate.
+        if data_formats:
+            _fmts = {
+                curves_order[_pos]: (data_formats.get(_case_key(curves_order[_pos])) or "").upper()
+                for _pos, _idx in _entries
+            }
+            _nonempty = {_f for _f in _fmts.values() if _f}
+            if len(_nonempty) > 1:
+                raise LASDataError(
+                    f"LASFile: array '{_base}' has inconsistent "
+                    f"data_format values {sorted(_nonempty)} in "
+                    f"{context}.  All channels of a 3D array must "
+                    f"share the same format specifier (the reader "
+                    f"rejects mixed formats on re-read)."
+                )
         # Check contiguity: positions must be consecutive (no intermixing).
         _positions = [p for p, _ in _entries]
         if _positions != list(range(_positions[0], _positions[0] + len(_positions))):
@@ -3367,6 +4181,23 @@ class LASFile:
         # construction, e.g. LASFile() then attribute assignment) ---
         if self.logs:
             _log_keys = set(self.logs.keys())
+            # E-13: within-container case-insensitive duplicate detection.
+            # logs={'GR': ..., 'gr': ...} — both keys pass the orphaned-key
+            # check (each maps into curves_order case-insensitively), but
+            # the writer's case-insensitive data lookup emits ONE column and
+            # silently drops the other's data.  Reject the ambiguous state
+            # at construction (mirror of the F-I2-MD4-03 cross-container
+            # overlap guard, applied WITHIN the container).
+            _log_ci: dict[str, str] = {}
+            for _lk in self.logs:
+                _lk_ck = _case_key(_lk)
+                if _lk_ck in _log_ci:
+                    raise LASDataError(
+                        f"LASFile: logs contain case-variant duplicate "
+                        f"keys {_log_ci[_lk_ck]!r} and {_lk!r}.  Each "
+                        f"curve may only be stored once in logs."
+                    )
+                _log_ci[_lk_ck] = _lk
             _log_keys_upper = {k.upper() for k in _log_keys}
             _orphaned_logs = {k for k in _log_keys if k.upper() not in _order_set_upper}
             if _orphaned_logs:
@@ -3414,6 +4245,20 @@ class LASFile:
         # --- string_data validation (same skip-when-empty rule) ---
         if self.string_data:
             _str_keys = set(self.string_data.keys())
+            # E-13: within-container case-insensitive duplicate detection
+            # (same rationale as the logs block above — a case-variant
+            # pair in string_data silently drops one column's data).
+            _str_ci: dict[str, str] = {}
+            for _sk in self.string_data:
+                _sk_ck = _case_key(_sk)
+                if _sk_ck in _str_ci:
+                    raise LASDataError(
+                        f"LASFile: string_data contain case-variant "
+                        f"duplicate keys {_str_ci[_sk_ck]!r} and "
+                        f"{_sk!r}.  Each curve may only be stored once "
+                        f"in string_data."
+                    )
+                _str_ci[_sk_ck] = _sk
             _str_keys_upper = {k.upper() for k in _str_keys}
             _orphaned_str = {k for k in _str_keys if k.upper() not in _order_set_upper}
             if _orphaned_str:
@@ -3609,15 +4454,25 @@ class LASFile:
                             f"{sorted(_ds_orphaned_data)}."
                         )
                 # Validate array length consistency within each section.
+                # M-18: guard 0-d numpy arrays (np.array(5.0)) — len() of
+                # an unsized object raises TypeError.  Treat them as
+                # single-element values, matching DataSection.
+                # __post_init__ and _GuardedDict._value_len (E-15).
                 if len(_ds.data) > 1:
-                    _ds_len = {name: len(arr) for name, arr in _ds.data.items()}
+                    _ds_len = {
+                        name: (1 if isinstance(arr, np.ndarray) and arr.ndim == 0 else len(arr))
+                        for name, arr in _ds.data.items()
+                    }
                     if len(set(_ds_len.values())) > 1:
                         raise LASDataError(
                             f"LASFile: data in section '{_ds.name}' "
                             f"has inconsistent array lengths: {_ds_len}"
                         )
                 if len(_ds.string_data) > 1:
-                    _sds_len = {name: len(arr) for name, arr in _ds.string_data.items()}
+                    _sds_len = {
+                        name: (1 if isinstance(arr, np.ndarray) and arr.ndim == 0 else len(arr))
+                        for name, arr in _ds.string_data.items()
+                    }
                     if len(set(_sds_len.values())) > 1:
                         raise LASDataError(
                             f"LASFile: string_data in section "
@@ -3626,8 +4481,15 @@ class LASFile:
                         )
                 # Cross-group row-count consistency.
                 if _ds.data and _ds.string_data:
-                    _data_rows = max(len(arr) for arr in _ds.data.values())
-                    _str_rows = max(len(arr) for arr in _ds.string_data.values())
+                    # M-18: 0-d arrays have no len() — treat as 1 row.
+                    _data_rows = max(
+                        (1 if isinstance(arr, np.ndarray) and arr.ndim == 0 else len(arr))
+                        for arr in _ds.data.values()
+                    )
+                    _str_rows = max(
+                        (1 if isinstance(arr, np.ndarray) and arr.ndim == 0 else len(arr))
+                        for arr in _ds.string_data.values()
+                    )
                     if _data_rows != _str_rows:
                         raise LASDataError(
                             f"LASFile: section '{_ds.name}': "
@@ -3641,9 +4503,21 @@ class LASFile:
             # sequentially from [1] to [n], with no other channels
             # intermixed." (LAS 3.0 Spec, Page 27)
             for _ds in self.data_sections:
+                # M-01: pass the section's curve data_formats so the
+                # cross-element format-consistency dimension is enforced
+                # at construction (the read side raises LASParseError
+                # "Inconsistent data_format"; the model must reject the
+                # same state).
+                _section_fmts: dict[str, str] = {}
+                if _ds.section_curves:
+                    _section_fmts = {
+                        _case_key(_sc.mnemonic): _sc.data_format
+                        for _sc in _ds.section_curves
+                    }
                 _validate_array_continuity(
                     _ds.curves_order or [],
                     f"section '{_ds.name}'",
+                    _section_fmts or None,
                 )
 
         # N-I-13: F-10 array-continuity validation for the TOP-LEVEL
@@ -3654,7 +4528,17 @@ class LASFile:
         # LASParseError on re-read — self-unreadable output (PFA e8378ea
         # added F-10 inside the gate, leaving the top-level case unguarded).
         if self.curves_order and not self.data_sections:
-            _validate_array_continuity(self.curves_order, "top-level curves_order")
+            # M-01: pass the top-level curve data_formats so the
+            # cross-element format-consistency dimension is enforced at
+            # construction for top-level arrays too.
+            _top_fmts: dict[str, str] = {}
+            if self.curves:
+                _top_fmts = {
+                    _case_key(_sc.mnemonic): _sc.data_format for _sc in self.curves
+                }
+            _validate_array_continuity(
+                self.curves_order, "top-level curves_order", _top_fmts or None
+            )
 
         # F-12p2: Validate parameters list — check every entry is a
         # ParameterEntry and detect duplicate mnemonics.  Direct
@@ -3668,14 +4552,20 @@ class LASFile:
                 )
         _pmn_seen: set[str] = set()
         for _p in self.parameters:
-            if _p.mnemonic in _pmn_seen:
+            # M-17: compare via _case_key — a case-variant duplicate
+            # ('GR' + 'gr') is the same logical parameter on the writer's
+            # case-insensitive ~P lookup and last-wins in to_dict's
+            # mnemonic→value dict; the pre-fix exact-case check let it
+            # pass with zero warnings (silent value drop on serialization).
+            _p_key = _case_key(_p.mnemonic)
+            if _p_key in _pmn_seen:
                 warnings.warn(
                     f"LASFile: duplicate parameter mnemonic "
                     f"{_p.mnemonic!r} — to_dict() will keep only "
                     f"the last value.",
                     stacklevel=2,
                 )
-            _pmn_seen.add(_p.mnemonic)
+            _pmn_seen.add(_p_key)
 
         # F-059: Cross-validate curve data_format against actual data
         # placement.  Now validated by validate() below.
@@ -3716,6 +4606,20 @@ class LASFile:
 
         # Run warning-producing checks via validate() (gated by _from_dict).
         if not self._from_dict:
+            # E-29: other x version check — LAS 3.0 does NOT allow ~Other
+            # (the parser rejects it, parser.py:1551-1558) and the 3.0
+            # writer DROPS the content.  Direct construction with both a
+            # 3.0 version and other content previously produced zero
+            # feedback at construction — the content vanished on write.
+            # Warn here (from_dict warns at its own site).
+            if self.version.is_las30 and self.other.strip():
+                warnings.warn(
+                    "LAS 3.0 file with ~Other content: ~Other is NOT "
+                    "ALLOWED in LAS 3.0 and the writer will drop this "
+                    "content.  Migrate it to user-defined Parameter or "
+                    "Column Data sections.",
+                    stacklevel=2,
+                )
             for issue in self.validate(complete=False):
                 warnings.warn(issue, stacklevel=2)
             # F-036: Validate mandatory well fields for direct construction.
@@ -3837,8 +4741,51 @@ class LASFile:
                     f"numeric dtype ({_sarr.dtype}).  'string_data' "
                     f"arrays must be non-numeric."
                 )
+            # E-39: bytes/bytearray elements must be rejected too.  The
+            # numeric check above was the ONLY dtype rejection — bytes
+            # arrays (kind 'S'/'V') and object arrays holding bytes/
+            # bytearray elements passed, and the writer emitted their
+            # repr() literals (b'GR') — type AND content corruption on
+            # roundtrip.  (from_dict already rejects bytes loudly on its
+            # path; validate() must flag the same state here.)
+            if _sarr.dtype.kind in ("S", "V") or (
+                _sarr.dtype.kind == "O"
+                and any(isinstance(_e, (bytes, bytearray)) for _e in _sarr.flat)
+            ):
+                issues.append(
+                    f"LASFile: curve '{_sk}' in 'string_data' contains "
+                    f"bytes/bytearray values (dtype {_sarr.dtype}).  "
+                    f"'string_data' arrays must hold text (str); bytes "
+                    f"are written as repr literals and corrupt the "
+                    f"output."
+                )
 
-        # --- data_format vs placement ---
+        # --- logs/string_data overlap + data_format vs placement ---
+        # N-13: re-runnable twin of the __post_init__ overlap raise
+        # (construction-time guard).  Post-construction mutation (a curve
+        # added to string_data that already exists in logs) bypasses the
+        # raise; the writer's _lookup_data_array prefers string_data and
+        # silently DROPS the numeric logs value.  The construction check
+        # is key-driven and version-agnostic; this re-check flags the
+        # overlap REGARDLESS of data_format — the old format-vs-placement
+        # loop skipped no-data_format curves entirely, masking exactly
+        # this state.
+        if self.logs and self.string_data:
+            _log_key_ci = {_case_key(k): k for k in self.logs}
+            _str_key_ci = {_case_key(k): k for k in self.string_data}
+            _overlap_ci = set(_log_key_ci) & set(_str_key_ci)
+            if _overlap_ci:
+                _overlap = sorted(
+                    {_log_key_ci[k] for k in _overlap_ci}
+                    | {_str_key_ci[k] for k in _overlap_ci}
+                )
+                issues.append(
+                    f"LASFile: curves {_overlap} appear in both 'logs' "
+                    f"and 'string_data'.  Each curve may only be stored "
+                    f"in one location; the writer will use the "
+                    f"string_data value and the numeric logs value "
+                    f"will be dropped."
+                )
         if self.curves and (self.logs or self.string_data):
             # N1b-4: the format-vs-placement diagnostics compared exact-case,
             # silently skipping case-variant keys (curve 'DEPT'/S + logs key
@@ -3849,6 +4796,12 @@ class LASFile:
             for _sc in self.curves:
                 _df = _sc.data_format
                 _mnem = _sc.mnemonic
+                # N-13: a curve present in BOTH containers was already
+                # flagged by the overlap check above — skip the
+                # format-vs-placement diagnostics so the overlap is not
+                # double-reported with a misleading placement message.
+                if _case_key(_mnem) in _log_ci and _case_key(_mnem) in _str_ci:
+                    continue
                 if not _df:
                     continue
                 if _df == "S" or (_df == "A" and not _sc.is_array_element):
@@ -3982,6 +4935,56 @@ class LASFile:
             if self.data_sections and not self.version.is_las30:
                 issues.append("data_sections requires LAS 3.0 version")
 
+            # E-10: Re-run the array-continuity validation on
+            # post-construction state (twin of the __post_init__ F-10
+            # calls).  Post-construction curves_order mutation
+            # (inserting a non-array curve between array channels, or
+            # reassigning an array index) bypasses the construction
+            # raise; the writer would then emit a file the library's own
+            # parser rejects on re-read — self-unreadable output with
+            # zero warnings.  validate(complete=True) runs on
+            # post-construction state (the writer calls it before
+            # emitting), so the invariant must be re-checked here with
+            # the same context strings as construction.  The helper
+            # raises LASDataError; validate() reports issues instead.
+            # NOTE: the per-section loop below deliberately passes NO
+            # data_formats — the section format-consistency dimension is
+            # already re-checked by DataSection.validate's M-01 block
+            # (models.py:3194-3220), which runs via the delegation above;
+            # passing it here would double-report the same state
+            # (N-14/E-34 defect class).  The TOP-LEVEL call has NO such
+            # delegated twin, so it must pass the curve data_formats
+            # itself (mirroring the construction-time call at
+            # __post_init__, models.py:4530-4541): without them, a
+            # post-construction top-level data_format mutation to mixed
+            # codes passed validate() with zero issues and the writer
+            # emitted a file the library's own reader refuses
+            # ("Inconsistent data_format").
+            from .exceptions import LASDataError
+
+            for _ds in self.data_sections:
+                try:
+                    _validate_array_continuity(
+                        _ds.curves_order or [],
+                        f"section '{_ds.name}'",
+                    )
+                except LASDataError as _e:
+                    issues.append(str(_e))
+            if self.curves_order and not self.data_sections:
+                _top_fmts: dict[str, str] = {}
+                if self.curves:
+                    _top_fmts = {
+                        _case_key(_sc.mnemonic): _sc.data_format for _sc in self.curves
+                    }
+                try:
+                    _validate_array_continuity(
+                        self.curves_order,
+                        "top-level curves_order",
+                        _top_fmts or None,
+                    )
+                except LASDataError as _e:
+                    issues.append(str(_e))
+
             # M-29: Warn when string_data is written to a non-LAS-3.0 file.
             # The LAS 1.2/2.0 writers cannot emit {S} string markers, so
             # string curves are written as unmarked columns; on re-read the
@@ -3996,6 +4999,74 @@ class LASFile:
                     f"cannot be represented in LAS 1.2/2.0 output — their "
                     f"values will not survive a write→read roundtrip."
                 )
+
+            # E-29: other x version re-check (twin of the construction warn
+            # in __post_init__ / from_dict).  Post-construction assignment
+            # of ``other`` on a LAS 3.0 model bypasses the construction
+            # checks; the 3.0 writer silently drops the content.  Flag it
+            # so the loss is not silent (parser rejects ~O on 3.0,
+            # parser.py:1551-1558).
+            if self.version.is_las30 and self.other.strip():
+                issues.append(
+                    "other content is present but version is LAS 3.0.  "
+                    "~Other is NOT ALLOWED in LAS 3.0 — the writer will "
+                    "drop this content.  Migrate it to user-defined "
+                    "Parameter or Column Data sections."
+                )
+
+            # N-12: top-level cross-group row-count re-check (twin of the
+            # F-M-031 construction check in __post_init__).  Post-
+            # construction replacement of the ONLY key in logs (or
+            # string_data) with a different-length array bypasses the
+            # construction raise; the writer then max()-null-pads the
+            # shorter group SILENTLY and the re-read FABRICATES null rows.
+            # Gated on LAS 3.0: for 1.2/2.0 the M-29 warning above already
+            # fires loudly for any top-level string_data, so an additional
+            # diagnostic would double-warn (N-14/E-34 defect class).
+            if self.version.is_las30 and self.logs and self.string_data:
+                _log_row_count = (
+                    1
+                    if isinstance(next(iter(self.logs.values())), np.ndarray)
+                    and next(iter(self.logs.values())).ndim == 0
+                    else len(next(iter(self.logs.values())))
+                )
+                _str_row_count = (
+                    1
+                    if isinstance(next(iter(self.string_data.values())), np.ndarray)
+                    and next(iter(self.string_data.values())).ndim == 0
+                    else len(next(iter(self.string_data.values())))
+                )
+                if _log_row_count != _str_row_count:
+                    issues.append(
+                        f"LASFile: logs row count ({_log_row_count}) does "
+                        f"not match string_data row count "
+                        f"({_str_row_count}).  The writer will null-pad "
+                        f"the shorter group and the re-read will "
+                        f"fabricate null rows."
+                    )
+
+            # E-13: within-container case-insensitive duplicate re-check
+            # (twin of the construction raises in __post_init__).  Post-
+            # construction mutation (``las.logs['gr'] = ...`` added next to
+            # an existing 'GR' key) bypasses the construction raise; the
+            # writer's case-insensitive data lookup emits ONE column and
+            # silently drops the other's data.  validate(complete=True)
+            # runs on post-construction state, so flag it here.
+            for _container_name, _container in (("logs", self.logs), ("string_data", self.string_data)):
+                if _container:
+                    _seen_ci: dict[str, str] = {}
+                    for _k in _container:
+                        _ck = _case_key(_k)
+                        if _ck in _seen_ci:
+                            issues.append(
+                                f"LASFile: {_container_name} contain "
+                                f"case-variant duplicate keys "
+                                f"{_seen_ci[_ck]!r} and {_k!r}.  The "
+                                f"writer will emit one column and "
+                                f"silently drop the other's data."
+                            )
+                            break
+                        _seen_ci[_ck] = _k
 
             # F-012: Cross-section data_sections name dedup.
             # __post_init__ (L1730-1741) checks for duplicate data section
@@ -4053,13 +5124,19 @@ class LASFile:
         directly to avoid the copy overhead.
         """
         params_dict: dict[str, str] = {}
+        _seen_param_keys: set[str] = set()
         for p in self.parameters:
             # F-19: Warn when a parameter mnemonic was already seen —
             # dict assignment is last-wins, so earlier values are
             # silently discarded.  to_dict() previously had no duplicate
             # detection; from_dict and from_dict validation now both
             # warn about duplicates, tracking the consistent approach.
-            if p.mnemonic in params_dict:
+            # M-17: the seen-set comparison is case-insensitive (_case_key)
+            # so a case-variant duplicate ('GR' + 'gr') warns like the
+            # exact-case duplicate — the dict key is original-case, so
+            # both entries still collapse into one serialized parameter.
+            _p_key = _case_key(p.mnemonic)
+            if _p_key in _seen_param_keys:
                 warnings.warn(
                     f"LASFile.to_dict(): duplicate parameter mnemonic "
                     f"{p.mnemonic!r} — dict result will contain only "
@@ -4067,6 +5144,7 @@ class LASFile:
                     f"parameter_entry list before serialization.",
                     stacklevel=2,
                 )
+            _seen_param_keys.add(_p_key)
             params_dict[p.mnemonic] = p.value
 
         return {
@@ -4165,11 +5243,21 @@ class LASFile:
 
                 Returns the resolved canonical name when *mnem_base* was
                 provided and the uppercased *raw* string matches an entry;
-                returns *raw* unchanged otherwise (identity).
+                returns the UPPERCASED *raw* otherwise.  M-10: the
+                pre-fix identity-on-miss return preserved the dict's
+                casing while the parser uppercases mnemonics
+                unconditionally (parser.py:3194/3018), so
+                parse() and from_dict() produced different curve/well
+                names for identical file content and
+                ``compare_las_dicts`` returned False.  Uppercase on
+                miss — exactly matching the parser's
+                ``_mnem_base_upper.get(raw.upper(), raw.upper())``
+                semantics in both the None and miss cases.
                 """
+                _key = raw.upper()
                 if _mnem_base_upper is None:
-                    return raw
-                return _mnem_base_upper.get(raw.upper(), raw)
+                    return _key
+                return _mnem_base_upper.get(_key, _key)
 
             # F-019: Use shared build_mnemonic_lookup() from mnem_base.py
             # instead of the 25-LOC inlined algorithm that was duplicated
@@ -4216,7 +5304,7 @@ class LASFile:
                 _raw_key = raw.upper()
                 _prev_raw = _resolved_curve_names.get(resolved)
                 if _prev_raw is not None and _prev_raw != _raw_key:
-                    if raw == resolved:
+                    if _raw_key == resolved:
                         # PXM-06: The canonical name itself collides with an
                         # alias that claimed the resolved slot earlier
                         # (e.g. ['LLD','BFV'] with LLD→BFV).  The canonical
@@ -4265,7 +5353,12 @@ class LASFile:
                             stacklevel=2,
                         )
                     _resolved_curve_names[_raw_key] = _raw_key
-                    return raw
+                    # M-10: return the UPPERCASED original (matching the
+                    # parser's unconditional uppercasing) — the pre-fix
+                    # ``return raw`` preserved the dict's casing, so
+                    # from_dict kept lowercase collision survivors the
+                    # parser never produces.
+                    return _raw_key
                 _resolved_curve_names[resolved] = _raw_key
                 return resolved
 
@@ -4304,7 +5397,7 @@ class LASFile:
                 _raw_key = raw.upper()
                 _prev_raw = _resolved_well_names.get(resolved)
                 if _prev_raw is not None and _prev_raw != _raw_key:
-                    if raw == resolved:
+                    if _raw_key == resolved:
                         # The canonical key collides with a stored alias:
                         # move the alias's value back under its original
                         # mnemonic so the caller's store of the canonical
@@ -4318,7 +5411,7 @@ class LASFile:
                     # Warn once per (raw, resolved) pair.
                     if (_raw_key, resolved) not in _warned_well_collisions:
                         _warned_well_collisions.add((_raw_key, resolved))
-                        if raw == resolved:
+                        if _raw_key == resolved:
                             warnings.warn(
                                 f"from_dict: well mnemonic '{raw}' resolves "
                                 f"to '{resolved}' via mnem_base, but "
@@ -4341,7 +5434,10 @@ class LASFile:
                                 stacklevel=2,
                             )
                     _resolved_well_names[_raw_key] = _raw_key
-                    return resolved if raw == resolved else raw
+                    # M-10: return the UPPERCASED original on collision
+                    # too (the pre-fix ``raw`` preserved dict casing the
+                    # parser never produces).
+                    return resolved if _raw_key == resolved else _raw_key
                 _resolved_well_names[resolved] = _raw_key
                 return resolved
 
@@ -4406,6 +5502,16 @@ class LASFile:
             for key, value in well.items():
                 if not isinstance(key, str):
                     raise TypeError(f"Well dict key must be str, got {type(key).__name__}: {key!r}")
+                # E-05: WellSection.to_dict() nests units/descriptions
+                # INSIDE the well dict (its documented contract:
+                # "including non-empty units and descriptions").  The
+                # well loop would otherwise ingest those nested dicts as
+                # junk well entries (key "UNITS"/"DESCRIPTIONS" with a
+                # str(dict) value).  They are transported top-level via
+                # well_units/well_descriptions (handled below), so skip
+                # the reserved nested keys here.
+                if key in ("units", "descriptions"):
+                    continue
                 # F-058: Normalize well entry keys through mnem_base,
                 # matching the parser's behaviour (parser.py:1932-1938).
                 # M-44: collision-aware — two raw mnemonics resolving to
@@ -4731,6 +5837,25 @@ class LASFile:
             for ds_dict in ds_data:
                 ds_string_data: dict[str, Any] = {}
                 _ds_string_raw = _resolve_dict_entry(ds_dict, "string_data", dict, dict)
+                # E-13: within-container case-insensitive duplicate
+                # detection on the RAW input dict.  _norm_curve_mnem
+                # uppercases keys (M-10), so a case-variant pair
+                # ('GR' + 'gr') in the input would normalize to the SAME
+                # key and the second entry would silently overwrite the
+                # first — one column's data dropped with zero feedback.
+                _ds_str_ci: dict[str, str] = {}
+                for _sk_raw in _ds_string_raw:
+                    _sk_ck = _case_key(_sk_raw)
+                    if _sk_ck in _ds_str_ci:
+                        ds_name = ds_dict.get("name", "<unknown>")
+                        raise ValueError(
+                            f"string_data in section '{ds_name}' contains "
+                            f"case-variant duplicate keys "
+                            f"{_ds_str_ci[_sk_ck]!r} and {_sk_raw!r}.  "
+                            f"Each curve may only be stored once in "
+                            f"string_data."
+                        )
+                    _ds_str_ci[_sk_ck] = _sk_raw
                 # F-24: Per-section string_data entry count guard.  Every other
                 # iterable dict in from_dict() has a count guard (curves_data →
                 # MAX_CURVES, ds_data → MAX_CURVES, logs → MAX_CURVES, etc.);
@@ -4861,6 +5986,22 @@ class LASFile:
                                 stacklevel=3,
                             )
                 ds_data_raw = _resolve_dict_entry(ds_dict, "data", dict, dict)
+                # E-13: within-container case-insensitive duplicate
+                # detection on the RAW input dict (same rationale as the
+                # per-section string_data block above — a case-variant
+                # pair would silently overwrite after normalization).
+                _ds_data_ci: dict[str, str] = {}
+                for _dk_raw in ds_data_raw:
+                    _dk_ck = _case_key(_dk_raw)
+                    if _dk_ck in _ds_data_ci:
+                        ds_name = ds_dict.get("name", "<unknown>")
+                        raise ValueError(
+                            f"data in section '{ds_name}' contains "
+                            f"case-variant duplicate keys "
+                            f"{_ds_data_ci[_dk_ck]!r} and {_dk_raw!r}.  "
+                            f"Each curve may only be stored once in data."
+                        )
+                    _ds_data_ci[_dk_ck] = _dk_raw
                 # F2-21: Per-section entry count guard.  Outer MAX_DATA_SECTIONS
                 # guards section count; per-array MAX_DATA_LINES guards element
                 # count.  Per-section curve entry count was unguarded — 1 section
@@ -5295,6 +6436,20 @@ class LASFile:
             # with data serialized before string_data was moved to
             # per-section DataSection objects).
             sd = _resolve_dict_entry(data, "string_data", dict, dict)
+            # E-13: within-container case-insensitive duplicate detection
+            # on the RAW top-level input dict (same rationale as the
+            # per-section blocks — a case-variant pair would silently
+            # overwrite after _norm_curve_mnem uppercasing).
+            _sd_ci: dict[str, str] = {}
+            for _sk_raw in sd:
+                _sk_ck = _case_key(_sk_raw)
+                if _sk_ck in _sd_ci:
+                    raise ValueError(
+                        f"string_data contains case-variant duplicate "
+                        f"keys {_sd_ci[_sk_ck]!r} and {_sk_raw!r}.  Each "
+                        f"curve may only be stored once in string_data."
+                    )
+                _sd_ci[_sk_ck] = _sk_raw
             # F-24: Top-level string_data entry count guard — same gap as
             # the per-section path fixed above.
             if len(sd) >= MAX_CURVES:
@@ -5373,6 +6528,20 @@ class LASFile:
                     )
 
             logs = _resolve_dict_entry(data, "logs", dict, dict)
+            # E-13: within-container case-insensitive duplicate detection
+            # on the RAW top-level input dict (same rationale as the
+            # string_data blocks — a case-variant pair would silently
+            # overwrite after _norm_curve_mnem uppercasing).
+            _logs_ci: dict[str, str] = {}
+            for _lk_raw in logs:
+                _lk_ck = _case_key(_lk_raw)
+                if _lk_ck in _logs_ci:
+                    raise ValueError(
+                        f"logs contains case-variant duplicate keys "
+                        f"{_logs_ci[_lk_ck]!r} and {_lk_raw!r}.  Each "
+                        f"curve may only be stored once in logs."
+                    )
+                _logs_ci[_lk_ck] = _lk_raw
             # F-06: Resource-exhaustion guard for logs.
             if len(logs) >= MAX_CURVES:
                 raise ValueError(
@@ -5715,14 +6884,18 @@ class _DevColumns(dict[str, NDArray[np.float64]]):
         # to_dict/from_dict).  The wholesale path deepcopies (DevFile.
         # __setattr__); item-level entry points now copy too.
         arr = np.atleast_1d(np.asarray(value, dtype=np.float64)).copy()
-        # Validate length consistency with existing columns.
-        if self:
-            existing_len = len(next(iter(self.values())))
-            if len(arr) != existing_len:
-                raise ValueError(
-                    f"DevFile: column '{key}' has length {len(arr)} "
-                    f"but existing columns have length {existing_len}"
-                )
+        # MOD-01: validate the RESULTING state.  Replacing the ONLY
+        # column is consistent growth (trivially consistent); adding or
+        # replacing a column against OTHER columns must preserve the
+        # equal-length invariant (same contract as
+        # _GuardedDict.__setitem__ — the sibling class got the MOD-01
+        # exclusion, _DevColumns was missed).
+        _others = [len(v) for k, v in self.items() if k != key]
+        if _others and any(_t != len(arr) for _t in _others):
+            raise ValueError(
+                f"DevFile: column '{key}' has length {len(arr)} "
+                f"but other columns have length {sorted(set(_others))}"
+            )
         # F-016: Per-column size guard mirrors from_dict guards.
         from .data_reader import MAX_DATA_LINES
 
@@ -6013,6 +7186,19 @@ class DevFile:
     # DataSection._from_dict.
     _from_dict: bool = field(default=False, repr=False)
 
+    # M-25: Reader-designed missing-data marker.  On the DEV read path,
+    # NaN is the reader's OWN designed missing-data representation
+    # (sentinel fill for short rows, declared-overcount array tails,
+    # unconvertible values — each occurrence already warned at read
+    # time).  Flagging that NaN again as "corruption" fires a false
+    # positive on every file that legitimately uses the sentinel.  The
+    # DEV reader (dev_reader.py) sets this to True on the DevFile it
+    # constructs; direct construction and from_dict (user data) leave it
+    # False so genuinely corrupt non-finite user data is still reported.
+    # Inf is never produced by the reader (all non-finite conversions
+    # collapse to NaN), so Inf is always flagged.
+    _designed_nan: bool = field(default=False, repr=False)
+
     def __setattr__(self, name: str, value: Any) -> None:
         """M-45/M-46/M-49: Guarded assignment for ``columns`` and
         ``column_order``.
@@ -6134,12 +7320,27 @@ class DevFile:
             return issues
 
         # NaN/Inf check for numeric column arrays.
+        # M-25: distinguish reader-designed missing-data NaN from genuine
+        # corruption.  On the DEV read path, NaN is the reader's OWN
+        # missing-data representation (sentinel fill for short rows,
+        # declared-overcount array tails, unconvertible values) — every
+        # such cell was already warned at read time, so re-flagging it
+        # here is a false "corruption" warning on every file that
+        # legitimately uses the sentinel.  The reader sets
+        # ``_designed_nan=True`` on the DevFile it constructs; direct
+        # construction and from_dict (user data) leave it False, so
+        # genuinely corrupt non-finite user data is still reported.  Inf
+        # is never produced by the reader (all non-finite conversions
+        # collapse to NaN), so Inf is flagged in both modes.
         for _col_name, _col_data in self.columns.items():
             if isinstance(_col_data, np.ndarray) and _col_data.dtype.kind in ("f", "c"):
                 if not np.all(np.isfinite(_col_data)):
-                    issues.append(
-                        f"DevFile: column '{_col_name}' contains non-finite values (NaN/Inf)."
-                    )
+                    _has_nan = bool(np.isnan(_col_data).any())
+                    _has_inf = bool(np.isinf(_col_data).any())
+                    if _has_inf or (_has_nan and not self._designed_nan):
+                        issues.append(
+                            f"DevFile: column '{_col_name}' contains non-finite values (NaN/Inf)."
+                        )
 
         # Data-quality validation (MD monotonicity, AZI/INC range, TVD
         # NaN density / MD-consistency).
@@ -6150,6 +7351,31 @@ class DevFile:
         # dev_reader._validate_dev_data's survivor blocks.
         _azi_bases = ("AZI", "AZIM", "AZ", "AZM", "AZIMUTH")
         _inc_bases = ("INC", "INCL", "DEVI", "DIP")
+
+        # E-14: resolve DEV column aliases before the MD/TVD data-quality
+        # checks.  dev_reader._validate_dev_data resolves
+        # MDKB/MDSS/MDRKB/DEPTH/DPT → MD and TVDKB/TVDSS/TVDBML → TVD via
+        # _DEV_ALIASES; the model-side checks previously matched only the
+        # exact primary names, so alias-named depth/vertical columns
+        # bypassed every check on the direct-construction path.  Use the
+        # SAME alias resolution as _validate_dev_data
+        # (_normalize_dev_column, lazy import — module-level import is
+        # circular: dev_reader imports models).
+        from .dev_reader import _normalize_dev_column
+
+        _resolved_cols = {_cn: _normalize_dev_column(_cn) for _cn in self.columns}
+        # First column resolving to MD — the MD reference for the TVD
+        # MD-consistency check.  The exact-case ``columns.get("MD")``
+        # previously missed alias names (MDKB/DEPTH) AND case-variant
+        # names ("md") — the consistency check silently skipped for both.
+        _md_ref_name = next(
+            (_cn for _cn, _r in _resolved_cols.items() if _r == "MD"), None
+        )
+        # Survivor bases for MD/TVD families — mirror dev_reader's
+        # _MD_FAMILY_BASES/_tvd_names (a dedup survivor of ANY family
+        # base, e.g. MDKB_2 or DEPTH_2, is still an MD-family column).
+        _MD_FAMILY_BASES = ("MD", "MDKB", "MDSS", "MDRKB", "DEPTH", "DPT")
+        _TVD_FAMILY_BASES = ("TVD", "TVDKB", "TVDSS", "TVDBML")
 
         def _matches_base(_name_upper: str, _bases: tuple[str, ...]) -> bool:
             """Exact primary name OR ``<base>_<digits>`` survivor."""
@@ -6164,18 +7390,28 @@ class DevFile:
                     return True
             return False
 
+        def _is_md_family(_name_upper: str, _resolved: str) -> bool:
+            """Resolved alias OR any MD-family base with _N survivor."""
+            if _resolved == "MD":
+                return True
+            return _matches_base(_name_upper, _MD_FAMILY_BASES)
+
+        def _is_tvd_family(_name_upper: str, _resolved: str) -> bool:
+            """Resolved alias OR any TVD-family base with _N survivor."""
+            if _resolved == "TVD":
+                return True
+            return _matches_base(_name_upper, _TVD_FAMILY_BASES)
+
         for _col_name, _col_data in self.columns.items():
             if _col_data is None or len(_col_data) == 0:
                 continue
             _col_upper = _col_name.upper()
-            # MD: monotonicity (primary "MD" or survivor "MD_2"/"MD_3").
+            _resolved = _resolved_cols[_col_name]
+            # MD: monotonicity (resolved alias — MDKB/MDSS/MDRKB/DEPTH/DPT
+            # → MD — primary "MD", or any MD-family _N survivor).
             # The exact-match check was the pre-V-17 gap: a dedup survivor
             # from MD+MDKB/DEPTH aliases escaped validation entirely.
-            if _col_upper == "MD" or (
-                _col_upper.startswith("MD")
-                and _col_upper[2:].startswith("_")
-                and _col_upper[3:].isdigit()
-            ):
+            if _is_md_family(_col_upper, _resolved):
                 _finite = _col_data[np.isfinite(_col_data)]
                 if len(_finite) >= 2:
                     _diffs = np.diff(_finite)
@@ -6226,11 +7462,8 @@ class DevFile:
             # TVD (primary and survivors); models.py had NO TVD check at
             # all (V-17 model-side gap) — add it here for parity so direct
             # construction reports the same issues as the read path.
-            if _col_upper == "TVD" or (
-                _col_upper.startswith("TVD")
-                and _col_upper[3:].startswith("_")
-                and _col_upper[4:].isdigit()
-            ):
+            # E-14: also match alias names (TVDKB/TVDSS/TVDBML → TVD).
+            if _is_tvd_family(_col_upper, _resolved):
                 _tvd = _col_data
                 _tvd_total = len(_tvd)
                 _tvd_nan = int(np.isnan(_tvd).sum())
@@ -6245,7 +7478,12 @@ class DevFile:
                 # MD-consistency: TVD should not decrease where MD
                 # increases (soft check — horizontal sections may keep
                 # TVD constant, but backward jumps signal corruption).
-                _md_data = self.columns.get("MD")
+                # E-14: resolve the MD reference through the alias map
+                # (exact-case columns.get("MD") missed MDKB/DEPTH aliases
+                # and case-variant names, silently skipping the check).
+                _md_data = (
+                    self.columns[_md_ref_name] if _md_ref_name is not None else None
+                )
                 if _md_data is not None:
                     _both = ~np.isnan(_tvd) & ~np.isnan(_md_data)
                     if np.sum(_both) >= 2:
@@ -6798,13 +8036,15 @@ class DevFile:
             # populated, re-run the structural checks to validate
             # column_order/columns consistency and consistent lengths.
             dev.__post_init__()
-            # F-43: Minimum data-quality validation matching reader's
-            # _validate_dev_data checks.  validate(complete=True) covers
-            # NaN/Inf, MD monotonicity, AZI/INC range; _validate_dev_data
-            # additionally covers negative MD, NaN density, repeated
-            # stations, TVD, and dedup survivors (F-012).
-            for issue in dev.validate(complete=True):
-                warnings.warn(issue, stacklevel=2)
+            # E-34/N-14: _validate_dev_data is the SINGLE data-quality
+            # pass for from_dict — it covers NaN/Inf (non-finite), negative
+            # MD, MD NaN density, MD monotonicity, repeated stations,
+            # AZI/INC range, TVD, and dedup survivors.  The explicit
+            # validate(complete=True) loop was removed: running BOTH passes
+            # double-warned every overlapping issue (4 warnings for 2
+            # issues — the old F-43 comment's "disjoint coverage" claim
+            # was false; both passes ran MD monotonicity, AZI/INC range,
+            # and TVD checks).
             from .dev_reader import _validate_dev_data
 
             _validate_dev_data(dev, _stacklevel=2)

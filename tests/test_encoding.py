@@ -1742,3 +1742,802 @@ class TestEncodingNewIrreducibleResidualsXfail:
                 enc, content = read_with_encoding(test_file)
         assert enc == "cp1251", f"C-3 residual: cp1251 short word misdecoded as {enc!r} (mojibake)"
         assert "\u0421\u041a\u0412" in content
+
+
+# ──────────────────────────────────────────────────────────────
+# E-02 (encoding, HIGH): cp866 Cyrillic beyond the 64K ratio window is
+# invisible to the whole-file run detector → silent latin-1/cp1252
+# mojibake.  The common cp866 words СКВАЖИНА/ПРИВЕТ/ТЕСТ/УАЗ/ПЛАСТ form  # noqa: RUF003
+# runs of at most 2 cp1251-class bytes (no 4-run, no strong byte, no №),
+# so _has_confirmed_cyrillic_run returns False and the Western tie-break
+# wins when the 64K window is all-ASCII.  E-07 passes only because its
+# sample contains МЕСТОРОЖДЕНИЕ's 0x8E 0x90 0x8E strong-byte triple; the
+# invisible class is unpinned.  Fix: the word-like Cyrillic discriminator
+# (_has_word_like_cyrillic_run) — the one detector that CAN see these
+# words (in the cp866 decode) — is made reachable on the Western-winner
+# path with whole-file evidence (strict rule-(2)-only judgment: 0x80-0x9F
+# uppercase-class bytes, no rule-(1) ≥0xA0 ambiguity).
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE02Cp866InvisibleBeyond64K:
+    """E-02: a cp866 file whose Cyrillic content lies BEYOND the 64K ratio
+    window must decode cp866 — the whole-file word-like Cyrillic evidence
+    check must reach the invisible-class words (СКВАЖИНА/ПРИВЕТ/ТЕСТ/УАЗ/
+    ПЛАСТ — no strong-byte triple like МЕСТОРОЖДЕНИЕ's)."""  # noqa: RUF002
+
+    def test_cp866_invisible_words_beyond_64k_detected(self, tmp_path: Path) -> None:
+        """The E-02 live repro: a >64K ASCII preamble followed by cp866
+        invisible-class words decodes cp866.  Pre-fix it decoded latin-1
+        (raw C1 controls, zero Cyrillic code points, 0 warnings).  The
+        sample deliberately EXCLUDES МЕСТОРОЖДЕНИЕ (whose strong-byte
+        triple masks the defect in the E-07 test)."""
+        russian = (
+            "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410 \u041f\u0420\u0418\u0412\u0415\u0422 "
+            "\u0422\u0415\u0421\u0422 \u0423\u0410\u0417 \u041f\u041b\u0410\u0421\u0422 "
+            "\u0413\u0410\u0417 \u041c\u0410\u0417 "
+        )
+        preamble = ("# " + "X" * 77 + "\n") * 900  # ~70KB ASCII preamble
+        raw = preamble.encode("ascii") + (russian * 30).encode("cp866") + b"\n"
+        assert len(raw) > 65_536  # Cyrillic content must lie beyond the ratio window
+        test_file = tmp_path / "e02_invisible_beyond_64k.las"
+        test_file.write_bytes(raw)
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp866", (
+            f"E-02: cp866 invisible-class words beyond 64K misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410" in content
+        assert "\u041f\u0420\u0418\u0412\u0415\u0422" in content
+
+    def test_cp1251_invisible_beyond_64k_control(self, tmp_path: Path) -> None:
+        """E-02 control: the same layout with cp1251 Cyrillic stays cp1251 —
+        the whole-file evidence check prefers the best Cyrillic candidate
+        (cp1251 first in the fallback order)."""
+        russian = (
+            "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410 \u041f\u0420\u0418\u0412\u0415\u0422 "
+            "\u0422\u0415\u0421\u0422 \u0423\u0410\u0417 \u041f\u041b\u0410\u0421\u0422 "
+        )
+        preamble = ("# " + "X" * 77 + "\n") * 900
+        raw = preamble.encode("ascii") + (russian * 30).encode("cp1251") + b"\n"
+        test_file = tmp_path / "e02_cp1251_control.las"
+        test_file.write_bytes(raw)
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1251", (
+            f"E-02 control: cp1251 beyond-64K misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410" in content
+
+
+# ──────────────────────────────────────────────────────────────
+# M-07 (encoding, MEDIUM — REGRESSION vs HEAD): the E-02 whole-file
+# evidence check flipped >64K Western cp1252 files to cp1251.  Two
+# holes: (a) the 8 alnum-under-cp1252 Western letters (ƒ Š Œ Ž š œ ž Ÿ
+# = 0x83/0x8A/0x8C/0x8E/0x9A/0x9C/0x9E/0x9F) stayed in
+# _STRICT_CYRILLIC_EVIDENCE_BYTES — a genuine cp1252 'the ŠŠŠ field'
+# run (0x8A×3) passed the strict set-byte evidence; (b) rule (2)'s EOF  # noqa: RUF003
+# and digit branches returned True with no byte-class check — 'well
+# name áéí' (@EOF) and 'áéí 2024' flipped on the boundary alone.
+# Fix: carve the 8 letters from the strict set AND gate the EOF/digit
+# branches on strict-set bytes when allow_rule1=False (E-02 whole-file
+# evidence).  All three repros decode cp1252 at HEAD and post-fix; the
+# genuine cp866 invisible-class target still flips.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM07StrictEvidenceCarve:
+    """M-07: >64K Western cp1252 files with accented runs / Western
+    letters must NOT flip to cp1251 via the E-02 whole-file evidence —
+    and the genuine cp866 invisible-class target must STILL flip."""
+
+    def test_western_s_letter_run_stays_cp1252(self, tmp_path: Path) -> None:
+        """M-07 live repro: 'the ŠŠŠ field' (cp1252 — 0x8A×3, alnum under
+        cp1252) decodes cp1252.  Pre-fix the strict set still contained
+        0x8A → whole-file evidence flipped it to cp1251 ('the ЉЉЉ field')."""  # noqa: RUF002
+        text = "the \u0160\u0160\u0160 field"
+        preamble = ("# " + "X" * 77 + "\n") * 900
+        raw = preamble.encode("ascii") + text.encode("cp1252") + b"\n"
+        assert len(raw) > 65_536  # E-02 whole-file evidence path
+        test_file = tmp_path / "m07_s_letter_run.las"
+        test_file.write_bytes(raw)
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", (
+            f"M-07: cp1252 'ŠŠŠ field' misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u0160\u0160\u0160" in content
+
+    def test_western_accented_run_before_digits_stays_cp1252(self, tmp_path: Path) -> None:
+        """M-07 live repro: 'áéí 2024' (cp1252 — 0xE1 0xE9 0xED, M-82
+        accents) decodes cp1252.  Pre-fix rule (2)'s digit branch returned
+        True with no byte-class check → flipped to cp1251 ('бйн 2024')."""
+        text = "\u00e1\u00e9\u00ed 2024"
+        preamble = ("# " + "X" * 77 + "\n") * 900
+        raw = preamble.encode("ascii") + text.encode("cp1252") + b"\n"
+        test_file = tmp_path / "m07_accented_digits.las"
+        test_file.write_bytes(raw)
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", (
+            f"M-07: cp1252 'áéí 2024' misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u00e1\u00e9\u00ed" in content
+
+    def test_western_accented_run_at_true_eof_stays_cp1252(self, tmp_path: Path) -> None:
+        """M-07 live repro: 'well name áéí' with the accented run at the
+        TRUE end of the file decodes cp1252.  Pre-fix the end-of-sample
+        branch returned True (not truncated) with no byte-class check →
+        flipped to cp1251 ('well name бйн')."""
+        text = "well name \u00e1\u00e9\u00ed"  # no trailing newline — run at EOF
+        preamble = ("# " + "X" * 77 + "\n") * 900
+        raw = preamble.encode("ascii") + text.encode("cp1252")
+        test_file = tmp_path / "m07_accented_eof.las"
+        test_file.write_bytes(raw)
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", (
+            f"M-07: cp1252 'áéí'@EOF misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u00e1\u00e9\u00ed" in content
+
+    def test_cp866_invisible_beyond_64k_still_flips(self, tmp_path: Path) -> None:
+        """M-07 positive control (E-02 direction): the genuine cp866
+        invisible-class target still flips — a >64K ASCII preamble followed
+        by cp866 words (СКВАЖИНА/ПРИВЕТ/ПЛАСТ carry strict 0x80-0x9F  # noqa: RUF002
+        evidence bytes 0x8D/0x8F that survived the carve) decodes cp866."""
+        russian = (
+            "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410 \u041f\u0420\u0418\u0412\u0415\u0422 "
+            "\u0422\u0415\u0421\u0422 \u0423\u0410\u0417 \u041f\u041b\u0410\u0421\u0422 "
+            "\u0413\u0410\u0417 \u041c\u0410\u0417 "
+        )
+        preamble = ("# " + "X" * 77 + "\n") * 900
+        raw = preamble.encode("ascii") + (russian * 30).encode("cp866") + b"\n"
+        assert len(raw) > 65_536
+        test_file = tmp_path / "m07_cp866_target.las"
+        test_file.write_bytes(raw)
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp866", (
+            f"M-07: cp866 invisible-class target misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410" in content
+
+
+# ──────────────────────────────────────────────────────────────
+# E3 (encoding, MEDIUM — REGRESSION vs HEAD, fix3 convergence pass):
+# the letter-follows branch of _is_genuine_word_run fell through to
+# _run_has_las_context UNGATED for allow_rule1=False (E-02 whole-file
+# evidence) — the M-07 byte-class gates on the EOF/digit branches were
+# missing here.  A >64K Western cp1252 file whose accented/carved-letter
+# run (áéí = 0xE1 0xE9 0xED, ŠŠŠ = 0x8A×3 — M-82/M-07-ambiguous bytes, no  # noqa: RUF003
+# strict-set byte) is followed by an uppercase LAS mnemonic (FIELD) or a
+# digit after an uppercase token (DEPT 1000) flipped the WHOLE file to
+# cp1251 mojibake post-fix2 (HEAD=cp1252 on all shapes).  Fix: gate the
+# LAS-context fall-through exactly like the EOF/digit branches — with
+# allow_rule1=False the run needs a strict 0x80-0x9F evidence byte
+# (0x81/0x8D/0x8F/0x90/0x9D — the C1-control class real Western text
+# cannot contain); the genuine cp866 СКВАЖИНА-class target (0x8D-bearing)
+# still flips via the set-byte fast path.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE3WesternRunLasContextNoFlip:
+    """E3: >64K Western cp1252 files with accented/carved-letter runs
+    followed by LAS context (uppercase mnemonic / digit-after-uppercase)
+    must NOT flip to cp1251 via the E-02 whole-file evidence — and the
+    M-20 section-marker guard must keep holding (no over-correction)."""
+
+    def test_western_accent_run_uppercase_field_stays_cp1252(self, tmp_path: Path) -> None:
+        """E3 live repro: 'áéí FIELD 1000.0' (cp1252 — 0xE1 0xE9 0xED +
+        uppercase mnemonic FIELD + digit) decodes cp1252.  Pre-fix the
+        ungated LAS-context fall-through flipped it to cp1251 ('бйн
+        FIELD 1000.0')."""
+        text = "\u00e1\u00e9\u00ed FIELD 1000.0"
+        preamble = ("# " + "X" * 77 + "\n") * 900
+        raw = preamble.encode("ascii") + text.encode("cp1252") + b"\n"
+        assert len(raw) > 65_536  # E-02 whole-file evidence path
+        test_file = tmp_path / "e3_accent_uppercase_field.las"
+        test_file.write_bytes(raw)
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", (
+            f"E3: cp1252 'áéí FIELD 1000.0' misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u00e1\u00e9\u00ed" in content
+
+    def test_western_carved_s_letter_run_uppercase_stays_cp1252(self, tmp_path: Path) -> None:
+        """E3 live repro: 'the ŠŠŠ FIELD' (cp1252 — 0x8A×3, M-07-carved
+        letter) decodes cp1252.  Pre-fix the carved-run set-byte path
+        fails (0x8A not strict) and the ungated LAS-context fall-through
+        flipped it to cp1251 ('the ЉЉЉ FIELD')."""  # noqa: RUF002
+        text = "the \u0160\u0160\u0160 FIELD"
+        preamble = ("# " + "X" * 77 + "\n") * 900
+        raw = preamble.encode("ascii") + text.encode("cp1252") + b"\n"
+        assert len(raw) > 65_536  # E-02 whole-file evidence path
+        test_file = tmp_path / "e3_s_letter_uppercase_field.las"
+        test_file.write_bytes(raw)
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", (
+            f"E3: cp1252 'ŠŠŠ FIELD' misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u0160\u0160\u0160" in content
+
+    def test_western_accent_run_dept_digit_stays_cp1252(self, tmp_path: Path) -> None:
+        """E3 live repro: 'áéí DEPT 1000' (cp1252 — accents + uppercase
+        mnemonic + digit-after-uppercase) decodes cp1252.  Pre-fix the
+        digit-after-uppercase LAS-context signal flipped it to cp1251
+        ('бйн DEPT 1000')."""
+        text = "\u00e1\u00e9\u00ed DEPT 1000"
+        preamble = ("# " + "X" * 77 + "\n") * 900
+        raw = preamble.encode("ascii") + text.encode("cp1252") + b"\n"
+        assert len(raw) > 65_536  # E-02 whole-file evidence path
+        test_file = tmp_path / "e3_accent_dept_digit.las"
+        test_file.write_bytes(raw)
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", (
+            f"E3: cp1252 'áéí DEPT 1000' misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u00e1\u00e9\u00ed" in content
+
+    def test_western_carved_s_letter_run_dept_digit_stays_cp1252(self, tmp_path: Path) -> None:
+        """E3 live repro: 'ŠŠŠ DEPT 1000.0' (cp1252 — carved letters +
+        uppercase mnemonic + digit) decodes cp1252.  Pre-fix it flipped
+        to cp1251 ('ЉЉЉ DEPT 1000.0')."""
+        text = "\u0160\u0160\u0160 DEPT 1000.0"
+        preamble = ("# " + "X" * 77 + "\n") * 900
+        raw = preamble.encode("ascii") + text.encode("cp1252") + b"\n"
+        assert len(raw) > 65_536  # E-02 whole-file evidence path
+        test_file = tmp_path / "e3_s_letter_dept_digit.las"
+        test_file.write_bytes(raw)
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", (
+            f"E3: cp1252 'ŠŠŠ DEPT 1000.0' misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u0160\u0160\u0160" in content
+
+    def test_western_accent_run_section_marker_stays_cp1252(self, tmp_path: Path) -> None:
+        """E3 control (no over-correction): the section-marker shape
+        '~A\\náéí 1234.5' (M-20 guard — digit follows a ~-prefixed
+        section header) decodes cp1252.  Held at HEAD AND post-fix2; the
+        new LAS-context gate must not disturb the section-marker guard."""
+        text = "~A\n\u00e1\u00e9\u00ed 1234.5"
+        preamble = ("# " + "X" * 77 + "\n") * 900
+        raw = preamble.encode("ascii") + text.encode("cp1252") + b"\n"
+        assert len(raw) > 65_536  # E-02 whole-file evidence path
+        test_file = tmp_path / "e3_accent_section_marker.las"
+        test_file.write_bytes(raw)
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", (
+            f"E3 control: cp1252 '~A\\náéí 1234.5' misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u00e1\u00e9\u00ed" in content
+
+
+# ──────────────────────────────────────────────────────────────
+# E-26 (encoding, MEDIUM): the №-adjacency digit-follow constraint alone
+# cannot distinguish the Russian "СКВ №1" convention from a Western  # noqa: RUF003
+# superscript-one + digit ("Nota¹1 Ñáñez") — both are 0xB9 followed by an
+# ASCII digit.  Pre-fix the Western ¹+digit shape adjacent to a 3-byte
+# accent run fired the №-rule → whole file decoded cp1251 mojibake.
+# Fix: the marker must ALSO be preceded (after optional whitespace) by a
+# byte that is a Cyrillic letter under cp1251 — the Russian convention
+# places № immediately after a Cyrillic word.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE26NumeroDigitVariant:
+    """E-26: Western cp1252 '¹'+digit adjacent to a 3-byte accent run must
+    NOT confirm Cyrillic — the №-adjacency rule requires a preceding
+    cp1251-Cyrillic byte, not just the 0xB9+digit shape."""
+
+    def test_western_superscript_one_digit_stays_cp1252(self, tmp_path: Path) -> None:
+        """The E-26 live repro: 'Nota¹1 Ñáñez' (cp1252 — superscript-one
+        directly followed by a digit, adjacent to the 3-byte accent run
+        Ñáñ) decodes cp1252.  Pre-fix the №-adjacency rule fired (0xB9 +
+        digit) → cp1251 mojibake ('Nota№1 Сбсez')."""  # noqa: RUF002
+        text = "Nota\u00b91 \u00d1\u00e1\u00f1ez"
+        test_file = tmp_path / "e26_superscript_digit.las"
+        test_file.write_bytes(text.encode("cp1252"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", (
+            f"E-26: cp1252 '¹'+digit+accent-run misdecoded as {enc!r} (mojibake)"
+        )
+        assert not any(0x0400 <= ord(c) <= 0x04FF for c in content)
+
+    def test_western_superscript_space_digit_stays_cp1252(self, tmp_path: Path) -> None:
+        """E-26 variant: 'Values ¹ 2 Ñáñ' (superscript + space + digit,
+        3-byte accent run) decodes cp1252 — the spaced form is also
+        Western footnote/ordinal convention, not a Russian № label."""
+        text = "Values \u00b9 2 \u00d1\u00e1\u00f1"
+        test_file = tmp_path / "e26_superscript_space_digit.las"
+        test_file.write_bytes(text.encode("cp1252"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", (
+            f"E-26: cp1252 '¹ 2'+accent-run misdecoded as {enc!r} (mojibake)"
+        )
+        assert not any(0x0400 <= ord(c) <= 0x04FF for c in content)
+
+    def test_genuine_cp1251_numero_digit_label_stays_cp1251(self, tmp_path: Path) -> None:
+        """E-26 positive control: the genuine Russian 'СКВ №1' (3-run + №
+        preceded by the Cyrillic В) still confirms Cyrillic — the fix must
+        not over-correct the ENC-01 positive control."""  # noqa: RUF002
+        russian = "\u0421\u041a\u0412 \u2116 1"
+        test_file = tmp_path / "e26_genuine_numero.las"
+        test_file.write_bytes(russian.encode("cp1251"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1251", (
+            f"E-26 positive control: genuine cp1251 №-label misdecoded as {enc!r}"
+        )
+        assert "\u0421\u041a\u0412" in content
+
+    def test_genuine_cp1251_numero_before_word_stays_cp1251(self, tmp_path: Path) -> None:
+        """M-08 control: the genuine Russian '№ 1 СКВ' (№ BEFORE the word,
+        at line start) still confirms Cyrillic — E-26's preceding-Cyrillic-
+        byte requirement must not break the №-before-word convention.
+        Pre-fix (E-26 constraint) it decoded cp1252 mojibake ('¹ 1 ÑÊÂ')."""  # noqa: RUF002
+        russian = "\u2116 1 \u0421\u041a\u0412"  # '№ 1 СКВ'  # noqa: RUF003
+        test_file = tmp_path / "m08_numero_before_word.las"
+        test_file.write_bytes(russian.encode("cp1251"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1251", (
+            f"M-08: genuine cp1251 №-before-word misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u0421\u041a\u0412" in content
+
+    def test_genuine_cp1251_numero_before_word_no_space_stays_cp1251(self, tmp_path: Path) -> None:
+        """M-08 control variant: '№1 СКВ' (no space after the marker, № at
+        line start) also confirms Cyrillic."""  # noqa: RUF002
+        russian = "\u21161 \u0421\u041a\u0412"  # '№1 СКВ'  # noqa: RUF003
+        test_file = tmp_path / "m08_numero_before_word_nospace.las"
+        test_file.write_bytes(russian.encode("cp1251"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1251", (
+            f"M-08: genuine cp1251 '№1 СКВ' misdecoded as {enc!r} (mojibake)"  # noqa: RUF001
+        )
+        assert "\u0421\u041a\u0412" in content
+
+
+# ──────────────────────────────────────────────────────────────
+# M-19 (encoding, MEDIUM): 3+ consecutive Western-symbol bytes (€ £ ¥ ¢ ¡
+# ¿ — the 0x80/0xA1-0xA3/0xA5/0xBF strong bytes, plus ¨ ¯ ´ ¸ × ÷) fired  # noqa: RUF003
+# the strong-byte Cyrillic rule → whole file decoded cp1251 mojibake.  The
+# genuine-Cyrillic mirror runs (cp1251 ЎЎЎ/ЈЈЈ/ҐҐҐ) are essentially  # noqa: RUF003
+# nonexistent in real Russian text — an ASYMMETRIC trade — so the
+# Western-symbol bytes are carved out of the strong class AND out of the
+# word-like discriminator's evidence for all-carved runs (€€€ = 0x80×3 —  # noqa: RUF003
+# byte-identical to cp866 ААА — stays Western; mixed runs like УАЗ keep  # noqa: RUF003
+# the F-02 set-byte gate).
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM19WesternSymbolRunsStayCp1252:
+    """M-19: genuine cp1252 files with 3+ consecutive Western-symbol runs
+    (currency, inverted punctuation, math signs) decode as cp1252 — the
+    strong-byte Cyrillic rule must not fire on symbols Western text
+    plausibly contains."""
+
+    def test_western_euro_run_stays_cp1252(self, tmp_path: Path) -> None:
+        """M-19: 'PRICE 100€€€ total in euros' (0x80×3) decodes cp1252.
+        Pre-fix: strong rule fired → cp1251 mojibake ('100ЂЂЂ')."""  # noqa: RUF002
+        text = "PRICE 100\u20ac\u20ac\u20ac total in euros"
+        test_file = tmp_path / "m19_euro_run.las"
+        test_file.write_bytes(text.encode("cp1252"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", f"M-19: cp1252 €€€ run misdecoded as {enc!r} (mojibake)"
+        assert "\u20ac\u20ac\u20ac" in content
+
+    def test_western_pound_run_stays_cp1252(self, tmp_path: Path) -> None:
+        """M-19: 'PRICE 100£££ total pounds' (0xA3×3) decodes cp1252."""  # noqa: RUF002
+        text = "PRICE 100\u00a3\u00a3\u00a3 total pounds"
+        test_file = tmp_path / "m19_pound_run.las"
+        test_file.write_bytes(text.encode("cp1252"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", f"M-19: cp1252 £££ run misdecoded as {enc!r} (mojibake)"
+        assert "\u00a3\u00a3\u00a3" in content
+
+    def test_western_yen_run_stays_cp1252(self, tmp_path: Path) -> None:
+        """M-19: 'PRICE 100¥¥¥ total yen' (0xA5×3) decodes cp1252."""  # noqa: RUF002
+        text = "PRICE 100\u00a5\u00a5\u00a5 total yen"
+        test_file = tmp_path / "m19_yen_run.las"
+        test_file.write_bytes(text.encode("cp1252"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", f"M-19: cp1252 ¥¥¥ run misdecoded as {enc!r} (mojibake)"
+        assert "\u00a5\u00a5\u00a5" in content
+
+    def test_western_cent_run_stays_cp1252(self, tmp_path: Path) -> None:
+        """M-19: 'cost 50¢¢¢ per item' (0xA2×3) decodes cp1252."""  # noqa: RUF002
+        text = "cost 50\u00a2\u00a2\u00a2 per item"
+        test_file = tmp_path / "m19_cent_run.las"
+        test_file.write_bytes(text.encode("cp1252"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", f"M-19: cp1252 ¢¢¢ run misdecoded as {enc!r} (mojibake)"
+        assert "\u00a2\u00a2\u00a2" in content
+
+    def test_western_inverted_exclamation_run_stays_cp1252(self, tmp_path: Path) -> None:
+        """M-19: 'Hola ¡¡¡ buenos dias amigo' (0xA1×3) decodes cp1252."""  # noqa: RUF002
+        text = "Hola \u00a1\u00a1\u00a1 buenos dias amigo"
+        test_file = tmp_path / "m19_inv_excl_run.las"
+        test_file.write_bytes(text.encode("cp1252"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", (
+            f"M-19: cp1252 ¡¡¡ run misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u00a1\u00a1\u00a1" in content
+
+    def test_western_inverted_question_run_stays_cp1252(self, tmp_path: Path) -> None:
+        """M-19: 'Es verdad ¿¿¿ no se' (0xBF×3) decodes cp1252."""  # noqa: RUF002
+        text = "Es verdad \u00bf\u00bf\u00bf no se"
+        test_file = tmp_path / "m19_inv_q_run.las"
+        test_file.write_bytes(text.encode("cp1252"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", f"M-19: cp1252 ¿¿¿ run misdecoded as {enc!r} (mojibake)"
+        assert "\u00bf\u00bf\u00bf" in content
+
+    def test_strong_rule_no_longer_fires_on_symbol_runs(self) -> None:
+        """M-19 guard: the strong-byte Cyrillic detector must NOT fire on
+        the carved Western-symbol runs (direct detector test — the carve
+        itself)."""
+        from pylasdev.encoding import _has_confirmed_cyrillic_run
+
+        for sym in (b"\x80", b"\xa1", b"\xa2", b"\xa3", b"\xa5", b"\xa8", b"\xaf",
+                    b"\xb4", b"\xb8", b"\xbf", b"\xd7", b"\xf7"):
+            assert not _has_confirmed_cyrillic_run(sym * 3), (
+                f"M-19: strong rule still fires on 0x{sym[0]:02X}x3"
+            )
+        # The cp866-only strong bytes (C1 controls under cp1252) must STAY
+        # strong — they are the load-bearing evidence for cp866 Cyrillic.
+        assert _has_confirmed_cyrillic_run(b"\x8f\x8f\x8f"), "M-19: 0x8Fx3 lost strong evidence"
+
+
+# ──────────────────────────────────────────────────────────────
+# M-20 (encoding, MEDIUM): the ENC-02(b) Western rescue is blocked for
+# short Western strings with smart-punct clusters → cp866 mojibake, via
+# two sub-mechanisms: (a) rule (2) of _is_genuine_word_run returns True
+# unconditionally at the end of the (possibly truncated) 64K sample —
+# a cluster sitting exactly at the sample boundary is judged "genuine
+# Cyrillic"; (b) _run_has_las_context counts a `~`-prefixed LAS section
+# marker + digit ('~A\n1234.5') as Cyrillic-evidence context.  Fix: a
+# truncated sample-end run is NOT genuine (the file continues beyond the
+# sample); `~`-prefixed markers are structural headers, not data mnemonics.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM20WesternRescueBlockers:
+    """M-20: the ENC-02(b) rescue must fire for Western smart-punct
+    clusters at a truncated sample boundary and before LAS section
+    markers — both previously blocked → cp866 mojibake."""
+
+    def test_cluster_at_truncated_sample_end_stays_cp1252(self, tmp_path: Path) -> None:
+        """M-20 sub-mechanism (a): a Western '†††' cluster whose run ENDS
+        exactly at the 64K sample boundary decodes cp1252.  Pre-fix,
+        rule (2)'s end-of-sample branch judged the truncated run genuine
+        (the file continues beyond the sample) → rescue blocked → cp866
+        mojibake ('ЖЖЖ nota').  M-09: the fixture is >65,536 bytes with
+        the run ending AT the boundary and no ASCII-letter-follows
+        evidence inside the sample, so ONLY the truncated-sample-end
+        branch (encoding.py:576) can resolve it — the old 65,440-byte
+        fixture resolved via the unchanged ASCII-letter-follows path and
+        passed even with the fixed branch reverted to `return True`."""
+        preamble = ("# " + "X" * 77 + "\n") * 819  # 65,520 bytes
+        partial = "# " + "X" * 11  # 13 bytes → 65,533 before the run
+        raw = preamble.encode("ascii") + partial.encode("ascii")
+        raw += "\u2020\u2020\u2020".encode("cp1252")  # run ends at 65,536
+        raw += " nota".encode("cp1252")  # file continues beyond the window
+        assert len(raw) > 65_536  # sample_truncated must be True
+        test_file = tmp_path / "m20_truncated_boundary.las"
+        test_file.write_bytes(raw)
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", (
+            f"M-20a: cp1252 boundary cluster misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u2020\u2020\u2020" in content
+
+    def test_cluster_before_section_marker_digits_stays_cp1252(self, tmp_path: Path) -> None:
+        """M-20 sub-mechanism (b): a Western '†‡‰' cluster followed by a
+        LAS section header with digits ('\n~A\n1234.5 5678.9') decodes
+        cp1252.  Pre-fix, _run_has_las_context counted the `~A` marker +
+        digit as LAS label evidence → cluster judged genuine → rescue
+        blocked → cp866 mojibake."""
+        text = "the note \u2020\u2021\u2030\n~A\n1234.5 5678.9"
+        test_file = tmp_path / "m20b_section_marker.las"
+        test_file.write_bytes(text.encode("cp1252"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", (
+            f"M-20b: cp1252 cluster+~A+digits misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u2020\u2021\u2030" in content
+        assert "1234.5" in content
+
+    def test_cluster_before_curve_marker_stays_cp1252(self, tmp_path: Path) -> None:
+        """M-20 sub-mechanism (b) variant: the multi-letter section marker
+        '~CURVE' must not count as Cyrillic evidence either — a Western
+        cluster followed by '\n~CURVE INFORMATION\n1 2 3' decodes cp1252."""
+        text = "the note \u2026\u2020\u2021\n~CURVE INFORMATION\n1 2 3"
+        test_file = tmp_path / "m20b_curve_marker.las"
+        test_file.write_bytes(text.encode("cp1252"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", (
+            f"M-20b: cp1252 cluster+~CURVE misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u2026\u2020\u2021" in content
+
+
+# ──────────────────────────────────────────────────────────────
+# N-10 (encoding, MEDIUM — stage-C family continuation): 0xA0-0xAF Western
+# symbol runs (guillemets «««, §§§, ¤¤¤, ©©©, ®®®, ¬¬¬, ¦¦¦, soft-hyphen
+# ×3+) decode as cp866 lowercase Cyrillic (ллл, ззз, ...) — byte-IDENTICAL  # noqa: RUF003
+# to genuine cp866 lowercase words (««« cp1252 == ллл cp866; «как» cp866
+# == «ªàª cp1252).  Rule (1) of _is_genuine_word_run (any run byte >= 0xA0
+# is "unambiguously genuine") is the load-bearing gate for the genuine
+# cp866 lowercase class, so NO byte-content carve can separate the pair —
+# the project's C-1/C-2/C-3 convention pins provably-irreducible classes
+# as strict xfail rather than changing the detector.  strict=True: a future
+# pass that changes the trade flips this pin to XPASS and the suite fails.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestN10A0AFWesternSymbolsXfail:
+    """N-10: the irreducible 0xA0-0xAF Western-symbol → cp866 lowercase
+    class, pinned strict-xfail exactly like the C-1/C-2/C-3 residuals.
+    Pins only — the detection logic is deliberately NOT changed (the
+    byte-identity with genuine cp866 lowercase words makes any byte-content
+    carve misclassify the genuine class; see the N-10 adversarial proof)."""
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "N-10 documented residual (stage-C F-5, ADV-M3 CONFIRMED): bytes "
+            "AB AB AB = cp1252 '\\u00ab\\u00ab\\u00ab' (Western guillemets) == "
+            "cp866 '\\u043b\\u043b\\u043b' (genuine lowercase Cyrillic word).  "
+            "The 0xA0-0xAF range IS cp866 lowercase Cyrillic "
+            "(\\u0430-\\u043f) — '\\u00ab\\u043a\\u0430\\u043a\\u00bb' "
+            "cp866 = 0xAA 0xE0 0xAA = cp1252 '\\u00ab\\u00aa\\u00e0\\u00ab' — so rule (1) of "
+            "_is_genuine_word_run (any run byte >= 0xA0 is unambiguous) is "
+            "load-bearing for the genuine class and any byte-content carve "
+            "misclassifies genuine cp866 lowercase words.  Trade kept in "
+            "favor of the genuine Russian-geoscience cp866 lowercase class."
+        ),
+    )
+    def test_cp1252_guillemet_run_stays_cp1252(self, tmp_path: Path) -> None:
+        """N-10 residual pin (stage-C F-5 + ADV-M3): 'the ««« quote marks'
+        (cp1252) would decode cp1252, but ««« is byte-identical to the
+        genuine cp866 word ллл — rule (1) marks it genuine, the rescue is
+        blocked, and it decodes cp866.  Cannot be fixed without dropping
+        the load-bearing rule-(1) gate.  strict=True guards the trade the
+        same way as the C-1 pin."""
+        text = "the \u00ab\u00ab\u00ab quote marks"
+        test_file = tmp_path / "n10_guillemets.las"
+        test_file.write_bytes(text.encode("cp1252"))
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, content = read_with_encoding(test_file)
+        assert enc == "cp1252", (
+            f"N-10 residual: cp1252 guillemet run misdecoded as {enc!r} (mojibake)"
+        )
+        assert "\u00ab\u00ab\u00ab" in content

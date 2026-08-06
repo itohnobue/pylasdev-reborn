@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+from typing import Any, ClassVar
+
 import numpy as np
 import pytest
 
@@ -196,6 +199,52 @@ class TestCompareLasDicts:
         """Test scalar string value mismatch detected."""
         d1 = {"name": "hello"}
         d2 = {"name": "world"}
+        assert compare_las_dicts(d1, d2) is False
+
+    # --- E-27: scalar leaf mismatches must log at WARNING (README contract) ---
+    def test_scalar_mismatch_emits_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """E-27: scalar leaf mismatch (units/version/well/descriptions) logs
+        a WARNING with the offending key — README.md:166-168 contract that
+        every mismatch path logs at WARNING level."""
+        d1 = {"well": {"STRT": "100.0", "STOP": "200.0"}}
+        d2 = {"well": {"STRT": "100.0", "STOP": "250.0"}}
+        with caplog.at_level(logging.WARNING, logger="pylasdev.compare"):
+            assert compare_las_dicts(d1, d2) is False
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, "scalar mismatch must emit a WARNING record"
+        assert any("well.STOP" in r.message for r in warnings), caplog.text
+
+    def test_scalar_mismatch_nested_in_data_sections_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """E-27: scalar mismatch inside data_sections also warns."""
+        d1 = {"data_sections": [{"name": "section_a"}]}
+        d2 = {"data_sections": [{"name": "section_b"}]}
+        with caplog.at_level(logging.WARNING, logger="pylasdev.compare"):
+            assert compare_las_dicts(d1, d2) is False
+        assert any(
+            r.levelno == logging.WARNING and "section" in r.message
+            for r in caplog.records
+        ), caplog.text
+
+    def test_scalar_match_emits_no_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """E-27: matching scalar leaves stay silent (no spurious warning)."""
+        d1 = {"well": {"STRT": "100.0", "STOP": "200.0"}}
+        d2 = {"well": {"STRT": "100.0", "STOP": "200.0"}}
+        with caplog.at_level(logging.WARNING, logger="pylasdev.compare"):
+            assert compare_las_dicts(d1, d2) is True
+        assert not any(
+            r.levelno == logging.WARNING for r in caplog.records
+        ), caplog.text
+
+    def test_scalar_mismatch_missing_key_warns(self) -> None:
+        """E-27: missing scalar key still warns (key-diff path) and is False."""
+        d1 = {"well": {"STRT": "100.0"}}
+        d2 = {"well": {"STRT": "100.0", "STOP": "200.0"}}
         assert compare_las_dicts(d1, d2) is False
 
     def test_scalar_missing_key_in_first(self) -> None:
@@ -1392,3 +1441,208 @@ class TestListToNumericMasked:
             )
             is True
         )
+
+
+class TestMaskedNonNumericArrayComparison:
+    """E-28: masked NON-NUMERIC arrays must follow the mask-unwrap contract.
+
+    Pre-fix, the non-numeric branch of _compare_arrays compared with
+    np.array_equal directly, whose internal asarray() strips masks — so
+    masked positions were compared by their raw data, inverting the
+    documented mask semantics (a masked position matches only another
+    masked position; compare.py _allclose_symmetric docstring) in three
+    directions: masked-vs-masked with different data compared UNEQUAL,
+    masked-vs-unmasked with same data compared EQUAL, and differing mask
+    patterns compared EQUAL.  The fix applies the mask-unwrap to the
+    non-numeric branch too, covering all dtype classes.
+    """
+
+    _STRUCTURED_DTYPE: ClassVar[np.dtype] = np.dtype([("a", "f8"), ("b", "i4")])
+
+    # (v0, v1, w0, w1): base pair + alternative pair per dtype class.
+    _CASES: ClassVar[dict[str, tuple[Any, Any, Any, Any]]] = {
+        "U": ("SAND", "SHALE", "SILT", "LIME"),
+        "S": (b"SAND", b"SHALE", b"SILT", b"LIME"),
+        "V": (
+            np.array((1.0, 2), dtype=_STRUCTURED_DTYPE),
+            np.array((3.0, 4), dtype=_STRUCTURED_DTYPE),
+            np.array((9.0, 9), dtype=_STRUCTURED_DTYPE),
+            np.array((5.0, 6), dtype=_STRUCTURED_DTYPE),
+        ),
+        "O": (
+            np.array("SAND", dtype=object),
+            np.array("SHALE", dtype=object),
+            np.array("SILT", dtype=object),
+            np.array("LIME", dtype=object),
+        ),
+        "b": (True, False, False, True),
+        "M": (
+            np.datetime64("2020-01-01"),
+            np.datetime64("2020-01-02"),
+            np.datetime64("2020-01-03"),
+            np.datetime64("2020-01-04"),
+        ),
+        "m": (
+            np.timedelta64(1, "s"),
+            np.timedelta64(2, "s"),
+            np.timedelta64(3, "s"),
+            np.timedelta64(4, "s"),
+        ),
+        "c": (1 + 2j, 3 + 4j, 5 + 6j, 7 + 8j),
+    }
+
+    _DTYPES: ClassVar[list[str]] = ["U", "S", "O", "V", "b", "M", "m", "c"]
+
+    @staticmethod
+    def _ma(dtype: str, v0: Any, v1: Any, mask: list[bool]) -> np.ma.MaskedArray:
+        """Build a 2-element masked array of the given dtype class."""
+        return np.ma.array([v0, v1], mask=mask)
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_masked_position_matches_masked_position(self, dtype: str) -> None:
+        """E-28 inversion 1: data differing ONLY at masked positions is EQUAL.
+
+        Pre-fix np.array_equal compared the raw data and returned False."""
+        v0, v1, _w0, w1 = self._CASES[dtype]
+        a = self._ma(dtype, v0, v1, [False, True])
+        b = self._ma(dtype, v0, w1, [False, True])
+        assert compare_las_dicts({"x": a}, {"x": b}) is True
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_mask_mismatch_unequal(self, dtype: str) -> None:
+        """E-28 inversion 2: same data with different mask patterns is UNEQUAL.
+
+        Pre-fix np.array_equal stripped the masks and returned True."""
+        v0, v1, _w0, _w1 = self._CASES[dtype]
+        a = self._ma(dtype, v0, v1, [False, True])
+        b = self._ma(dtype, v0, v1, [True, False])
+        assert compare_las_dicts({"x": a}, {"x": b}) is False
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_masked_vs_unmasked_same_data_unequal(self, dtype: str) -> None:
+        """E-28 inversion 3: masked position never matches an unmasked value.
+
+        A MaskedArray with a masked position vs a plain ndarray with the
+        same data is UNEQUAL (pre-fix: True)."""
+        v0, v1, _w0, _w1 = self._CASES[dtype]
+        a = self._ma(dtype, v0, v1, [False, True])
+        plain = np.array([v0, v1])
+        assert compare_las_dicts({"x": a}, {"x": plain}) is False
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_unmasked_position_mismatch_still_unequal(self, dtype: str) -> None:
+        """E-28 guard: data differing at an UNMASKED position stays unequal."""
+        v0, v1, w0, _w1 = self._CASES[dtype]
+        a = self._ma(dtype, v0, v1, [False, True])
+        b = self._ma(dtype, w0, v1, [False, True])
+        assert compare_las_dicts({"x": a}, {"x": b}) is False
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_all_masked_equal_regardless_of_data(self, dtype: str) -> None:
+        """E-28: fully-masked arrays are EQUAL even with different data."""
+        v0, v1, w0, w1 = self._CASES[dtype]
+        a = self._ma(dtype, v0, v1, [True, True])
+        b = self._ma(dtype, w0, w1, [True, True])
+        assert compare_las_dicts({"x": a}, {"x": b}) is True
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_identical_masked_arrays_equal(self, dtype: str) -> None:
+        """E-28 guard: identical masked arrays (mask + data) still equal."""
+        v0, v1, _w0, _w1 = self._CASES[dtype]
+        a = self._ma(dtype, v0, v1, [False, True])
+        b = self._ma(dtype, v0, v1, [False, True])
+        assert compare_las_dicts({"x": a}, {"x": b}) is True
+
+    def test_mask_mismatch_emits_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """E-28: mask mismatch logs the dedicated warning."""
+        a = np.ma.array(["SAND", "SHALE"], mask=[False, True])
+        b = np.ma.array(["SAND", "SHALE"], mask=[True, False])
+        with caplog.at_level(logging.WARNING, logger="pylasdev.compare"):
+            assert compare_las_dicts({"x": a}, {"x": b}) is False
+        assert any("mask mismatch" in r.message for r in caplog.records), caplog.text
+
+    def test_structured_masked_vs_masked_never_raises(self) -> None:
+        """H-02: V-kind masked vs V-kind masked returns a verdict, never raises.
+
+        Pre-fix, equal masks reached ``~mask`` on a structured boolean
+        mask and raised ``TypeError: ufunc 'invert' not supported``.
+        Data differing only at a masked position still compares EQUAL
+        (mask contract); differing mask patterns are a structural
+        mismatch, not a crash."""
+        v0, v1, _w0, w1 = self._CASES["V"]
+        a = self._ma("V", v0, v1, [False, True])
+        b = self._ma("V", v0, w1, [False, True])
+        assert compare_las_dicts({"x": a}, {"x": b}) is True
+        c = self._ma("V", v0, v1, [True, False])
+        assert compare_las_dicts({"x": a}, {"x": c}) is False
+
+    def test_structured_masked_vs_plain_never_raises(self) -> None:
+        """H-02: V-kind masked vs plain returns a verdict, never raises.
+
+        Pre-fix, ``np.array_equal`` compared the structured mask against
+        a plain boolean zeros array and raised ``TypeError: Cannot
+        compare structured or void to non-void arrays``."""
+        v0, v1, _w0, _w1 = self._CASES["V"]
+        a = self._ma("V", v0, v1, [False, True])
+        plain = np.array([v0, v1])
+        assert compare_las_dicts({"x": a}, {"x": plain}) is False
+        assert compare_las_dicts({"x": plain}, {"x": a}) is False
+
+    def test_structured_plain_vs_plain_never_raises(self) -> None:
+        """H-02: V-kind plain vs plain returns a verdict, never raises."""
+        v0, v1, _w0, w1 = self._CASES["V"]
+        same = np.array([v0, v1])
+        other = np.array([v0, w1])
+        assert compare_las_dicts({"x": same}, {"x": same}) is True
+        assert compare_las_dicts({"x": same}, {"x": other}) is False
+
+
+class TestZeroDimNumericTolerance:
+    """N-11: 0-d numeric ndarrays must use rtol/atol like 1-d arrays.
+
+    Pre-fix, Phase 1 coerced 0-d ndarrays to Python scalars before the
+    type dispatch, so 0-d-vs-0-d fell into exact scalar equality and
+    bypassed rtol/atol — 0-d 1.0 vs 1.0005 @ rtol=1e-3 was False while
+    [1.0] vs [1.0005] was True.  Both operands being 0-d now stay on
+    the array path, giving identical verdicts to the 1-d representation.
+    """
+
+    def test_0d_within_default_tolerance_matches_1d(self) -> None:
+        """0-d and 1-d both True at default tolerances for a tiny diff."""
+        d_0d = {"logs": {"DEPT": np.array(1.0)}}
+        d_1d = {"logs": {"DEPT": np.array([1.0])}}
+        o_0d = {"logs": {"DEPT": np.array(1.0 + 1e-9)}}
+        o_1d = {"logs": {"DEPT": np.array([1.0 + 1e-9])}}
+        assert compare_las_dicts(d_0d, o_0d) is True
+        assert compare_las_dicts(d_1d, o_1d) is True
+
+    def test_0d_beyond_default_tolerance_matches_1d(self) -> None:
+        """0-d and 1-d both False at default tolerances for a 0.05% diff."""
+        d_0d = {"logs": {"DEPT": np.array(1.0)}}
+        d_1d = {"logs": {"DEPT": np.array([1.0])}}
+        o_0d = {"logs": {"DEPT": np.array(1.0005)}}
+        o_1d = {"logs": {"DEPT": np.array([1.0005])}}
+        assert compare_las_dicts(d_0d, o_0d) is False
+        assert compare_las_dicts(d_1d, o_1d) is False
+        # Custom rtol widens both representations identically.
+        assert compare_las_dicts(d_0d, o_0d, rtol=1e-3) is True
+        assert compare_las_dicts(d_1d, o_1d, rtol=1e-3) is True
+
+    def test_0d_integer_arrays_stay_exact(self) -> None:
+        """N-11 guard: integer 0-d arrays keep exact comparison."""
+        assert compare_las_dicts({"x": np.array(5)}, {"x": np.array(5)}) is True
+        assert compare_las_dicts({"x": np.array(5)}, {"x": np.array(6)}) is False
+
+    def test_0d_masked_vs_masked_equal(self) -> None:
+        """N-11 guard: masked 0-d vs masked 0-d still equals (masked == masked)."""
+        assert (
+            compare_las_dicts(
+                {"x": np.ma.array(1.0, mask=True)}, {"x": np.ma.array(2.0, mask=True)}
+            )
+            is True
+        )
+
+    def test_0d_vs_scalar_still_exact(self) -> None:
+        """N-11 guard (F-42): 0-d vs plain scalar keeps the scalar path."""
+        assert compare_las_dicts({"x": np.array(42.0)}, {"x": 42.0}) is True
+        assert compare_las_dicts({"x": np.array(42.0)}, {"x": 42.5}) is False

@@ -54,7 +54,9 @@ def _curve_identity(curve: CurveDefinition, emitted_name: str | None = None) -> 
 
 
 def _definition_signature(
-    curve: CurveDefinition, emitted_name: str | None = None
+    curve: CurveDefinition,
+    emitted_name: str | None = None,
+    string_mnemonics: frozenset[str] | None = None,
 ) -> tuple[Any, ...]:
     """Full per-curve signature used to dedup per-section Definition blocks.
 
@@ -64,17 +66,31 @@ def _definition_signature(
     the previous signature omitted ``array_info.index`` so NMR[1]/NMR[2]
     collapsed to one Definition).
 
+    M-29: the signature ALSO includes the curve's string-ness in the
+    emitted scope (its mnemonic present in the section's string_data).
+    The pre-fix signature was string_data-blind: two sections with
+    identical curve definitions but DIFFERENT string placement (GR as
+    string in section 1, numeric in section 2) collapsed to ONE shared
+    Definition block whose ``{S}`` marker was decided by the FIRST
+    section's string keys — the second section's values were re-read as
+    the wrong type (nulls, and in the iter-3 variant a LASParseError
+    made the written file SELF-UNREADABLE with 0 write warnings).
+    String-ness is compared via the EMITTED name (``_mnem_key``),
+    matching the ``{S}``-marker decision in ``_format_curve_line``.
+
     W-10: ``emitted_name`` overrides the M-59 reconstruction (see
     ``_curve_identity``).
     """
+    _emitted = emitted_name if emitted_name is not None else _emitted_mnemonic(curve)
     return (
-        emitted_name if emitted_name is not None else _emitted_mnemonic(curve),
+        _emitted,
         curve.unit or "",
         curve.description or "",
         curve.data_format or "",
         curve.api_code or "",
         curve.array_info.index if curve.array_info is not None else None,
         curve.array_info.time_offset if curve.array_info is not None else None,
+        string_mnemonics is not None and _mnem_key(_emitted) in string_mnemonics,
     )
 
 
@@ -627,19 +643,24 @@ class _Las30Writer(_WriterBase):
     # ── Other section ────────────────────────────────────────────────
 
     def _write_other_section(self) -> list[str]:
-        """Write ~O Other section — LAS 3.0 skips (deprecated)."""
+        """Write ~O Other section — LAS 3.0 REFUSES (deprecated)."""
         lines: list[str] = []
         if not self._las_file.other or not self._las_file.other.strip():
             return lines
-        import warnings
-
-        warnings.warn(
-            "~Other section content was NOT written because LAS 3.0 "
-            "deprecates the ~Other section.  Other content should be "
-            "migrated to user-defined Parameter or Column Data sections.",
-            stacklevel=3,
+        # E-18: refuse loudly instead of warn+drop.  LAS 3.0 deprecates
+        # the ~Other section, so the content cannot be represented in the
+        # output — the pre-fix behavior silently(ish) discarded user
+        # content.  The parser side (fix-parser-A) now rejects ~O on LAS
+        # 3.0 files at read, so a parsed 3.0 model never carries `other`;
+        # but a DIRECTLY-constructed 3.0 model can still set it, and
+        # validate() only warns.  Refusing forces the user to migrate the
+        # content to user-defined Parameter or Column Data sections
+        # instead of discovering the loss on a later re-read.
+        raise LASWriteError(
+            "~Other content cannot be written to a LAS 3.0 file: the "
+            "~Other section is deprecated in LAS 3.0.  Migrate the "
+            "content to user-defined Parameter or Column Data sections."
         )
-        return lines
 
     # ── ASCII data sections ──────────────────────────────────────────
 
@@ -906,17 +927,23 @@ class _Las30Writer(_WriterBase):
                 if _mnem_key(_entry) in {_mnem_key(k) for k in (section.data or {})} or _mnem_key(
                     _entry
                 ) in {_mnem_key(k) for k in (section.string_data or {})}:
-                    _warnings_module.warn(
+                    # E-30: the ~C-side warning promises "The ASCII data
+                    # pass will refuse to write if this curve carries
+                    # data" (see _write_curve_section).  The pre-fix code
+                    # only warned here and DROPPED the data-bearing
+                    # column — the written file had more data columns
+                    # than curve definitions and re-read silently
+                    # relabeled the values onto another curve (W-11).
+                    # Refuse loudly, matching the legacy path's contract.
+                    raise LASWriteError(
                         f"Curve '{_entry}' appears in the curves_order of "
                         f"section {section.name!r} but has no definition "
                         f"in the top-level curves or the section's "
-                        f"section_curves.  The curve's DATA is dropped "
-                        f"from the output — it cannot be represented "
-                        f"without a definition, and re-read would "
-                        f"silently relabel its values onto another "
-                        f"curve.  Add a curve definition for '{_entry}' "
-                        f"or remove it from curves_order.",
-                        stacklevel=4,
+                        f"section_curves, AND carries data.  The writer "
+                        f"cannot represent this column — re-read would "
+                        f"silently relabel its values onto another curve. "
+                        f"Add a curve definition for '{_entry}' or remove "
+                        f"it from curves_order."
                     )
                 else:
                     _warnings_module.warn(
@@ -1051,13 +1078,42 @@ class _Las30Writer(_WriterBase):
                     _curve_identity(c, self._main_emitted_names.get(id(c)))
                     for c in self._main_curves
                 )
-                if _sec_identity != _main_identity:
-                    # N-I-20: distinct curve set/identity/order — emit a
-                    # per-section Definition and pipe to it.  The
-                    # hardcoded ``| CURVE`` re-scoped EVERY LOG_DATA
-                    # section to the global union on re-read, silently
-                    # relabeling columns (e.g. DT landing in GR) for
-                    # sections with their own scope.
+                # N-04: the main ~C block forces the {S} marker for ANY
+                # curve whose mnemonic is in the UNION of every scope's
+                # string_data keys (_all_string_mnemonics).  A section
+                # whose curve is NUMERIC in THIS section (data, not
+                # string_data) would inherit the union-forced {S} when it
+                # pipes ``| CURVE`` — the parser classifies a column by
+                # the marker ONLY, so the numeric values would be
+                # re-read as strings (null-filled on roundtrip).  The
+                # pipe decision must therefore compare the EMITTED
+                # marker-ness per curve: when the section's own string
+                # placement differs from the main block's forced marker,
+                # the section gets a per-section Definition whose
+                # marker matches ITS placement (section.string_data keys
+                # are passed to _format_curve_line at the Definition
+                # emission).
+                _sec_str_set = (
+                    frozenset(_mnem_key(k) for k in section.string_data.keys())
+                    if section.string_data
+                    else frozenset()
+                )
+                _main_str_set = self._all_string_mnemonics()
+                _sec_marker = tuple(
+                    _mnem_key(_emitted_by_id[id(c)]) in _sec_str_set for c in _sec_curves
+                )
+                _main_marker = tuple(
+                    _mnem_key(self._main_emitted_names.get(id(c), _emitted_mnemonic(c)))
+                    in _main_str_set
+                    for c in self._main_curves
+                )
+                if _sec_identity != _main_identity or _sec_marker != _main_marker:
+                    # N-I-20: distinct curve set/identity/order OR marker
+                    # placement — emit a per-section Definition and pipe
+                    # to it.  The hardcoded ``| CURVE`` re-scoped EVERY
+                    # LOG_DATA section to the global union on re-read,
+                    # silently relabeling columns (e.g. DT landing in GR)
+                    # for sections with their own scope.
                     def_prefix = "Log"
 
             # Emit per-section Definition section (dedup by curve signature).
@@ -1069,8 +1125,24 @@ class _Las30Writer(_WriterBase):
             if def_prefix:
                 sec_curves = _sec_curves
                 if sec_curves:
+                    # M-29: the Definition dedup signature must be
+                    # string-aware — pass the section's OWN string_data
+                    # keys so a section whose curve is string here does
+                    # not share a Definition with a section where the
+                    # same curve is numeric (the shared block's {S}
+                    # marker was decided by whichever section emitted
+                    # first, null-filling the other section's values and
+                    # — in the iter-3 variant — producing a
+                    # SELF-UNREADABLE file).
+                    _sec_str_sig = (
+                        frozenset(_mnem_key(k) for k in section.string_data.keys())
+                        if section.string_data
+                        else frozenset()
+                    )
                     sig = tuple(
-                        _definition_signature(curve, _emitted_by_id[id(curve)])
+                        _definition_signature(
+                            curve, _emitted_by_id[id(curve)], _sec_str_sig
+                        )
                         for curve in sec_curves
                     )
                     if def_prefix not in emitted_defs:
@@ -1115,6 +1187,34 @@ class _Las30Writer(_WriterBase):
             # W-11/W-12/I2-13: emit data rows aligned to the SAME
             # resolved+deduped curve set the pipe target declares — the
             # live curves_order entries in live order.
+            # E-44: a section with ZERO data rows is emitted header-only —
+            # the reader early-returns for empty data sections and the
+            # section's name/section_type/curves_order metadata is
+            # silently LOST on write→read.  Warn loudly at write time so
+            # the loss is visible (reader-side preservation is the
+            # fix-las30 facet).
+            _sec_has_rows = False
+            for _entry, _cd, _override in _emit_pairs:
+                _arr, _ = _lookup_data_array(
+                    _entry, section.data or {}, section.string_data or {}
+                )
+                if _arr is not None:
+                    if isinstance(_arr, np.ndarray) and _arr.ndim == 0:
+                        _sec_has_rows = True  # E-16: 0-d treated as 1 row
+                    elif len(_arr) > 0:
+                        _sec_has_rows = True
+                    if _sec_has_rows:
+                        break
+            if not _sec_has_rows:
+                _warnings_module.warn(
+                    f"Data section {section.name!r} (section_type "
+                    f"{sec_type!r}) has NO data rows — the section header "
+                    f"is emitted but on re-read the empty section is "
+                    f"dropped and its name/section_type/curves_order "
+                    f"metadata is lost.  Add data rows or remove the "
+                    f"section.",
+                    stacklevel=4,
+                )
             lines.extend(
                 _format_data_rows(
                     [_entry for _entry, _cd, _override in _emit_pairs],

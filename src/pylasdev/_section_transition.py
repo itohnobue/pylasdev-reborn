@@ -129,10 +129,24 @@ class _SectionTransitionHandler:
                 # DEPT/GR).  __MAIN_ALL__ accumulates the union; __MAIN__ keeps
                 # last-writer-wins for the BARE-~A fallback (F-S9-02: a bare
                 # data section scopes to the MOST RECENT plain ~C block).
+                # M-14: the union is a min/max over plain-~C ranges and is
+                # therefore only valid while those ranges are CONTIGUOUS.
+                # An interleaved _Definition/_Data block sits INSIDE the
+                # min..max span (curve indices are global file order), so
+                # merging across the gap would leak the definition curves
+                # into the "| CURVE" scope (silent data misattribution: the
+                # genuine log column nulled, its values stored under the
+                # _Definition name).  Only merge when the new plain-~C range
+                # is contiguous with the accumulated union; a plain-~C block
+                # after a _Definition is NOT part of the main scope (its
+                # columns degrade to a loud extra-column warning instead of
+                # silent misattribution).
                 _prev_all = p._state.definition_curve_ranges.get("__MAIN_ALL__")
-                if _prev_all is not None:
+                if _prev_all is not None and start <= _prev_all[1]:
                     _all_start = min(_prev_all[0], start)
                     _all_end = max(_prev_all[1], end)
+                elif _prev_all is not None:
+                    _all_start, _all_end = _prev_all
                 else:
                     _all_start, _all_end = start, end
                 p._state.definition_curve_ranges["__MAIN_ALL__"] = (_all_start, _all_end)
@@ -361,10 +375,15 @@ class _SectionTransitionHandler:
             # PARS-09: keep __MAIN__ last-writer-wins for the bare-~A
             # fallback, but accumulate __MAIN_ALL__ (union) for "| CURVE"
             # pipe resolution (see capture_current_state).
+            # M-14: only merge CONTIGUOUS plain-~C ranges (see
+            # capture_current_state) — never span an interleaved
+            # _Definition block's curves.
             _prev_all = p._state.definition_curve_ranges.get("__MAIN_ALL__")
-            if _prev_all is not None:
+            if _prev_all is not None and start <= _prev_all[1]:
                 _all_start = min(_prev_all[0], start)
                 _all_end = max(_prev_all[1], end)
+            elif _prev_all is not None:
+                _all_start, _all_end = _prev_all
             else:
                 _all_start, _all_end = start, end
             p._state.definition_curve_ranges["__MAIN_ALL__"] = (_all_start, _all_end)

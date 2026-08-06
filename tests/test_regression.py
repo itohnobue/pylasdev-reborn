@@ -19,12 +19,18 @@ import pytest
 
 from pylasdev import (
     read_dev_file,
+    read_dev_file_as_object,
     read_las_file,
     read_las_file_as_object,
     write_las_file,
 )
 from pylasdev._las30_data import _build_spec_form_array_info
 from pylasdev.compare import _compare_lists, compare_las_dicts
+from pylasdev.data_reader import (
+    _declared_mnemonic_set,
+    _deduplicate_curves,
+    _mnemonic_header_declared,
+)
 from pylasdev.encoding import read_with_encoding
 from pylasdev.exceptions import LASDataError, LASParseError
 from pylasdev.mnem_base import MNEM_BASE, build_mnemonic_lookup, resolve_mnemonic
@@ -4234,6 +4240,512 @@ class TestF11SpecFormTrailingSpaceRoundtrip:
 
 
 # ──────────────────────────────────────────────────────────────
+# E-01 (LAS 3.0, HIGH): restore_tilde over-restored '_~'→'~' on EVERY
+# token of every data row while the writer's M-85 '_~' escape fires only
+# for FIRST-column string values starting '~'+non-letter.  Genuine
+# '_~'-prefixed values in any column were silently corrupted.  Fix:
+# position/type-aware restore (first column only) + writer-predicate
+# check (only '_~'+non-letter restores; '_~'+letter is never writer
+# output).
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE01Las30TildeRestoreScoped:
+    """E-01: the '_~' restore must fire only where the writer could have
+    emitted the M-85 escape — first-column string values starting
+    '~'+non-letter.  Genuine '_~' values elsewhere survive verbatim."""
+
+    _CURVES = (
+        " DEPT.M       : DEPTH  {F}\n"
+        " TAG.         : TAG  {S}\n"
+    )
+
+    def _las30(self, tmp_path: Path, curves: str, data: str, name: str) -> Path:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA:\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n" + curves + "~A LOG | CURVE\n" + data
+        )
+        test_file = tmp_path / name
+        test_file.write_text(content, encoding="utf-8")
+        return test_file
+
+    def test_non_first_column_genuine_tilde_underscore_preserved(self, tmp_path: Path) -> None:
+        """A genuine '_~3D' in a NON-first column (the writer never
+        escapes it there) must survive — pre-fix it was read as '~3D'."""
+        test_file = self._las30(
+            tmp_path,
+            self._CURVES,
+            "1000,_~3D\n1001,~3D\n",
+            "e01_nonfirst.las",
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        assert las.string_data["TAG"].tolist() == ["_~3D", "~3D"], (
+            f"E-01: genuine '_~3D' in non-first column corrupted: "
+            f"{las.string_data['TAG'].tolist()!r}"
+        )
+
+    def test_first_column_genuine_tilde_underscore_preserved(self, tmp_path: Path) -> None:
+        """A first-column genuine '_~DEPT' — which the writer would NEVER
+        escape (M-85 fires only for '~'+non-letter; M-28 strips the tilde
+        of '~'+letter) — must survive.  Pre-fix: read as '~DEPT'."""
+        curves = (
+            " TAG.         : TAG  {S}\n"
+            " DEPT.M       : DEPTH  {F}\n"
+        )
+        test_file = self._las30(
+            tmp_path,
+            curves,
+            "_~DEPT,100\n_~3D,200\n",
+            "e01_firstcol.las",
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        assert las.string_data["TAG"].tolist() == ["_~DEPT", "~3D"], (
+            f"E-01: first-column genuine '_~' values corrupted: "
+            f"{las.string_data['TAG'].tolist()!r}"
+        )
+
+    def test_escape_collision_writer_roundtrip(self, tmp_path: Path) -> None:
+        """ESCAPE-COLLISION residual: a section holding BOTH a genuine
+        '~3D' (writer-escaped to '_~3D') and a genuine '_~3D' writes two
+        byte-identical '_~3D' rows.  The escaped value MUST roundtrip
+        ('~3D' → '_~3D' → '~3D'); the genuine '_~3D' is byte-identical
+        and falls in the documented irreducible trade (both restore) —
+        the corruption surface is limited to exactly the writer's escape
+        class instead of every token of every row."""
+        las = LASFile()
+        las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["TAG", "GR"]
+        las.curves = [
+            CurveDefinition(mnemonic="TAG", unit="", data_format="S", description="Tag"),
+            CurveDefinition(mnemonic="GR", unit="GAPI", data_format="F", description="Gamma"),
+        ]
+        las.string_data["TAG"] = np.array(["~3D", "_~3D", "plain"], dtype=object)
+        las.logs["GR"] = np.array([100.0, 200.0, 300.0])
+        out = tmp_path / "e01_collision.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(str(out), las)
+        written = out.read_text(encoding="utf-8")
+        # Both values emitted as identical '_~3D' rows (escape + verbatim).
+        assert written.count("_~3D") == 2, written
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            back = read_las_file_as_object(out)
+        # The writer-escaped '~3D' roundtrips; the byte-identical genuine
+        # '_~3D' restores to '~3D' — the documented irreducible trade.
+        assert back.string_data["TAG"].tolist() == ["~3D", "~3D", "plain"], (
+            back.string_data["TAG"].tolist()
+        )
+        np.testing.assert_allclose(back.logs["GR"], [100.0, 200.0, 300.0])
+
+
+# ──────────────────────────────────────────────────────────────
+# E-21 (LAS 3.0, MEDIUM): the wrapped-layout rejection message was
+# misleading — it claimed "WRAP=YES" and told users to "set WRAP to NO"
+# even when the file already declared WRAP=NO (detection is content-
+# based, declaration-independent).  R-5 keeps the DELIBERATE rejection
+# (no LAS 3.0 wrapped reader) but the message must reflect reality.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE21Las30FlowingRejectionMessage:
+    """E-21: a WRAP=NO-declared LAS 3.0 file with flowing layout (2+
+    depth steps per line) raises the content-detected wrapped-layout
+    rejection WITHOUT claiming the file declares WRAP=YES or instructing
+    "set WRAP to NO"."""
+
+    _FLOWING = (
+        "~VERSION INFORMATION\n"
+        " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+        " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+        " DLM.    SPACE :\n"
+        "~WELL INFORMATION\n"
+        " NULL.    -999.25 : NULL VALUE\n"
+        "~CURVE INFORMATION\n"
+        " DEPT.M   :  Depth {F}\n"
+        " GR.GAPI  :  Gamma {F}\n"
+        " RHOB.K/M3:  Density {F}\n"
+        "~A\n"
+        "1000.0 10.0 20.0 1001.0 11.0 21.0\n"
+        "1002.0 12.0 22.0 1003.0 13.0 23.0\n"
+    )
+
+    def test_wrap_no_flowing_message_is_declaration_independent(self, tmp_path: Path) -> None:
+        test_file = tmp_path / "e21_flowing_no.las"
+        test_file.write_text(self._FLOWING, encoding="utf-8")
+        with pytest.raises(LASParseError) as exc_info:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                read_las_file_as_object(test_file)
+        msg = str(exc_info.value)
+        # No misleading claim about the declared WRAP value, and no
+        # impossible instruction (the file ALREADY declares WRAP=NO).
+        assert "WRAP=YES" not in msg, msg
+        assert "set WRAP to NO" not in msg, msg
+        assert "not supported by pylasdev" in msg, msg
+
+    def test_wrap_yes_flowing_keeps_pinned_message(self, tmp_path: Path) -> None:
+        """Control: when the file DOES declare WRAP=YES the pinned
+        'WRAP=YES is not supported' phrasing is retained (locked by
+        tests/test_reader.py:4082)."""
+        test_file = tmp_path / "e21_flowing_yes.las"
+        test_file.write_text(self._FLOWING.replace(" WRAP.   NO", " WRAP.   YES"), encoding="utf-8")
+        with pytest.raises(LASParseError, match="WRAP=YES is not supported"):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                read_las_file_as_object(test_file)
+
+
+# ──────────────────────────────────────────────────────────────
+# M-21 (LAS 3.0, MEDIUM): the short-row warning gate keyed on the
+# DECLARED WRAP header while the LAS 1.2/2.0 twin keys on the
+# CONTENT-DETECTED wrap state — a declared-WRAP=YES file whose data is
+# actually non-wrapped silently null-filled short rows with ZERO
+# diagnostics.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM21Las30ShortRowGateOnActualWrap:
+    """M-21: declared WRAP=YES + actually-non-wrapped (uniform short
+    rows — H-02 column-mismatch class) must emit the short-row
+    diagnostic, matching the 1.2/2.0 twin."""
+
+    def test_declared_yes_actually_nonwrapped_short_row_warns(self, tmp_path: Path) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   YES  : WRAPPED\n"
+            " DLM.    SPACE:\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT .M   :  Depth\n"
+            " GR  .GAPI :  Gamma\n"
+            " RHOB.K/M3 :  Density\n"
+            "~A LOG | CURVE\n"
+            "1000.0 10.0\n"
+            "1001.0 12.0\n"
+            "1002.0 13.0\n"
+        )
+        test_file = tmp_path / "m21_declared_yes.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            las = read_las_file_as_object(test_file)
+        # Pre-fix: declared WRAP=YES suppressed the short-row count → the
+        # missing RHOB values were null-filled with ZERO diagnostics.
+        assert any("fewer values" in str(w.message) for w in rec), (
+            f"M-21: no short-row warning, got: {[str(w.message) for w in rec]}"
+        )
+        sec = las.data_sections[0]
+        np.testing.assert_allclose(sec.data["DEPT"], [1000.0, 1001.0, 1002.0])
+        np.testing.assert_allclose(sec.data["RHOB"], [-999.25, -999.25, -999.25])
+
+
+# ──────────────────────────────────────────────────────────────
+# M-06 (LAS 3.0, MEDIUM): NaN/Inf tokens in a >=2-element spec-form
+# group counted as "string evidence" → the channel misrouted to
+# duplicate STRING curves.  The probe now mirrors the fill loop's
+# NaN→null semantics: NaN/Inf are numeric-parseable.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM06Las30SpecFormNanNotStringEvidence:
+    """M-06: NaN/Inf tokens must not flip the spec-form numeric probe —
+    the fill loop null-fills them for numeric curves."""
+
+    def test_probe_accepts_nan_inf(self) -> None:
+        from pylasdev._las30_data import _spec_form_group_data_is_numeric
+
+        assert _spec_form_group_data_is_numeric(["1.0 nan inf"], " ", [0, 1, 2]) is True
+        assert _spec_form_group_data_is_numeric(["1.0 NaN -1e999"], " ", [0, 1, 2]) is True
+        assert _spec_form_group_data_is_numeric(["SAND nan"], " ", [0, 1]) is False
+
+    def test_spec_form_channel_with_nan_routes_numeric(self, tmp_path: Path) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA:\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       : DEPTH  {F}\n"
+            " NMR.ms       : NMR Echo Array {A:0}\n"
+            " NMR.ms       : NMR Echo Array {A:5}\n"
+            "~A LOG | CURVE\n"
+            "100,nan,11\n"
+            "101,12,13\n"
+        )
+        test_file = tmp_path / "m06_nan.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        # Pre-fix: the 'nan' token flipped the probe → duplicate STRING
+        # curves 'NMR'/'NMR_2'.  Post-fix: numeric array channel with the
+        # NaN cell null-filled.
+        assert "NMR[1]" in las.logs, list(las.logs.keys())
+        assert "NMR[1]" not in las.string_data, list(las.string_data.keys())
+        np.testing.assert_allclose(las.logs["NMR[1]"], [-999.25, 12.0])
+        np.testing.assert_allclose(las.logs["NMR[2]"], [11.0, 13.0])
+
+
+# ──────────────────────────────────────────────────────────────
+# E-22 (LAS 3.0, MEDIUM): a LONE '{A:0}' spec-form array element was
+# never synthesized (synthesis required >=2 members) → numeric values
+# misrouted to string_data and the '{A:0} {S}' marker doubled on write.
+# Single-element groups now synthesize when the member carries the
+# preserved '{A:N}' marker and the data is numeric.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE22Las30SingleElementSpecForm:
+    """E-22: lone spec-form array elements synthesize (index 1, marker
+    time_offset) instead of being misrouted to string_data."""
+
+    def test_lone_a0_channel_routes_numeric(self, tmp_path: Path) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA:\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       : DEPTH  {F}\n"
+            " NMR.ms       : NMR Echo Array {A:0}\n"
+            "~A LOG | CURVE\n"
+            "100,10\n"
+            "101,11\n"
+        )
+        test_file = tmp_path / "e22_lone_a0.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        nmr = next(c for c in las.curves if c.mnemonic == "NMR[1]")
+        assert nmr.array_info is not None
+        assert nmr.array_info.index == 1
+        assert nmr.array_info.time_offset == 0.0
+        assert nmr.description == "NMR Echo Array", nmr.description
+        assert "NMR[1]" in las.logs, list(las.logs.keys())
+        assert "NMR[1]" not in las.string_data, list(las.string_data.keys())
+        np.testing.assert_allclose(las.logs["NMR[1]"], [10.0, 11.0])
+        # Writer emits the marker exactly once — no '{A:0} {S}' doubling.
+        out = tmp_path / "e22_lone_a0_out.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(str(out), las)
+        written = out.read_text(encoding="utf-8")
+        assert written.count("{A:0}") == 1, written
+        assert "{A:0}  {A" not in written, written
+
+    def test_lone_markerless_a_curve_stays_string(self, tmp_path: Path) -> None:
+        """Control: a lone plain-{A} (marker stripped by the parser) or
+        marker-less A-format curve with string data stays a STRING curve
+        (test-pinned F-06 behavior — no synthesis without the preserved
+        '{A:N}' element marker)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA:\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       : DEPTH  {F}\n"
+            " LITH.        : Lithology {A}\n"
+            "~A LOG | CURVE\n"
+            "100,SAND\n"
+            "101,CLAY\n"
+        )
+        test_file = tmp_path / "e22_lone_plain_a.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        assert [c.mnemonic for c in las.curves] == ["DEPT", "LITH"], [
+            c.mnemonic for c in las.curves
+        ]
+        assert las.string_data["LITH"].tolist() == ["SAND", "CLAY"]
+
+
+# ──────────────────────────────────────────────────────────────
+# M-16 (LAS 3.0, MEDIUM): duplicate plain-mnemonic {A} groups with
+# numeric-looking data were SILENTLY reclassified to float array
+# channels — a data-type mutation on external files (string_data →
+# logs).  Offset-bearing '{A:N}' markers confirm genuine spec-form
+# channels; a marker-less conversion (plain '{A}' markers are stripped
+# by the parser) now warns loudly.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM16Las30MarkerlessConversionWarns:
+    """M-16: marker-less numeric-looking duplicate-A conversion must not
+    be silent; marker-bearing spec-form channels convert cleanly."""
+
+    def test_markerless_numeric_duplicate_warns_and_synthesizes(self, tmp_path: Path) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA:\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       : DEPTH  {F}\n"
+            " LITH.        : Lithology Code A {A}\n"
+            " LITH.        : Lithology Code A {A}\n"
+            "~A LOG | CURVE\n"
+            "100,1,2\n"
+            "101,3,4\n"
+        )
+        test_file = tmp_path / "m16_lith.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            las = read_las_file_as_object(test_file)
+        assert any("reclassified as a spec-form array channel" in str(w.message) for w in rec), (
+            f"M-16: markerless conversion silent: {[str(w.message) for w in rec]}"
+        )
+        # The conversion itself is test-pinned (F-06 numeric probe) — the
+        # fix makes it LOUD, not silent.
+        assert any(c.mnemonic == "LITH[1]" for c in las.curves)
+        assert "LITH[1]" in las.logs
+        assert "LITH[1]" not in las.string_data
+
+    def test_marker_bearing_spec_form_converts_without_warning(self, tmp_path: Path) -> None:
+        """Control: a genuine '{A:N}'-marked spec-form channel converts
+        with no M-16 warning (the preserved marker confirms it)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA:\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       : DEPTH  {F}\n"
+            " NMR.ms       : NMR Echo Array {A:0}\n"
+            " NMR.ms       : NMR Echo Array {A:5}\n"
+            "~A LOG | CURVE\n"
+            "100,10,11\n"
+            "101,12,13\n"
+        )
+        test_file = tmp_path / "m16_nmr.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            las = read_las_file_as_object(test_file)
+        assert not any("reclassified as a spec-form array channel" in str(w.message) for w in rec), (
+            f"M-16: marker-bearing channel warned: {[str(w.message) for w in rec]}"
+        )
+        assert "NMR[1]" in las.logs
+
+    def test_nonnumeric_duplicate_stays_string_no_warning(self, tmp_path: Path) -> None:
+        """Control: non-numeric data never converts and never warns."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA:\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       : DEPTH  {F}\n"
+            " LITH.        : Lithology Code A {A}\n"
+            " LITH.        : Lithology Code A {A}\n"
+            "~A LOG | CURVE\n"
+            "100,SAND,SHALE\n"
+            "101,CLAY,SLT\n"
+        )
+        test_file = tmp_path / "m16_lith_str.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            las = read_las_file_as_object(test_file)
+        assert not any("reclassified as a spec-form array channel" in str(w.message) for w in rec), (
+            f"M-16: string group warned: {[str(w.message) for w in rec]}"
+        )
+        assert [c.mnemonic for c in las.curves] == ["DEPT", "LITH", "LITH_2"], [
+            c.mnemonic for c in las.curves
+        ]
+        assert las.string_data["LITH"].tolist() == ["SAND", "CLAY"]
+        assert las.string_data["LITH_2"].tolist() == ["SHALE", "SLT"]
+
+
+# ──────────────────────────────────────────────────────────────
+# M-15 (LAS 3.0, MEDIUM): the 1-based index validation was skipped for
+# SINGLE-element array groups (`len(_elements) < 2: continue`) — a lone
+# 'NMR[0]' parsed silently.  Single-element groups now validate the
+# index (>= 1); per-section continuation elements (section 1 NMR[1],
+# section 2 NMR[2]) remain valid (M-64 lock).
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM15Las30SingleElementIndexValidation:
+    """M-15: single-element array groups must enforce the positive-index
+    rule (sibling of the models-side N-01 fix)."""
+
+    def test_lone_zero_index_array_raises(self, tmp_path: Path) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA:\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       : DEPTH  {F}\n"
+            " NMR[0].ms    : NMR Echo Array {A:5}\n"
+            "~A LOG | CURVE\n"
+            "100,10\n"
+            "101,11\n"
+        )
+        test_file = tmp_path / "m15_zero.las"
+        test_file.write_text(content, encoding="utf-8")
+        with pytest.raises(LASParseError, match="starts at index 0"):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                read_las_file_as_object(test_file)
+
+    def test_lone_index_one_array_parses(self, tmp_path: Path) -> None:
+        """Control: a lone '[1]' element is a valid single-element
+        array — parses normally."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA:\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M       : DEPTH  {F}\n"
+            " NMR[1].ms    : NMR Echo Array {A:5}\n"
+            "~A LOG | CURVE\n"
+            "100,10\n"
+            "101,11\n"
+        )
+        test_file = tmp_path / "m15_one.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        assert "NMR[1]" in las.logs
+
+
+# ──────────────────────────────────────────────────────────────
 # L30-02 (LAS 3.0, MEDIUM): DLM=COMMA + embedded comma in a {S}
 # string value truncates the string AND shifts the following columns,
 # silently losing genuine values as "extra columns".  csv.reader
@@ -4278,6 +4790,61 @@ class TestL3002CommaEmbeddedDelimiterWarning:
         # The non-corrupt second row's genuine GR value is preserved.
         sec = las.data_sections[0]
         np.testing.assert_allclose(sec.data["GR"], [-999.25, 20.0])
+
+
+# ──────────────────────────────────────────────────────────────
+# M-05 (LAS 3.0, MEDIUM): DLM=COMMA grouped-thousands values were split
+# by the inline comma split and NEVER recombined — "1,234.5" silently
+# mis-assigned every subsequent column with ZERO diagnostics, while the
+# LAS 1.2/2.0 path recombined with a loud warning (M-30).  The 3.0 fill
+# loop now routes the non-space split through the shared _split_data_line
+# (expected=curve_count) so both paths deliver the same loud-warning
+# parity.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM05Las30CommaGroupedThousands:
+    """M-05: LAS 3.0 DLM=COMMA files with comma-grouped thousands must
+    recombine with a loud warning (parity with LAS 1.2/2.0 M-30) — never a
+    silent column mis-assignment."""
+
+    def test_equal_token_count_recombined_with_warning(self, tmp_path: Path) -> None:
+        """Equal-token-count case: 3 tokens == 3 curves with a
+        comma-grouped DEPT.  Pre-fix: DEPT=[1.0,5.0], GR=[234.5,60.0],
+        RHOB=[50.0,0.2] with ZERO warnings.  Post-fix: recombined with a
+        loud warning → DEPT=[1234.5,5.0], GR=[50.0,60.0], RHOB null-filled
+        (short row)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA:\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT .M   :  Depth\n"
+            " GR  .GAPI :  Gamma {F}\n"
+            " RHOB.K/M3 :  Density\n"
+            "~ASCII\n"
+            "1,234.5,50\n"
+            "5,60,0.2\n"
+        )
+        test_file = tmp_path / "m05_30_comma.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            las = read_las_file_as_object(test_file)
+        thousands_msgs = [
+            str(w.message) for w in caught if "thousands separator" in str(w.message)
+        ]
+        assert thousands_msgs, (
+            f"M-05: no thousands-separator recombination warning on LAS 3.0: "
+            f"{[str(w.message) for w in caught]}"
+        )
+        sec = las.data_sections[0]
+        np.testing.assert_allclose(sec.data["DEPT"], [1234.5, 5.0])
+        np.testing.assert_allclose(sec.data["GR"], [50.0, 60.0])
+        np.testing.assert_allclose(sec.data["RHOB"], [-999.25, 0.2])
 
 
 # ──────────────────────────────────────────────────────────────
@@ -6152,3 +6719,1320 @@ class TestM10WellNoPeriodRoundtrip:
         assert las.well["LOC"] == "ACME:OIL", (
             f"L24 (deferred): colon-in-value corrupted: {las.well.get('LOC')!r}"
         )
+
+
+# ──────────────────────────────────────────────────────────────
+# E-33 (dev_reader, MEDIUM): thousands summary warning text was
+# factually wrong for decimal/exponent variants.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE33ThousandsWarningTextAccurate:
+    """E-33: the non-semicolon thousands summary warning claimed the
+    values "were not converted and may be NaN" — false for the
+    decimal/exponent variants ("1,234.5", "1,234E3") which F-06 ALWAYS
+    converts (comma-stripped).  Only the ambiguous bare form ("1,234")
+    stays unconverted → NaN.  The message now states both behaviors
+    accurately; conversion VALUES are unchanged (pinned by
+    TestF06ThousandsDecimalConversion).  FAILS on pre-fix code (message
+    claims "were not converted"), PASSES on post-fix code."""
+
+    def test_decimal_thousands_warning_text_is_accurate(self, tmp_path: Path) -> None:
+        content = "1,234.5 5,678.9\n9,000.5 10,456.7\n"
+        test_file = tmp_path / "e33_decimal.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        # Values still convert (F-06 pinned behavior).
+        np.testing.assert_array_equal(data["col_0"], [1234.5, 9000.5])
+        thousands_warnings = [str(x.message) for x in w if "thousands" in str(x.message)]
+        assert len(thousands_warnings) >= 1
+        # E-33: the message must not claim the values were not converted.
+        assert all("were not converted" not in m for m in thousands_warnings), (
+            f"Decimal thousands are converted; message must not deny it: "
+            f"{thousands_warnings}"
+        )
+        # And must state the converted reading explicitly.
+        assert any("commas stripped" in m for m in thousands_warnings), (
+            f"Message must state decimal thousands are comma-stripped: "
+            f"{thousands_warnings}"
+        )
+
+    def test_bare_thousands_warning_mentions_nan(self, tmp_path: Path) -> None:
+        """Bare "1,234" in space mode IS unconverted → NaN; the message
+        must still say so (M-25 policy, unchanged)."""
+        content = "1,234 5,678\n9,000 10,456\n"
+        test_file = tmp_path / "e33_bare.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+
+        assert all(np.isnan(v) for v in data["col_0"])
+        thousands_warnings = [str(x.message) for x in w if "thousands" in str(x.message)]
+        assert len(thousands_warnings) >= 1
+        assert any("not converted and becomes NaN" in m for m in thousands_warnings), (
+            f"Bare thousands stay NaN; message must state it: {thousands_warnings}"
+        )
+
+
+# ──────────────────────────────────────────────────────────────
+# N-14 (models, MEDIUM): DevFile.from_dict ALSO double-warned.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestN14FromDictSingleValidationPass:
+    """N-14 (shared root with E-34): DevFile.from_dict ran
+    validate(complete=True) AND _validate_dev_data, double-warning every
+    overlapping issue (4 warnings for 2 distinct issues).  from_dict now
+    runs _validate_dev_data as the SINGLE data-quality pass.
+    FAILS on pre-fix code (2 warnings per issue), PASSES on post-fix code
+    (1 warning per issue)."""
+
+    def test_from_dict_warns_once_per_issue(self) -> None:
+        dev = DevFile(
+            columns={
+                "MD": np.array([100.0, 50.0]),
+                "AZI": np.array([450.0, 45.0]),
+                "INC": np.array([30.0, 30.0]),
+            },
+            column_order=["MD", "AZI", "INC"],
+            _from_dict=True,
+        )
+        d = dev.to_dict()
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            DevFile.from_dict(d)
+
+        mono = [x for x in w if "not monotonically increasing" in str(x.message)]
+        azi = [x for x in w if "Azimuth column" in str(x.message)]
+        assert len(mono) == 1, (
+            f"MD monotonicity must warn exactly once, got {len(mono)}: "
+            f"{[str(x.message) for x in w]}"
+        )
+        assert len(azi) == 1, (
+            f"AZI range must warn exactly once, got {len(azi)}: "
+            f"{[str(x.message) for x in w]}"
+        )
+
+    def test_from_dict_nan_inf_warning_survives(self) -> None:
+        """M-25 coordination: the NaN/Inf check must survive the from_dict
+        dedup (it now lives in _validate_dev_data)."""
+        dev = DevFile(
+            columns={
+                "MD": np.array([100.0, np.nan]),
+                "AZIM": np.array([10.0, 20.0]),
+            },
+            column_order=["MD", "AZIM"],
+            _from_dict=True,
+        )
+        d = dev.to_dict()
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            DevFile.from_dict(d)
+
+        non_finite = [x for x in w if "non-finite values" in str(x.message)]
+        assert len(non_finite) == 1, (
+            f"NaN/Inf warning must fire exactly once, got {len(non_finite)}: "
+            f"{[str(x.message) for x in w]}"
+        )
+
+
+# ──────────────────────────────────────────────────────────────
+# M-01 (MEDIUM, CONFIRMED): `_designed_nan` was never set on the DEV
+# read path — the read-path _validate_dev_data NaN block warned
+# "column 'X' contains non-finite values (NaN/Inf)" as CORRUPTION on
+# every reader-designed NaN (short-row fills, sentinel fills).  The
+# reader now marks its DevFile with ``_designed_nan=True`` and the
+# NaN half of the non-finite check is gated on the marker (Inf is
+# always flagged).  Genuine non-finite user data (marker unset, e.g.
+# direct construction or DevFile.from_dict) still warns.
+# FAILS on pre-fix code (false positive fired), PASSES on post-fix code.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM01DesignedNanReadPathSuppression:
+    """M-01: reader-designed NaN must not fire the false "non-finite"
+    corruption warning on the DEV read path."""
+
+    def test_short_row_fill_no_false_warning(self, tmp_path: Path) -> None:
+        """A short data row (fewer values than declared columns) is filled
+        with the reader's designed NaN — no non-finite corruption warning."""
+        content = (
+            "MD,TVD,X,Y\n"
+            "100.0,100.0,10.0,20.0\n"
+            "200.0,200.0,30.0\n"
+        )
+        test_file = tmp_path / "m01_short_row.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            dev = read_dev_file_as_object(test_file)
+
+        non_finite = [x for x in w if "non-finite values" in str(x.message)]
+        assert len(non_finite) == 0, (
+            f"Short-row designed NaN must not fire the corruption warning, "
+            f"got {len(non_finite)}: {[str(x.message) for x in w]}"
+        )
+        assert np.isnan(dev.columns["Y"][1])
+
+    def test_sentinel_fill_no_false_warning(self, tmp_path: Path) -> None:
+        """Text (``na``) and numeric (``-999.25``) sentinels map to the
+        reader's designed NaN — no non-finite corruption warning."""
+        content = (
+            "MD,TVD,AZIM,INC\n"
+            "100.0,-999.25,45.0,30.0\n"
+            "200.0,na,45.0,30.0\n"
+            "300.0,300.0,45.0,30.0\n"
+        )
+        test_file = tmp_path / "m01_sentinel.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            dev = read_dev_file_as_object(test_file)
+
+        non_finite = [x for x in w if "non-finite values" in str(x.message)]
+        assert len(non_finite) == 0, (
+            f"Sentinel designed NaN must not fire the corruption warning, "
+            f"got {len(non_finite)}: {[str(x.message) for x in w]}"
+        )
+        assert np.isnan(dev.columns["TVD"][0])
+        assert np.isnan(dev.columns["TVD"][1])
+
+    def test_read_devfile_validate_clean_with_designed_nan(self, tmp_path: Path) -> None:
+        """The DevFile the reader returns carries ``_designed_nan=True``:
+        validate(complete=True) on it reports no non-finite issue."""
+        content = "MD,AZIM\n100.0,10.0\nnan,20.0\n200.0,30.0\n"
+        test_file = tmp_path / "m01_read_validate.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        dev = read_dev_file_as_object(test_file)
+        assert dev._designed_nan is True
+        issues = dev.validate(complete=True)
+        assert not any("non-finite" in i for i in issues), issues
+
+    def test_direct_corrupt_devfile_still_warns(self) -> None:
+        """M-01 control: genuinely corrupt non-finite USER data (DevFile
+        constructed directly, marker unset) still fires the warning."""
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile(
+            columns={"MD": np.array([0.0, np.nan])},
+            column_order=["MD"],
+            _from_dict=True,
+        )
+        assert dev._designed_nan is False
+        with pytest.warns(UserWarning, match="non-finite values"):
+            _validate_dev_data(dev)
+
+    def test_inf_always_warns_even_designed(self) -> None:
+        """M-01: Inf is never a designed sentinel (the reader collapses all
+        non-finite conversions to NaN), so it is flagged even when the
+        marker is set."""
+        from pylasdev.dev_reader import _validate_dev_data
+
+        dev = DevFile(
+            columns={"MD": np.array([0.0, np.inf])},
+            column_order=["MD"],
+            _from_dict=True,
+            _designed_nan=True,
+        )
+        with pytest.warns(UserWarning, match="non-finite values"):
+            _validate_dev_data(dev)
+
+
+# ──────────────────────────────────────────────────────────────
+# M-06 (MEDIUM, CONFIRMED): the top-level E-10 re-check in
+# LASFile.validate(complete=True) passed no data_formats, so a
+# post-construction top-level data_format mutation to mixed codes
+# passed validate() with [] and the writer emitted a file the
+# library's own reader rejects ("Inconsistent data_format") with
+# zero warnings.  validate() now passes the top-level curve
+# data_formats (mirroring construction-time __post_init__).
+# FAILS on pre-fix code (validate == []), PASSES on post-fix code.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM06TopLevelDataFormatMutation:
+    """M-06: validate(complete=True) flags a post-construction top-level
+    data_format mutation to mixed codes."""
+
+    @staticmethod
+    def _las() -> LASFile:
+        return LASFile(
+            version=VersionSection(vers="3.0"),
+            curves_order=["DEPT", "NMR[1]", "NMR[2]", "GR"],
+            curves=[
+                CurveDefinition(mnemonic="DEPT", data_format="F"),
+                CurveDefinition(mnemonic="NMR[1]", data_format="F"),
+                CurveDefinition(mnemonic="NMR[2]", data_format="F"),
+                CurveDefinition(mnemonic="GR", data_format="F"),
+            ],
+            logs={
+                m: np.array([1.0, 2.0]) for m in ["DEPT", "NMR[1]", "NMR[2]", "GR"]
+            },
+        )
+
+    def test_top_level_mixed_format_mutation_flagged(self) -> None:
+        """Mutating one channel of a top-level array to a different
+        data_format (NMR[2] F→I, NMR[1] stays F) must be flagged by
+        validate(complete=True) — pre-fix validate() returned [] and the
+        writer emitted a self-unreadable file with zero warnings."""
+        las = self._las()
+        assert las.validate(complete=True) == []
+
+        las.curves[2].data_format = "I"
+        issues = las.validate(complete=True)
+        assert any("inconsistent data_format" in i and "NMR" in i for i in issues), issues
+
+    def test_uniform_format_mutation_stays_clean(self) -> None:
+        """M-06 control: mutating BOTH channels to the same format keeps
+        validate(complete=True) clean — only MIXED formats are the
+        reader-rejected state."""
+        las = self._las()
+        las.curves[1].data_format = "E"  # NMR[1]
+        las.curves[2].data_format = "E"  # NMR[2]
+        assert las.validate(complete=True) == []
+
+
+# ──────────────────────────────────────────────────────────────
+# E-17 + E-43 (parser, MEDIUM, CONFIRMED — regressing function
+# `_pre_scan`, fix-audit-prescan): the pre-scan estimate must equal the
+# reader's actual data-line consumption on every historical divergence
+# trigger — no spurious "Pre-scan overcount" warning, no G-04 growth on
+# valid files.  The phase-2 finalize re-uses the reader's own primitives
+# (shared dedup-aware declared-set builder + _detect_string_curves +
+# is_mnemonic_header_row), so these fixtures can never diverge again.
+# FAILS on pre-fix code, PASSES on post-fix code.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE17E43PreScanReaderParity:
+    """E-17/E-43 parity lock: ``parser.data_line_count`` equals the
+    reader's consumption for every divergence trigger.  Pre-fix behavior
+    per trigger: multi-marker ``{S}..{I}`` → spurious overcount; plain
+    ``{A:5}`` single curve → silent undercount (all-string mismatch);
+    ``NMR[1]`` bracket strip → overcount; raw ``GR GR`` + ``GR_2`` header
+    → overcount; F-22 cross-base ``DEPT_2_2`` → overcount;
+    ``~LOG_DEFINITION`` on 1.2/2.0 → overcount."""
+
+    @staticmethod
+    def _head() -> str:
+        return (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+        )
+
+    def _assert_parity(self, tmp_path: Path, name: str, content: str, expected: int) -> None:
+        parser = LASParser()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            parser.parse(content)
+        assert parser.data_line_count == expected, (
+            f"{name}: pre-scan counted {parser.data_line_count} data lines, "
+            f"expected {expected} (reader consumption)"
+        )
+        test_file = tmp_path / f"{name}.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            read_las_file_as_object(test_file)
+        overcount = [w for w in caught if "Pre-scan overcount" in str(w.message)]
+        assert not overcount, (
+            f"{name}: spurious pre-scan overcount: {[str(w.message) for w in overcount]}"
+        )
+
+    def test_multi_marker_s_i_description_no_overcount(self, tmp_path: Path) -> None:
+        """E-17 (iter-3 trigger): a multi-marker description '{S}..{I}' on a
+        SINGLE curve.  The reader uses the TRAILING marker ({I} → numeric);
+        the old pre-scan used FIRST-match ({S} → all_string=True), so the
+        standalone 'DEPT' header was counted as data → spurious overcount."""
+        content = (
+            self._head()
+            + " DEPT.M : Depth {S} ray {I}\n"
+            "~A\n"
+            "DEPT\n"
+            "1000.0\n"
+            "1001.0\n"
+        )
+        self._assert_parity(tmp_path, "e17_multi_marker", content, expected=2)
+
+    def test_plain_a_offset_single_curve_is_all_string(self, tmp_path: Path) -> None:
+        """E-17 ({A:N} trigger): a PLAIN '{A:5}' single curve classifies as
+        STRING on the reader side (data_format='A' with no bracket mnemonic
+        keeps array_info=None), so 'LITH' IS data (all-string exclusion).
+        The old pre-scan's `not _off` truthiness missed {A:5} and skipped
+        the header → silent undercount + G-04 growth."""
+        content = (
+            self._head()
+            + " LITH. : Lithology {A:5}\n"
+            "~A\n"
+            "LITH\n"
+            "SAND\n"
+            "CLAY\n"
+        )
+        self._assert_parity(tmp_path, "e17_plain_a5", content, expected=3)
+
+    def test_bracketed_array_mnemonic_header_no_overcount(self, tmp_path: Path) -> None:
+        """E-43 (bracket axis): header tokens 'DEPT NMR[1] NMR[2]' are all
+        declared curves on the reader side (curves_order keeps brackets).
+        The old pre-scan stripped brackets ('NMR[1]'→'NMR') so its match
+        set could never contain 'NMR[1]' → header counted → overcount."""
+        content = (
+            self._head()
+            + " DEPT.M : Depth\n"
+            " NMR[1]. : NMR {A:1}\n"
+            " NMR[2]. : NMR {A:2}\n"
+            "~A\n"
+            "DEPT NMR[1] NMR[2]\n"
+            "1000.0 10.0 20.0\n"
+            "1001.0 11.0 21.0\n"
+        )
+        self._assert_parity(tmp_path, "e43_bracket", content, expected=2)
+
+    def test_raw_duplicate_curves_gr_2_header_no_overcount(self, tmp_path: Path) -> None:
+        """E-43 (dedup axis): the ~C block declares GR twice; the reader
+        renames the second to GR_2 BEFORE building its declared set, so the
+        'DEPT GR GR_2' header IS skipped.  The old pre-scan built its match
+        set from raw pre-dedup names (never GR_2) → header counted →
+        overcount."""
+        content = (
+            self._head()
+            + " DEPT.M : Depth\n"
+            " GR.GAPI : Gamma\n"
+            " GR.API : Gamma2\n"
+            "~A\n"
+            "DEPT GR GR_2\n"
+            "1000.0 10.0 20.0\n"
+            "1001.0 11.0 21.0\n"
+        )
+        self._assert_parity(tmp_path, "e43_dedup", content, expected=2)
+
+    def test_f22_cross_base_collision_header_no_overcount(self, tmp_path: Path) -> None:
+        """E-43 (F-22 axis): 'DEPT DEPT DEPT_2' dedups to
+        'DEPT DEPT_2 DEPT_2_2'; the header uses the post-dedup names.
+        The old pre-scan's set ({DEPT, DEPT_2}) lacked DEPT_2_2 → counted
+        → overcount."""
+        content = (
+            self._head()
+            + " DEPT.M : Depth\n"
+            " DEPT.M : Depth2\n"
+            " DEPT_2.M : Depth3\n"
+            "~A\n"
+            "DEPT DEPT_2 DEPT_2_2\n"
+            "1000.0 10.0 20.0\n"
+            "1001.0 11.0 21.0\n"
+        )
+        self._assert_parity(tmp_path, "e43_f22_crossbase", content, expected=2)
+
+    def test_definition_section_curves_in_declared_set(self, tmp_path: Path) -> None:
+        """E-17 (_DEFINITION axis): a ~LOG_DEFINITION section declares
+        DEPT/GR (the parser routes _DEFINITION to the curve handler and
+        the reader's declared set includes them), but the old pre-scan
+        only entered curve mode for {'C','CURVE'} → its set was empty →
+        the 'DEPT GR' header was counted → overcount.
+
+        N-08 (fix-parser-C): the _DEFINITION dispatch is now gated on
+        is_las30 — on a KNOWN non-3.0 file ~{Name}_DEFINITION is a
+        customer section (other_lines) and must NOT inject curves.  This
+        parity fixture therefore uses a LAS 3.0 file, where _DEFINITION
+        legitimately declares curves and the pre-scan/reader lock still
+        applies."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE :\n"
+            "~WELL INFORMATION\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~LOG_DEFINITION\n"
+            " DEPT.M : Depth\n"
+            " GR.GAPI : Gamma\n"
+            "~A\n"
+            "DEPT GR\n"
+            "1000.0 10.0\n"
+            "1001.0 11.0\n"
+        )
+        self._assert_parity(tmp_path, "e17_definition", content, expected=2)
+
+    def test_shared_declared_set_pre_dedup_equals_reader_post_dedup(self) -> None:
+        """Unit-level lock (fix-audit-prescan §b.4): the phase-2 finalize's
+        declared set — built on PRE-dedup state via _declared_mnemonic_set —
+        must equal _mnemonic_header_declared on the reader's POST-dedup
+        model.  One code path, one algorithm, deterministic on the same
+        declaration order."""
+        names = ["DEPT", "GR", "GR", "GR_2"]  # raw dup + F-22 collision input
+        declared_phase2 = _declared_mnemonic_set(names, ["", "", "", ""])
+        las = LASFile()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las.curves_order = list(names)
+            for n in names:
+                las.curves.append(CurveDefinition(mnemonic=n))
+            _deduplicate_curves(las)
+        declared_reader = _mnemonic_header_declared(las)
+        assert declared_phase2 == declared_reader, (
+            f"phase-2 declared set {sorted(declared_phase2)} != "
+            f"reader post-dedup set {sorted(declared_reader)}"
+        )
+        assert "GR_2" in declared_phase2 and "GR_2_2" in declared_phase2, (
+            f"post-dedup names missing from phase-2 declared set: "
+            f"{sorted(declared_phase2)}"
+        )
+
+
+# ──────────────────────────────────────────────────────────────
+# E-18 (parser, MEDIUM, CONFIRMED): the LAS 3.0 ~Other rejection was
+# version-ORDER-dependent — ~O BEFORE ~V was silently accepted (is_las30
+# still False at the default 2.0), its content landed in `other`, and the
+# LAS 3.0 writer DROPPED it on write (read-OK → write-drops asymmetry).
+# parse() now re-checks once the version is final (keyed on the recorded
+# section type "O") and raises LASParseError mirroring the in-section
+# rejection.  FAILS on pre-fix code (parse succeeds), PASSES on post-fix.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE18OtherOrderIndependentLas30Rejection:
+    """E-18: an ~Other section in a LAS 3.0 file raises LASParseError
+    regardless of whether ~O appears before or after ~V; LAS 1.2/2.0 keeps
+    accepting ~O in any position; ~-noise lines (~., ~#) routed to `other`
+    without an ~O section must NOT raise."""
+
+    _V3_BODY = (
+        "~VERSION INFORMATION\n"
+        " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+        " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+        "~WELL INFORMATION\n"
+        " NULL.   -999.25 : NULL VALUE\n"
+        "~CURVE INFORMATION\n"
+        " DEPT.M   : DEPTH\n"
+        "~A\n"
+        "1000.0\n"
+    )
+
+    def test_other_before_version_raises(self) -> None:
+        """~O before ~V in a LAS 3.0 file: pre-fix silently accepted (is_las30
+        still False at the default 2.0), content landed in `other`, then the
+        3.0 writer dropped it — read-OK → write-drops asymmetry.  Post-fix
+        the version-final re-check raises."""
+        content = "~OTHER\nfree text\n" + self._V3_BODY
+        with pytest.raises(LASParseError, match="~Other"):
+            LASParser().parse(content)
+
+    def test_other_before_version_raises_on_read_path(self, tmp_path: Path) -> None:
+        """The full read path (read_las_file_as_object) surfaces the same
+        rejection — the parser-side re-check must be version-order-independent
+        for library consumers too."""
+        content = "~OTHER\nfree text\n" + self._V3_BODY
+        test_file = tmp_path / "e18_other_before_v.las"
+        test_file.write_text(content, encoding="utf-8")
+        with pytest.raises(LASParseError, match="~Other"):
+            read_las_file_as_object(test_file)
+
+    def test_other_after_version_still_raises(self) -> None:
+        """Control: ~O AFTER ~V on LAS 3.0 was already rejected in-section —
+        the post-parse re-check must not change that behavior."""
+        content = self._V3_BODY + "~OTHER\nmore text\n"
+        with pytest.raises(LASParseError, match="~Other"):
+            LASParser().parse(content)
+
+    def test_other_before_version_las20_accepted(self) -> None:
+        """Control: LAS 1.2/2.0 allows ~Other — an ~O section before ~V must
+        still parse (the E-18 rejection is LAS 3.0-only)."""
+        content = (
+            "~OTHER\nfree text\n"
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        assert "free text" in las.other
+
+    def test_tilde_noise_lines_las30_not_rejected(self) -> None:
+        """Control: ~-prefixed non-section lines (~., ~#) are routed to
+        `other` by F-83 WITHOUT an ~O section — the re-check keys on the
+        recorded section type "O", so these must NOT raise on LAS 3.0."""
+        content = self._V3_BODY.replace("~A\n", "~A\n~.\n~#\n")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        assert las.other == "~.\n~#\n"
+
+
+# ──────────────────────────────────────────────────────────────
+# E-38 (parser, MEDIUM, CONFIRMED): parse() routed LASFile.validate
+# (complete=True) + _ParserState.validate() data-integrity issues
+# EXCLUSIVELY to logger.warning — zero warnings-API visibility.
+# parse() now ALSO emits warnings.warn (L-01 convention) for every issue.
+# FAILS on pre-fix code (catch_warnings sees nothing), PASSES on post-fix.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE38ParseValidationIssuesWarningsApi:
+    """E-38: data-integrity issues found by parse() must be visible through
+    the warnings API (catch_warnings / warnings-as-errors suites), not just
+    the logging API."""
+
+    def test_validate_complete_issue_emitted_via_warnings(self) -> None:
+        """STEP=0 is a validate(complete=True) issue — pre-fix it was
+        logger-only; post-fix a 'LASFile validation issue' UserWarning is
+        emitted."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   1000.0 : START DEPTH\n"
+            " STOP.M   1002.0 : STOP DEPTH\n"
+            " STEP.M   0.0    : STEP\n"
+            " NULL.   -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   : DEPTH\n"
+            "~A DEPT\n"
+            "1000.0\n"
+            "1001.0\n"
+        )
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            LASParser().parse(content)
+        issues = [str(w.message) for w in rec if "LASFile validation issue" in str(w.message)]
+        assert any("STEP is zero" in m for m in issues), (
+            f"STEP=0 validate issue not visible via warnings API: {issues}"
+        )
+
+
+# ──────────────────────────────────────────────────────────────
+# H-01 (parser, WEAKENED HIGH→MEDIUM, CONFIRMED regression facet):
+# the N-09 curve-side brace unescape ran ONLY inside
+# ``if format_matches:`` — brace descriptions that produce no format
+# match (digit-led "2{3}4", unbalanced "Depth {" on 3.0; non-{I,S,A}
+# brace text on 1.2/2.0 where the M-35 filter empties the match list)
+# kept the writer's ``\{`` escapes → silent backslash corruption that
+# accumulated on every write→read roundtrip (HEAD roundtripped EXACT).
+# The unescape now runs unconditionally on the curve path, mirroring
+# the parameter path.  FAILS on pre-fix code, PASSES on post-fix.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestH01CurveBraceUnescapeUnconditional:
+    """H-01: write→read roundtrip of brace descriptions that do NOT
+    produce a format match must be EXACT — the curve-side brace unescape
+    runs unconditionally (mirror of the parameter path), so the writer's
+    ``\\{`` escapes are always reversed."""
+
+    @staticmethod
+    def _roundtrip(
+        tmp_path: Path,
+        vers: str,
+        data_format: str,
+        description: str,
+        dlm: str = "COMMA",
+    ) -> tuple[str, str]:
+        las = LASFile(version=VersionSection(vers=vers, wrap="NO", dlm=dlm))
+        las.well["NULL"] = "-999.25"
+        las.curves_order = ["DEPT"]
+        las.curves.append(
+            CurveDefinition(
+                mnemonic="DEPT", unit="M", data_format=data_format, description=description
+            )
+        )
+        las.logs["DEPT"] = np.array([1000.0, 1001.0])
+        out = tmp_path / "h01_roundtrip.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(out, las)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            back = read_las_file_as_object(out)
+        cd = next(c for c in back.curves if c.mnemonic == "DEPT")
+        return cd.description, cd.data_format
+
+    def test_las30_digit_led_braces_roundtrip_exact(self, tmp_path: Path) -> None:
+        """3.0, data_format='' — "2{3}4" has NO format match (digit-led);
+        pre-fix the description came back as '2\\{3\\}4' (literal
+        backslashes, worsening per roundtrip); post-fix EXACT."""
+        desc, fmt = self._roundtrip(tmp_path, "3.0", "", "2{3}4")
+        assert desc == "2{3}4", f"H-01: digit-led braces corrupted: {desc!r}"
+        assert fmt == "", f"H-01: data_format fabricated: {fmt!r}"
+
+    def test_las30_unbalanced_brace_roundtrip_exact(self, tmp_path: Path) -> None:
+        """3.0 — "Depth {" has no closing brace, so no format match;
+        pre-fix 'Depth \\{' leaked literal backslashes; post-fix EXACT."""
+        desc, fmt = self._roundtrip(tmp_path, "3.0", "", "Depth {")
+        assert desc == "Depth {", f"H-01: unbalanced brace corrupted: {desc!r}"
+        assert fmt == "", f"H-01: data_format fabricated: {fmt!r}"
+
+    def test_las30_non_format_brace_text_roundtrip_exact(self, tmp_path: Path) -> None:
+        """3.0 — "Bulk {Density}" + real format F: the {Density} token is
+        user text and must survive; the trailing {F} is stripped; EXACT."""
+        desc, fmt = self._roundtrip(tmp_path, "3.0", "F", "Bulk {Density}")
+        assert desc == "Bulk {Density}", f"H-01: brace text corrupted: {desc!r}"
+        assert fmt == "F", f"H-01: data_format lost: {fmt!r}"
+
+    def test_las20_non_isa_brace_description_roundtrip_exact(self, tmp_path: Path) -> None:
+        """2.0 — the M-35 filter drops {Density} (non-{I,S,A}) from the
+        match list → format_matches empty → pre-fix the unescape never ran
+        and 'Bulk \\{Density\\}' survived; post-fix EXACT."""
+        desc, fmt = self._roundtrip(tmp_path, "2.0", "", "Bulk {Density}")
+        assert desc == "Bulk {Density}", f"H-01: 2.0 brace text corrupted: {desc!r}"
+        assert fmt == "", f"H-01: 2.0 data_format fabricated: {fmt!r}"
+
+    def test_las20_n09_mid_description_s_token_preserved(self, tmp_path: Path) -> None:
+        """N-09 target preserved on 2.0: 'Gamma {S} ray' roundtrips EXACT
+        and no data_format is fabricated from the mid-description token
+        (the M-35 filter empties the match list; pre-fix the escaped
+        '\\{S\\}' text survived)."""
+        desc, fmt = self._roundtrip(tmp_path, "2.0", "", "Gamma {S} ray")
+        assert desc == "Gamma {S} ray", f"H-01: N-09 text corrupted: {desc!r}"
+        assert fmt == "", f"H-01: 2.0 data_format fabricated: {fmt!r}"
+
+    def test_las30_n09_mid_description_s_token_roundtrip_exact(self, tmp_path: Path) -> None:
+        """N-09 target preserved on 3.0: 'Gamma {S} ray' with real
+        data_format 'S' roundtrips EXACT with the format intact."""
+        desc, fmt = self._roundtrip(tmp_path, "3.0", "S", "Gamma {S} ray")
+        assert desc == "Gamma {S} ray", f"H-01: N-09 text corrupted: {desc!r}"
+        assert fmt == "S", f"H-01: 3.0 data_format lost: {fmt!r}"
+
+
+# ──────────────────────────────────────────────────────────────
+# M-02 (parser, MEDIUM, CONFIRMED): _finalize_pre_scan subtracted only
+# the standalone mnemonic header row, never the optional units row the
+# reader also skips (data_reader.py:1056-1061) → spurious "Pre-scan
+# overcount" warning + data_line_count off-by-one on M-13-shaped files
+# (mnemonic header + units row).  The pre-scan now subtracts the units
+# row with the SAME is_units_header_row predicate the reader consumes
+# (shared M-13 contract).  FAILS on pre-fix code (overcount warning
+# fires), PASSES on post-fix.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM02PreScanUnitsRowSubtracted:
+    """M-02: a units row directly below the mnemonic header row is
+    skipped by the reader AND subtracted by the parser pre-scan — no
+    spurious 'Pre-scan overcount' warning, data_line_count matches the
+    reader's actual consumption."""
+
+    _CONTENT_TEMPLATE = (
+        "~VERSION INFORMATION\n"
+        " VERS.   {vers}  : CWLS LOG ASCII STANDARD\n"
+        " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+        "~WELL INFORMATION\n"
+        " NULL.    -999.25 : NULL VALUE\n"
+        "~CURVE INFORMATION\n"
+        " DEPT.M   :  Depth\n"
+        " GR.GAPI  :  Gamma\n"
+        "~A\n"
+        "DEPT GR\n"
+        "M GAPI\n"
+        "1000.0 50.0\n"
+        "1001.0 51.0\n"
+    )
+
+    def test_las20_no_pre_scan_overcount_on_m13_file(self, tmp_path: Path) -> None:
+        """End-to-end: the M-13 file parses with NO 'Pre-scan overcount'
+        warning and correct data (pre-fix: phase-1 counted 4 lines, the
+        header-only subtraction left 3, the reader consumed 2 → spurious
+        warning + F36 trim path)."""
+        content = self._CONTENT_TEMPLATE.format(vers="2.0")
+        test_file = tmp_path / "m02_units.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            data = read_las_file(test_file)
+        overcount = [w for w in caught if "Pre-scan overcount" in str(w.message)]
+        assert not overcount, (
+            f"M-02: spurious pre-scan overcount on M-13 file: "
+            f"{[str(w.message) for w in overcount]}"
+        )
+        np.testing.assert_allclose(data["logs"]["DEPT"], [1000.0, 1001.0])
+        np.testing.assert_allclose(data["logs"]["GR"], [50.0, 51.0])
+
+    def test_las20_data_line_count_matches_reader_consumption(self) -> None:
+        """Parser-level: phase-1 counts 4 non-comment lines; the header
+        AND the units row are subtracted → data_line_count == 2 (the
+        reader's actual consumption)."""
+        parser = LASParser()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            parser.parse(self._CONTENT_TEMPLATE.format(vers="2.0"))
+        assert parser.data_line_count == 2, (
+            f"M-02: pre-scan must subtract header + units row, "
+            f"data_line_count={parser.data_line_count}"
+        )
+
+    def test_las12_data_line_count_matches_reader_consumption(self) -> None:
+        """LAS 1.2 twin of the M-13 subtraction contract."""
+        parser = LASParser()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            parser.parse(self._CONTENT_TEMPLATE.format(vers="1.2"))
+        assert parser.data_line_count == 2, (
+            f"M-02: LAS 1.2 pre-scan must subtract header + units row, "
+            f"data_line_count={parser.data_line_count}"
+        )
+
+
+# ──────────────────────────────────────────────────────────────
+# M-04 (parser, MEDIUM, CONFIRMED): the LAS 3.0 accumulation skipped
+# the standalone mnemonic header row (M-40) but NOT a following units
+# row → phantom all-null first row + one-row shift (DEPT=
+# [-999.25, 1000, 1001]).  The accumulation now skips the units row on
+# the first data line only, gated on a mnemonic header row having just
+# been skipped — same is_units_header_row predicate and same gate as
+# the reader's M-13 skip (data_reader.py:1056-1061).  Also mirrored on
+# the deferred (pre-~V) replay path.  FAILS on pre-fix code, PASSES on
+# post-fix.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM04Las30HeaderUnitsAccumulation:
+    """M-04: a units row directly below the mnemonic header row inside a
+    LAS 3.0 data section is a header, not data — no phantom all-null
+    first row, no one-row shift."""
+
+    def test_las30_header_units_row_no_phantom_row(self, tmp_path: Path) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            "~LOG\n"
+            "DEPT GR\n"
+            "M GAPI\n"
+            "1000.0 50.0\n"
+            "1001.0 55.0\n"
+        )
+        test_file = tmp_path / "m04_units.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        sec = las.data_sections[0]
+        # Pre-fix: "M GAPI" consumed as the first data row →
+        # DEPT=[-999.25, 1000.0, 1001.0] (phantom all-null first row).
+        np.testing.assert_allclose(sec.data["DEPT"], [1000.0, 1001.0])
+        np.testing.assert_allclose(sec.data["GR"], [50.0, 55.0])
+
+    def test_las30_pre_v_deferred_header_units_row_no_phantom_row(
+        self, tmp_path: Path
+    ) -> None:
+        """Deferred (pre-~V) twin: the PARS-04 replay filter must apply
+        the same header + units skip — no phantom row on the deferred
+        path either."""
+        content = (
+            "~ASCII\n"
+            "DEPT,GR\n"
+            "M,GAPI\n"
+            "1000.0,50.0\n"
+            "1001.0,55.0\n"
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+        )
+        test_file = tmp_path / "m04_units_deferred.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        sec = las.data_sections[0]
+        np.testing.assert_allclose(sec.data["DEPT"], [1000.0, 1001.0])
+        np.testing.assert_allclose(sec.data["GR"], [50.0, 55.0])
+
+    def test_las30_letters_only_first_row_not_skipped_without_header(
+        self, tmp_path: Path
+    ) -> None:
+        """Control: without a preceding mnemonic header row, a first row
+        of letters-only tokens is DATA (all-string section), never a
+        units row — the units skip is gated on the header having been
+        skipped first (position gate), mirroring the reader."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " LITH.    :  Lithology {S}\n"
+            " FORM.    :  Formation {S}\n"
+            "~LOG\n"
+            "ACME SAND\n"
+            "SHALE GRN\n"
+        )
+        test_file = tmp_path / "m04_control.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        sec = las.data_sections[0]
+        # Both letters-only rows are genuine data rows: no mnemonic
+        # header row precedes them, so nothing may be skipped as units.
+        np.testing.assert_array_equal(
+            sec.string_data["LITH"], np.array(["ACME", "SHALE"], dtype=object)
+        )
+        np.testing.assert_array_equal(
+            sec.string_data["FORM"], np.array(["SAND", "GRN"], dtype=object)
+        )
+
+
+# ──────────────────────────────────────────────────────────────
+# M-04 fix3 (parser, MEDIUM, CONFIRMED — P1): the
+# _skipped_mnemonic_header units-row position gate leaked across
+# section transitions when the prior A section accumulated ZERO data
+# rows (skipped mnemonic header + optional units row only).  The next
+# section's genuine letters-only first data row was then silently
+# dropped (repro: DEPT=[2000.0, 2001.0] with 3 rows in the file —
+# "ACME SAND" lost).  The gate is now closed one-shot at the units row
+# AND at every section boundary (flush entry + A→unknown empty path),
+# so the flag never survives into a subsequent section (invariant at
+# parser.py:1202-1205).  FAILS on pre-fix code, PASSES on post-fix.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM04Fix3StaleHeaderFlagSectionTransition:
+    """fix3-P1: _skipped_mnemonic_header must not leak across section
+    transitions after an A section that accumulated no data rows — the
+    next section's letters-only first data row must be consumed."""
+
+    # LAS 3.0 template: the first ~LOG is header+units-only (ZERO data
+    # rows); the second ~LOG carries a letters-only first row followed
+    # by numeric rows scoped to the DEPT/GR curves from the initial ~C.
+    # Post-fix the letters-only row is consumed as data (null-filled
+    # DEPT/GR) → DEPT=[-999.25, 2000.0, 2001.0], 3 rows total.
+    @staticmethod
+    def _numeric_body(transition: str) -> str:
+        return (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE\n"
+            "~WELL INFORMATION\n"
+            " STRT.M   1000.0 : START DEPTH\n"
+            " STOP.M   2000.0 : STOP DEPTH\n"
+            " STEP.M   1.0    : STEP\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            "~LOG\n"
+            "DEPT GR\n"
+            "M GAPI\n"
+            + transition
+            + "~LOG\n"
+            "ACME SAND\n"
+            "2000.0 150.0\n"
+            "2001.0 155.0\n"
+        )
+
+    @staticmethod
+    def _assert_three_rows(las: Any) -> None:
+        sec = las.data_sections[1] if len(las.data_sections) > 1 else las.data_sections[0]
+        # Pre-fix: "ACME SAND" dropped by the stale units gate →
+        # DEPT=[2000.0, 2001.0] (2 rows).  Post-fix: consumed as data →
+        # null-filled first row, 3 rows.
+        np.testing.assert_allclose(sec.data["DEPT"], [-999.25, 2000.0, 2001.0])
+        np.testing.assert_allclose(sec.data["GR"], [-999.25, 150.0, 155.0])
+
+    def test_las30_a_to_unknown_empty_section_keeps_next_first_row(
+        self, tmp_path: Path
+    ) -> None:
+        """A→unknown with a header+units-only empty prior section: the
+        next section's letters-only first data row must be consumed."""
+        content = self._numeric_body("  ~CUSTOMSECT\ncustomer\n")
+        test_file = tmp_path / "m04fix3_a_unknown.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        self._assert_three_rows(las)
+
+    def test_las30_a_to_unknown_empty_header_only_section_keeps_next_first_row(
+        self, tmp_path: Path
+    ) -> None:
+        """A→unknown with a header-ONLY empty prior section (no units
+        row): the units-gate one-shot clear never fires, so the leak can
+        only be closed by the A→unknown boundary clear — the next
+        section's letters-only first data row must still be consumed."""
+        content = self._numeric_body("  ~CUSTOMSECT\ncustomer\n").replace(
+            "DEPT GR\nM GAPI\n", "DEPT GR\n"
+        )
+        test_file = tmp_path / "m04fix3_a_unknown_no_units.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        self._assert_three_rows(las)
+
+    def test_las30_a_to_a_consecutive_empty_section_keeps_next_first_row(
+        self, tmp_path: Path
+    ) -> None:
+        """A→A consecutive data sections with a header+units-only empty
+        first section: the second section's letters-only first data row
+        must be consumed (flush entry clear)."""
+        content = self._numeric_body("")
+        test_file = tmp_path / "m04fix3_a_a.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        self._assert_three_rows(las)
+
+    def test_las30_a_to_w_empty_section_keeps_next_first_row(self, tmp_path: Path) -> None:
+        """A→W (known non-data section) with a header+units-only empty
+        prior A section: the next A section's letters-only first data row
+        must be consumed (flush entry clear)."""
+        content = self._numeric_body(
+            "~WELL INFORMATION\n"
+            " STRT.M   1000.0 : START DEPTH\n"
+            " STOP.M   2000.0 : STOP DEPTH\n"
+            " STEP.M   1.0    : STEP\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+        )
+        test_file = tmp_path / "m04fix3_a_w.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        self._assert_three_rows(las)
+
+    def test_las30_a_to_c_empty_section_keeps_next_string_first_row(
+        self, tmp_path: Path
+    ) -> None:
+        """A→C (known section re-scoping curves) with a header+units-only
+        empty prior A section: the next A section's letters-only first
+        data row (string curves) must be consumed."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            "~LOG\n"
+            "DEPT GR\n"
+            "M GAPI\n"
+            "~CURVE INFORMATION\n"
+            " LITH.    :  Lithology {S}\n"
+            " FORM.    :  Formation {S}\n"
+            "~LOG\n"
+            "ACME SAND\n"
+            "SHALE GRN\n"
+        )
+        test_file = tmp_path / "m04fix3_a_c.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        sec = las.data_sections[-1]
+        # Pre-fix: "ACME SAND" dropped by the stale units gate →
+        # LITH=["SHALE"] only.  Post-fix: both rows consumed.
+        np.testing.assert_array_equal(
+            sec.string_data["LITH"], np.array(["ACME", "SHALE"], dtype=object)
+        )
+        np.testing.assert_array_equal(
+            sec.string_data["FORM"], np.array(["SAND", "GRN"], dtype=object)
+        )
+
+    def test_las30_units_row_then_letters_only_data_row_same_section(
+        self, tmp_path: Path
+    ) -> None:
+        """Within-section variant: a letters-only data row that follows
+        the units row in the SAME section must be consumed — the units
+        gate is one-shot (closes once the units row is skipped)."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            "~LOG\n"
+            "DEPT GR\n"
+            "M GAPI\n"
+            "ACME SAND\n"
+            "2000.0 150.0\n"
+        )
+        test_file = tmp_path / "m04fix3_within_section.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        sec = las.data_sections[0]
+        # Pre-fix: "ACME SAND" dropped by the stale flag → DEPT=[2000.0].
+        np.testing.assert_allclose(sec.data["DEPT"], [-999.25, 2000.0])
+        np.testing.assert_allclose(sec.data["GR"], [-999.25, 150.0])
+
+    def test_las30_a_to_eof_empty_section_no_leak_into_next_parse(self) -> None:
+        """A→EOF control: a trailing header+units-only A section leaves
+        the flag set at parse end (the EOF flush only clears it when
+        data lines exist), but the next parse() on the SAME parser
+        resets it (_reset) — no cross-file leak."""
+        empty_tail = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    SPACE\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            "~LOG\n"
+            "DEPT GR\n"
+            "M GAPI\n"
+        )
+        parser = LASParser()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # The header+units-only section accumulates no rows → no
+            # DataSection is emitted; the flag stays set at parse end.
+            las1 = parser.parse(empty_tail)
+            assert las1.data_sections == []
+            las2 = parser.parse(empty_tail + "1000.0 50.0\n1001.0 55.0\n")
+        np.testing.assert_allclose(las2.data_sections[0].data["DEPT"], [1000.0, 1001.0])
+        np.testing.assert_allclose(las2.data_sections[0].data["GR"], [50.0, 55.0])
+
+
+# ──────────────────────────────────────────────────────────────
+# M-13 fix4 (reader, MEDIUM, CONFIRMED — F1): the reader's
+# _mnemonic_header_skipped units-row position gate was SET when the
+# standalone mnemonic header row was skipped but NEVER consumed
+# one-shot — the gate stayed live at current_line == 0, silently
+# dropping a genuine letters-only first DATA row that followed the
+# header/units pair ("~A\nDEPT GR\nM GAPI\nACME SAND\n..." → DEPT=
+# [2000.0, 2001.0] instead of [-999.25, 2000.0, 2001.0]; wrapped
+# mode FULLY SILENT — no F-024 analog).  The gate is now closed
+# one-shot at the units row AND when the first data row is consumed
+# (parser fix3-P1 parity, parser.py:4498/:4503), in both
+# _read_normal and _read_wrapped.  FAILS on pre-fix code, PASSES on
+# post-fix.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM13Fix4ReaderStickyUnitsFlagOneShot:
+    """fix4-F1: the reader's _mnemonic_header_skipped flag must be
+    consumed one-shot — a letters-only first data row after the
+    header/units pair is genuine data and must be preserved (LAS 1.2/
+    2.0 reader paths, _read_normal and _read_wrapped)."""
+
+    @staticmethod
+    def _normal_content() -> str:
+        return (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            "~A\n"
+            "DEPT GR\n"
+            "M GAPI\n"
+            "ACME SAND\n"
+            "2000.0 150.0\n"
+            "2001.0 155.0\n"
+        )
+
+    def test_normal_letters_only_first_data_row_preserved(self, tmp_path: Path) -> None:
+        """WRAP=NO (_read_normal): a letters-only first data row after the
+        header/units pair must be consumed (null-filled), not dropped as a
+        units row — the units gate is one-shot.  Pre-fix DEPT=[2000.0,
+        2001.0] ("ACME SAND" lost) and F-024 "Pre-scan overcount"
+        fires; post-fix DEPT=[-999.25, 2000.0, 2001.0] with no F-024."""
+        test_file = tmp_path / "m13fix4_normal.las"
+        test_file.write_text(self._normal_content(), encoding="utf-8")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            las = read_las_file_as_object(test_file)
+        np.testing.assert_allclose(las.logs["DEPT"], [-999.25, 2000.0, 2001.0])
+        np.testing.assert_allclose(las.logs["GR"], [-999.25, 150.0, 155.0])
+        # M-02 pin: the parser pre-scan counts the letters row as a data
+        # line (declared 3), so once the reader consumes all 3 no spurious
+        # "Pre-scan overcount" (F-024) may fire (pre-fix it fired:
+        # declared 3, actual 2).
+        pre_scan_msgs = [
+            str(w.message) for w in caught if "Pre-scan overcount" in str(w.message)
+        ]
+        assert not pre_scan_msgs, (
+            f"F-024: spurious pre-scan overcount warning after fix4: {pre_scan_msgs}"
+        )
+
+    def test_wrapped_letters_only_first_data_row_preserved(self, tmp_path: Path) -> None:
+        """WRAP=YES (_read_wrapped): identical defect — pre-fix the row
+        was dropped with ZERO diagnostics (fully silent, no F-024 analog);
+        post-fix it is consumed as a null-filled first step."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+            " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            "~A\n"
+            "DEPT GR\n"
+            "M GAPI\n"
+            "ACME SAND\n"
+            "2000.0\n"
+            "150.0\n"
+            "2001.0\n"
+            "155.0\n"
+        )
+        test_file = tmp_path / "m13fix4_wrapped.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        np.testing.assert_allclose(las.logs["DEPT"], [-999.25, 2000.0, 2001.0])
+        np.testing.assert_allclose(las.logs["GR"], [-999.25, 150.0, 155.0])
+
+
+# ──────────────────────────────────────────────────────────────
+# M-04 fix5 (parser deferred replay, MEDIUM, CONFIRMED — F-01):
+# the deferred (pre-~V) replay filter's LOOP-LOCAL
+# _mnemonic_header_skipped flag was SET when the standalone
+# mnemonic header row was skipped but NEVER consumed one-shot —
+# the gate stayed live, silently dropping a genuine letters-only
+# first DATA row that followed the header/units pair
+# ("~ASCII\nDEPT,GR\nM,GAPI\nACME,SAND\n2000.0,150.0\n..." →
+# DEPT=[2000.0, 2001.0] instead of [-999.25, 2000.0, 2001.0];
+# two letters rows → BOTH dropped) while the non-deferred twin
+# preserved them.  The gate is now closed one-shot at the units
+# row AND when the first data row is consumed
+# (parser.py:3284-3290), mirroring parser.py:4498/:4503
+# (fix3-P1) and data_reader.py:1074/:1082-1083, :1555/:1563-1564
+# (fix4-F1).  FAILS on pre-fix code, PASSES on post-fix.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM04Fix5DeferredStickyUnitsFlagOneShot:
+    """fix5-F-01: the deferred replay filter's _mnemonic_header_skipped
+    local must be consumed one-shot — a letters-only first data row after
+    the header/units pair is genuine data and must be preserved (LAS 3.0
+    data-before-~V deferred path, PARS-04 replay filter)."""
+
+    @staticmethod
+    def _deferred_content() -> str:
+        return (
+            "~ASCII\n"
+            "DEPT,GR\n"
+            "M,GAPI\n"
+            "ACME,SAND\n"
+            "2000.0,150.0\n"
+            "2001.0,155.0\n"
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+        )
+
+    @staticmethod
+    def _non_deferred_content() -> str:
+        return (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+            " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
+            " DLM.    COMMA :\n"
+            "~WELL INFORMATION\n"
+            " NULL.    -999.25 : NULL VALUE\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M   :  Depth\n"
+            " GR.GAPI  :  Gamma\n"
+            "~LOG\n"
+            "DEPT,GR\n"
+            "M,GAPI\n"
+            "ACME,SAND\n"
+            "2000.0,150.0\n"
+            "2001.0,155.0\n"
+        )
+
+    def test_las30_pre_v_deferred_letters_only_first_data_row_preserved(
+        self, tmp_path: Path
+    ) -> None:
+        """Deferred path (data before ~V): a letters-only first data row
+        after the header/units pair must be consumed (null-filled), not
+        dropped as a units row — the units gate is one-shot.  Pre-fix
+        DEPT=[2000.0, 2001.0] ("ACME,SAND" lost); post-fix DEPT=
+        [-999.25, 2000.0, 2001.0].  Parity: the non-deferred twin on
+        identical content preserves the same rows."""
+        test_file = tmp_path / "m04fix5_deferred.las"
+        test_file.write_text(self._deferred_content(), encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        sec = las.data_sections[0]
+        np.testing.assert_allclose(sec.data["DEPT"], [-999.25, 2000.0, 2001.0])
+        np.testing.assert_allclose(sec.data["GR"], [-999.25, 150.0, 155.0])
+        # Parity: identical content with ~VERSION before the data section
+        # (non-deferred twin) must preserve the same rows.
+        twin_file = tmp_path / "m04fix5_non_deferred.las"
+        twin_file.write_text(self._non_deferred_content(), encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            twin = read_las_file_as_object(twin_file)
+        twin_sec = twin.data_sections[0]
+        np.testing.assert_allclose(twin_sec.data["DEPT"], [-999.25, 2000.0, 2001.0])
+        np.testing.assert_allclose(twin_sec.data["GR"], [-999.25, 150.0, 155.0])
+
+    def test_las30_pre_v_deferred_two_letters_rows_preserved(
+        self, tmp_path: Path
+    ) -> None:
+        """Deferred path: TWO letters-only first data rows after the
+        header/units pair must BOTH be consumed (null-filled).  Pre-fix
+        both rows were dropped (sticky gate — every subsequent
+        letters-only row while _filtered_lines stays empty); post-fix
+        DEPT=[-999.25, -999.25, 2000.0, 2001.0]."""
+        content = self._deferred_content().replace(
+            "ACME,SAND\n", "ACME,SAND\nSHALE,GRN\n", 1
+        )
+        test_file = tmp_path / "m04fix5_deferred_2l.las"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = read_las_file_as_object(test_file)
+        sec = las.data_sections[0]
+        np.testing.assert_allclose(
+            sec.data["DEPT"], [-999.25, -999.25, 2000.0, 2001.0]
+        )
+        np.testing.assert_allclose(
+            sec.data["GR"], [-999.25, -999.25, 150.0, 155.0]
+        )
+

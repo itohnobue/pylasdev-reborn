@@ -53,6 +53,68 @@ def _scalars_equal(a: Any, b: Any) -> bool:
         return False
 
 
+def _reduce_structured_mask(mask: np.ndarray) -> np.ndarray:
+    """Reduce a structured (V-kind) boolean mask to a plain boolean mask.
+
+    Structured MaskedArrays carry a structured mask — one boolean per
+    field — which ``~`` and ``np.array_equal`` cannot operate on
+    (H-02: an uncaught TypeError escaped ``compare_las_dicts``).  A
+    position is treated as masked when ANY of its fields is masked,
+    matching the mask contract's single boolean-per-position model
+    (numpy itself broadcasts a plain mask to every field, so a masked
+    position is an all-fields-masked position).  Plain boolean masks
+    pass through unchanged.
+    """
+    if mask.dtype.kind != "V":
+        return mask
+    reduced: np.ndarray | None = None
+    for name in mask.dtype.names or ():
+        field = mask[name]
+        reduced = field if reduced is None else reduced | field
+    return mask if reduced is None else reduced
+
+
+def _unwrap_masks(
+    arr1: np.ndarray,
+    arr2: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None] | None:
+    """Unwrap MaskedArray operands by mask; ``None`` signals a mask mismatch.
+
+    A masked position matches only another masked position — never an
+    unmasked value — and masked positions never participate in the
+    value check.  Returns ``(arr1, arr2, keep)`` where ``keep`` is the
+    boolean index of positions both operands consider unmasked (None
+    when neither operand is masked).  Returns None when the masks
+    differ: a position masked in one operand but not the other is a
+    structural mismatch, not a value comparison.
+
+    Structured (V-kind) masks are reduced to a plain boolean mask by
+    ``_reduce_structured_mask`` before any mask arithmetic, so ``~``
+    and ``np.array_equal`` never see a structured operand (H-02).
+    """
+    mask1 = (
+        _reduce_structured_mask(np.ma.getmaskarray(arr1))
+        if isinstance(arr1, np.ma.MaskedArray)
+        else None
+    )
+    mask2 = (
+        _reduce_structured_mask(np.ma.getmaskarray(arr2))
+        if isinstance(arr2, np.ma.MaskedArray)
+        else None
+    )
+    if mask1 is not None:
+        arr1 = np.ma.getdata(arr1)
+    if mask2 is not None:
+        arr2 = np.ma.getdata(arr2)
+    if mask1 is None and mask2 is None:
+        return arr1, arr2, None
+    m1 = mask1 if mask1 is not None else np.zeros(arr2.shape, dtype=bool)
+    m2 = mask2 if mask2 is not None else np.zeros(arr1.shape, dtype=bool)
+    if not np.array_equal(m1, m2):
+        return None
+    return arr1, arr2, ~m1
+
+
 def _allclose_symmetric(
     arr1: np.ndarray,
     arr2: np.ndarray,
@@ -94,18 +156,11 @@ def _allclose_symmetric(
     # Unwrap MaskedArray operands by mask.  Both positions must be
     # masked (or both unmasked) to match; masked positions are
     # equal-by-construction and skipped by the value check below.
-    mask1 = np.ma.getmaskarray(arr1) if isinstance(arr1, np.ma.MaskedArray) else None
-    mask2 = np.ma.getmaskarray(arr2) if isinstance(arr2, np.ma.MaskedArray) else None
-    if mask1 is not None:
-        arr1 = np.ma.getdata(arr1)
-    if mask2 is not None:
-        arr2 = np.ma.getdata(arr2)
-    if mask1 is not None or mask2 is not None:
-        m1 = mask1 if mask1 is not None else np.zeros(arr2.shape, dtype=bool)
-        m2 = mask2 if mask2 is not None else np.zeros(arr1.shape, dtype=bool)
-        if not np.array_equal(m1, m2):
-            return False
-        keep = ~m1
+    unwrapped = _unwrap_masks(arr1, arr2)
+    if unwrapped is None:
+        return False
+    arr1, arr2, keep = unwrapped
+    if keep is not None:
         arr1 = arr1[keep]
         arr2 = arr2[keep]
         if arr1.size == 0:
@@ -172,6 +227,30 @@ def _compare_arrays(
         "b",
         "c",
     ):
+        # E-28: masked non-numeric arrays follow the same mask-unwrap
+        # contract as the numeric path.  np.array_equal's asarray()
+        # strips masks, which would compare masked positions by their
+        # raw data — inverting the documented semantics (masked ==
+        # masked only, masked never matches unmasked).
+        try:
+            unwrapped = _unwrap_masks(arr1, arr2)
+        except (ValueError, TypeError):
+            # H-02: a V-kind mask that _reduce_structured_mask cannot
+            # normalize (e.g. a field-less structured dtype) would
+            # otherwise raise here.  Fall back to the pre-fix v2.0.4
+            # semantics — np.array_equal strips masks internally, so
+            # masked positions compare by raw data — a crash-free
+            # verdict, never a raise escaping the public API.
+            unwrapped = arr1, arr2, None
+        if unwrapped is None:
+            logger.warning("Array mask mismatch at '%s'", label)
+            return False
+        arr1, arr2, keep = unwrapped
+        if keep is not None:
+            arr1 = arr1[keep]
+            arr2 = arr2[keep]
+            if arr1.size == 0:
+                return True
         if not np.array_equal(arr1, arr2):
             logger.warning("Array values mismatch at '%s'", label)
             return False
@@ -211,16 +290,27 @@ def _coerce_and_compare(a: Any, b: Any, label: str, rtol: float, atol: float) ->
     # F-42: .item() ignores the mask on MaskedArray/MaskedConstant,
     # returning the raw underlying data even when the value is marked
     # as invalid.  Check the mask first and preserve masked semantics.
-    if isinstance(a, np.ndarray) and a.ndim == 0:
-        if np.ma.is_masked(a):
-            a = np.ma.masked
-        else:
-            a = a.item()
-    if isinstance(b, np.ndarray) and b.ndim == 0:
-        if np.ma.is_masked(b):
-            b = np.ma.masked
-        else:
-            b = b.item()
+    # N-11: when BOTH operands are 0-d ndarrays they stay on the array
+    # path so rtol/atol apply — matching the 1-d verdict instead of
+    # falling into exact scalar equality (0-d 1.0 vs 1.0005 @ rtol=1e-3
+    # must compare True like [1.0] vs [1.0005]).
+    both_0d = (
+        isinstance(a, np.ndarray)
+        and a.ndim == 0
+        and isinstance(b, np.ndarray)
+        and b.ndim == 0
+    )
+    if not both_0d:
+        if isinstance(a, np.ndarray) and a.ndim == 0:
+            if np.ma.is_masked(a):
+                a = np.ma.masked
+            else:
+                a = a.item()
+        if isinstance(b, np.ndarray) and b.ndim == 0:
+            if np.ma.is_masked(b):
+                b = np.ma.masked
+            else:
+                b = b.item()
 
     # ── Phase 2: Symmetric type-dispatch ──
     # AND-checks (both operands match a type) come before OR-checks
@@ -281,7 +371,13 @@ def _coerce_and_compare(a: Any, b: Any, label: str, rtol: float, atol: float) ->
         return False
 
     # scalar x scalar — all remaining types
-    return _scalars_equal(a, b)
+    # E-27: scalar leaf mismatches (units, version, well fields,
+    # descriptions) must log at WARNING like every other mismatch path
+    # (README contract) instead of returning False silently.
+    if not _scalars_equal(a, b):
+        logger.warning("Scalar mismatch at '%s': %r vs %r", label, a, b)
+        return False
+    return True
 
 
 # ──────────────────────────────────────────────────────────────

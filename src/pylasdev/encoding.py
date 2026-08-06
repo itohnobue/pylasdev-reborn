@@ -222,6 +222,48 @@ def _is_printable_byte(enc: str, b: int) -> bool:
         return False
 
 
+# M-19: the Western-symbol strong bytes — bytes that are Cyrillic under
+# cp1251, NOT alnum under cp1252 (hence "strong"), AND printable under
+# cp1252 — i.e. bytes a real Western file can plausibly contain as symbols:
+# € (0x80), ¡ ¢ £ ¥ ¨ ¯ ´ ¸ ¿ (0xA1-0xA3/0xA5/0xA8/0xAF/0xB4/0xB8/0xBF) and  # noqa: RUF003
+# × ÷ (0xD7/0xF7).  3+ consecutive such bytes fired the strong-byte Cyrillic  # noqa: RUF003
+# rule and flipped whole Western files to cp1251 mojibake (M-19); the
+# genuine-Cyrillic mirror runs (cp1251 ЎЎЎ/ЈЈЈ/ҐҐҐ etc.) are essentially  # noqa: RUF003
+# nonexistent in real Russian text — an ASYMMETRIC trade — so they are
+# carved out of the strong class.  The 0x80-0x9F cp866-only strong bytes
+# (0x81/0x8D/0x8F/0x90/0x9D — C1 controls / undefined under cp1252) stay:
+# they are the load-bearing evidence for cp866-encoded Cyrillic.
+_WESTERN_STRONG_SYMBOL_BYTES: frozenset[int] = frozenset(
+    b
+    for b in range(0x80, 0x100)
+    if 0x0400 <= ord(bytes([b]).decode("cp1251", errors="replace")) <= 0x04FF
+    and not bytes([b]).decode("cp1252", errors="replace").isalnum()
+    and _is_printable_byte("cp1252", b)
+)
+
+# E-02: the strict whole-file evidence set — cp1251-Cyrillic bytes in the
+# 0x80-0x9F range (the cp866 UPPERCASE Cyrillic zone) MINUS the M-19-carved
+# Western symbols (0x80 € — byte-identical to cp866 А) MINUS the M-07-carved  # noqa: RUF003
+# Western LETTERS.  This is the only byte evidence the whole-file word-like
+# check may trust: bytes >= 0xA0 are M-82/N-10-ambiguous (cp866 lowercase /
+# Western symbols / accented Latin), and 0xC0-0xFF are accented-Latin-ambiguous
+# (M-82) — neither may alone flip a Western winner.  M-07: the 8 alnum-under-
+# cp1252 letters (ƒ Š Œ Ž š œ ž Ÿ = 0x83/0x8A/0x8C/0x8E/0x9A/0x9C/0x9E/0x9F)
+# are ALSO carved — a genuine cp1252 'the ŠŠŠ field' (0x8A×3) passed the  # noqa: RUF003
+# strict set-byte evidence and flipped whole Western files to cp1251 mojibake.
+# What remains is the C1-control/undefined-under-cp1252 class (0x81/0x8D/0x8F/
+# 0x90/0x9D) — bytes real Western text cannot contain.  Genuine cp866
+# uppercase words (СКВАЖИНА = 0x91 0x8A 0x82 0x80 0x86 0x88 0x8D 0x80) still
+# carry 0x8D-class set bytes.
+_STRICT_CYRILLIC_EVIDENCE_BYTES: frozenset[int] = frozenset(
+    b
+    for b in _CP1251_CYRILLIC_BYTES
+    if b < 0xA0
+    and b not in _WESTERN_STRONG_SYMBOL_BYTES
+    and not bytes([b]).decode("cp1252", errors="replace").isalnum()
+)
+
+
 # M4 (F-01/F-09 regression): the Western near-tie rescue may only switch to
 # a Western candidate when the sample contains Western-SYMBOL bytes that are
 # genuinely printable under that candidate (see _printable_inflators) — NOT
@@ -277,6 +319,21 @@ def _build_cyrillic_run_regexes() -> tuple[re.Pattern[bytes], re.Pattern[bytes],
     strong_bytes = bytes(
         b for b in cyrillic_bytes if not bytes([b]).decode("cp1252", errors="replace").isalnum()
     )
+    # M-19: carve the Western-symbol strong bytes out of the strong class.
+    # A "strong byte" is justified as a byte "Western text cannot plausibly
+    # contain" — but the 0x80 € / 0xA1-0xA3 ¡¢£ / 0xA5 ¥ / 0xA8 ¨ / 0xAF ¯ /
+    # 0xB4 ´ / 0xB8 ¸ / 0xBF ¿ / 0xD7 × / 0xF7 ÷ class IS plausibly  # noqa: RUF003
+    # contained in Western text (currency, inverted punctuation, math
+    # signs), so 3+ consecutive such bytes fired the strong rule and
+    # flipped whole Western files to cp1251 mojibake.  The genuine-Cyrillic
+    # mirror (cp1251 ЎЎЎ/ЈЈЈ/ҐҐҐ runs of the same bytes) is essentially  # noqa: RUF003
+    # nonexistent in real Russian text — an ASYMMETRIC trade — so the
+    # printable-under-cp1252 strong bytes are carved out (the set is
+    # computed once in _WESTERN_STRONG_SYMBOL_BYTES, above).  The cp866-only
+    # strong bytes (0x81/0x8D/0x8F/0x90/0x9D — C1 controls/undefined under
+    # cp1252) stay: they are the load-bearing evidence for cp866-encoded
+    # Cyrillic (МЕСТОРОЖДЕНИЕ's 0x8E 0x90 0x8E triple, E-07).
+    strong_bytes = bytes(b for b in strong_bytes if b not in _WESTERN_STRONG_SYMBOL_BYTES)
     cyrillic_class = b"[" + cyrillic_bytes + b"]"
     strong_class = b"[" + strong_bytes + b"]"
     return (
@@ -287,6 +344,14 @@ def _build_cyrillic_run_regexes() -> tuple[re.Pattern[bytes], re.Pattern[bytes],
 
 
 _CYRILLIC_RUN_GE_RE, _CYRILLIC_RUN_3_RE, _STRONG_CYRILLIC_RUN_RE = _build_cyrillic_run_regexes()
+
+# E-02: C-speed pre-gate for the whole-file word-like Cyrillic evidence
+# check in _decode_best_quality.  A decoded string without a run of 3+
+# Cyrillic code points cannot contain a word-like Cyrillic word, so the
+# Python-level _has_word_like_cyrillic_run scan is only entered when this
+# regex (which runs at C speed over the whole decode) matches — keeping
+# pure-ASCII and Western-only files on the cheap path.
+_CYRILLIC_WORD_PRE_RE = re.compile("[\u0400-\u04FF]{3}")
 
 
 def _window_has_numero_prefix(window: bytes) -> bool:
@@ -299,7 +364,31 @@ def _window_has_numero_prefix(window: bytes) -> bool:
     a 0xB9 counts as "№" only when followed — after optional whitespace —
     by an ASCII digit.  A Western "¹" is an ordinal/footnote marker, not a
     "№ <number>" prefix, so the digit-follow constraint disambiguates.
-    """
+
+    E-26: the digit-follow constraint alone is NOT sufficient — a Western
+    superscript-one is commonly followed by a digit too ("Nota¹1 Ñáñez",
+    footnote lists "1¹ 2²"), which flipped genuine cp1252 files to cp1251
+    mojibake.  The Russian convention places № immediately AFTER a Cyrillic
+    word ("СКВ №1", "ПЛАСТ №2"), so the marker must also be PRECEDED —  # noqa: RUF002
+    after optional whitespace — by a byte that is a Cyrillic letter under
+    cp1251 (_CP1251_CYRILLIC_BYTES).  Western superscripts follow ASCII
+    words ("Nota¹1", "señal¹2", "Values ¹ 2") or stand alone, so the
+    preceding-byte constraint disambiguates the two classes.  Residual: a
+    superscript directly following an ACCENTED Latin letter ("café¹2" —
+    é decodes to Cyrillic й under cp1251) still fires; that byte is
+    M-82-ambiguous by design.
+
+    M-08: the preceding-byte requirement alone is NOT sufficient either —
+    the Russian convention ALSO places № BEFORE the word ("№ 1 СКВ",
+    "№1 СКВ" — well labels at line start), where no preceding Cyrillic
+    byte exists.  The marker is additionally confirmed at the start of the
+    window/data or at a line start (prev < 0, or a newline after optional
+    whitespace).  A preceding ASCII LETTER is deliberately NOT accepted:
+    "Nota¹1 Ñáñez" / "Values ¹ 2 Ñáñ" (Western superscript-one + digit +
+    accent run) must not look Russian (E-26), and the "SKV № 1 СКВ"
+    after-ASCII class is byte-structurally identical to them at the marker
+    level — no rule can separate the two without misclassifying one side.
+    """  # noqa: RUF002
     idx = 0
     while True:
         idx = window.find(0xB9, idx)
@@ -309,7 +398,18 @@ def _window_has_numero_prefix(window: bytes) -> bool:
         while nxt < len(window) and window[nxt] in (0x20, 0x09):  # space/tab
             nxt += 1
         if nxt < len(window) and 0x30 <= window[nxt] <= 0x39:
-            return True
+            prev = idx - 1
+            while prev >= 0 and window[prev] in (0x20, 0x09):  # space/tab
+                prev -= 1
+            # M-08: line start / data start confirms the №-before-word
+            # convention ("№ 1 СКВ", "№1 СКВ" — possibly after leading  # noqa: RUF003
+            # whitespace on the line).
+            if prev < 0:
+                return True
+            if window[prev] in (0x0A, 0x0D):
+                return True
+            if window[prev] in _CP1251_CYRILLIC_BYTES:
+                return True
         idx += 1
 
 
@@ -349,7 +449,13 @@ def _has_confirmed_cyrillic_run(data: bytes) -> bool:
     return False
 
 
-def _has_word_like_cyrillic_run(decoded: str, raw: bytes | None = None) -> bool:
+def _has_word_like_cyrillic_run(
+    decoded: str,
+    raw: bytes | None = None,
+    sample_truncated: bool = False,
+    *,
+    allow_rule1: bool = True,
+) -> bool:
     """Return True if *decoded* contains a run of Cyrillic letters that reads
     as a GENUINE Cyrillic word.
 
@@ -373,6 +479,15 @@ def _has_word_like_cyrillic_run(decoded: str, raw: bytes | None = None) -> bool:
         ALSO followed by a space + ASCII word (УАЗ FIELD), so the run is  # noqa: RUF003
         then judged by its byte content (F-02: a byte that is Cyrillic
         under cp1251 marks a genuine word, see _is_genuine_word_run).
+
+    M-20 (sample-end sub-mechanism): *sample_truncated* tells rule (2) that
+    the sample ends at a 64K boundary, not at the end of the file.  A
+    truncated sample-end run carries no boundary evidence — the true file
+    continues beyond the sample, so "end of sample" must NOT mark the run
+    genuine (a Western smart-punct cluster sitting exactly at the 64K
+    boundary would otherwise block the ENC-02(b) rescue → cp866 mojibake).
+    At a TRUE end-of-file (sample_truncated=False) the end-of-sample rule
+    still marks a genuine LAS Cyrillic label (УАЗ at EOF).
 
     ENC-M1 (M4 regression, FIX pass 2): this is the discriminator that
     distinguishes genuine cp866 Cyrillic (0x80-0x9F range, all bytes
@@ -414,7 +529,9 @@ def _has_word_like_cyrillic_run(decoded: str, raw: bytes | None = None) -> bool:
                 j += 1
             if j - i >= _WORD_LIKE_CYRILLIC_RUN_MIN:
                 if raw is not None:
-                    if _is_genuine_word_run(decoded, raw, i, j):
+                    if _is_genuine_word_run(
+                        decoded, raw, i, j, sample_truncated, allow_rule1=allow_rule1
+                    ):
                         return True
                 else:
                     before = decoded[i - 1] if i > 0 else ""
@@ -430,21 +547,43 @@ def _has_word_like_cyrillic_run(decoded: str, raw: bytes | None = None) -> bool:
     return False
 
 
-def _is_genuine_word_run(decoded: str, raw: bytes, i: int, j: int) -> bool:
+def _is_genuine_word_run(
+    decoded: str,
+    raw: bytes,
+    i: int,
+    j: int,
+    sample_truncated: bool = False,
+    *,
+    allow_rule1: bool = True,
+) -> bool:
     """Return True when the single-byte Cyrillic run ``decoded[i:j]`` (with
     corresponding raw bytes ``raw[i:j]``) reads as a genuine Cyrillic word
     rather than a cp866/cp1251 misdecode of Western typographic punctuation.
 
     Applies the two evidence rules documented in
     :func:`_has_word_like_cyrillic_run`: rule (1) the unambiguous-alphabet
-    evidence, and rule (2) the boundary evidence.
+    evidence, and rule (2) the boundary evidence.  *sample_truncated* is
+    forwarded to rule (2)'s end-of-sample branch (see the caller's
+    docstring, M-20).  *allow_rule1=False* (E-02 whole-file evidence) skips
+    rule (1): bytes >= 0xA0 (cp866 lowercase, Western symbols, accented
+    Latin) are ambiguous beyond the ratio window and must not alone mark a
+    run genuine — only the 0x80-0x9F uppercase class, decided by rule (2)'s
+    set-byte / boundary / LAS-context evidence, counts as whole-file
+    Cyrillic evidence.
     """
     # Rule (1): a character whose source byte is NOT in the ambiguous
     # 0x80-0x9F smart-punctuation range (lowercase Cyrillic 0xA0-0xAF /
     # 0xE0-0xEF, the 0xF0-0xF7 extras) is unambiguously genuine Cyrillic.
-    for k in range(i, j):
-        if k >= len(raw) or raw[k] >= 0xA0:
-            return True
+    # M-19: the carved Western-symbol bytes (0xA1-0xA3/0xA5/0xA8/0xAF/0xB4/
+    # 0xB8/0xBF/0xD7/0xF7) are NOT unambiguous — they are exactly the bytes
+    # whose Western-symbol runs must not confirm Cyrillic.
+    if allow_rule1:
+        for k in range(i, j):
+            if (
+                k >= len(raw)
+                or (raw[k] >= 0xA0 and raw[k] not in _WESTERN_STRONG_SYMBOL_BYTES)
+            ):
+                return True
     # Rule (2): for an all-ambiguous run, examine the byte after the run
     # (after optional whitespace / ASCII punctuation).
     k = j
@@ -458,7 +597,20 @@ def _is_genuine_word_run(decoded: str, raw: bytes, i: int, j: int) -> bool:
             break
     if k >= len(raw):
         # End of the sample — a genuine LAS Cyrillic label (УАЗ at EOF,  # noqa: RUF003
-        # СКВ №1 tail).  # noqa: RUF003
+        # СКВ №1 tail).  M-20: only when the sample is NOT truncated — a  # noqa: RUF003
+        # 64K-boundary cut carries no boundary evidence (the file continues
+        # beyond the sample), so a truncated sample-end run must not be
+        # judged genuine.
+        if sample_truncated:
+            return False
+        # M-07 (E-02 whole-file evidence, allow_rule1=False): the true-EOF
+        # boundary alone must not flip a Western winner either — an
+        # accented-Latin run at EOF ('well name áéí' — 0xE1 0xE9 0xED,
+        # M-82-ambiguous bytes >= 0xA0) carries no class information.
+        # Only a run holding a strict 0x80-0x9F evidence byte
+        # (СКВАЖИНА-class) may be judged genuine at EOF.
+        if not allow_rule1:
+            return any(raw[t] in _STRICT_CYRILLIC_EVIDENCE_BYTES for t in range(i, j))
         return True
     b = raw[k]
     if 0x41 <= b <= 0x5A or 0x61 <= b <= 0x7A:
@@ -471,9 +623,22 @@ def _is_genuine_word_run(decoded: str, raw: bytes, i: int, j: int) -> bool:
         # = 0x93 0x80 0x87 contains 0x80 = Ђ) marks a genuine Cyrillic
         # word, while the Western smart-punctuation class (…†‡‰‚„–—'")  # noqa: RUF003
         # uses bytes that are NOT Cyrillic under cp1251 and stays Western
-        # prose punctuation.
-        if any(raw[t] in _CP1251_CYRILLIC_BYTES for t in range(i, j)):
-            return True
+        # prose punctuation.  E-02 (allow_rule1=False, whole-file evidence):
+        # the trusted set shrinks to _STRICT_CYRILLIC_EVIDENCE_BYTES — the
+        # 0x80-0x9F cp866-uppercase zone minus the M-19-carved Western
+        # symbols — so accented-Latin bytes (0xC0-0xFF, M-82) and cp866
+        # lowercase / Western-symbol bytes (>= 0xA0, N-10) never alone flip
+        # a Western winner.
+        _set_bytes = _CP1251_CYRILLIC_BYTES if allow_rule1 else _STRICT_CYRILLIC_EVIDENCE_BYTES
+        # M-19 guard: a run consisting ENTIRELY of carved Western-symbol
+        # bytes (€€€ = 0x80×3, £££ = 0xA3×3, ××× = 0xD7×3 — the cp1251  # noqa: RUF003
+        # mirrors ЎЎЎ/ЈЈЈ/ҐҐҐ are essentially nonexistent in real Russian  # noqa: RUF003
+        # text) must NOT pass the set-byte evidence — its bytes are Western
+        # symbols, not Cyrillic words.  Mixed runs (УАЗ = 0x93 0x80 0x87)  # noqa: RUF003
+        # keep the set-byte fast path (the F-02 load-bearing gate).
+        if not all(raw[t] in _WESTERN_STRONG_SYMBOL_BYTES for t in range(i, j)):
+            if any(raw[t] in _set_bytes for t in range(i, j)):
+                return True
         # E-01 (FIX pass 5): the byte-content set above recognizes only 14
         # of the 32 cp866 uppercase letters in the ambiguous 0x80-0x9F
         # range — the 18-letter complement (В Д Е Ж З И Й Л С Т У Ф Х Ц Ч  # noqa: RUF003
@@ -491,11 +656,29 @@ def _is_genuine_word_run(decoded: str, raw: bytes, i: int, j: int) -> bool:
         # prose (M-1 pass-6 refinement: the digit must follow an uppercase
         # token — 'and 3 more', 'dated 2024' are ordinary Western prose,
         # not LAS labels).
+        # E3 (fix3 convergence pass): the LAS-context evidence above is
+        # context-only — for allow_rule1=False (E-02 whole-file evidence)
+        # it must not flip a Western winner either.  The M-07 byte-class
+        # gates on the EOF (above) and digit (below) branches are mirrored
+        # here: a run holding no strict 0x80-0x9F evidence byte (Western
+        # accents áéí = 0xE1 0xE9 0xED, M-07-carved letters ŠŠŠ = 0x8A×3)  # noqa: RUF003
+        # may not count as Cyrillic evidence even when followed by an
+        # uppercase LAS mnemonic or a digit after an uppercase token —
+        # the C1-control strict class (0x81/0x8D/0x8F/0x90/0x9D) stays
+        # load-bearing via the set-byte fast path above.
+        if not allow_rule1:
+            return any(raw[t] in _STRICT_CYRILLIC_EVIDENCE_BYTES for t in range(i, j))
         return _run_has_las_context(raw, k)
     # Any other non-letter byte (digit, hyphen + digit tail, №, symbol)
     # marks a genuine LAS Cyrillic label (УАЗ-469, СКВ №1).  Note the  # noqa: RUF003
     # hyphen itself is ASCII punctuation and was skipped above — what
     # matters is the digit that follows it (УАЗ-469), not the hyphen.  # noqa: RUF003
+    # M-07 (E-02 whole-file evidence, allow_rule1=False): the digit
+    # boundary alone must not flip a Western winner either — 'áéí 2024'
+    # (0xE1 0xE9 0xED, M-82-ambiguous accents) needs a strict 0x80-0x9F
+    # evidence byte in the run to count as a genuine label.
+    if not allow_rule1:
+        return any(raw[t] in _STRICT_CYRILLIC_EVIDENCE_BYTES for t in range(i, j))
     return True
 
 
@@ -534,6 +717,12 @@ def _run_has_las_context(raw: bytes, k: int) -> bool:
     # Western prose and do NOT mark a LAS label.  This is still context
     # evidence (not a byte-content rule), so the 0x80-0x9F symmetry root
     # cause stays addressed.
+    # M-20 (LAS-context sub-mechanism): a digit following a `~`-prefixed
+    # SECTION MARKER ('~A\n1234.5', '~C\n1 2 3') is NOT LAS label evidence
+    # either — the single uppercase letter of a section header is a
+    # structural marker, not a data mnemonic + value, so a Western
+    # smart-punct cluster followed by a section header must not be judged
+    # genuine Cyrillic ('…†‡\n~A\n1234.5' → cp866 mojibake).
     end = min(len(raw), k + _LAS_DIGIT_CONTEXT_WINDOW)
     for pos in range(k, end):
         if not (0x30 <= raw[pos] <= 0x39):
@@ -550,17 +739,48 @@ def _run_has_las_context(raw: bytes, k: int) -> bool:
         s = t
         while s >= k and (0x41 <= raw[s] <= 0x5A or 0x61 <= raw[s] <= 0x7A):
             s -= 1
-        if s < t and all(0x41 <= raw[i] <= 0x5A for i in range(s + 1, t + 1)):
+        if (
+            s < t
+            and all(0x41 <= raw[i] <= 0x5A for i in range(s + 1, t + 1))
+            and not _is_las_section_marker(raw, s + 1)
+        ):
             return True
     # (b) UPPERCASE ASCII word follows the run — the FULL word is uppercase
     # (FIELD, DEPT, GR), NOT a sentence-initial capital in Western prose
-    # ('And more' — 'A' followed by lowercase — stays Western).
+    # ('And more' — 'A' followed by lowercase — stays Western).  M-20: a
+    # `~`-prefixed section marker ('~A', '~C') is a structural header, not
+    # a data mnemonic, so it does NOT mark a LAS label either.
     t = k
     while t < len(raw) and 0x41 <= raw[t] <= 0x5A:
         t += 1
     if t == k:
         return False
+    if _is_las_section_marker(raw, k):
+        return False
     return t >= len(raw) or not (0x61 <= raw[t] <= 0x7A)
+
+
+def _is_las_section_marker(raw: bytes, token_start: int) -> bool:
+    """Return True when the uppercase ASCII token starting at *token_start*
+    belongs to a LAS section header — the LINE it sits on starts with
+    ``~`` (e.g. the 'A' of '~A', the 'CURVE'/'INFORMATION' of
+    '~CURVE INFORMATION').
+
+    M-20 (LAS-context sub-mechanism): section markers are structural
+    headers, not data mnemonics — '~A\\n1234.5' and '~CURVE INFORMATION'
+    must not count as Cyrillic-evidence LAS context (a Western smart-punct
+    cluster followed by a section header would otherwise block the
+    ENC-02(b) rescue → cp866 mojibake).  The check scans back from the
+    token to the start of its line: if the line's first non-whitespace
+    byte is 0x7E (tilde), the token is part of a section header.  Data
+    labels (FIELD, DEPT, GR — preceded by whitespace or prose) never sit
+    on a ``~``-prefixed line.
+    """
+    line_start = raw.rfind(b"\n", 0, token_start) + 1
+    p = line_start
+    while p < token_start and raw[p] in (0x09, 0x0A, 0x0D, 0x20):
+        p += 1
+    return p < token_start and raw[p] == 0x7E
 
 
 def detect_encoding(file_path: Path) -> str:
@@ -836,16 +1056,68 @@ def _decode_best_quality(
             _best_sample_raw = (
                 raw_bytes[: len(_best_sample)] if best_enc in ("cp866", "cp1251") else None
             )
+            _sample_truncated = len(raw_bytes) > len(_best_sample)
             if (
                 _west_ascii_letters >= _WESTERN_MIN_ASCII_LETTERS
                 and _west_ratio >= _WESTERN_RATIO_FLOOR
                 and best_ratio - _west_ratio - _smart_punct_artifact
                 <= _NEAR_TIE_CYRILLIC_MARGIN * best_ratio
-                and not _has_word_like_cyrillic_run(_best_sample, _best_sample_raw)
+                and not _has_word_like_cyrillic_run(
+                    _best_sample, _best_sample_raw, _sample_truncated
+                )
             ):
                 best_enc = _west_enc
                 _best_sample = _west_sample
                 best_ratio = _west_ratio
+
+    # E-02 (HIGH): whole-file Cyrillic evidence when a Western candidate
+    # wins.  The ratio sort sees only the first _MIN_VALIDATION_CHARS (64K)
+    # window, so a cp866 file whose Cyrillic content lies BEYOND the window
+    # (large ASCII headers, large numeric ~A blocks — the M-31 motivating
+    # layout) ties the ratio with the Western candidates, and the Western
+    # tie-break wins → silent latin-1/cp1252 mojibake of all header strings.
+    # The whole-file run detector (_has_confirmed_cyrillic_run) cannot see
+    # the common cp866 words (СКВАЖИНА/ПРИВЕТ/ТЕСТ/УАЗ/ПЛАСТ form runs of  # noqa: RUF003
+    # at most 2 cp1251-class bytes — no 4-run, no strong byte, no №), and
+    # the one detector that CAN see them (_has_word_like_cyrillic_run) was
+    # unreachable: its only call site sat inside ENC-02(b), gated on a
+    # NON-Western winner.  This check makes the word-like discriminator
+    # reachable on the Western-winner path, using the FULL file decode (the
+    # 64K sample would truncate the very evidence we need).  It fires only
+    # when (a) the file actually has content beyond the ratio window
+    # (within-window decisions stay with the pinned within-window machinery
+    # — the C-3 ratio-tie trade is deliberately kept), (b) the winner is
+    # Western, (c) the run detector did NOT confirm Cyrillic (E-06's
+    # near-tie machinery already owns the confirmed case), and (d) a
+    # non-Western candidate's full decode contains a word-like Cyrillic run
+    # — judged WITHOUT rule (1) and with the strict 0x80-0x9F evidence set
+    # (allow_rule1=False): bytes >= 0xA0 (cp866 lowercase / Western symbols
+    # / accented Latin) and 0xC0-0xFF accents are ambiguous (M-82/N-10) and
+    # must not flip a Western file, while the 0x80-0x9F uppercase class
+    # (СКВАЖИНА-class) is decided by rule (2)'s set-byte / boundary /
+    # LAS-context evidence.  The check is cheap: _CYRILLIC_WORD_PRE_RE is a
+    # C-speed pre-gate that skips decodes without a 3+ Cyrillic run.
+    if (
+        len(raw_bytes) > _MIN_VALIDATION_CHARS
+        and best_enc in _WESTERN
+        and not _is_cyrillic
+        and best_enc != "utf-8"
+    ):
+        for _cyr_cand in candidates:
+            if _cyr_cand[0] not in _CYRILLIC_ENCS:
+                continue
+            _cyr_full: str
+            try:
+                _cyr_full = raw_bytes.decode(_cyr_cand[0])
+            except UnicodeDecodeError:
+                continue
+            if _CYRILLIC_WORD_PRE_RE.search(_cyr_full) and _has_word_like_cyrillic_run(
+                _cyr_full, raw_bytes, allow_rule1=False
+            ):
+                best_enc = _cyr_cand[0]
+                _best_sample = _cyr_cand[1]
+                best_ratio = _cyr_cand[2]
+                break
 
     # F-88: After selecting the winning encoding, re-decode the full
     # content from raw_bytes rather than returning the stored sample.

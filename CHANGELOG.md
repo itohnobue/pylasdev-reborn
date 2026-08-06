@@ -5,6 +5,38 @@ All notable changes to pylasdev will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.6] — 2026-08-06
+
+### Production Check
+
+A full production check of the library (LAS 1.2/2.0/3.0 + DEV reading/writing,
+comparison, encoding) with fixes across all domains. The regression suite now
+passes 2221 tests (0 failures, 1 skipped DEV-writer placeholder, 6 xfail-pinned
+documented encoding residuals); ruff and mypy are clean.
+
+### Fixed
+
+- **Data reading**: wrapped-mode memory retention bounded; wrap-detection header-row
+  handling; mnemonic-header/units-row skip parity across all paths; LAS
+  thousands-separator recombination (1.2/2.0/3.0); pending-buffer trims
+- **Parsing**: pre-scan/reader classification unified (shared source of truth);
+  LAS 3.0 `~O` order-independent rejection; curve/parameter format+zone extraction
+  order-independence; `~{Name}_DATA`/`~{Name}_DEFINITION` gated to LAS 3.0;
+  brace-escape roundtrip symmetry
+- **Models/validation**: mutation-path guards (entries, VersionSection,
+  ParameterZone, mnemonic, section_type, array index/length caps); case-insensitive
+  dedup everywhere; `validate()` re-checks (array continuity, cross-container row
+  counts, overlap, top-level data_format consistency); DevFile designed-NaN handling
+- **Writing**: 0-d array support; case-variant well-key dedup; well-unit validation;
+  `{A:N}` offset caps; per-section definition string-awareness; zero-data-row section
+  warnings; single-pass validate
+- **Encoding**: cp866 beyond-window detection; №-context rules; Western symbol
+  carve; short-Western rescue; strict-xfail pins documented
+- **Comparison**: scalar-mismatch warnings; masked non-numeric array contract;
+  0-d tolerance routing; structured-mask safety
+- **Testing**: large regression test suite added for all fixed classes (only
+  valuable tests)
+
 ## [2.0.5] — 2026-08-03
 
 ### Production Check

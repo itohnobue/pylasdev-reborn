@@ -483,13 +483,32 @@ def _dev_to_finite_float(
     sentinels — they indicate absent data, not real measurements, and
     leaving them as values pollutes the trajectory and triggers spurious
     data-quality warnings.
+
+    E-35: The TEXT sentinels in :data:`_DEV_SENTINELS` ("na", "null",
+    "err", "-", "n/a", ...) are mapped to the missing-data value BEFORE
+    the conversion-failure path.  Previously they fell through to
+    :func:`data_reader._to_finite_float`, failed conversion, and were
+    counted in ``_failure_counter`` — so a legitimate sentinel-bearing
+    file fired the misleading "may indicate string data, corrupt
+    values" summary warning.  The detection paths already treat these
+    tokens as missing data (F-021/F-023/M-24); conversion must honor
+    the same contract (the F-04 promise "exactly like the text
+    sentinels" — the text sentinels themselves never counted as
+    failures).
     """
+    # E-35: text sentinels are missing data, not conversion failures.
+    # Case/whitespace normalization mirrors the detection paths
+    # (``t.lower().strip() in _DEV_SENTINELS``).
+    if value_str.strip().lower() in _DEV_SENTINELS:
+        return null_value
     normalized = _normalize_thousands_token(value_str)
+    _classified_as_thousands = False
     if normalized is not None:
         # F-06: full thousands token — bare "1,234" AND the decimal/
         # exponent variants "1,234.5" / "1,234,567.8" / "1,234E3".
         if _thousands_counter is not None:
             _thousands_counter[0] += 1
+        _classified_as_thousands = True
         if (not _comma_as_thousands) or "." in value_str or "e" in value_str.lower():
             # Unambiguous forms (decimal/exponent) always convert; the
             # semicolon delimiter reads the bare thousands value (I2-17).
@@ -505,6 +524,7 @@ def _dev_to_finite_float(
         # in semicolon mode).
         if _thousands_counter is not None:
             _thousands_counter[0] += 1
+        _classified_as_thousands = True
         if not _comma_as_thousands:
             value_str = value_str.replace(",", "")
     else:
@@ -512,7 +532,17 @@ def _dev_to_finite_float(
     result = _to_finite_float(
         value_str,
         null_value,
-        _failure_counter=_failure_counter,
+        # M-24: a token already classified as thousands carries its own
+        # dedicated summary warning (_thousands_counter, the loud
+        # thousands message).  Counting it in _failure_counter TOO fired
+        # 2-3 misleading warnings for one token — e.g. a space-delimited
+        # bare "1,234" (which stays unconverted → NaN by the documented
+        # M-25 policy) triggered BOTH the generic "could not be
+        # converted" warning AND the thousands summary.  Tokens
+        # classified as thousands skip the generic failure accounting
+        # (mirrors the E-35 sentinel contract: a token with a dedicated
+        # diagnostic must not also pollute the generic one).
+        _failure_counter=None if _classified_as_thousands else _failure_counter,
     )
     # F-04: map numeric null sentinels to the missing-data value.
     if result in _DEV_NUMERIC_SENTINELS:
@@ -591,6 +621,21 @@ def _recombine_thousands_separators(
     — a strict exact-fit gate would reject ``MD,TVD,X`` + ``1,234,567.8,90``
     (post-merge 2 ≠ expected 3) and break that regression.
 
+    E-24 / F-30b: The exact-fit first-run gate applies ONLY to surplus
+    rows (``len(values) > expected``) OR runs whose leading group is a
+    full 3-digit group.  A comma row whose split token count EQUALS the
+    declared columns (e.g. ``"1,234.5,3"`` in a 3-column file) previously
+    hit the ``len(values) <= expected`` early return and was NEVER
+    recombined — the thousands value silently column-shifted (MD=1.0,
+    TVD=234.5 instead of MD=1234.5).  For equal-count rows an unambiguous
+    thousands run with a 1-2 digit leading group (e.g. ``"1,234.5"``)
+    merges; the recombined row is SHORTER than declared and the missing
+    trailing column(s) are NaN-filled by the caller's ragged-row
+    machinery, with the V-08 warning firing loudly.  A 3-digit leading
+    group (e.g. ``"101,201,301.5,401,501"``) stays DEV-02-gated even in
+    equal-count rows — that shape is genuine ragged columns, not
+    thousands (test_dev_reader.py:3002 headerless twin).
+
     DEV-03 (all runs): EVERY completed run recombines (not just the first),
     each with its own warning — a second thousands value in the same row is
     no longer destroyed into fabricated columns and no longer silent.
@@ -609,7 +654,7 @@ def _recombine_thousands_separators(
         none does (row already matches the expected count, or contains no
         run that passes the gates above).
     """
-    if len(values) <= expected:
+    if len(values) < expected:
         return None
     out: list[str] = []
     pairs: list[tuple[str, str]] = []
@@ -651,13 +696,23 @@ def _recombine_thousands_separators(
         run_len = j - i
         post_count = len(out) + 1 + (n - j)
         _body = token[1:] if token[:1] in "+-" else token
-        if not (len(_body) <= 2 and run_len >= 3) and post_count != expected:
+        if (
+            (len(values) > expected or len(_body) >= 3)
+            and not (len(_body) <= 2 and run_len >= 3)
+            and post_count != expected
+        ):
             # First-run gate (DEV-02): a 3-digit leading group (or a 1-2
             # digit leading group with a single comma group) is ambiguous
             # with genuine columns; only merge when the recombined row
             # exactly satisfies the declared columns.  Reject and LOCK the
             # run so a shifted-position re-merge cannot absorb the same
-            # surplus one token later.
+            # surplus one token later.  E-24/F-30b: the exact-fit gate
+            # applies to SURPLUS rows (len > expected) always, and to
+            # equal-count rows only when the leading group is a full
+            # 3-digit group (the genuine-ragged-columns shape); an
+            # equal-count row with a 1-2 digit leading group merges and
+            # the caller NaN-fills the shorter row instead of silently
+            # column-shifting.
             out.extend(values[i:j])
             i = j
             continue
@@ -889,6 +944,57 @@ def _looks_like_dev_header(tokens: list[str]) -> bool:
         True when every token is alphabetic and at most 6 characters.
     """
     return bool(tokens) and all(t.isalpha() and len(t) <= 6 for t in tokens)
+
+
+def _split_detected_delimiter(line: str, max_tokens: int) -> list[str]:
+    """Split a content line by its apparent delimiter.
+
+    The DUG paths must compare the declared column count against the
+    token count the READ path will actually derive.  The read path
+    splits by the delimiter chosen from the header line — comma or
+    semicolon when the line carries them, whitespace otherwise.  A data
+    line like ``"1.0,2.0,3.0,4.0"`` is a SINGLE whitespace token but
+    FOUR comma tokens; counting by whitespace made the DUG Pattern B
+    count-match never fire for delimiter-delimited headerless files,
+    so the first data row was consumed as fabricated column names
+    (N-19).  ``maxsplit`` mirrors the token-cap safety used by the
+    pre-checks so this cannot allocate unbounded token lists.
+
+    Args:
+        line:      Stripped content line.
+        max_tokens: Token safety cap from data_reader.
+
+    Returns:
+        Non-empty tokens split by ``;`` (when present), else by ``,``
+        (when present), else by whitespace.
+    """
+    if ";" in line:
+        return [t.strip() for t in line.split(";", maxsplit=max_tokens) if t.strip()]
+    if "," in line:
+        return [t.strip() for t in line.split(",", maxsplit=max_tokens) if t.strip()]
+    return line.split(maxsplit=max_tokens)
+
+
+def _warn_dug_count_mismatch(col_count: int, header_tokens: list[str]) -> None:
+    """M-09: warn when a DUG file's declared column count disagrees with
+    its column-name line token count.
+
+    The DUG declared count is metadata; the read path derives columns
+    from the header line, so a mismatch silently produced a column
+    layout the file never declared (``4\\nMDKB TVDSS X`` parsed 3
+    columns with zero warnings).  Both DUG Pattern A and Pattern B emit
+    this warning before returning ``("dug", N)``.  The header is still
+    parsed (warn loudly, do not destroy the data — same policy as the
+    E-23 min-column guard).
+    """
+    warnings.warn(
+        f"DUG-format DEV file declares {col_count} column(s) but the "
+        f"column-name line has {len(header_tokens)} name(s): "
+        f"{header_tokens!r}. The declared column count does not match "
+        f"the header; the survey will be parsed with the header's "
+        f"{len(header_tokens)} columns.",
+        stacklevel=3,
+    )
 
 
 def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int]:
@@ -1132,7 +1238,24 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
         )
     ):
         semi_tokens = [t.strip() for t in _semi_text.split(";", maxsplit=_max_tokens) if t.strip()]
-        if semi_tokens and all(_is_float_token(_convert_comma_decimal(t)) for t in semi_tokens):
+        # M-26: mirror the comma-path sentinel guard (F-023) and the
+        # whitespace F-021 guard — a mostly-float semicolon row whose
+        # non-float tokens are ALL known missing-data sentinels is
+        # headerless DATA, not a column header.  Without this a
+        # headerless semicolon file with a text sentinel in its first
+        # data row ("1.0;2.0;na") failed the all-float check, fell
+        # through to whitespace detection, and the first station was
+        # consumed as fabricated column names ('1.0','2.0','NA').
+        _semi_float = [_is_float_token(_convert_comma_decimal(t)) for t in semi_tokens]
+        _semi_mostly_float = (
+            len(semi_tokens) >= 2 and sum(_semi_float) >= len(semi_tokens) - 1
+        )
+        _semi_is_sentinel = _semi_mostly_float and all(
+            t.lower().strip() in _DEV_SENTINELS
+            for t in semi_tokens
+            if not _is_float_token(_convert_comma_decimal(t))
+        )
+        if semi_tokens and (all(_semi_float) or _semi_is_sentinel):
             # DEV-01: count-prefix skip mirroring the comma/whitespace twins.
             # The comma path (above, "headerless", 1 on a single-integer
             # first line) and whitespace DUG Pattern A return
@@ -1185,6 +1308,17 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 if _non_float_second and not all(
                     t.lower().strip() in _DEV_SENTINELS for t in _non_float_second
                 ):
+                    # M-09: validate the DECLARED count against the parsed
+                    # header token count (delimiter-aware — a comma header
+                    # like "MD,TVD,X" splits into its real tokens).  A
+                    # mismatch means the file's count line and its column
+                    # names disagree; warn loudly instead of silently
+                    # parsing with the header's layout.
+                    _second_hdr_tokens = _split_detected_delimiter(
+                        content_entries[1][1], _max_tokens
+                    )
+                    if col_count != len(_second_hdr_tokens):
+                        _warn_dug_count_mismatch(col_count, _second_hdr_tokens)
                     return ("dug", 2)
                 # Secondary heuristic — when ALL second-line tokens parse as
                 # floats (e.g. numeric column names "100 200 300"), check if
@@ -1287,7 +1421,19 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
             except ValueError:
                 pass
             else:
-                third_tokens = content_entries[2][1].split(maxsplit=_max_tokens)
+                # N-19: tokenize the third line by the DETECTED delimiter
+                # (comma/semicolon when present, else whitespace), NOT by
+                # whitespace alone.  A delimiter-delimited headerless data
+                # line ("1.0,2.0,3.0,4.0") is ONE whitespace token but FOUR
+                # comma tokens; the whitespace count never matched the
+                # declared count, so the count-match below could not fire
+                # and the first data row was consumed as fabricated column
+                # names (first station LOST, both comma and semicolon
+                # variants).  The primary check and the count-match below
+                # both use the delimiter-aware token list — a comma DUG
+                # header ("MD,TVD,X,Y") still tokenizes to its real column
+                # names and the float checks see clean tokens.
+                third_tokens = _split_detected_delimiter(content_entries[2][1], _max_tokens)
                 # F-03: Primary check mirrors Pattern A's M-24 sentinel
                 # guard (:1063-1071) — any non-float token means a text
                 # column header, EXCEPT when every non-float token is a
@@ -1307,6 +1453,14 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 if _non_float_third and not all(
                     t.lower().strip() in _DEV_SENTINELS for t in _non_float_third
                 ):
+                    # M-09: validate the DECLARED count against the parsed
+                    # header token count — a mismatch means the file's
+                    # count line and its column names disagree; warn
+                    # loudly instead of silently parsing with the header's
+                    # layout (the count is delimiter-aware, so a comma
+                    # header counts its real tokens).
+                    if col_count != len(third_tokens):
+                        _warn_dug_count_mismatch(col_count, third_tokens)
                     return ("dug", 3)
                 # F-03: Count-match heuristic mirroring Pattern A's
                 # I2F-001/N-I-24 count-match branch (:1089).  When the
@@ -1505,7 +1659,46 @@ def _validate_dev_data(dev: DevFile, *, _stacklevel: int = 3) -> None:
     All violations emit :func:`warnings.warn` rather than raising
     exceptions so that users can inspect raw data even when it
     contains quality issues.
+
+    E-34/N-14: This function is the SINGLE data-quality pass for the DEV
+    read path and ``DevFile.from_dict``.  The non-finite (NaN/Inf) check
+    below lives here (restored from the pre-F-047 architecture): the read
+    path suppresses ``__post_init__``'s ``validate(complete=True)`` call
+    (via ``_from_dict``) and from_dict no longer runs the explicit
+    validate loop, so this check must not disappear.  Its message mirrors
+    ``DevFile.validate(complete=True)`` so the pinned warning texts keep
+    matching.
+
+    M-01: the NaN half of the non-finite check is gated on the
+    reader-designed missing-data marker.  On the read path NaN is the
+    reader's OWN missing-data representation (sentinel fill for short
+    rows, declared-overcount array tails, unconvertible values — each
+    occurrence already warned at read time), so flagging it again here is
+    a false "corruption" warning on every file that legitimately uses the
+    sentinel.  The reader sets ``_designed_nan=True`` on the DevFile it
+    constructs (read_dev_file_as_object); direct construction and
+    ``DevFile.from_dict`` (user data) leave it False so genuinely corrupt
+    non-finite user data is still reported.  Inf is never produced by the
+    reader (all non-finite conversions collapse to NaN), so Inf is
+    flagged in both modes — mirroring the models-side gate
+    (models.py:7325) exactly.
     """
+    # --- NaN/Inf check for numeric column arrays ---
+    # Mirrors DevFile.validate(complete=True) (models.py:7320-7328).
+    # Only fires on genuine non-finite values; the reader's own designed
+    # NaN sentinels are suppressed via the M-01 marker (see docstring).
+    for _col_name, _col_data in dev.columns.items():
+        if isinstance(_col_data, np.ndarray) and _col_data.dtype.kind in ("f", "c"):
+            if not np.all(np.isfinite(_col_data)):
+                _has_nan = bool(np.isnan(_col_data).any())
+                _has_inf = bool(np.isinf(_col_data).any())
+                if _has_inf or (_has_nan and not dev._designed_nan):
+                    warnings.warn(
+                        f"DevFile: column '{_col_name}' contains non-finite "
+                        f"values (NaN/Inf).",
+                        stacklevel=_stacklevel,
+                    )
+
     # --- Check MD column exists (case-insensitive; F-043) ---
     # Each validation block independently guards its prerequisite
     # columns; azimuth and inclination range checks still run when
@@ -2460,6 +2653,17 @@ def read_dev_file_as_object(
 
     # --- Pass 2: Parse header and data ---
     dev = DevFile()
+    # M-01: mark this DevFile as reader-produced so the models-side
+    # validate() gate (models.py:7325) and the _validate_dev_data NaN
+    # block below suppress the false "non-finite values" corruption
+    # warning for the reader's OWN designed missing-data NaN (sentinel
+    # fills, short-row fills, unconvertible values — each already warned
+    # at read time where applicable).  Direct construction and
+    # DevFile.from_dict (user data) leave the marker unset, so genuinely
+    # corrupt non-finite user data is still reported.  Inf is never
+    # produced by the reader (all non-finite conversions collapse to
+    # NaN), so Inf is flagged in both modes.
+    dev._designed_nan = True
     dev.source_file = str(file_path)
     dev.encoding = detected_encoding
     names: list[str] = []
@@ -2501,6 +2705,10 @@ def read_dev_file_as_object(
         # subsequent column.  When a row has surplus tokens beyond the
         # declared columns and consecutive tokens match the thousands
         # pattern, recombine them (with a warning) before assignment.
+        # E-24/F-30b: also recombine when the split token count EQUALS the
+        # declared columns — an equal-count row carrying a thousands value
+        # (e.g. "1,234.5,3" in a 3-column file) previously skipped
+        # recombination entirely and silently column-shifted.
         # M-52: The gate previously required non-empty ``names``, so the FIRST
         # headerless data row — which defines the column count — was never
         # recombined: "1,234.5" defined 2 columns from its raw split and every
@@ -2527,7 +2735,7 @@ def read_dev_file_as_object(
                 _expected_cols = len(values) - 1
                 if not _is_valid_thousands_leading_group(values[0]):
                     _expected_cols = len(values)
-            if len(values) > _expected_cols:
+            if len(values) >= _expected_cols:
                 _recombined = _recombine_thousands_separators(values, _expected_cols)
                 if _recombined is not None:
                     _merged_vals, _recombine_pairs = _recombined
@@ -2659,6 +2867,22 @@ def read_dev_file_as_object(
                     names = [_normalize_dev_column(n) for n in names]
                 # Deduplicate column names.
                 names = _deduplicate_dev_columns(names)
+                # E-23: DUG files with FEWER than 4 columns were silently
+                # accepted, but the published DUG specification requires
+                # at least four columns to tie MD, TVD, X, and Y.  Warn
+                # loudly instead of rejecting: 3-column DUG files
+                # (MD/INC/AZI) are legitimate real-world directional
+                # survey exports.  The guard runs AFTER normalization +
+                # dedup so alias variants (MDKB TVDSS UTMX UTMY → 4)
+                # count correctly.
+                if len(names) < 4:
+                    warnings.warn(
+                        f"DUG-format DEV file declares only {len(names)} "
+                        f"column(s): {names}. The DUG specification "
+                        f"requires at least four columns to tie MD, TVD, "
+                        f"X, and Y; the parsed survey may be incomplete.",
+                        stacklevel=2,
+                    )
                 if len(names) >= MAX_CURVES:
                     raise DEVReadError(
                         f"Column count ({len(names)}) exceeds maximum allowed "
@@ -2878,22 +3102,41 @@ def read_dev_file_as_object(
                 stacklevel=2,
             )
         else:
+            # E-33: The old text claimed the values "were not converted
+            # and may be NaN" — factually wrong for the decimal/exponent
+            # variants ("1,234.5", "1,234,567.8", "1,234E3"), which F-06
+            # ALWAYS converts (comma-stripped) in this branch.  Only the
+            # ambiguous BARE form ("1,234") stays unconverted → NaN in
+            # space/tab/comma contexts.  The message now states both
+            # behaviors accurately.  Conversion behavior unchanged (values
+            # test-pinned test_regression.py:1609-1657).
             warnings.warn(
                 f"{_tc[0]} value(s) contain comma-separated thousands "
-                f"separators (e.g. '1,234'), which are not supported in "
-                f"{delimiter!r}-delimited DEV data. These values were not "
-                f"converted and may be NaN. If the file uses a comma as a "
-                f"locale decimal separator, values must use 1-2 fractional "
-                f"digits (e.g. '1,50').",
+                f"separators (e.g. '1,234'). In {delimiter!r}-delimited "
+                f"DEV data, thousands values with a decimal or exponent "
+                f"part (e.g. '1,234.5') are read with the commas "
+                f"stripped; a bare thousands group (e.g. '1,234') is "
+                f"not converted and becomes NaN. If the file uses a "
+                f"comma as a locale decimal separator, values must use "
+                f"1-2 fractional digits (e.g. '1,50').",
                 stacklevel=2,
             )
 
-    # F-041: Re-invoke structural invariants and validate(complete=True)
-    # after populating all columns.  The initial __post_init__ call during
-    # DevFile() construction early-returns because columns is empty.
-    # Calling it here verifies column_order consistency, array length
-    # uniformity, and runs data-quality validation (NaN/Inf, MD
-    # monotonicity, AZI/INC range via validate(complete=True)).
-    dev.__post_init__()
-    _validate_dev_data(dev, _stacklevel=3)
+    # F-041 + E-34: Re-invoke structural invariants and run data-quality
+    # validation after populating all columns.  The initial __post_init__
+    # call during DevFile() construction early-returns because columns is
+    # empty.  __post_init__'s validate(complete=True) call is suppressed
+    # via the _from_dict flag (the same mechanism LASFile.from_dict uses,
+    # models.py:5609-5618): _validate_dev_data below is the SINGLE
+    # data-quality pass for the read path (it carries the NaN/Inf
+    # non-finite check the suppressed validate() call used to provide,
+    # plus negative MD, MD monotonicity, repeated stations, AZI/INC
+    # range, TVD).  Previously both ran, double-warning every issue
+    # (E-34: 4 warnings for 2 issues).
+    dev._from_dict = True
+    try:
+        dev.__post_init__()
+        _validate_dev_data(dev, _stacklevel=3)
+    finally:
+        dev._from_dict = False
     return dev

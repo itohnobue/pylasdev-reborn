@@ -120,6 +120,44 @@ def _escape_pipes_for_las_value(value: str) -> str:
     return value.replace("|", "\\|")
 
 
+def _escape_braces_for_las_value(value: str) -> str:
+    """Escape literal braces in a LAS description (``{`` → ``\\{``, ``}`` → ``\\}``).
+
+    N-09: the parser treats a braced token at the end of a curve/parameter
+    description as a LAS data-format specifier (``{S}``, ``{F}``,
+    ``{A:N}``) and strips it, fabricating a ``data_format`` from user
+    text.  A user description containing a valid format token in braces
+    (e.g. ``"Gamma {S} ray"``) was silently destroyed on write→read, and
+    the trailing token was re-parsed as the curve's format — re-routing a
+    numeric column to string_data.  Escaping literal braces keeps them
+    out of FORMAT_SPEC_PATTERN's reach; the writer's OWN appended format
+    token (``desc  {S}``) is appended AFTER the escape and stays
+    unescaped so the parser still recognizes it.  The parser reverses
+    this with ``_unescape_braces_for_las_value`` at the format-strip
+    sites (parser.py:3355/3610).  Applied on ALL versions so the
+    non-3.0 writers' ``{I}`` marker handling is symmetric.
+    """
+    return value.replace("{", "\\{").replace("}", "\\}")
+
+
+def _unescape_braces_for_las_value(value: str) -> str:
+    """Reverse the ``_escape_braces_for_las_value`` transformation.
+
+    Restores ``\\{`` → ``{`` and ``\\}`` → ``}`` in a description after the
+    parser has stripped the writer's appended (unescaped) format token.
+    Mirrors the pipe-escape trade (``_unescape_pipes_for_las_value``): a
+    genuine external ``\\{`` sequence in a description is restored
+    unconditionally.
+
+    .. note::
+
+       Legitimate backslash-brace text in original data (e.g. a literal
+       ``\\{S}`` in a description) will be incorrectly unescaped.  This is
+       the same trade-off documented for the pipe escape.
+    """
+    return value.replace("\\{", "{").replace("\\}", "}")
+
+
 # ── Read-side inverses (moved from parser.py) ───────────────────────────
 
 
@@ -204,15 +242,35 @@ def desanitize_las_value(
     unchanged.
 
     ``_~`` restore (M-85) is gated on *restore_tilde*: the LAS 3.0 data
-    path passes ``True`` (its writer emits ``_~``); the LAS 1.2/2.0 data
-    path and all header call sites pass the default ``False`` (ADV-M3
-    adjudication — the 1.2/2.0 writer never emits ``_~``, so a genuine
-    external ``_~`` value must be preserved; II-13).
+    path passes ``True`` for the FIRST-column token only; the LAS 1.2/2.0
+    data path (data_reader._read_normal / _read_wrapped) passes ``True``
+    for the first-column STRING token only (E-19 — the 1.2/2.0 writer
+    emits the same M-85 ``_~`` escape to keep the row parseable, so the
+    read side restores it position-scoped exactly like the LAS 3.0 path).
+    Header call sites and non-first-column tokens pass the default
+    ``False``: a genuine external ``_~`` value in any other position is
+    preserved (II-13).
+
+    E-01: even when *restore_tilde* is True, the ``_~`` restore is scoped
+    to the writer's ACTUAL escape output.  The M-85 escape
+    (_writer_base.py:710-737) fires only for a FIRST-column string value
+    starting ``~``+NON-letter (or bare ``~``) — a ``~``+letter start is
+    handled by the M-28 tilde-strip, never escaped.  So ``_~`` followed
+    by an ASCII letter can never be writer output and is preserved (a
+    genuine first-column ``_~DEPT`` value survives).  Residual: a
+    first-column genuine ``_~3D`` is byte-identical to the writer's
+    escape of a genuine ``~3D`` (the ESCAPE-COLLISION case — a section
+    holding both writes two identical ``_~3D`` rows and the restore
+    fires on both, restoring the escaped value correctly and the genuine
+    value to ``~3D``).  This is the same irreducible trade the ``_#``
+    restore documents below: the escape prefix is a valid data character,
+    so the ambiguous byte pattern cannot be separated on read.
 
     Args:
         value: The raw value to desanitize.
-        restore_tilde: When True, restore ``_~`` → ``~`` (LAS 3.0 data
-            path only; default False is fail-safe).
+        restore_tilde: When True, restore ``_~`` → ``~`` for tokens
+            matching the M-85 escape predicate (LAS 3.0 first-column
+            data path only; default False is fail-safe).
         _enabled: Hoisted ``_DESANITIZE_ENABLED`` flag (IT3-F-01 perf —
             cached once per read).  None → look up the thread-local flag.
     """
@@ -222,10 +280,18 @@ def desanitize_las_value(
         return value
     if value.startswith("_#"):
         return value[1:]
-    # M-85: restore the leading '~' escaped by the writer for a first-column
-    # string value starting with '~'+non-letter (or bare '~').
+    # M-85/E-01: restore the leading '~' escaped by the writer for a
+    # first-column string value starting with '~'+non-letter (or bare
+    # '~').  The restore is scoped to the writer's ACTUAL escape output:
+    # M-85 fires only for '~'+NON-letter starts (a '~'+letter start is
+    # handled by the M-28 tilde-strip, never escaped), so '_~'+letter can
+    # never be writer output and must be preserved.  The caller (LAS 3.0
+    # data path) further restricts restore_tilde to the FIRST column, so
+    # a genuine '_~' value in a non-first column is never touched.
     if restore_tilde and value.startswith("_~"):
-        return value[1:]
+        rest = value[2:]
+        if not rest or not (rest[0].isascii() and rest[0].isalpha()):
+            return value[1:]
     # Case 2: whitespace-prefixed value with sanitized _# (e.g., " _#comment").
     # F-25: Restrict to the writer's ACTUAL escape scope — only an "_#"
     # preceded exclusively by leading whitespace (the FIRST non-whitespace

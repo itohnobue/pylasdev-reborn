@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import math
 import warnings
+from collections.abc import Callable, Sequence
 from typing import cast
 
 import numpy as np
@@ -49,6 +50,19 @@ MAX_STRING_VALUES = MAX_TOTAL_ELEMENTS // 12
 # documented "Overridable" behavior to break when MAX_CURVES is overridden.
 MAX_TOKENS_PER_LINE: int | None = None
 
+# E-20: Wrapped-mode pending-buffer trim cadence (in tokens).  The
+# ``_read_wrapped`` accumulation protocol keeps consumed tokens in the
+# ``pending`` list (an O(1) ``read_idx`` frontier avoids per-flush list
+# copies).  Without a trim, every token string stays alive until EOF — a
+# crafted WRAP=YES file can retain ~58 GB before the MAX_TOTAL_ELEMENTS
+# guard raises.  When ``read_idx`` crosses this threshold the consumed
+# prefix is deleted in one O(n) slice (amortized O(1) per token) and the
+# frontier resets; the buffer then holds only the unconsumed tail.  The
+# read_idx-only bound keeps the O(1)-per-step extraction intact (the
+# window between ``read_idx`` and ``len(pending)`` never exceeds a partial
+# step plus one line).  Overridable; tests shrink it to exercise trims.
+_PENDING_TRIM_THRESHOLD = 1_000_000
+
 # M-06/M-62: int64 representability bounds for {I} integer curves.  The
 # int64 storage branch must reject values (data values OR the null
 # sentinel) outside this range — numpy int64 array assignment of a larger
@@ -58,6 +72,13 @@ MAX_TOKENS_PER_LINE: int | None = None
 # the null sentinel and counted as conversion failures.
 _INT64_MIN = int(np.iinfo(np.int64).min)
 _INT64_MAX = int(np.iinfo(np.int64).max)
+
+# M-10 test seam: optional callback invoked from ``_read_wrapped`` once per
+# line (after the periodic trim) while the ``pending`` buffer is live, so
+# tests can measure token retention DURING parse.  ``None`` in production —
+# the hot loop pays one None-check per line and nothing else.  Tests
+# monkeypatch it (same established pattern as _PENDING_TRIM_THRESHOLD).
+_read_wrapped_trace_hook: Callable[[list[str]], None] | None = None
 
 
 def _resolve_max_tokens_per_line() -> int:
@@ -81,6 +102,7 @@ from ._data_section_reader import (  # noqa: E402
     _split_header_row,
     detect_actual_wrap_from_window,
     is_mnemonic_header_row,
+    is_units_header_row,
 )
 from ._sanitize import (  # noqa: E402
     _is_desanitize_enabled,
@@ -116,15 +138,26 @@ def _parse_float_with_d_notation(value_str: str) -> float:
     return float(value_str.replace("D", "E").replace("d", "e"))
 
 
-def _desanitize_las_value(value: str, _enabled: bool | None = None) -> str:
-    """Reverse the writer's ``_``-prefix-on-``#`` escape (shared helper).
+def _desanitize_las_value(
+    value: str,
+    _enabled: bool | None = None,
+    *,
+    restore_tilde: bool = False,
+) -> str:
+    """Reverse the writer's ``_``-prefix escapes (shared helper).
 
     Thin wrapper over :func:`pylasdev._sanitize.desanitize_las_value` with
     the positional ``(value, _enabled)`` form the IT3-F-01 tests pin
-    (II-12).  ``restore_tilde`` stays at the fail-safe default ``False``:
-    the LAS 1.2/2.0 writer never emits ``_~`` escapes (M-85 is the LAS 3.0
-    data path), so a genuine external ``_~`` value must be preserved
-    (ADV-M3 S-1 adjudication, II-13).
+    (II-12).
+
+    E-19: *restore_tilde* is forwarded position-scoped by the data-row
+    callers.  The LAS 1.2/2.0 writer DOES emit the M-85 ``_~`` escape for
+    a first-column string value starting ``~``+non-letter (it keeps the
+    row from being misread as a section header), so the 1.2/2.0 data
+    path passes ``restore_tilde=(i == 0)`` exactly like the LAS 3.0 path
+    (the wrapper's default stays the fail-safe ``False`` for the header
+    and numeric call sites — a genuine external ``_~`` value in any
+    other position is preserved; II-13).
 
     Two cases (matching writer's ``_sanitize_las_value``):
 
@@ -146,7 +179,7 @@ def _desanitize_las_value(value: str, _enabled: bool | None = None) -> str:
     ``_read_wrapped``.  When *enabled* is None (any external caller), fall
     back to the thread-local lookup to preserve the previous behavior.
     """
-    return desanitize_las_value(value, _enabled=_enabled)
+    return desanitize_las_value(value, restore_tilde=restore_tilde, _enabled=_enabled)
 
 
 def _get_well_entry_ci(
@@ -457,7 +490,11 @@ def read_ascii_data(
         #   - _read_wrapped on non-wrapped  → depth/C1 swap via the
         #     depth-line flag protocol treating full lines as single values
         actual_wrap = _detect_actual_wrap(
-            lines, curve_count, delimiter, declared_wrap=las_file.version.wrap
+            lines,
+            curve_count,
+            delimiter,
+            declared_wrap=las_file.version.wrap,
+            las_file=las_file,
         )
         # IT3-F-01: The desanitize flag is constant for this read (E-04
         # sets it above and restores it in finally).  Cache it once here
@@ -490,6 +527,7 @@ def _detect_actual_wrap(
     curve_count: int,
     delimiter: str = " ",
     declared_wrap: str | None = None,
+    las_file: LASFile | None = None,
 ) -> bool:
     """Detect if data is actually wrapped by checking the first data lines.
 
@@ -510,12 +548,25 @@ def _detect_actual_wrap(
             Used as a tiebreak when the data window is genuinely ambiguous
             (2-2 or 1-1 split).  None means the header is unavailable —
             default to wrapped (conservative).
+        las_file: Optional LASFile for the mnemonic-header match set
+            (E-41).  When given, standalone mnemonic header rows are
+            excluded from the window so a full-width header cannot flip a
+            genuinely wrapped file to non-wrapped.  When None (direct
+            detector callers/tests) no header filtering is applied.
 
     Returns:
         True if data is actually wrapped, False if non-wrapped despite header.
     """
     in_ascii = False
     window: list[int] = []  # value counts of up to 4 data lines
+    # E-41: hoist the mnemonic-header match set + all-string clause once
+    # (only when a LASFile is available).  The header-skip applies ONLY
+    # while the window is empty — the first line(s) of the section, the
+    # only position where a standalone mnemonic header can appear (DR-M3).
+    _mnemonic_declared = _mnemonic_header_declared(las_file) if las_file is not None else None
+    _all_string = (
+        len(_detect_string_curves(las_file)) == curve_count if las_file is not None else None
+    )
     for line in lines:
         stripped = line.strip()
 
@@ -545,6 +596,25 @@ def _detect_actual_wrap(
         if not in_ascii or not stripped or stripped.startswith("#"):
             continue
 
+        # E-41: a standalone mnemonic header row is a column header, not a
+        # data line — counting it as a full-width data line lets the header
+        # flip genuinely wrapped ≥3-curve data to non-wrapped (silent column
+        # shift of the whole depth log).  Skip it while the window is empty
+        # so the window counts DATA lines only (mirrors _read_normal's
+        # current_line == 0 header gate; the LAS 3.0 twin never sees header
+        # rows — the parser pre-filters them).
+        if (
+            not window
+            and _mnemonic_declared is not None
+            and is_mnemonic_header_row(
+                _split_header_row(stripped),
+                declared=_mnemonic_declared,
+                curve_count=curve_count,
+                all_string=bool(_all_string),
+            )
+        ):
+            continue
+
         # Data line found — split using DLM-aware split (shared utility).
         values = _split_data_line(stripped, delimiter)
 
@@ -567,6 +637,50 @@ def _detect_actual_wrap(
     )
 
 
+def _deduped_name_order(names: list[str]) -> tuple[list[str], list[tuple[int, str, str]]]:
+    """Pure name-rename core of :func:`_deduplicate_curves` (F-M19).
+
+    Computes the post-dedup curve-name order for *names* — appending
+    ``_2``, ``_3``... to duplicate names (and F-22 cross-base collisions
+    where an original name matches a previously generated ``_N`` suffix)
+    exactly like the reader's dedup pass.  Returns the renamed order plus
+    the ``(idx, old_name, new_name)`` rename triples so callers can
+    either replay the model mutations (:func:`_deduplicate_curves`) or
+    build the post-dedup declared set from PRE-dedup state without
+    mutating anything (parser._finalize_pre_scan, E-43).
+
+    No model mutation and no warnings — pure name computation.
+    """
+    seen: dict[str, int] = {}
+    new_order: list[str] = []
+    renames: list[tuple[int, str, str]] = []
+    output_names: set[str] = set()
+    for idx, name in enumerate(names):
+        if name in seen:
+            seen[name] += 1
+            new_name = _resolve_unique_curve_name(name, seen[name], output_names)
+            # Update the seen counter to match the actual suffix used
+            seen[name] = _suffix_from_name(new_name, name)
+            renames.append((idx, name, new_name))
+            new_order.append(new_name)
+            output_names.add(new_name)
+        elif name in output_names:
+            # F-22: cross-base collision — an original name matches a
+            # previously generated _N suffix.  Input ["DEPT","DEPT","DEPT_2"]
+            # should produce ["DEPT","DEPT_2","DEPT_2_2"], not
+            # ["DEPT","DEPT_2","DEPT_2"] with duplicate keys.
+            new_name = _resolve_unique_curve_name(name, 2, output_names)
+            seen[name] = _suffix_from_name(new_name, name)
+            renames.append((idx, name, new_name))
+            new_order.append(new_name)
+            output_names.add(new_name)
+        else:
+            seen[name] = 1
+            new_order.append(name)
+            output_names.add(name)
+    return new_order, renames
+
+
 def _deduplicate_curves(las_file: LASFile, _stacklevel: int = 2) -> None:
     """Detect and rename duplicate curve names with warning.
 
@@ -574,55 +688,38 @@ def _deduplicate_curves(las_file: LASFile, _stacklevel: int = 2) -> None:
     its own array in las_file.logs. Also updates the corresponding
     CurveDefinition objects to keep curves_order and curves in sync.
 
+    The rename DECISIONS come from the shared pure core
+    :func:`_deduped_name_order` (E-17/E-43 — the parser's pre-scan
+    finalize simulates the same algorithm on pre-dedup state); this
+    function replays the renames over the model with a warning per
+    renamed curve.
+
     Args:
         las_file: LASFile to deduplicate curves in.
         _stacklevel: Stacklevel for warnings.warn (default 2 points
             to the immediate caller; pass 3 when called from deeper
             call chains such as parser._process_ascii_data).
     """
-    seen: dict[str, int] = {}
-    new_order: list[str] = []
-    # Track all names in the output order for collision detection (F-22)
-    output_names: set[str] = set()
-    for idx, name in enumerate(las_file.curves_order):
-        if name in seen:
-            seen[name] += 1
-            new_name = _resolve_unique_curve_name(name, seen[name], output_names)
-            # Update the seen counter to match the actual suffix used
-            seen[name] = _suffix_from_name(new_name, name)
-            _rename_duplicate_curve(
-                las_file,
-                idx,
-                name,
-                new_name,
-                new_order,
-                output_names,
-                _stacklevel,
-            )
-        else:
-            # F-22: Check for cross-base collisions where an
-            # original name matches a previously generated _N suffix.
-            # Input ["DEPT","DEPT","DEPT_2"] should produce
-            # ["DEPT","DEPT_2","DEPT_2_2"], not
-            # ["DEPT","DEPT_2","DEPT_2"] with duplicate keys.
-            if name in output_names:
-                new_name = _resolve_unique_curve_name(name, 2, output_names)
-                seen[name] = _suffix_from_name(new_name, name)
-                _rename_duplicate_curve(
-                    las_file,
-                    idx,
-                    name,
-                    new_name,
-                    new_order,
-                    output_names,
-                    _stacklevel,
-                )
-            else:
-                seen[name] = 1
-                new_order.append(name)
-                output_names.add(name)
-    if new_order != las_file.curves_order:
-        las_file.curves_order = new_order
+    new_order, renames = _deduped_name_order(las_file.curves_order)
+    if not renames:
+        return
+    # Replay the renames: each renamed curve gets its pre-dedup name as
+    # original_mnemonic (when empty) and one dedup warning.  The scratch
+    # accumulators are irrelevant post-decision — _rename_duplicate_curve
+    # requires them by signature only.
+    _scratch_order: list[str] = []
+    _scratch_names: set[str] = set()
+    for idx, old_name, new_name in renames:
+        _rename_duplicate_curve(
+            las_file,
+            idx,
+            old_name,
+            new_name,
+            _scratch_order,
+            _scratch_names,
+            _stacklevel,
+        )
+    las_file.curves_order = new_order
 
 
 def _resolve_unique_curve_name(
@@ -697,6 +794,50 @@ def _rename_duplicate_curve(
         las_file.curves[idx].mnemonic = new_name
 
 
+def _declared_mnemonic_set(
+    names: Sequence[str], originals: Sequence[str] | None = None
+) -> set[str]:
+    """Build the mnemonic-header match set for a curve declaration list.
+
+    Single source of truth for the mnemonic-header declared set
+    (E-17/E-43 — the reader and the parser's pre-scan finalize share ONE
+    code path instead of the historical parallel raw-text mirrors):
+
+    - the reader calls this through :func:`_mnemonic_header_declared`
+      with POST-dedup model state (the dedup branch is a no-op on unique
+      names — outputs identical to the pre-refactor comprehension);
+    - the parser's ``_finalize_pre_scan`` calls it with PRE-dedup model
+      state (``curves_order`` + parallel ``original_mnemonic`` values),
+      where the dedup branch simulates exactly what the reader's own
+      ``_deduplicate_curves`` pass will do before it consumes data.
+
+    The set contains the RESOLVED curve mnemonics (post-dedup order) plus
+    each curve's ``original_mnemonic`` — mnem_base-normalized curves keep
+    their vendor name (e.g. ``LLD``→``BFV`` with ``original_mnemonic="LLD"``)
+    and renamed duplicates keep their pre-dedup name (dedup sets
+    ``original_mnemonic`` to the old name only when it was empty —
+    :func:`_rename_duplicate_curve`), so a header row written in raw
+    vendor or pre-dedup mnemonics is still recognized.
+
+    Args:
+        names: Curve names in declaration order (pre- or post-dedup;
+            duplicates are resolved exactly like ``_deduplicate_curves``).
+        originals: Parallel ``original_mnemonic`` values (empty strings
+            when absent).  When a curve is renamed and its original is
+            empty, the pre-dedup name is used — reproducing the reader's
+            post-dedup ``curves[idx].original_mnemonic`` state.
+    """
+    renamed, _renames = _deduped_name_order(list(names))
+    declared = {name.upper() for name in renamed}
+    for idx, name in enumerate(renamed):
+        _orig = originals[idx] if originals is not None and idx < len(originals) else ""
+        if _orig:
+            declared.add(_orig.upper())
+        elif name != names[idx]:
+            declared.add(names[idx].upper())
+    return declared
+
+
 def _mnemonic_header_declared(las_file: LASFile) -> set[str]:
     """Build the mnemonic-header match set once per read.
 
@@ -708,14 +849,14 @@ def _mnemonic_header_declared(las_file: LASFile) -> set[str]:
 
     Must be called AFTER ``_deduplicate_curves`` so ``_2``-suffix renames
     and their ``original_mnemonic`` values are in place.
+
+    E-17/E-43: thin wrapper over the shared :func:`_declared_mnemonic_set`
+    with POST-dedup model state (dedup branch no-op on unique names).
     """
-    declared = {name.upper() for name in las_file.curves_order}
-    for idx, curve in enumerate(las_file.curves):
-        if idx >= len(las_file.curves_order):
-            break
-        if curve.original_mnemonic:
-            declared.add(curve.original_mnemonic.upper())
-    return declared
+    return _declared_mnemonic_set(
+        las_file.curves_order,
+        [c.original_mnemonic for c in las_file.curves],
+    )
 
 
 def _is_mnemonic_header_row(
@@ -874,10 +1015,17 @@ def _read_normal(
     short_row_count: int | None = None  # F-11: Track short-row count for summary
     # I2-02: Track embedded-delimiter string truncation for summary.
     embedded_delim_count: int | None = None
+    # M-13: Track whether the standalone mnemonic header row was skipped so
+    # an optional units row directly after it can also be skipped (first
+    # data line only).
+    _mnemonic_header_skipped = False
 
     for stripped in _iter_ascii_data_lines(lines):
         # Split using DLM-aware split (shared utility).
-        values = _split_data_line(stripped, delimiter)
+        # M-30: pass the declared curve count so the comma branch can
+        # recombine thousands-separated fragments ("1,234.5") with a loud
+        # warning instead of silently mis-assigning columns.
+        values = _split_data_line(stripped, delimiter, expected=curve_count)
 
         # M-37: Skip a standalone mnemonic header row (e.g. "~A\nDEPT GR\n"
         # before the numeric rows).  LAS 2.0 places mnemonics on the ~A
@@ -898,7 +1046,41 @@ def _read_normal(
             _string_curve_indices,
             declared=_mnemonic_declared,
         ):
+            _mnemonic_header_skipped = True
             continue
+
+        # M-13: Some real-world files emit an optional UNITS row directly
+        # after the mnemonic header row (e.g. "~A\nDEPT GR\nM GAPI\n...");
+        # consuming it as a data row produced a phantom all-null first row
+        # and a one-row shift of the whole depth log.  Skip it — but only
+        # when (a) a mnemonic header row was just skipped (the units row
+        # can only appear in that position) and (b) we are still on the
+        # first data line (current_line == 0).  The shared
+        # is_units_header_row predicate is deliberately narrow (letters
+        # only) so a genuine first data row is never misclassified; the
+        # parser pre-scan (parser._finalize_pre_scan) subtracts the units
+        # row itself using the same predicate, so both sides agree
+        # on which rows are header/units vs data (M-13 shared contract).
+        if (
+            current_line == 0
+            and _mnemonic_header_skipped
+            and is_units_header_row(_split_header_row(stripped))
+        ):
+            # M-13 (fix4-P1): one-shot — the units row has been consumed.
+            # Close the position gate NOW (parser fix3-P1 parity,
+            # parser.py:4498): a genuine letters-only first data row that
+            # follows within this same section must not be dropped as a
+            # units row.
+            _mnemonic_header_skipped = False
+            continue
+
+        # M-13 (fix4-P1): a data row has been consumed — the units-row
+        # position gate is closed (parser fix3-P1 parity, parser.py:4503).
+        # The current_line == 0 position gate below already makes the flag
+        # inert after the first data row; the explicit reset is parity
+        # hygiene against future refactors that relax the position gate.
+        if current_line == 0 and _mnemonic_header_skipped:
+            _mnemonic_header_skipped = False
 
         # Warn about extra columns being silently discarded.
         # F-I2-XPD-03: First occurrence logs full context; subsequent
@@ -1017,8 +1199,15 @@ def _read_normal(
                         f"or corrupt."
                     )
                 _string_value_count += 1
+                # E-19: restore the writer's M-85 '_~' escape for the
+                # FIRST-column token only (the escape fires only for a
+                # first-column string value starting '~'+non-letter), so a
+                # genuine '_~' value in any other column is preserved.
+                # The 1.2/2.0 writer emits the same escape as LAS 3.0 and
+                # the restore is position-scoped exactly like the 3.0 path
+                # (_las30_data.py:1195).
                 las_file.string_data[curve_name][current_line] = _desanitize_las_value(
-                    values[i], _desanitize_enabled
+                    values[i], _desanitize_enabled, restore_tilde=(i == 0)
                 )
             elif i in _integer_curve_indices:
                 # L-03/EXT-04: {I} curve — parse via int() to preserve
@@ -1292,31 +1481,87 @@ def _read_wrapped(
     # X-2: consumed values stay buffered until EOF — a `read_idx` pointer
     # tracks the frontier so a wide continuation line is NOT re-copied on
     # every flush (`pending = pending[curve_count:]` was O(n) per flush →
-    # O(n²) per line on crafted wide-line wrapped files).  The buffer is
-    # trimmed once, after the loop, with a single O(n) slice.
+    # O(n²) per line on crafted wide-line wrapped files).  E-20: the
+    # buffer is trimmed periodically (module constant
+    # _PENDING_TRIM_THRESHOLD) so consumed tokens do not stay alive until
+    # EOF (~58 GB retention on crafted files) — each trim is one O(n)
+    # slice, amortized O(1) per token, and the O(1)-per-step extraction is
+    # preserved (the unconsumed tail is always < one step plus one line).
     pending: list[str] = []
     read_idx = 0
     total_elements = 0  # F-54-upgrade: dynamic element counter for wrapped mode
+    # E-42: physical data-line counter.  The header-skip gate below must
+    # close after the FIRST data line (like _read_normal's current_line ==
+    # 0) — gating on step completion (total_elements == 0) kept the gate
+    # open across multiple lines in depth-first wrapped layouts, silently
+    # dropping a string continuation value that coincidentally matched a
+    # mnemonic on line 2+ as a "header".
+    current_line = 0
+    # M-13 (wrapped): track whether the standalone mnemonic header row was
+    # skipped so an optional units row directly after it can also be
+    # skipped (first data line only — same position gate as _read_normal).
+    _mnemonic_header_skipped = False
 
     for stripped in _iter_ascii_data_lines(lines, mode_suffix=" (wrapped mode)"):
         # Split using DLM-aware split (shared utility).
-        values = _split_data_line(stripped, delimiter)
+        # M-30: pass the declared curve count so the comma branch
+        # recombines thousands-separated fragments ("1,234.5") with a loud
+        # warning before they enter the step-accumulation buffer.
+        values = _split_data_line(stripped, delimiter, expected=curve_count)
 
         # F-03 (FIX-CONV-1)/II-16: M-37's standalone-mnemonic-header skip
-        # must apply in wrapped mode too, gated on the first step only
+        # must apply in wrapped mode too, gated on the first data line only
         # (DR-M3 — a standalone mnemonic header can only legitimately
         # appear at the top of the section).  H-1/II-11: the predicate
         # consumes the SUPERSET tokenization so a space-separated header
         # row in a DLM=COMMA file is recognized (the DLM-aware values
         # would see one token "DEPT GR" and consume the header as data).
-        if total_elements == 0 and _is_mnemonic_header_row(
+        # E-42: the gate is keyed to the LINE POSITION (current_line == 0,
+        # first physical line only) — a step-completion key stayed open
+        # across depth-first continuation lines.
+        if current_line == 0 and _is_mnemonic_header_row(
             _split_header_row(stripped),
             las_file,
             curve_count,
             _string_curve_indices,
             declared=_mnemonic_declared,
         ):
+            _mnemonic_header_skipped = True
             continue
+
+        # M-13 (wrapped — M-03): some real-world files emit an optional
+        # UNITS row directly after the mnemonic header row (e.g. "~A\nDEPT
+        # GR\nM GAPI\n..."); consuming it as a data step produced a phantom
+        # all-null first step and a one-step shift of the whole depth log.
+        # Skip it — but only when (a) a mnemonic header row was just
+        # skipped (the units row can only appear in that position) and (b)
+        # we are still on the first data line (current_line == 0).  The
+        # shared is_units_header_row predicate is deliberately narrow
+        # (letters only) so a genuine first data row is never
+        # misclassified; the parser pre-scan (parser._finalize_pre_scan)
+        # subtracts the units row itself using the same predicate (M-13
+        # shared contract).
+        if (
+            current_line == 0
+            and _mnemonic_header_skipped
+            and is_units_header_row(_split_header_row(stripped))
+        ):
+            # M-13 (fix4-P1): one-shot — the units row has been consumed.
+            # Close the position gate NOW (parser fix3-P1 parity,
+            # parser.py:4498): a genuine letters-only first data row that
+            # follows within this same section must not be dropped as a
+            # units row.  This path has no F-024 overcount diagnostic —
+            # the drop was fully silent before this fix.
+            _mnemonic_header_skipped = False
+            continue
+
+        # M-13 (fix4-P1): a data line has been consumed — the units-row
+        # position gate is closed (parser fix3-P1 parity, parser.py:4503).
+        # The current_line == 0 position gate below already makes the flag
+        # inert after the first physical data line; the explicit reset is
+        # parity hygiene against future refactors that relax the gate.
+        if current_line == 0 and _mnemonic_header_skipped:
+            _mnemonic_header_skipped = False
 
         pending.extend(values)
         while len(pending) - read_idx >= curve_count:
@@ -1327,8 +1572,12 @@ def _read_wrapped(
                 # {I} curves via _to_integer_value, else _to_finite_float.
                 if _ci in _string_curve_indices:
                     _check_string_cap()
+                    # E-19: restore the writer's M-85 '_~' escape for the
+                    # FIRST-column token of each step only (mirrors
+                    # _read_normal and the LAS 3.0 path) — a genuine
+                    # '_~' value in any other column is preserved.
                     _string_lists[_string_curve_map[_ci]].append(
-                        _desanitize_las_value(_v, _desanitize_enabled)
+                        _desanitize_las_value(_v, _desanitize_enabled, restore_tilde=(_ci == 0))
                     )
                 elif _ci in _integer_curve_indices:
                     _append_value(
@@ -1357,9 +1606,28 @@ def _read_wrapped(
                     f"The file may be malformed or corrupt."
                 )
 
+        current_line += 1
+
+        # E-20: bounded retention — once the consumed frontier crosses the
+        # threshold, drop the consumed prefix in one slice and reset the
+        # frontier.  The unconsumed tail (partial step + current line) is
+        # unaffected, so the N-I-08 trailing-step diagnostic below still
+        # sees exactly the leftover values.
+        if read_idx >= _PENDING_TRIM_THRESHOLD:
+            del pending[:read_idx]
+            read_idx = 0
+
+        # M-10 test seam: invoke the optional hook while `pending` is live
+        # (after the trim, so the unconsumed-tail state is observable).
+        # None in production — one None-check per line, no other cost.
+        if _read_wrapped_trace_hook is not None:
+            _read_wrapped_trace_hook(pending)
+
     # X-2: single O(n) trim at EOF — the read_idx pointer above avoided a
     # per-flush list copy; this final slice leaves only the trailing
-    # partial step for the N-I-08 diagnostic below.
+    # partial step for the N-I-08 diagnostic below.  (E-20: with periodic
+    # trims the buffer already holds only the unconsumed tail; when the
+    # threshold was never crossed this slice still applies.)
     pending = pending[read_idx:]
 
     # N-I-08: Detect a trailing incomplete step.  In valid wrapped mode

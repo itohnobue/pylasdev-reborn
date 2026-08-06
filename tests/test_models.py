@@ -14,12 +14,14 @@ from pylasdev import write_las_file
 from pylasdev.exceptions import LASDataError, LASWriteError
 from pylasdev.mnem_base import MNEM_BASE
 from pylasdev.models import (
+    MAX_FIELD_LENGTH,
     ArrayElementInfo,
     CurveDefinition,
     DataSection,
     DevFile,
     LASFile,
     ParameterEntry,
+    ParameterZone,
     VersionSection,
     WellSection,
 )
@@ -1672,7 +1674,7 @@ class TestDevFile:
             "MD": np.array([0.0, 100.0, 200.0]),
             "TVD": np.array([0.0, 99.0]),
         }
-        with pytest.raises(LASDataError, match=r"has length.*but existing columns"):
+        with pytest.raises(LASDataError, match=r"has length.*but other columns have length"):
             DevFile.from_dict(data)
 
     # --- F2-003: non-dict input to DevFile.from_dict ---
@@ -2012,7 +2014,7 @@ class TestProductionCheckModelsFixes:
 
     def test_array_element_info_negative_index_raises(self) -> None:
         """F-004: ArrayElementInfo with negative index raises ValueError."""
-        with pytest.raises(ValueError, match="index must be >= 0"):
+        with pytest.raises(ValueError, match="index must be >= 1"):
             ArrayElementInfo(base_name="NMR", index=-1)
 
     def test_array_element_info_non_finite_time_offset_raises(self) -> None:
@@ -2537,7 +2539,7 @@ class TestRegressionModelsFixes:
         previously accepting negative time offsets silently.
         """
         with pytest.raises(ValueError, match="time_offset must be >= 0"):
-            ArrayElementInfo(base_name="T", time_offset=-1.0)
+            ArrayElementInfo(base_name="T", index=1, time_offset=-1.0)
 
     # --- M-15: array_info type validation ---
 
@@ -3641,8 +3643,22 @@ class TestG5WellKeyContentValidation:
             WellSection(entries={1: "x"})  # type: ignore[dict-item]
 
     def test_writer_defensive_rejects_mutated_key(self, tmp_path) -> None:
-        """Entries mutated after construction (well.entries is a plain dict)
-        are rejected by the writer instead of being silently dropped."""
+        """E-03: entries mutated after construction are rejected AT the
+        mutation site (well.entries is now a guarded dict), so a
+        non-roundtrippable key cannot reach the writer at all."""
+        las = LASFile(
+            curves_order=["DEPT"],
+            curves=[CurveDefinition(mnemonic="DEPT")],
+            logs={"DEPT": np.array([1.0, 2.0])},
+        )
+        with pytest.raises(ValueError, match="cannot roundtrip"):
+            las.well.entries["GR.CO"] = "1"
+
+    def test_writer_backstop_still_rejects_bypassed_key(self, tmp_path) -> None:
+        """E-03: even when the entries mutation guard is bypassed (direct
+        dict.__setitem__ on the guarded dict), the writer's key-content
+        backstop still rejects the non-roundtrippable key — defense in
+        depth stays as-is."""
         from pylasdev import write_las_file
 
         las = LASFile(
@@ -3650,7 +3666,8 @@ class TestG5WellKeyContentValidation:
             curves=[CurveDefinition(mnemonic="DEPT")],
             logs={"DEPT": np.array([1.0, 2.0])},
         )
-        las.well.entries["GR.CO"] = "1"
+        # Bypass the model-layer guard exactly like a raw dict would.
+        dict.__setitem__(las.well.entries, "GR.CO", "1")  # type: ignore[arg-type]
         with pytest.raises((ValueError, LASWriteError), match="cannot roundtrip"):
             write_las_file(str(tmp_path / "bad.las"), las)
 
@@ -4570,7 +4587,13 @@ class TestMOD3CaseVariantRoundtripFromDict:
         d = las.to_dict()
         assert d["curves_order"] == ["dept", "GR"]
         las2 = LASFile.from_dict(d)
-        assert las2.curves_order == ["dept", "GR"]
+        # M-10: from_dict normalizes mnemonics identically to the parser
+        # (uppercase on lookup miss) — the case-variant roundtrip is
+        # still supported (case-insensitive comparisons, data preserved),
+        # but the stored curves_order casing is the parser-canonical
+        # uppercase, so parse() and from_dict() produce identical models
+        # for identical file content.
+        assert las2.curves_order == ["DEPT", "GR"]
         np.testing.assert_array_equal(las2.logs["DEPT"], np.array([100.0, 101.0, 102.0]))
         np.testing.assert_array_equal(las2.logs["GR"], np.array([75.0, 76.0, 77.0]))
         # Second roundtrip must be stable (to_dict → from_dict idempotent).
@@ -4597,7 +4620,10 @@ class TestMOD3CaseVariantRoundtripFromDict:
         las.well["STEP"] = "1"
         las.well["NULL"] = "-999.25"
         las2 = LASFile.from_dict(las.to_dict())
-        assert las2.curves_order == ["dept", "TDEP"]
+        # M-10: curves_order casing normalizes to the parser-canonical
+        # uppercase on the from_dict path (see test above); string_data
+        # values are preserved.
+        assert las2.curves_order == ["DEPT", "TDEP"]
         np.testing.assert_array_equal(las2.string_data["TDEP"], np.array(["a", "b", "c"]))
 
     def test_mod3_las30_case_variant_roundtrip_from_dict(self) -> None:
@@ -4629,8 +4655,11 @@ class TestMOD3CaseVariantRoundtripFromDict:
         las.well["STEP"] = "1"
         las.well["NULL"] = "-999.25"
         las2 = LASFile.from_dict(las.to_dict())
-        assert las2.curves_order == ["dept", "GR"]
-        assert las2.data_sections[0].curves_order == ["dept", "GR"]
+        # M-10: curves_order casing normalizes to the parser-canonical
+        # uppercase on the from_dict path (see the LAS 2.0 test above);
+        # per-section data and section order are preserved.
+        assert las2.curves_order == ["DEPT", "GR"]
+        assert las2.data_sections[0].curves_order == ["DEPT", "GR"]
         np.testing.assert_array_equal(
             las2.data_sections[0].data["DEPT"], np.array([100.0, 101.0, 102.0])
         )
@@ -4753,7 +4782,7 @@ class TestF38LeafFieldMutationGuarded:
         ai = ArrayElementInfo(base_name="NMR", index=1, time_offset=0.0)
         with pytest.raises(TypeError, match="base_name must be str"):
             ai.base_name = 42  # type: ignore[assignment]
-        with pytest.raises(ValueError, match="index must be >= 0"):
+        with pytest.raises(ValueError, match="index must be >= 1"):
             ai.index = -1
         with pytest.raises(ValueError, match="time_offset must be a finite"):
             ai.time_offset = float("nan")
@@ -4912,7 +4941,10 @@ class TestCaseNormalizationRegression:
                 "logs": {"dept": [9007199254740993, 9007199254740995]},
             }
         )
-        arr = las.logs["dept"]
+        # M-10: the case-variant log key is normalized to the
+        # parser-canonical uppercase on the from_dict path; the {I}
+        # int64 precision is preserved.
+        arr = las.logs["DEPT"]
         assert arr.dtype == np.int64, f"dtype {arr.dtype} — precision loss"
         assert int(arr[0]) == 9007199254740993
         assert int(arr[1]) == 9007199254740995
@@ -4939,7 +4971,10 @@ class TestCaseNormalizationRegression:
                 ],
             }
         )
-        arr = las.data_sections[0].data["dept"]
+        # M-10: the case-variant section data key is normalized to the
+        # parser-canonical uppercase; the {I} int64 precision is
+        # preserved.
+        arr = las.data_sections[0].data["DEPT"]
         assert arr.dtype == np.int64, f"dtype {arr.dtype} — precision loss"
         assert int(arr[0]) == 9007199254740993
 
@@ -5084,7 +5119,7 @@ class TestCaseNormalizationRegression:
     def test_n1b3_from_dict_case_variant_duplicate_detection(self) -> None:
         """N1b-3 (from_dict): the top-level duplicate detection must reject
         case-variant duplicates on the from_dict path too."""
-        with pytest.raises(LASDataError, match="Duplicate curve name"):
+        with pytest.raises(LASDataError, match="case-variant duplicate keys"):
             LASFile.from_dict(
                 {
                     "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
@@ -5122,3 +5157,1660 @@ class TestCaseNormalizationRegression:
             LASFile.from_dict(las.to_dict())
         false_warns = [str(w.message) for w in rec if "Cross-check mismatch" in str(w.message)]
         assert false_warns == [], f"false M-17 cross-check warnings: {false_warns}"
+
+
+# ──────────────────────────────────────────────────────────────
+# M-31 (MEDIUM): Well units/descriptions had NO MAX_FIELD_LENGTH on
+# any path — a 200k-char unit is emitted by the writer and then the
+# re-read fails with LASParseError (self-unreadable output).  The
+# generic 256-char header-line warning fires but the file is still
+# written.  Now key AND value are length-checked at construction,
+# item mutation, and wholesale assignment.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM31WellUnitsDescriptionsMaxFieldLength:
+    """M-31: well units/descriptions keys and values must enforce
+    MAX_FIELD_LENGTH on every path — a value the parser cannot re-read
+    must be rejected at the model instead of written as self-unreadable
+    output."""
+
+    def test_construction_long_unit_value_raises(self) -> None:
+        with pytest.raises(ValueError, match="exceeds maximum allowed"):
+            WellSection(units={"DEPT": "X" * (MAX_FIELD_LENGTH + 1)})
+
+    def test_construction_long_unit_key_raises(self) -> None:
+        with pytest.raises(ValueError, match="exceeds maximum allowed"):
+            WellSection(units={"X" * (MAX_FIELD_LENGTH + 1): "M"})
+
+    def test_construction_long_description_value_raises(self) -> None:
+        with pytest.raises(ValueError, match="exceeds maximum allowed"):
+            WellSection(descriptions={"DEPT": "Y" * (MAX_FIELD_LENGTH + 1)})
+
+    def test_mutation_long_unit_value_raises(self) -> None:
+        w = WellSection()
+        with pytest.raises(ValueError, match="exceeds maximum allowed"):
+            w.units["DEPT"] = "X" * (MAX_FIELD_LENGTH + 1)
+
+    def test_mutation_long_description_key_raises(self) -> None:
+        w = WellSection()
+        with pytest.raises(ValueError, match="exceeds maximum allowed"):
+            w.descriptions["X" * (MAX_FIELD_LENGTH + 1)] = "desc"
+
+    def test_wholesale_assignment_long_unit_value_raises(self) -> None:
+        w = WellSection()
+        with pytest.raises(ValueError, match="exceeds maximum allowed"):
+            w.units = {"DEPT": "X" * (MAX_FIELD_LENGTH + 1)}
+
+    def test_boundary_accepts_exact_max_length(self) -> None:
+        w = WellSection(units={"DEPT": "X" * MAX_FIELD_LENGTH})
+        assert len(w.units["DEPT"]) == MAX_FIELD_LENGTH
+        w.units["GR"] = "Y" * MAX_FIELD_LENGTH
+        assert len(w.units["GR"]) == MAX_FIELD_LENGTH
+
+
+# ──────────────────────────────────────────────────────────────
+# M-32 (MEDIUM): VersionSection vers/wrap/dlm had NO MAX_FIELD_LENGTH —
+# an over-long VERS is only warned as "unrecognized" (never rejected)
+# yet still emitted, producing ~V lines the parser cannot re-read.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM32VersionSectionMaxFieldLength:
+    """M-32: VersionSection vers/wrap/dlm must enforce MAX_FIELD_LENGTH
+    at construction (length checked before the value checks so the
+    diagnostic names the real problem)."""
+
+    def test_long_vers_raises(self) -> None:
+        with pytest.raises(ValueError, match=r"VERS length .* exceeds maximum allowed"):
+            VersionSection(vers="3.0" + "x" * MAX_FIELD_LENGTH)
+
+    def test_long_wrap_raises(self) -> None:
+        with pytest.raises(ValueError, match=r"WRAP length .* exceeds maximum allowed"):
+            VersionSection(wrap="YES" + "x" * (MAX_FIELD_LENGTH - 2))
+
+    def test_long_dlm_raises(self) -> None:
+        with pytest.raises(ValueError, match=r"DLM length .* exceeds maximum allowed"):
+            VersionSection(dlm="COMMA" + "x" * (MAX_FIELD_LENGTH - 4))
+
+    def test_short_values_still_work(self) -> None:
+        v = VersionSection(vers="3.0", wrap="NO", dlm="TAB")
+        assert (v.vers, v.wrap, v.dlm) == ("3.0", "NO", "TAB")
+
+
+# ──────────────────────────────────────────────────────────────
+# N-01 (MEDIUM): ArrayElementInfo.index accepted 0 — LAS 3.0 array
+# indices are 1-based.  The read side rejects index 0 for ≥2-element
+# groups; single-element arrays and metadata-only files parsed/round-
+# tripped silently.  from_dict's missing-'index' default (0) silently
+# yielded an invalid 0-based element.  Now __post_init__ + __setattr__
+# require index >= 1, making the from_dict missing-key case an error.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestN01ArrayElementIndexOneBased:
+    """N-01: index must be 1-based (>= 1) on construction, mutation,
+    and the from_dict missing-key path."""
+
+    def test_zero_index_construction_raises(self) -> None:
+        with pytest.raises(ValueError, match="index must be >= 1"):
+            ArrayElementInfo(base_name="NMR", index=0)
+
+    def test_zero_index_mutation_raises(self) -> None:
+        ai = ArrayElementInfo(base_name="NMR", index=1)
+        with pytest.raises(ValueError, match="index must be >= 1"):
+            ai.index = 0
+
+    def test_from_dict_missing_index_raises(self) -> None:
+        """array_info dict without an 'index' key must NOT silently
+        default to 0 — it is an explicit error (spec: 1-based)."""
+        with pytest.raises(ValueError, match="index must be >= 1"):
+            LASFile.from_dict(
+                {
+                    "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+                    "well": {"NULL": "-999.25"},
+                    "curves_order": ["NMR[1]"],
+                    "curves": [
+                        {
+                            "mnemonic": "NMR[1]",
+                            "array_info": {"base_name": "NMR"},
+                        }
+                    ],
+                    "logs": {"NMR[1]": [1.0, 2.0]},
+                }
+            )
+
+    def test_from_dict_missing_index_sc_array_info_raises(self) -> None:
+        """Per-section (data_sections) array_info missing 'index' is an
+        error too — same 1-based contract."""
+        with pytest.raises(ValueError, match="index must be >= 1"):
+            LASFile.from_dict(
+                {
+                    "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+                    "well": {"NULL": "-999.25"},
+                    "data_sections": [
+                        {
+                            "name": "LOG",
+                            "section_type": "LOG_DATA",
+                            "curves_order": ["NMR[1]"],
+                            "section_curves": [
+                                {
+                                    "mnemonic": "NMR[1]",
+                                    "array_info": {"base_name": "NMR"},
+                                }
+                            ],
+                            "data": {"NMR[1]": [1.0, 2.0]},
+                        }
+                    ],
+                }
+            )
+
+    def test_one_based_index_still_accepted(self) -> None:
+        ai = ArrayElementInfo(base_name="NMR", index=1, time_offset=0.0)
+        ai.index = 2
+        assert ai.index == 2
+
+
+# ──────────────────────────────────────────────────────────────
+# N-12 (MEDIUM): LAS 3.0 post-construction replacement of the ONLY key
+# in a group (section data↔string_data, or top-level logs↔string_data)
+# with a different-length array passes validate(complete=True)=[] —
+# the writer max()-null-pads SILENTLY and the re-read FABRICATES null
+# rows.  validate(complete=True) now re-checks per-section group
+# lengths (unconditional) and top-level LAS 3.0 group lengths (M-29
+# already warns loudly for 1.2/2.0, so no double-warning there).
+# ──────────────────────────────────────────────────────────────
+
+
+class TestN12PostConstructionGroupRowCountRecheck:
+    """N-12: validate(complete=True) must flag cross-group row-count
+    mismatch introduced by post-construction ONLY-key replacement."""
+
+    def _section(self) -> DataSection:
+        return DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["DEPT", "TEXT"],
+            data={"DEPT": np.array([1.0, 2.0, 3.0])},
+            string_data={"TEXT": np.array(["a", "b", "c"], dtype=object)},
+        )
+
+    def test_section_only_key_replacement_flags_validate(self) -> None:
+        ds = self._section()
+        # Only-key replacement with a different-length array: allowed by
+        # _GuardedDict (no sibling reference), but the group is now
+        # inconsistent — validate must flag it.
+        ds.data["DEPT"] = np.array([0.0])
+        issues = ds.validate(complete=True)
+        assert any("row count" in i for i in issues), issues
+
+    def test_section_consistent_replacement_no_issue(self) -> None:
+        ds = self._section()
+        ds.data["DEPT"] = np.array([9.0, 8.0, 7.0])
+        issues = ds.validate(complete=True)
+        assert not any("row count" in i for i in issues), issues
+
+    def test_top_level_las30_only_key_replacement_flags_validate(self) -> None:
+        las = LASFile(
+            version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"),
+            curves_order=["DEPT", "TEXT"],
+            curves=[
+                CurveDefinition(mnemonic="DEPT"),
+                CurveDefinition(mnemonic="TEXT", data_format="S"),
+            ],
+            logs={"DEPT": np.array([1.0, 2.0, 3.0])},
+            string_data={"TEXT": np.array(["a", "b", "c"], dtype=object)},
+        )
+        las.logs["DEPT"] = np.array([0.0])
+        issues = las.validate(complete=True)
+        assert any("logs row count" in i for i in issues), issues
+
+    def test_top_level_non_las30_no_cross_group_double_warning(self) -> None:
+        """1.2/2.0 top-level: M-29 (string_data in non-3.0) is already
+        loud — the N-12 cross-group diagnostic must NOT fire on top of
+        it (double-warning defect class)."""
+        las = LASFile(
+            version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+            curves_order=["DEPT", "TEXT"],
+            curves=[
+                CurveDefinition(mnemonic="DEPT"),
+                CurveDefinition(mnemonic="TEXT", data_format="S"),
+            ],
+            logs={"DEPT": np.array([1.0, 2.0, 3.0])},
+            string_data={"TEXT": np.array(["a", "b", "c"], dtype=object)},
+        )
+        las.logs["DEPT"] = np.array([0.0])
+        issues = las.validate(complete=True)
+        assert not any("logs row count" in i for i in issues), issues
+        assert any("string_data is present" in i for i in issues), issues
+
+
+# ──────────────────────────────────────────────────────────────
+# N-13 (MEDIUM): post-construction exact-case logs∩string_data overlap
+# (curve added to string_data that exists in logs with NO data_format)
+# bypassed the construction raise; validate(complete=True) skipped
+# no-data_format curves and the writer silently dropped the numeric
+# logs value (_lookup_data_array prefers string_data).  validate now
+# re-runs the construction overlap check regardless of data_format.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestN13PostConstructionOverlapValidate:
+    """N-13: validate(complete=True) must flag a logs∩string_data key
+    overlap introduced post-construction — regardless of data_format —
+    and the format-vs-placement loop must not double-report it."""
+
+    def _lasfile(self) -> LASFile:
+        return LASFile(
+            version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"),
+            curves_order=["DEPT", "LITH", "TEXT"],
+            curves=[
+                CurveDefinition(mnemonic="DEPT"),
+                CurveDefinition(mnemonic="LITH"),  # data_format='' (no format)
+                CurveDefinition(mnemonic="TEXT", data_format="S"),
+            ],
+            logs={
+                "DEPT": np.array([1.0, 2.0]),
+                "LITH": np.array([10.0, 20.0]),
+            },
+            string_data={"TEXT": np.array(["a", "b"], dtype=object)},
+        )
+
+    def test_no_data_format_overlap_flagged(self) -> None:
+        """The exact N-13 shape: 'LITH' exists in logs with no
+        data_format, then is added to string_data post-construction."""
+        las = self._lasfile()
+        las.string_data["LITH"] = np.array(["x", "y"], dtype=object)
+        issues = las.validate(complete=True)
+        assert any("both 'logs' and 'string_data'" in i for i in issues), issues
+
+    def test_overlap_not_double_reported_as_placement_issue(self) -> None:
+        """A formatted overlap is flagged once as an overlap — the
+        format-vs-placement loop must not ALSO emit a misleading
+        'S-format in logs' placement diagnostic."""
+        las = self._lasfile()
+        las.curves[1].data_format = "S"  # LITH now S-format AND overlapping
+        las.string_data["LITH"] = np.array(["x", "y"], dtype=object)
+        issues = las.validate(complete=True)
+        overlap_issues = [i for i in issues if "both 'logs' and 'string_data'" in i]
+        assert len(overlap_issues) == 1, issues
+        assert not any("data_format='S'" in i and "LITH" in i for i in issues), issues
+
+    def test_construction_overlap_still_raises(self) -> None:
+        """Control: the construction-time overlap raise is unchanged
+        (loud behavior preserved)."""
+        with pytest.raises(LASDataError, match="appear in both logs and string_data"):
+            LASFile(
+                version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+                curves_order=["DEPT"],
+                curves=[CurveDefinition(mnemonic="DEPT")],
+                logs={"DEPT": np.array([1.0, 2.0])},
+                string_data={"DEPT": np.array(["a", "b"], dtype=object)},
+            )
+
+
+
+# ──────────────────────────────────────────────────────────────
+# M-01 (MEDIUM): _validate_array_continuity missing the read-side
+# data_format-consistency dimension.  The reader rejects a LAS 3.0
+# array group whose channels declare differing format specifiers
+# ("Inconsistent data_format for array", _las30_data.py:790-794);
+# the model must reject the same state at construction AND re-check
+# it in validate() (post-construction mutation).
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM01ArrayDataFormatConsistency:
+    """M-01: array groups must share one data_format across channels."""
+
+    @staticmethod
+    def _section(formats: list[str]) -> DataSection:
+        return DataSection(
+            name="LOG",
+            curves_order=[f"NMR[{i + 1}]" for i in range(len(formats))],
+            section_curves=[
+                CurveDefinition(mnemonic=f"NMR[{i + 1}]", data_format=f1)
+                for i, f1 in enumerate(formats)
+            ],
+            data={
+                f"NMR[{i + 1}]": np.array([1.0, 2.0]) for i in range(len(formats))
+            },
+        )
+
+    def test_top_level_inconsistent_format_raises(self) -> None:
+        """M-01: a top-level array group with mixed formats is rejected
+        at construction — the reader would refuse the written file."""
+        with pytest.raises(LASDataError, match="inconsistent data_format"):
+            LASFile(
+                version=VersionSection(vers="3.0"),
+                curves_order=["NMR[1]", "NMR[2]"],
+                curves=[
+                    CurveDefinition(mnemonic="NMR[1]", data_format="F"),
+                    CurveDefinition(mnemonic="NMR[2]", data_format="E"),
+                ],
+            )
+
+    def test_section_inconsistent_format_raises(self) -> None:
+        """M-01: a per-section array group with mixed formats is rejected
+        at construction."""
+        ds = self._section(["F", "E"])
+        with pytest.raises(LASDataError, match="inconsistent data_format"):
+            LASFile(
+                version=VersionSection(vers="3.0"),
+                curves_order=["NMR[1]", "NMR[2]"],
+                curves=[],
+                data_sections=[ds],
+            )
+
+    def test_consistent_formats_pass(self) -> None:
+        """M-01 control: a uniform-format array group constructs fine."""
+        las = LASFile(
+            version=VersionSection(vers="3.0"),
+            curves_order=["NMR[1]", "NMR[2]"],
+            curves=[],
+            data_sections=[self._section(["F", "F"])],
+        )
+        assert las.validate(complete=True) == []
+
+    def test_validate_reechecks_post_construction_mutation(self) -> None:
+        """M-01: validate(complete=True) catches a data_format reassigned
+        after construction (bypassing __post_init__)."""
+        las = LASFile(
+            version=VersionSection(vers="3.0"),
+            curves_order=["NMR[1]", "NMR[2]"],
+            curves=[],
+            data_sections=[self._section(["F", "F"])],
+        )
+        las.data_sections[0].section_curves[1].data_format = "E"
+        issues = las.data_sections[0].validate(complete=True)
+        assert any("inconsistent data_format" in i and "NMR" in i for i in issues), issues
+
+
+# ──────────────────────────────────────────────────────────────
+# M-02 (MEDIUM): ParameterEntry.__setattr__ guarded only
+# data_format/value/unit/description — zone/array_index/section_type
+# mutations bypassed the construction contract (zone → opaque
+# LASWriteError; array_index=-1 → parameter silently dropped;
+# section_type with spaces → ~P section misrouted to ~Other).
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM02ParameterEntrySetattrGuards:
+    """M-02: post-construction leaf-field assignments re-validate."""
+
+    def test_zone_type_raises(self) -> None:
+        p = ParameterEntry(mnemonic="T", value="1")
+        with pytest.raises(TypeError, match="zone must be ParameterZone or None"):
+            p.zone = "Zone1"
+
+    def test_zone_valid_assignment_passes(self) -> None:
+        from pylasdev.models import ParameterZone
+
+        p = ParameterEntry(mnemonic="T", value="1")
+        z = ParameterZone(zone_name="A", zone_index=1)
+        p.zone = z
+        assert p.zone is z
+
+    def test_negative_array_index_raises(self) -> None:
+        p = ParameterEntry(mnemonic="RUN", value="1")
+        with pytest.raises(ValueError, match="array_index must be >= 0"):
+            p.array_index = -1
+
+    def test_non_int_array_index_raises(self) -> None:
+        p = ParameterEntry(mnemonic="RUN", value="1")
+        with pytest.raises(TypeError, match="array_index must be int or None"):
+            p.array_index = "1"
+
+    def test_numpy_int_array_index_coerced(self) -> None:
+        p = ParameterEntry(mnemonic="RUN", value="1")
+        p.array_index = np.int64(2)
+        assert p.array_index == 2
+        assert type(p.array_index) is int
+
+    def test_section_type_space_raises(self) -> None:
+        p = ParameterEntry(mnemonic="T", value="1")
+        with pytest.raises(ValueError, match="whitespace"):
+            p.section_type = "MY CORE"
+
+    def test_section_type_pipe_raises(self) -> None:
+        p = ParameterEntry(mnemonic="T", value="1")
+        with pytest.raises(ValueError, match="pipe"):
+            p.section_type = "A|B"
+
+    def test_section_type_whitespace_only_normalized_to_none(self) -> None:
+        p = ParameterEntry(mnemonic="T", value="1")
+        p.section_type = "   "
+        assert p.section_type is None
+
+    def test_section_type_valid_assignment_stripped(self) -> None:
+        p = ParameterEntry(mnemonic="T", value="1")
+        p.section_type = "CORE"
+        assert p.section_type == "CORE"
+
+
+# ──────────────────────────────────────────────────────────────
+# M-03 (MEDIUM): DataSection.section_type mutation unguarded — a
+# post-construction section_type with spaces/pipe produced a broken
+# ``~MY CORE_Data`` header the parser misroutes to ~Other, losing
+# the whole section's data.  __setattr__ re-validates and
+# validate() re-checks.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM03DataSectionSectionTypeGuard:
+    """M-03: DataSection.section_type re-validates on assignment and
+    in validate()."""
+
+    def test_assignment_space_raises(self) -> None:
+        ds = DataSection(name="S", section_type="LOG_DATA")
+        with pytest.raises(LASDataError, match="whitespace"):
+            ds.section_type = "MY CORE"
+
+    def test_assignment_pipe_raises(self) -> None:
+        ds = DataSection(name="S", section_type="LOG_DATA")
+        with pytest.raises(LASDataError, match="pipe"):
+            ds.section_type = "A|B"
+
+    def test_assignment_whitespace_only_normalized(self) -> None:
+        ds = DataSection(name="S", section_type="LOG_DATA")
+        ds.section_type = "   "
+        assert ds.section_type == ""
+
+    def test_assignment_valid_stripped(self) -> None:
+        ds = DataSection(name="S", section_type="LOG_DATA")
+        ds.section_type = " CORE_DATA "
+        assert ds.section_type == "CORE_DATA"
+
+    def test_validate_reechecks_bypassed_state(self) -> None:
+        """M-03: validate(complete=True) flags an invalid section_type
+        even when __setattr__ was bypassed (direct __dict__ write)."""
+        ds = DataSection(name="S", section_type="LOG_DATA")
+        object.__setattr__(ds, "section_type", "MY CORE")
+        issues = ds.validate(complete=True)
+        assert any("section_type contains invalid characters" in i for i in issues), issues
+
+
+# ──────────────────────────────────────────────────────────────
+# M-10 (MEDIUM): mnemonic case normalization diverged between
+# from_dict (identity on lookup miss) and the parser (unconditional
+# uppercase) → compare_las_dicts False for identical file content.
+# Both sides now normalize identically (uppercase on miss),
+# including the WELL side.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM10MnemonicCaseNormalization:
+    """M-10: from_dict normalizes mnemonics identically to the parser."""
+
+    _LAS20_LOWERCASE = """~VERSION
+VERS. 2.0
+WRAP. NO
+DLM. SPACE
+~WELL
+STRT. 100.0
+STOP. 101.0
+STEP. 1.0
+NULL. -999.25
+~CURVE
+dept.M  : Depth
+gr.GAPI  : Gamma Ray
+~PARAMETER
+bht.DEGC  35.5  : Bottom Hole Temp
+~A  dept  gr
+100.0  10.0
+101.0  11.0
+"""
+
+    def test_from_dict_uppercases_curve_mnemonics(self) -> None:
+        """M-10: from_dict with a lowercase curve dict produces the same
+        uppercase curves_order the parser produces for the same file."""
+        las = LASFile.from_dict(
+            {
+                "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+                "well": {"STRT": "100.0", "STOP": "101.0", "STEP": "1.0", "NULL": "-999.25"},
+                "curves_order": ["dept", "gr"],
+                "curves": [
+                    {"mnemonic": "dept", "unit": "M", "description": "Depth"},
+                    {"mnemonic": "gr", "unit": "GAPI", "description": "Gamma Ray"},
+                ],
+                "logs": {"dept": [100.0, 101.0], "gr": [10.0, 11.0]},
+            }
+        )
+        assert las.curves_order == ["DEPT", "GR"]
+        assert las.curves[0].mnemonic == "DEPT"
+        assert list(las.logs.keys()) == ["DEPT", "GR"]
+
+    def test_from_dict_uppercases_well_mnemonics(self) -> None:
+        """M-10: well entry keys normalize like the parser's well path
+        (parser.py:3018-3019 uppercases the mnemonic before lookup)."""
+        las = LASFile.from_dict(
+            {
+                "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+                "well": {"strt": "100.0", "stop": "101.0", "step": "1.0", "null": "-999.25"},
+                "curves_order": ["DEPT"],
+                "curves": [{"mnemonic": "DEPT"}],
+                "logs": {"DEPT": [100.0, 101.0]},
+            }
+        )
+        assert las.well.entries == {"STRT": "100.0", "STOP": "101.0", "STEP": "1.0", "NULL": "-999.25"}
+
+    def test_from_dict_uppercases_parameter_mnemonics(self) -> None:
+        """M-10: parameter mnemonics normalize like the parser's ~P path."""
+        las = LASFile.from_dict(
+            {
+                "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+                "well": {"STRT": "100.0", "STOP": "101.0", "STEP": "1.0", "NULL": "-999.25"},
+                "curves_order": ["DEPT"],
+                "curves": [{"mnemonic": "DEPT"}],
+                "logs": {"DEPT": [100.0, 101.0]},
+                "parameters": {"bht": "35.5"},
+                "parameter_details": [
+                    {"mnemonic": "bht", "unit": "DEGC", "value": "35.5", "description": "BH Temp"}
+                ],
+            }
+        )
+        assert las.parameters[0].mnemonic == "BHT"
+
+    def test_compare_las_dicts_parse_vs_from_dict_lowercase(self, tmp_path: Path) -> None:
+        """M-10: parse() and from_dict() of the same (lowercase-mnemonic)
+        content now produce identical to_dicts — compare_las_dicts True.
+        Pre-fix the case divergence made it False for identical content."""
+        from pylasdev import read_las_file_as_object
+        from pylasdev.compare import compare_las_dicts
+
+        f = tmp_path / "lowercase.las"
+        f.write_text(self._LAS20_LOWERCASE, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            parsed = read_las_file_as_object(f)
+        hand_dict: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100.0", "STOP": "101.0", "STEP": "1.0", "NULL": "-999.25"},
+            # The parser stores a (possibly empty) unit entry for every
+            # well mnemonic — mirror it so the dual shapes are identical.
+            "well_units": {"STRT": "", "STOP": "", "STEP": "", "NULL": ""},
+            "well_descriptions": {},
+            "parameters": {"bht": "35.5"},
+            "parameter_details": [
+                {
+                    "mnemonic": "bht",
+                    "unit": "DEGC",
+                    "value": "35.5",
+                    "description": "Bottom Hole Temp",
+                }
+            ],
+            "curves": [
+                {
+                    "mnemonic": "dept",
+                    "unit": "M",
+                    "api_code": "",
+                    "description": "Depth",
+                    "original_mnemonic": "dept",
+                },
+                {
+                    "mnemonic": "gr",
+                    "unit": "GAPI",
+                    "api_code": "",
+                    "description": "Gamma Ray",
+                    "original_mnemonic": "gr",
+                },
+            ],
+            "logs": {"dept": np.array([100.0, 101.0]), "gr": np.array([10.0, 11.0])},
+            "curves_order": ["dept", "gr"],
+            "other": "",
+            "data_sections": [],
+            "string_data": {},
+            "encoding": "utf-8",
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            from_dict_las = LASFile.from_dict(hand_dict)
+        # source_file is set by the read path (the file's path) and is
+        # outside the case-normalization contract — drop it from both
+        # sides so the comparison isolates the mnemonic casing.
+        parsed_d = {k: v for k, v in parsed.to_dict().items() if k != "source_file"}
+        from_dict_d = {k: v for k, v in from_dict_las.to_dict().items() if k != "source_file"}
+        assert compare_las_dicts(parsed_d, from_dict_d) is True
+
+
+# ──────────────────────────────────────────────────────────────
+# M-17 (MEDIUM): case-variant duplicate parameter mnemonics passed
+# the exact-case duplicate checks with zero warnings → the
+# construction dup check and the to_dict last-wins warning now
+# compare case-insensitively.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM17CaseVariantDuplicateParameters:
+    """M-17: 'GR' + 'gr' are the same logical parameter for the
+    case-insensitive ~P roundtrip and must warn like exact-case dups."""
+
+    @staticmethod
+    def _las_with_case_variant_params() -> LASFile:
+        return LASFile(
+            version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+            well=WellSection(
+                entries={"STRT": "0", "STOP": "1", "STEP": "0.5", "NULL": "-999.25"}
+            ),
+            curves_order=["DEPT"],
+            curves=[CurveDefinition(mnemonic="DEPT")],
+            logs={"DEPT": np.array([1.0, 2.0])},
+            parameters=[
+                ParameterEntry(mnemonic="GR", value="10"),
+                ParameterEntry(mnemonic="gr", value="20"),
+            ],
+        )
+
+    def test_construction_warns_case_variant_duplicate(self) -> None:
+        """M-17: LASFile construction warns for a case-variant duplicate
+        (pre-fix: exact-case check → zero warnings)."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            self._las_with_case_variant_params()
+        dup = [x for x in w if "duplicate parameter mnemonic" in str(x.message)]
+        assert len(dup) >= 1, f"expected dup warning, got: {[str(x.message) for x in w]}"
+
+    def test_to_dict_warns_case_variant_last_wins(self) -> None:
+        """M-17: to_dict warns for a case-variant duplicate (pre-fix: the
+        exact-case seen-check let it pass silently)."""
+        las = self._las_with_case_variant_params()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            las.to_dict()
+        dup = [x for x in w if "LASFile.to_dict(): duplicate parameter mnemonic" in str(x.message)]
+        assert len(dup) == 1, f"expected 1 to_dict dup warning, got: {[str(x.message) for x in w]}"
+
+    def test_exact_case_duplicate_still_warns(self) -> None:
+        """M-17 control: the exact-case duplicate warning is unchanged."""
+        las = LASFile(
+            version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+            well=WellSection(
+                entries={"STRT": "0", "STOP": "1", "STEP": "0.5", "NULL": "-999.25"}
+            ),
+            curves_order=["DEPT"],
+            curves=[CurveDefinition(mnemonic="DEPT")],
+            logs={"DEPT": np.array([1.0, 2.0])},
+            parameters=[
+                ParameterEntry(mnemonic="GR", value="10"),
+                ParameterEntry(mnemonic="GR", value="20"),
+            ],
+        )
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            las.to_dict()
+        dup = [x for x in w if "LASFile.to_dict(): duplicate parameter mnemonic" in str(x.message)]
+        assert len(dup) == 1
+
+
+# ──────────────────────────────────────────────────────────────
+# M-18 (MEDIUM): CurveDefinition lacked the bracket-notation
+# index ↔ array_info.index cross-check (ParameterEntry's M-42
+# twin).  A curve ``NMR[1]`` with array_info.index=2 writes the
+# bracket index and silently diverges from array_info on re-parse.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM18CurveDefinitionBracketIndexCrossCheck:
+    """M-18: bracket mnemonic index must match array_info.index."""
+
+    def test_mismatched_index_warns(self) -> None:
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            CurveDefinition(
+                mnemonic="NMR[2]",
+                array_info=ArrayElementInfo(base_name="NMR", index=1),
+            )
+        idx_warnings = [
+            x
+            for x in w
+            if "array notation with index 2" in str(x.message)
+            and "array_info.index" in str(x.message)
+        ]
+        assert len(idx_warnings) == 1, f"expected index cross-check warning, got {[str(x.message) for x in w]}"
+
+    def test_matching_index_silent(self) -> None:
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            CurveDefinition(
+                mnemonic="NMR[2]",
+                array_info=ArrayElementInfo(base_name="NMR", index=2),
+            )
+        assert not any("array_info.index" in str(x.message) for x in w)
+
+    def test_base_name_mismatch_still_warns(self) -> None:
+        """M-18 control: the M-17 base_name cross-check is unchanged."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            CurveDefinition(
+                mnemonic="NMR[1]",
+                array_info=ArrayElementInfo(base_name="DT", index=1),
+            )
+        assert any("array_info.base_name" in str(x.message) for x in w)
+
+
+# ──────────────────────────────────────────────────────────────
+# M-25 (MEDIUM): DevFile.validate(complete=True) flagged ANY NaN as
+# corruption, but on DEV reads NaN is the reader's OWN designed
+# missing-data representation (sentinel/short-row fill).  The
+# models-side fix: the reader marks its DevFile with
+# ``_designed_nan=True`` and validate() then reports only genuine
+# Inf (the reader never produces Inf) — while direct construction
+# and from_dict (user data) keep the full check.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM25DevFileDesignedNan:
+    """M-25: reader-designed NaN is not reported as corruption; genuine
+    non-finite user data still is."""
+
+    def test_designed_nan_not_flagged(self) -> None:
+        """M-25: a reader-marked DevFile (designed missing-data NaN) has
+        no non-finite issue (pre-fix: NaN always flagged)."""
+        dev = DevFile(
+            columns={
+                "MD": np.array([0.0, np.nan, 2.0]),
+                "AZI": np.array([90.0, np.nan, 90.0]),
+            },
+            column_order=["MD", "AZI"],
+            _from_dict=True,
+            _designed_nan=True,
+        )
+        issues = dev.validate(complete=True)
+        assert not any("non-finite" in i for i in issues), issues
+
+    def test_inf_always_flagged_even_designed(self) -> None:
+        """M-25: Inf is never a designed sentinel (the reader collapses
+        all non-finite conversions to NaN), so it is flagged in both
+        modes."""
+        dev = DevFile(
+            columns={"MD": np.array([0.0, np.inf])},
+            column_order=["MD"],
+            _from_dict=True,
+            _designed_nan=True,
+        )
+        issues = dev.validate(complete=True)
+        assert any("non-finite" in i for i in issues), issues
+
+    def test_genuine_nan_still_flagged(self) -> None:
+        """M-25 control: user-constructed DevFile (no reader marker) keeps
+        the full NaN/Inf check."""
+        dev = DevFile(
+            columns={"MD": np.array([0.0, np.nan])},
+            column_order=["MD"],
+            _from_dict=True,
+        )
+        issues = dev.validate(complete=True)
+        assert any("non-finite" in i for i in issues), issues
+
+
+# ──────────────────────────────────────────────────────────────
+# M-28 (MEDIUM): the F-115 logs∩data_sections overlap warning fired
+# on EVERY canonical LAS 3.0 parse→to_dict→from_dict roundtrip (the
+# parser populates both views with the same values by design) →
+# warnings-as-errors automation broke.  The check now distinguishes
+# a canonical-copy (identical values) from a genuine conflict
+# (differing values) and warns only on divergence.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM28F115CanonicalCopyVsConflict:
+    """M-28: F-115 warns only when logs/data_sections values diverge."""
+
+    @staticmethod
+    def _canonical_dict(gr_section_values: np.ndarray | None = None) -> dict[str, Any]:
+        if gr_section_values is None:
+            gr_section_values = np.array([10.0, 11.0, 12.0])
+        return {
+            "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "0", "STOP": "1", "STEP": "0.5", "NULL": "-999.25"},
+            "curves": [
+                {"mnemonic": "DEPT", "unit": "M"},
+                {"mnemonic": "GR", "unit": "API"},
+            ],
+            "curves_order": ["DEPT", "GR"],
+            "logs": {
+                "DEPT": np.array([0.0, 0.5, 1.0]),
+                "GR": np.array([10.0, 11.0, 12.0]),
+            },
+            "data_sections": [
+                {
+                    "name": "LOG",
+                    "section_type": "LOG_DATA",
+                    "curves_order": ["DEPT", "GR"],
+                    "data": {
+                        "DEPT": np.array([0.0, 0.5, 1.0]),
+                        "GR": gr_section_values,
+                    },
+                }
+            ],
+        }
+
+    @staticmethod
+    def _f115_warnings(w: list[warnings.WarningMessage]) -> list[str]:
+        return [str(x.message) for x in w if "appear in both 'logs' and 'data_sections'" in str(x.message)]
+
+    def test_canonical_copy_no_warning(self) -> None:
+        """M-28: the parser-style roundtrip dict (identical values in
+        logs and the owning section) must NOT warn (pre-fix: warned on
+        every canonical roundtrip)."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            LASFile.from_dict(self._canonical_dict())
+        assert self._f115_warnings(w) == [], f"expected no F-115 warning, got: {self._f115_warnings(w)}"
+
+    def test_canonical_copy_with_nan_cells_no_warning(self) -> None:
+        """M-28: identical values including NaN null cells are still a
+        canonical copy (equal_nan comparison), not a conflict."""
+        d = self._canonical_dict()
+        d["logs"]["GR"] = np.array([10.0, np.nan, 12.0])
+        d["data_sections"][0]["data"]["GR"] = np.array([10.0, np.nan, 12.0])
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            LASFile.from_dict(d)
+        assert self._f115_warnings(w) == [], f"expected no F-115 warning, got: {self._f115_warnings(w)}"
+
+    def test_genuine_conflict_still_warns(self) -> None:
+        """M-28: differing values between logs and the section are a real
+        conflict and still warn."""
+        d = self._canonical_dict(gr_section_values=np.array([20.0, 21.0, 22.0]))
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            LASFile.from_dict(d)
+        assert len(self._f115_warnings(w)) == 1, f"expected 1 F-115 warning, got: {self._f115_warnings(w)}"
+
+
+# ──────────────────────────────────────────────────────────────
+# fix-models-B regression tests (E-11, E-12, E-13, E-14, E-15,
+# E-29, E-39, E-46) — verified findings from the s7 synthesis.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE11DevColumnsOnlyKeyReplacement:
+    """E-11: _DevColumns.__setitem__ false-rejected replacing the ONLY
+    column with a different-length array (the MOD-01 exclusion present in
+    _GuardedDict.__setitem__ was never ported to _DevColumns)."""
+
+    def test_only_column_replacement_allows_growth(self) -> None:
+        dev = DevFile()
+        dev.columns["MD"] = np.array([1.0, 2.0, 3.0])
+        # Replace the ONLY column with a different length — trivially
+        # consistent growth, must be allowed (MOD-01 contract).
+        dev.columns["MD"] = np.array([1.0, 2.0])
+        np.testing.assert_array_equal(dev.columns["MD"], np.array([1.0, 2.0]))
+
+    def test_only_column_replacement_allows_shrink(self) -> None:
+        dev = DevFile()
+        dev.columns["MD"] = np.array([1.0])
+        dev.columns["MD"] = np.array([1.0, 2.0, 3.0, 4.0])
+        assert len(dev.columns["MD"]) == 4
+
+    def test_replacement_against_other_columns_still_raises(self) -> None:
+        dev = DevFile(
+            columns={"MD": np.array([1.0, 2.0]), "TVD": np.array([3.0, 4.0])},
+            column_order=["MD", "TVD"],
+        )
+        with pytest.raises(ValueError, match="other columns have length"):
+            dev.columns["MD"] = np.array([1.0, 2.0, 3.0])
+
+
+class TestE12TopLevelConstructionRowCountLoudPath:
+    """E-12: the 1.2/2.0 top-level logs↔string_data row-count invariant
+    raises at construction (the loud path).  Post-construction 1.2/2.0
+    top-level mismatch is already loud via M-29 (pinned by D's N-12 test
+    test_top_level_non_las30_no_cross_group_double_warning)."""
+
+    def _las20(self) -> LASFile:
+        return LASFile(
+            version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+            curves_order=["DEPT", "TEXT"],
+            curves=[
+                CurveDefinition(mnemonic="DEPT"),
+                CurveDefinition(mnemonic="TEXT", data_format="S"),
+            ],
+            logs={"DEPT": np.array([1.0, 2.0, 3.0])},
+            string_data={"TEXT": np.array(["a", "b"], dtype=object)},
+        )
+
+    def test_las20_construction_raises_on_cross_group_mismatch(self) -> None:
+        with pytest.raises(LASDataError, match="does not match string_data row count"):
+            self._las20()
+
+    def test_las20_construction_matching_rows_passes(self) -> None:
+        las = LASFile(
+            version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+            curves_order=["DEPT", "TEXT"],
+            curves=[
+                CurveDefinition(mnemonic="DEPT"),
+                CurveDefinition(mnemonic="TEXT", data_format="S"),
+            ],
+            logs={"DEPT": np.array([1.0, 2.0, 3.0])},
+            string_data={"TEXT": np.array(["a", "b", "c"], dtype=object)},
+        )
+        assert las.logs["DEPT"].shape == (3,)
+
+
+class TestE13CaseVariantDuplicateKeysWithinContainer:
+    """E-13: case-variant duplicate keys WITHIN one container
+    (logs={'GR', 'gr'}, string_data, DataSection.data) pass all previous
+    validation → the writer's case-insensitive lookup emits ONE column and
+    silently drops the other's data.  Now rejected at construction, at
+    from_dict, and re-checked in validate(complete=True)."""
+
+    def test_construction_logs_case_variant_duplicate_raises(self) -> None:
+        with pytest.raises(LASDataError, match="case-variant duplicate keys"):
+            LASFile(
+                version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+                curves_order=["GR"],
+                curves=[CurveDefinition(mnemonic="GR")],
+                logs={"GR": np.array([1.0]), "gr": np.array([2.0])},
+            )
+
+    def test_construction_string_data_case_variant_duplicate_raises(self) -> None:
+        with pytest.raises(LASDataError, match="case-variant duplicate keys"):
+            LASFile(
+                version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+                curves_order=["GR"],
+                curves=[CurveDefinition(mnemonic="GR", data_format="S")],
+                string_data={"GR": np.array(["a"]), "gr": np.array(["b"])},
+            )
+
+    def test_construction_data_section_data_case_variant_duplicate_raises(self) -> None:
+        with pytest.raises(LASDataError, match="case-variant duplicate keys"):
+            DataSection(
+                name="LOG",
+                curves_order=["GR"],
+                data={"GR": np.array([1.0]), "gr": np.array([2.0])},
+            )
+
+    def test_construction_data_section_string_data_case_variant_duplicate_raises(self) -> None:
+        with pytest.raises(LASDataError, match="case-variant duplicate keys"):
+            DataSection(
+                name="LOG",
+                curves_order=["GR"],
+                string_data={"GR": np.array(["a"]), "gr": np.array(["b"])},
+            )
+
+    def test_from_dict_top_level_logs_case_variant_duplicate_raises(self) -> None:
+        with pytest.raises(LASDataError, match="case-variant duplicate keys"):
+            LASFile.from_dict(
+                {
+                    "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+                    "well": {"STRT": "0", "STOP": "1", "STEP": "0.5", "NULL": "-999"},
+                    "curves_order": ["GR"],
+                    "curves": [{"mnemonic": "GR"}],
+                    "logs": {"GR": [1.0], "gr": [2.0]},
+                }
+            )
+
+    def test_from_dict_per_section_data_case_variant_duplicate_raises(self) -> None:
+        with pytest.raises(LASDataError, match="case-variant duplicate keys"):
+            LASFile.from_dict(
+                {
+                    "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+                    "well": {"STRT": "0", "STOP": "1", "STEP": "0.5", "NULL": "-999"},
+                    "curves_order": ["GR"],
+                    "data_sections": [
+                        {
+                            "name": "LOG",
+                            "curves_order": ["GR"],
+                            "data": {"GR": [1.0], "gr": [2.0]},
+                        }
+                    ],
+                }
+            )
+
+    def test_validate_rechecks_post_construction_logs_duplicate(self) -> None:
+        las = LASFile(
+            version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+            curves_order=["GR"],
+            curves=[CurveDefinition(mnemonic="GR")],
+            logs={"GR": np.array([1.0])},
+        )
+        # Post-construction mutation bypasses the construction raise.
+        las.logs["gr"] = np.array([2.0])
+        issues = las.validate(complete=True)
+        assert any("case-variant duplicate keys" in i for i in issues), issues
+
+    def test_validate_rechecks_post_construction_section_duplicate(self) -> None:
+        ds = DataSection(
+            name="LOG",
+            curves_order=["GR"],
+            data={"GR": np.array([1.0])},
+        )
+        ds.data["gr"] = np.array([2.0])
+        issues = ds.validate(complete=True)
+        assert any("case-variant duplicate keys" in i for i in issues), issues
+
+    def test_supported_cross_container_case_variant_still_roundtrips(self) -> None:
+        """Control: the supported MOD-3 state (case-variant BETWEEN
+        curves_order and data keys, not within one container) is
+        untouched — 'dept' order entry + 'DEPT' data key still works."""
+        las = LASFile(
+            version=VersionSection(vers="2.0", wrap="NO", dlm="SPACE"),
+            curves_order=["dept"],
+            curves=[CurveDefinition(mnemonic="DEPT", unit="M")],
+            logs={"DEPT": np.array([100.0, 101.0])},
+        )
+        assert las.logs["DEPT"].shape == (2,)
+
+
+class TestE14DevFileAliasValidation:
+    """E-14: DevFile.validate(complete=True) only checked exact 'MD'/
+    'TVD' names — alias-named columns (MDKB/MDSS/DEPTH/DPT,
+    TVDKB/TVDSS/TVDBML) bypassed MD monotonicity, TVD NaN-density, and
+    TVD/MD-consistency.  Aliases now resolve via the same map
+    _validate_dev_data uses."""
+
+    def test_mdkb_non_monotonic_flagged(self) -> None:
+        dev = DevFile(
+            columns={"MDKB": np.array([0.0, 150.0, 120.0, 140.0])},
+            column_order=["MDKB"],
+            _from_dict=True,
+        )
+        issues = dev.validate(complete=True)
+        assert any("not monotonically increasing" in i for i in issues), issues
+
+    def test_depth_alias_non_monotonic_flagged(self) -> None:
+        dev = DevFile(
+            columns={"DEPTH": np.array([100.0, 50.0])},
+            column_order=["DEPTH"],
+            _from_dict=True,
+        )
+        issues = dev.validate(complete=True)
+        assert any("not monotonically increasing" in i for i in issues), issues
+
+    def test_tvdss_nan_density_flagged(self) -> None:
+        dev = DevFile(
+            columns={
+                "MD": np.array([0.0, 100.0, 200.0]),
+                "TVDSS": np.array([np.nan, np.nan, 300.0]),
+            },
+            column_order=["MD", "TVDSS"],
+            _from_dict=True,
+        )
+        issues = dev.validate(complete=True)
+        assert any("TVD column 'TVDSS'" in i and "NaN" in i for i in issues), issues
+
+    def test_alias_md_reference_used_for_tvd_consistency(self) -> None:
+        """The TVD MD-consistency check must use the alias-resolved MD
+        reference (MDKB) instead of the exact-case columns.get('MD')."""
+        dev = DevFile(
+            columns={
+                "MDKB": np.array([0.0, 100.0, 200.0, 300.0]),
+                "TVDSS": np.array([0.0, 90.0, 95.0, 80.0]),
+            },
+            column_order=["MDKB", "TVDSS"],
+            _from_dict=True,
+        )
+        issues = dev.validate(complete=True)
+        assert any("TVD column 'TVDSS' decreases" in i for i in issues), issues
+
+    def test_case_variant_md_column_flagged(self) -> None:
+        dev = DevFile(
+            columns={"md": np.array([100.0, 50.0])},
+            column_order=["md"],
+            _from_dict=True,
+        )
+        issues = dev.validate(complete=True)
+        assert any("not monotonically increasing" in i for i in issues), issues
+
+
+class TestE15ZeroDimArraysInDataSections:
+    """E-15: LASFile.__post_init__ data_sections loop crashed with
+    TypeError on 0-d numpy arrays (len() of unsized object).  The M-18
+    ndim==0 guard now treats them as single-element values."""
+
+    def test_zero_dim_section_data_constructs(self) -> None:
+        ds = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["DEPT"],
+            data={"DEPT": np.array(1.0)},
+        )
+        las = LASFile(
+            version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"),
+            curves_order=[],
+            data_sections=[ds],
+        )
+        assert las.data_sections[0].data["DEPT"].ndim == 0
+
+    def test_zero_dim_with_string_data_cross_group_constructs(self) -> None:
+        ds = DataSection(
+            name="LOG",
+            section_type="LOG_DATA",
+            curves_order=["A", "B"],
+            data={"A": np.array(1.0)},
+            string_data={"B": np.array(["x"], dtype=object)},
+        )
+        las = LASFile(
+            version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"),
+            curves_order=[],
+            data_sections=[ds],
+        )
+        assert las.data_sections[0].data["A"].ndim == 0
+
+
+class TestE29Las30OtherCheck:
+    """E-29: LAS 3.0 + other content — the parser rejects ~O on 3.0 and
+    the 3.0 writer drops the content; construction and validate() now
+    give loud feedback instead of silent acceptance."""
+
+    def test_direct_construction_warns(self) -> None:
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            LASFile(version=VersionSection(vers="3.0"), other="junk")
+        assert any("~Other" in str(x.message) for x in w), (
+            f"expected ~Other warning, got: {[str(x.message) for x in w]}"
+        )
+
+    def test_direct_construction_20_other_no_warning(self) -> None:
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            LASFile(version=VersionSection(vers="2.0"), other="junk")
+        assert not any("~Other" in str(x.message) for x in w), (
+            f"unexpected ~Other warning: {[str(x.message) for x in w]}"
+        )
+
+    def test_from_dict_warns_once(self) -> None:
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            LASFile.from_dict(
+                {
+                    "version": {"VERS": "3.0", "WRAP": "NO", "DLM": "COMMA"},
+                    "well": {"STRT": "0", "STOP": "1", "STEP": "0.5", "NULL": "-999"},
+                    "other": "junk",
+                }
+            )
+        n = len([x for x in w if "~Other" in str(x.message)])
+        assert n == 1, f"expected exactly 1 ~Other warning, got {n}: {[str(x.message) for x in w]}"
+
+    def test_validate_complete_rechecks_other(self) -> None:
+        las = LASFile(version=VersionSection(vers="3.0"))
+        las.other = "post-construction junk"
+        issues = las.validate(complete=True)
+        assert any("~Other is NOT ALLOWED in LAS 3.0" in i for i in issues), issues
+
+
+class TestE39BytesInStringData:
+    """E-39: bytes/bytearray in string_data passed validate(complete=True)
+    (only numeric dtypes were rejected) → the writer emitted repr
+    literals (b'GR') — type AND content corruption.  Now flagged."""
+
+    def test_lasfile_bytes_string_data_flagged(self) -> None:
+        las = LASFile(
+            version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"),
+            curves_order=["TEXT"],
+            curves=[CurveDefinition(mnemonic="TEXT", data_format="S")],
+            string_data={"TEXT": np.array([b"abc", b"def"], dtype=object)},
+        )
+        issues = las.validate(complete=True)
+        assert any("bytes/bytearray" in i for i in issues), issues
+
+    def test_lasfile_bytearray_string_data_flagged(self) -> None:
+        # Build the object array element-by-element: np.array([bytearray])
+        # would treat the bytearray as a sequence and produce a 2-D array
+        # (which the MOD-17 construction guard rejects — also loud).
+        _arr = np.empty(1, dtype=object)
+        _arr[0] = bytearray(b"abc")
+        las = LASFile(
+            version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"),
+            curves_order=["TEXT"],
+            curves=[CurveDefinition(mnemonic="TEXT", data_format="S")],
+            string_data={"TEXT": _arr},
+        )
+        issues = las.validate(complete=True)
+        assert any("bytes/bytearray" in i for i in issues), issues
+
+    def test_lasfile_bytes_dtype_string_data_flagged(self) -> None:
+        las = LASFile(
+            version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"),
+            curves_order=["TEXT"],
+            curves=[CurveDefinition(mnemonic="TEXT", data_format="S")],
+            string_data={"TEXT": np.array([b"abc", b"def"])},  # dtype 'S' (not object)
+        )
+        issues = las.validate(complete=True)
+        assert any("bytes/bytearray" in i for i in issues), issues
+
+    def test_datasection_bytes_string_data_flagged(self) -> None:
+        ds = DataSection(
+            name="LOG",
+            curves_order=["TEXT"],
+            string_data={"TEXT": np.array([b"x"], dtype=object)},
+        )
+        issues = ds.validate(complete=True)
+        assert any("bytes/bytearray" in i for i in issues), issues
+
+    def test_str_string_data_still_clean(self) -> None:
+        las = LASFile(
+            version=VersionSection(vers="3.0", wrap="NO", dlm="COMMA"),
+            curves_order=["TEXT"],
+            curves=[CurveDefinition(mnemonic="TEXT", data_format="S")],
+            string_data={"TEXT": np.array(["a", "b"], dtype=object)},
+        )
+        issues = las.validate(complete=True)
+        assert not any("bytes/bytearray" in i for i in issues), issues
+
+
+class TestE46CurveDefinitionExtendedFormatCodes:
+    """E-46: CurveDefinition raised ValueError on extended Fortran codes
+    ('F8.3'/'E10.2') that ParameterEntry/from_dict/parser all normalize.
+    Now truncates to the single-letter code at construction AND on
+    __setattr__; single-char invalid codes still raise (F-37 contract)."""
+
+    def test_construction_truncates_f83(self) -> None:
+        c = CurveDefinition(mnemonic="GR", data_format="F8.3")
+        assert c.data_format == "F"
+
+    def test_construction_truncates_e102(self) -> None:
+        c = CurveDefinition(mnemonic="GR", data_format="E10.2")
+        assert c.data_format == "E"
+
+    def test_setattr_truncates_extended_code(self) -> None:
+        c = CurveDefinition(mnemonic="GR", data_format="F")
+        c.data_format = "F8.3"
+        assert c.data_format == "F"
+
+    def test_single_char_invalid_still_raises(self) -> None:
+        with pytest.raises(ValueError, match="invalid data_format"):
+            CurveDefinition(mnemonic="GR", data_format="Q")
+
+    def test_setattr_single_char_invalid_still_raises(self) -> None:
+        c = CurveDefinition(mnemonic="GR", data_format="F")
+        with pytest.raises(ValueError, match="invalid data_format"):
+            c.data_format = "Q"
+
+    def test_lowercase_extended_truncates(self) -> None:
+        c = CurveDefinition(mnemonic="GR", data_format="f8.3")
+        assert c.data_format == "F"
+
+
+# ──────────────────────────────────────────────────────────────
+# E-03 (MEDIUM): WellSection.entries had NO mutation guard on any
+# path.  Item mutation (well.entries['STRT'] = 123), wholesale
+# assignment (well.entries = {...}) and update() all bypassed the
+# __post_init__/__setitem__ contract — non-str values crashed the
+# writer with an opaque AttributeError, and non-roundtrippable keys
+# were silently dropped on re-read.  Now re-wrapped through a
+# validating dict at every entry point.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE03WellEntriesMutationGuard:
+    """E-03: entries dict guards key content, value type, and length."""
+
+    def test_item_mutation_rejects_non_roundtrippable_key(self) -> None:
+        w = WellSection()
+        with pytest.raises(ValueError, match="cannot roundtrip"):
+            w.entries["GR.CO"] = "1"
+
+    def test_update_rejects_non_roundtrippable_key(self) -> None:
+        w = WellSection(entries={"STRT": "100"})
+        with pytest.raises(ValueError, match="cannot roundtrip"):
+            w.entries.update({"GR.CO": "1"})
+
+    def test_wholesale_assignment_rejects_bad_key(self) -> None:
+        w = WellSection()
+        with pytest.raises(ValueError, match="cannot roundtrip"):
+            w.entries = {"GR:1": "x"}  # type: ignore[assignment]
+
+    def test_non_str_key_rejected_on_mutation(self) -> None:
+        w = WellSection()
+        with pytest.raises(TypeError, match="must be str"):
+            w.entries[1] = "x"  # type: ignore[index]
+
+    def test_non_str_value_coerced_with_warning(self) -> None:
+        w = WellSection()
+        with pytest.warns(UserWarning, match="coercing non-str value"):
+            w.entries["STRT"] = 123  # type: ignore[assignment]
+        assert w.entries["STRT"] == "123"
+
+    def test_overlong_value_rejected_on_mutation(self) -> None:
+        w = WellSection()
+        with pytest.raises(ValueError, match="exceeds maximum allowed"):
+            w.entries["STRT"] = "x" * (MAX_FIELD_LENGTH + 1)
+
+    def test_valid_mutation_preserved(self) -> None:
+        w = WellSection(entries={"STRT": "100"})
+        w.entries["STOP"] = "200"
+        w.entries.update({"STEP": "1"})
+        assert w.entries == {"STRT": "100", "STOP": "200", "STEP": "1"}
+
+
+# ──────────────────────────────────────────────────────────────
+# E-04 (MEDIUM): VersionSection WRAP/DLM/VERS post-construction
+# mutation was never re-checked.  WRAP was the only ~V field never
+# re-checked anywhere — an invalid WRAP also silently disables the
+# 256-char line-limit enforcement.  __setattr__ now re-validates and
+# validate() re-checks WRAP/DLM values.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE04VersionSectionMutationRevalidation:
+    """E-04: WRAP/DLM/VERS mutations re-apply the construction contract."""
+
+    def test_wrap_mutation_rejects_invalid(self) -> None:
+        vs = VersionSection()
+        with pytest.raises(ValueError, match="invalid WRAP value"):
+            vs.wrap = "MAYBE"
+
+    def test_dlm_mutation_rejects_invalid(self) -> None:
+        vs = VersionSection()
+        with pytest.raises(ValueError, match="invalid DLM value"):
+            vs.dlm = "FOO"
+
+    def test_wrap_mutation_normalizes_uppercase(self) -> None:
+        vs = VersionSection()
+        vs.wrap = "no"
+        assert vs.wrap == "NO"
+
+    def test_dlm_mutation_case_preserved(self) -> None:
+        vs = VersionSection()
+        vs.dlm = "space"
+        assert vs.dlm == "space"
+
+    def test_vers_mutation_rejects_none(self) -> None:
+        vs = VersionSection()
+        with pytest.raises(ValueError, match="VERS cannot be None"):
+            vs.vers = None  # type: ignore[assignment]
+
+    def test_validate_catches_bypassed_invalid_wrap(self) -> None:
+        vs = VersionSection()
+        object.__setattr__(vs, "wrap", "MAYBE")
+        issues = vs.validate()
+        assert any("invalid WRAP value" in i for i in issues), issues
+
+    def test_validate_catches_bypassed_invalid_dlm(self) -> None:
+        vs = VersionSection()
+        object.__setattr__(vs, "dlm", "FOO")
+        issues = vs.validate()
+        assert any("invalid DLM value" in i for i in issues), issues
+
+    def test_validate_clean_for_valid_state(self) -> None:
+        vs = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        assert vs.validate() == []
+
+
+# ──────────────────────────────────────────────────────────────
+# E-05 (MEDIUM): WellSection.to_dict() nests units/descriptions
+# inside the well dict (documented contract); LASFile.from_dict's
+# well loop treated them as well entries → junk 'UNITS'/'DESCRIPTIONS'
+# entries.  from_dict now skips the reserved nested keys (they are
+# transported via well_units/well_descriptions).
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE05WellToDictNestedUnitsNoJunk:
+    """E-05: well.to_dict() output roundtrips through from_dict cleanly."""
+
+    def test_nested_units_not_ingested_as_entry(self) -> None:
+        well = WellSection(
+            entries={"STRT": "100", "STOP": "200"},
+            units={"STRT": "m"},
+            descriptions={"STRT": "Start"},
+        )
+        wd = well.to_dict()
+        assert "units" in wd and "descriptions" in wd  # documented nesting
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": wd,
+            "well_units": dict(well.units),
+            "well_descriptions": dict(well.descriptions),
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([1.0])},
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASFile.from_dict(data)
+        assert "UNITS" not in {k.upper() for k in las.well.entries}
+        assert "DESCRIPTIONS" not in {k.upper() for k in las.well.entries}
+        assert las.well.entries["STRT"] == "100"
+        assert las.well.units["STRT"] == "m"
+        assert las.well.descriptions["STRT"] == "Start"
+
+    def test_flat_well_dict_unchanged(self) -> None:
+        data: dict[str, Any] = {
+            "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+            "well": {"STRT": "100", "STOP": "200"},
+            "well_units": {"STRT": "m"},
+            "well_descriptions": {"STRT": "Start"},
+            "curves_order": ["DEPT"],
+            "curves": [{"mnemonic": "DEPT"}],
+            "logs": {"DEPT": np.array([1.0])},
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASFile.from_dict(data)
+        assert las.well.entries == {"STRT": "100", "STOP": "200"}
+        assert las.well.units["STRT"] == "m"
+
+
+# ──────────────────────────────────────────────────────────────
+# E-06 (MEDIUM): CurveDefinition/ParameterEntry __setattr__ re-
+# validated every leaf EXCEPT mnemonic.  A mutated mnemonic with
+# non-roundtrippable characters (colon, dot, etc.) passed and the
+# writer emitted a ~C/~P line the parser cannot match — silently
+# dropping the curve/parameter AND its data.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE06MnemonicMutationRevalidated:
+    """E-06: mnemonic mutation re-applies the __post_init__ contract."""
+
+    def test_curve_mnemonic_colon_rejected(self) -> None:
+        c = CurveDefinition(mnemonic="GR")
+        with pytest.raises(ValueError, match="cannot roundtrip"):
+            c.mnemonic = "GR:1"
+
+    def test_curve_mnemonic_dot_rejected(self) -> None:
+        c = CurveDefinition(mnemonic="GR")
+        # Dots hit the __post_init__-mirrored content check first.
+        with pytest.raises(ValueError, match="spaces/tabs/newlines/dots"):
+            c.mnemonic = "GR.CO"
+
+    def test_parameter_mnemonic_colon_rejected(self) -> None:
+        p = ParameterEntry(mnemonic="GR")
+        with pytest.raises(ValueError, match="cannot roundtrip"):
+            p.mnemonic = "GR:1"
+
+    def test_parameter_mnemonic_non_str_rejected(self) -> None:
+        p = ParameterEntry(mnemonic="GR")
+        with pytest.raises(TypeError, match="mnemonic must be str"):
+            p.mnemonic = 42  # type: ignore[assignment]
+
+    def test_curve_mnemonic_valid_mutation_passes(self) -> None:
+        c = CurveDefinition(mnemonic="GR")
+        c.mnemonic = "NEW"
+        assert c.mnemonic == "NEW"
+
+    def test_parameter_mnemonic_array_form_accepted(self) -> None:
+        p = ParameterEntry(mnemonic="GR")
+        p.mnemonic = "RUN[1]"
+        assert p.mnemonic == "RUN[1]"
+
+
+# ──────────────────────────────────────────────────────────────
+# E-07 (MEDIUM): ParameterZone had NO __setattr__ — post-construction
+# mutation of zone_index/zone_name bypassed the construction contract
+# (negative index → writer emitted an unreadable zone association;
+# bracket chars → raw text leaked into the parameter description).
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE07ParameterZoneMutationRevalidated:
+    """E-07: ParameterZone leaf fields re-validate on assignment."""
+
+    def test_negative_zone_index_rejected_on_mutation(self) -> None:
+        pz = ParameterZone(zone_name="RUN", zone_index=1)
+        with pytest.raises(ValueError, match="zone_index must be >= 0"):
+            pz.zone_index = -1
+
+    def test_non_int_zone_index_rejected_on_mutation(self) -> None:
+        pz = ParameterZone(zone_name="RUN", zone_index=1)
+        with pytest.raises(TypeError, match="zone_index must be int or None"):
+            pz.zone_index = "1"  # type: ignore[assignment]
+
+    def test_zone_name_brackets_warn_on_mutation(self) -> None:
+        pz = ParameterZone(zone_name="RUN", zone_index=1)
+        with pytest.warns(UserWarning, match="cannot roundtrip"):
+            pz.zone_name = "Bad[Name]"
+
+    def test_zone_name_whitespace_normalized_on_mutation(self) -> None:
+        pz = ParameterZone(zone_name="RUN", zone_index=1)
+        with pytest.warns(UserWarning, match="Normalizing to"):
+            pz.zone_name = " |Zone "
+        assert pz.zone_name == "|Zone"
+
+    def test_valid_mutations_preserved(self) -> None:
+        pz = ParameterZone(zone_name="RUN", zone_index=1)
+        pz.zone_index = 2
+        pz.zone_name = "MAIN"
+        assert (pz.zone_index, pz.zone_name) == (2, "MAIN")
+
+
+# ──────────────────────────────────────────────────────────────
+# E-08 (MEDIUM): _validate_array_continuity grouped array curves by
+# case-SENSITIVE base — a case-variant interleaved pair ('NMR[1]' +
+# 'nmr[2]' with a non-array curve between) passed as two single-
+# element groups and the writer emitted self-unreadable output.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE08ArrayContinuityCaseInsensitiveBase:
+    """E-08: array grouping uses _case_key on the base mnemonic."""
+
+    def test_case_variant_interleaved_arrays_rejected(self) -> None:
+        with pytest.raises(LASDataError, match="not contiguous"):
+            LASFile(
+                version=VersionSection(vers="3.0"),
+                curves_order=["DEPT", "NMR[1]", "GR", "nmr[2]"],
+                curves=[
+                    CurveDefinition(mnemonic=m)
+                    for m in ["DEPT", "NMR[1]", "GR", "nmr[2]"]
+                ],
+                logs={
+                    m: np.array([1.0])
+                    for m in ["DEPT", "NMR[1]", "GR", "nmr[2]"]
+                },
+            )
+
+    def test_case_variant_contiguous_arrays_accepted(self) -> None:
+        las = LASFile(
+            version=VersionSection(vers="3.0"),
+            curves_order=["DEPT", "NMR[1]", "nmr[2]", "GR"],
+            curves=[
+                CurveDefinition(mnemonic=m)
+                for m in ["DEPT", "NMR[1]", "nmr[2]", "GR"]
+            ],
+            logs={
+                m: np.array([1.0]) for m in ["DEPT", "NMR[1]", "nmr[2]", "GR"]
+            },
+        )
+        assert len(las.curves) == 4
+
+
+# ──────────────────────────────────────────────────────────────
+# E-09 (MEDIUM): MAX_FIELD_LENGTH gaps — ParameterEntry already-str
+# values (missing elif branch on BOTH mutation and construction) and
+# CurveDefinition/ParameterEntry mnemonics were never length-checked;
+# over-long values were emitted and then failed the parser's own
+# guard on re-read (self-unreadable).
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE09MaxFieldLengthGaps:
+    """E-09: length checks on ParameterEntry values + all mnemonics."""
+
+    def test_parameter_value_overlong_construction_raises(self) -> None:
+        with pytest.raises(ValueError, match="exceeds maximum allowed"):
+            ParameterEntry(mnemonic="GR", value="x" * (MAX_FIELD_LENGTH + 1))
+
+    def test_parameter_value_overlong_mutation_raises(self) -> None:
+        p = ParameterEntry(mnemonic="GR", value="x")
+        with pytest.raises(ValueError, match="exceeds maximum allowed"):
+            p.value = "y" * (MAX_FIELD_LENGTH + 1)
+
+    def test_parameter_unit_overlong_mutation_raises(self) -> None:
+        p = ParameterEntry(mnemonic="GR", value="x")
+        with pytest.raises(ValueError, match="exceeds maximum allowed"):
+            p.unit = "u" * (MAX_FIELD_LENGTH + 1)
+
+    def test_curve_mnemonic_overlong_construction_raises(self) -> None:
+        with pytest.raises(ValueError, match="exceeds maximum allowed"):
+            CurveDefinition(mnemonic="x" * (MAX_FIELD_LENGTH + 1))
+
+    def test_parameter_mnemonic_overlong_construction_raises(self) -> None:
+        with pytest.raises(ValueError, match="exceeds maximum allowed"):
+            ParameterEntry(mnemonic="x" * (MAX_FIELD_LENGTH + 1))
+
+    def test_curve_mnemonic_overlong_mutation_raises(self) -> None:
+        c = CurveDefinition(mnemonic="GR")
+        with pytest.raises(ValueError, match="exceeds maximum allowed"):
+            c.mnemonic = "y" * (MAX_FIELD_LENGTH + 1)
+
+    def test_parameter_mnemonic_overlong_mutation_raises(self) -> None:
+        p = ParameterEntry(mnemonic="GR", value="x")
+        with pytest.raises(ValueError, match="exceeds maximum allowed"):
+            p.mnemonic = "z" * (MAX_FIELD_LENGTH + 1)
+
+
+# ──────────────────────────────────────────────────────────────
+# E-10 (MEDIUM): _validate_array_continuity enforced ONLY at
+# construction — post-construction curves_order mutation bypassed it
+# and the writer emitted self-unreadable files.  validate(complete=True)
+# now re-runs it for data_sections AND top-level curves_order.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestE10ValidateRerunsArrayContinuity:
+    """E-10: validate(complete=True) re-checks array contiguity."""
+
+    def test_top_level_interleaved_mutation_flagged(self) -> None:
+        las = LASFile(
+            version=VersionSection(vers="3.0"),
+            curves_order=["DEPT", "NMR[1]", "NMR[2]", "GR"],
+            curves=[
+                CurveDefinition(mnemonic=m)
+                for m in ["DEPT", "NMR[1]", "NMR[2]", "GR"]
+            ],
+            logs={
+                m: np.array([1.0]) for m in ["DEPT", "NMR[1]", "NMR[2]", "GR"]
+            },
+        )
+        las.curves_order[2] = "GR"
+        las.curves_order[3] = "NMR[2]"
+        issues = las.validate(complete=True)
+        assert any("not contiguous" in i for i in issues), issues
+
+    def test_section_interleaved_mutation_flagged(self) -> None:
+        ds = DataSection(
+            name="LOG",
+            curves_order=["NMR[1]", "NMR[2]"],
+            section_curves=[
+                CurveDefinition(mnemonic="NMR[1]"),
+                CurveDefinition(mnemonic="NMR[2]"),
+            ],
+            data={"NMR[1]": np.array([1.0]), "NMR[2]": np.array([1.0])},
+        )
+        las = LASFile(
+            version=VersionSection(vers="3.0"),
+            curves_order=["NMR[1]", "NMR[2]"],
+            data_sections=[ds],
+        )
+        las.data_sections[0].curves_order.insert(1, "GR")
+        issues = las.validate(complete=True)
+        assert any("not contiguous" in i for i in issues), issues
+
+    def test_valid_state_stays_clean(self) -> None:
+        las = LASFile(
+            version=VersionSection(vers="3.0"),
+            curves_order=["DEPT", "NMR[1]", "NMR[2]", "GR"],
+            curves=[
+                CurveDefinition(mnemonic=m)
+                for m in ["DEPT", "NMR[1]", "NMR[2]", "GR"]
+            ],
+            logs={
+                m: np.array([1.0]) for m in ["DEPT", "NMR[1]", "NMR[2]", "GR"]
+            },
+        )
+        assert las.validate(complete=True) == []

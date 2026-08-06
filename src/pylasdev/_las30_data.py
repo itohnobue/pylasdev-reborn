@@ -22,8 +22,10 @@ if TYPE_CHECKING:
     from .models import LASFile
 
 from . import data_reader as _data_reader
+from ._data_section_reader import _split_data_line
 from .data_reader import (
     _get_null_value,
+    _parse_float_with_d_notation,
     _resolve_max_tokens_per_line,
     _to_finite_float,
     _to_integer_value,
@@ -355,19 +357,26 @@ def _spec_form_group_data_is_numeric(
     """Return True when every value in the group's columns is numeric.
 
     F-06: Confirms a repeated-plain-mnemonic A-format group is a genuine
-    spec-form array channel.  The parser strips the ``{A:N}`` marker from
-    curve descriptions (parser.py:2502-2504) before this layer runs, so
-    the marker is unobservable here — a repeated plain mnemonic with
-    ``data_format="A"`` is ambiguous between a spec-form array channel and
-    duplicate STRING curves.  The DATA is the only unambiguous
-    discriminator: array channels carry numeric values, duplicate STRING
-    curves carry non-numeric values (e.g. two ``LITH ... {A}`` entries
-    holding "SAND SHALE").  A group whose columns contain ANY non-numeric
-    value is a string curve and must NOT be reclassified (pre-fix
-    behavior: deduplicate as STRING curves, values preserved).
+    spec-form array channel.  The parser strips plain ``{A}`` format
+    markers from curve descriptions before this layer runs, so a repeated
+    plain mnemonic with ``data_format="A"`` is ambiguous between a
+    spec-form array channel and duplicate STRING curves (offset-bearing
+    ``{A:N}`` markers ARE preserved — see L30-01).  The DATA is the
+    unambiguous discriminator for marker-less groups: array channels
+    carry numeric values, duplicate STRING curves carry non-numeric
+    values (e.g. two ``LITH ... {A}`` entries holding "SAND SHALE").  A
+    group whose columns contain ANY non-numeric value is a string curve
+    and must NOT be reclassified (pre-fix behavior: deduplicate as
+    STRING curves, values preserved).
 
     Numeric compatibility mirrors the fill loop's ``_to_finite_float``:
     empty/missing tokens are null-compatible (not string evidence).
+    M-06: NaN/Inf tokens (``nan``, ``inf``, ``1e999``) are ALSO
+    null-compatible — the fill loop parses them numerically and
+    null-fills the cell for a numeric curve, so they must not count as
+    string evidence (pre-fix: a NaN token in a >=2-element spec-form
+    group misrouted the whole channel to duplicate STRING curves,
+    contradicting the fill loop's NaN->null semantics).
 
     Args:
         data_lines: Collected ASCII data lines for the section, or None.
@@ -381,7 +390,6 @@ def _spec_form_group_data_is_numeric(
         return False
     from ._data_section_reader import _split_data_line
 
-    _failure_counter = [0]
     for line in data_lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -392,11 +400,17 @@ def _spec_form_group_data_is_numeric(
                 # Short row — the cell is null-filled downstream (null for
                 # numeric curves), which is not string evidence.
                 continue
-            _before = _failure_counter[0]
-            # null_value argument is irrelevant to the counter: only the
-            # parse success/failure of the token is being probed.
-            _to_finite_float(values[col], 0.0, _failure_counter=_failure_counter)
-            if _failure_counter[0] > _before:
+            token = values[col]
+            if not token:
+                # Empty token — null-compatible, not string evidence.
+                continue
+            # M-06: mirror the fill loop's NaN->null semantics — a
+            # parseable number (including nan/inf, which float() accepts)
+            # is numeric evidence; only a genuine parse failure proves
+            # string semantics.
+            try:
+                _parse_float_with_d_notation(token)
+            except (ValueError, OverflowError):
                 return False
     return True
 
@@ -420,6 +434,21 @@ def _build_spec_form_array_info(
     :func:`_spec_form_group_data_is_numeric`).  Duplicate A-format STRING
     curves (e.g. two ``LITH ... {A}`` entries) are left untouched so the
     caller's dedup preserves them as STRING curves with values intact.
+
+    E-22: A SINGLE-element group whose member carries the preserved
+    ``{A:N}`` spec-form element marker is a lone array channel (e.g. a
+    one-element ``{A:0}`` array) — it synthesizes with index 1 and the
+    marker's time offset instead of being misrouted to string_data.  A
+    marker-less single A-format curve stays untouched (it is a plain
+    ``{A}``-style string curve; test-pinned F-06 behavior).
+
+    M-16: For 2+ member groups, the parser preserves ONLY offset-bearing
+    ``{A:N}`` markers (L30-01, parser.py) — plain ``{A}`` markers are
+    stripped, so a marker-less group is ambiguous between a spec-form
+    array and duplicate STRING curves.  The numeric-data probe remains
+    the discriminator for those (F-06, test-pinned), but the conversion
+    is a DATA-TYPE MUTATION on external files (string_data -> logs) and
+    must not be silent: a loud warning names the reclassification.
 
     Returns a NEW list; the caller's list is not mutated.
     """
@@ -451,20 +480,17 @@ def _build_spec_form_array_info(
     if current_base is not None:
         groups.append((current_base, current_indices))
 
-    if not any(len(indices) >= 2 for _, indices in groups):
-        return section_curves
-
     result = list(section_curves)
-    for base, indices in groups:
-        if len(indices) < 2:
-            continue
-        # F-06: Only synthesize GENUINE array channels.  A repeated plain
-        # mnemonic with data_format "A" is ambiguous (marker stripped by
-        # parser); numeric data confirms the array channel, non-numeric
-        # data means duplicate STRING curves whose values must be
-        # preserved (pre-fix behavior).
-        if not _spec_form_group_data_is_numeric(data_lines, delimiter, indices):
-            continue
+
+    def _synthesize_members(indices: list[int]) -> None:
+        """Rewrite the group members at *indices* as array elements.
+
+        Shared by the multi-element (M-08) and single-element (E-22)
+        paths.  Extracts each member's ``{A:N}`` time offset, strips the
+        marker from the description (the writer re-emits it once from
+        ``array_info.time_offset``), and attaches 1-based
+        ``ArrayElementInfo``.
+        """
         for pos, curve_idx in enumerate(indices, start=1):
             curve = result[curve_idx]
             offset: float | None = None
@@ -506,6 +532,51 @@ def _build_spec_form_array_info(
                 raise LASParseError(
                     f"Invalid spec-form array element '{base}[{pos}]' ({description!r}): {exc}"
                 ) from exc
+
+    for base, indices in groups:
+        if len(indices) < 2:
+            # E-22: single-element spec-form groups synthesize ONLY when
+            # the member carries the preserved '{A:N}' element marker
+            # (offset-bearing markers survive the parser; a lone '{A:0}'
+            # array channel is a genuine single-element array).  Marker-
+            # less single A-format curves (plain '{A}' duplicates, no
+            # marker) are string curves — untouched (test-pinned).
+            member = result[indices[0]]
+            if not _SPEC_FORM_ARRAY_RE.search(member.description or ""):
+                continue
+            if not _spec_form_group_data_is_numeric(data_lines, delimiter, indices):
+                continue
+            _synthesize_members(indices)
+            continue
+        # F-06: Only synthesize GENUINE array channels.  A repeated plain
+        # mnemonic with data_format "A" is ambiguous (plain markers
+        # stripped by parser); numeric data confirms the array channel,
+        # non-numeric data means duplicate STRING curves whose values must
+        # be preserved (pre-fix behavior).
+        if not _spec_form_group_data_is_numeric(data_lines, delimiter, indices):
+            continue
+        # M-16: offset-bearing '{A:N}' markers ARE observable (L30-01
+        # preserves them) — their presence confirms the spec-form channel
+        # and the conversion is legitimate.  A marker-less group is
+        # ambiguous: the numeric probe says array, but duplicate STRING
+        # curves holding numeric-looking codes ('1','2') would be silently
+        # reclassified (string_data -> logs data-type mutation).  Warn
+        # loudly instead of converting silently.
+        has_spec_form_marker = any(
+            _SPEC_FORM_ARRAY_RE.search(result[i].description or "") for i in indices
+        )
+        if not has_spec_form_marker:
+            warnings.warn(
+                f"Duplicate A-format curve group '{base}' holds numeric-looking "
+                f"data and was reclassified as a spec-form array channel "
+                f"({', '.join(f'{base}[{pos}]' for pos in range(1, len(indices) + 1))}). "
+                f"If these curves were intended as STRING data (e.g. duplicate "
+                f"'{base} ... {{A}}' declarations), their values are now stored "
+                f"as numeric arrays instead of string_data.",
+                UserWarning,
+                stacklevel=2,
+            )
+        _synthesize_members(indices)
     return result
 
 
@@ -578,10 +649,32 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
             ctx.las_file.version.wrap,
         )
     if actual_wrap:
+        # E-21: LAS 3.0 has no wrapped-data reader — this is a DELIBERATE
+        # rejection (R-5), not an accidental gap.  The LAS 1.2/2.0
+        # accumulator (_read_wrapped, data_reader.py:1142) operates on
+        # LASFile.logs with a different row protocol and cannot be shared
+        # with the 3.0 per-section DataSection fill loop without a
+        # cross-module refactor; the shared detection core therefore feeds
+        # a LOUD, declaration-independent error instead of the silent
+        # DEPT-shift that would follow from misparsing wrapped rows as
+        # non-wrapped.  The CWLS 3.0 spec's WRAP rule is unverified, so
+        # NO new rejection rule is encoded here beyond the existing
+        # content-based detection.  Because detection is content-based
+        # (the declared WRAP header may be wrong), the message must not
+        # instruct the user to "set WRAP to NO" — the file may already
+        # declare NO (the pre-fix message misdiagnosed such files).
+        if (ctx.las_file.version.wrap or "").upper() == "YES":
+            raise LASParseError(
+                "LAS 3.0 WRAP=YES is not supported by pylasdev.  "
+                "Convert the file to unwrapped format (one line per "
+                "depth step) before parsing."
+            )
         raise LASParseError(
-            "LAS 3.0 WRAP=YES is not supported by pylasdev.  "
-            "Convert the file to unwrapped format (one line per "
-            "depth step) before parsing, or set WRAP to NO."
+            "LAS 3.0 wrapped/flowing data layout (multiple depth steps "
+            "per line) is not supported by pylasdev, even when WRAP=NO "
+            "is declared — the wrapped layout was detected from the "
+            "data content.  Convert the file to unwrapped format (one "
+            "line per depth step) before parsing."
         )
 
     # Get delimiter character
@@ -660,11 +753,26 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
                 (curve.array_info.index, curve.mnemonic, curve.data_format or "", _pos)
             )
     for _base_name, _elements in _array_groups.items():
-        if len(_elements) < 2:
-            continue
+        # M-15: validate SINGLE-element array groups too.  The previous
+        # ``len(_elements) < 2: continue`` short-circuit skipped the
+        # index rule for lone elements — a metadata-only or
+        # single-element file with ``NMR[0]`` parsed silently (sibling of
+        # the models-side N-01 fix: the read-side check here + the
+        # model-side construction check cover the full chain).  A single
+        # element is rejected only for a NON-POSITIVE index: a section
+        # may legitimately carry a per-section continuation element
+        # (section 1 ``NMR[1]``, section 2 ``NMR[2]`` — M-64 locks that
+        # roundtrip), so ``index >= 1`` is the valid range.
         _elements.sort(key=lambda e: e[0])
-        # F-034 (a): Arrays in LAS 3.0 must use 1-based indices.
         _first_idx = _elements[0][0]
+        if len(_elements) == 1:
+            if _first_idx < 1:
+                raise LASParseError(
+                    f"Array '{_base_name}' starts at index {_first_idx}; "
+                    f"LAS 3.0 requires 1-based array indices ([1]→[n])"
+                )
+            continue
+        # F-034 (a): Arrays in LAS 3.0 must use 1-based indices.
         if _first_idx != 1:
             raise LASParseError(
                 f"Array '{_base_name}' starts at index {_first_idx}; "
@@ -989,18 +1097,19 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
         if delimiter == " ":
             values = line.split(maxsplit=_max_tokens)
         else:
-            # str.split(delimiter) avoids the csv.reader quoting
-            # asymmetry with the writer (which uses raw
-            # delimiter.join()).  csv.reader with QUOTE_MINIMAL
-            # interprets " as CSV quoting; the writer does not emit
-            # CSV quotes — causing roundtrip data corruption for
-            # string values containing double-quote characters.
-            values = line.strip().split(delimiter, maxsplit=_max_tokens)
-            # Strip trailing empty strings from non-space delimiters
-            # (e.g., trailing COMMA produces phantom empty column).
-            # Space-delimited split handles this automatically.
-            while values and values[-1] == "":
-                values.pop()
+            # M-05/M-30 parity (LAS 3.0): route the non-space split through
+            # the shared DLM-aware splitter so the comma branch ALSO
+            # recombines thousands-separated fragments ("1,234.5" →
+            # "1234.5") with a loud warning instead of silently
+            # mis-assigning every subsequent column (mirrors
+            # data_reader.py:1021/1484 — the LAS 1.2/2.0 paths already use
+            # _split_data_line).  F-I2-M01: strip the line first — leading
+            # whitespace would produce an empty first token and column
+            # shift; the shared splitter expects a stripped line.  F2-015:
+            # csv.reader quoting is deliberately not used (the writer emits
+            # raw delimiter.join()); str.split keeps the writer's own
+            # roundtrips byte-identical.
+            values = _split_data_line(line.strip(), delimiter, expected=num_curves)
 
         # Warn about extra columns being silently discarded
         if len(values) > num_curves:
@@ -1036,11 +1145,16 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
         # F-11: Warn when non-wrapped data lines have fewer values than
         # declared curves.  Short rows in wrapped mode are expected
         # (values span multiple lines), so this warning only fires in
-        # non-wrapped (WRAP=NO) mode.
-        if len(values) < num_curves:
-            is_not_wrapped = ctx.las_file.version.wrap.upper() != "YES"
-            if is_not_wrapped:
-                short_count += 1
+        # non-wrapped mode.
+        # M-21: key the gate on the CONTENT-DETECTED wrap state
+        # (actual_wrap), matching the LAS 1.2/2.0 twin (_read_normal only
+        # runs when not actually wrapped and warns on short rows
+        # unconditionally, data_reader.py:946-963).  The previous gate
+        # keyed on the DECLARED WRAP header — a declared-WRAP=YES file
+        # whose data is actually non-wrapped silently null-filled short
+        # rows with ZERO diagnostics.
+        if len(values) < num_curves and not actual_wrap:
+            short_count += 1
 
         # Pad with null values if needed.
         # String curves use "" (empty string) to avoid width-ambiguity
@@ -1065,11 +1179,22 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
             # token is passed through untouched.
             val_str = values[i]
             # F-007: Reverse the writer's _sanitize_las_value #-prefix escape.
-            # II-13: restore_tilde=True ONLY on the LAS 3.0 data path — the
-            # LAS 3.0 writer emits the M-85 '_~' escape for first-column
-            # string values, so the restore is correct here (the LAS 1.2/2.0
-            # data path and header call sites keep the fail-safe False).
-            val_str = _desanitize_las_value(val_str, restore_tilde=True)
+            # E-01 (HIGH): the M-85 '_~' escape is emitted by the writer
+            # ONLY for FIRST-column string values starting '~'+non-letter
+            # (_writer_base.py:710-737); a genuine '_~'-prefixed value is
+            # written VERBATIM (the escape predicate `\s*~` never matches
+            # '_~...').  restore_tilde is therefore position-scoped to the
+            # first column (i == 0) — the pre-fix code applied it to EVERY
+            # token of every row, corrupting genuine '_~' values in ANY
+            # column (e.g. a second-column {S} value '_~sandstone' was
+            # silently read as '~sandstone').  _sanitize.desanitize_las_value
+            # additionally applies the writer-escape predicate (only
+            # '_~'+non-letter tokens restore), so a first-column genuine
+            # '_~DEPT' — which the writer would never emit — survives too.
+            # The escape-collision residual (genuine '~3D' escaped AND
+            # genuine '_~3D' both write byte-identically as '_~3D') is a
+            # documented irreducible trade (see _sanitize.py).
+            val_str = _desanitize_las_value(val_str, restore_tilde=(i == 0))
             if string_curves.get(i, False):
                 # F-39, F-40, I2-F-03: Desanitize reversal warnings for
                 # writer-side one-way sanitization transformations.  Each
