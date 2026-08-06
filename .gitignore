@@ -42,3 +42,6 @@ session.md
 opencode.json
 loop-tasks.txt
 loop-tasks-run.sh
+
+# Local plan files (not part of the repo)
+plans/
