@@ -354,8 +354,12 @@ _CYRILLIC_RUN_GE_RE, _CYRILLIC_RUN_3_RE, _STRONG_CYRILLIC_RUN_RE = _build_cyrill
 _CYRILLIC_WORD_PRE_RE = re.compile("[\u0400-\u04FF]{3}")
 
 
-def _window_has_numero_prefix(window: bytes) -> bool:
+def _window_has_numero_prefix(window: bytes, at_data_start: bool = False) -> bool:
     """Return True if *window* contains a 0xB9 byte that is a Cyrillic "№".
+
+    *at_data_start* tells the caller's window begins at the TRUE start of
+    the data being scanned (not at a slice boundary) — see the M-08 note
+    on the ``prev < 0`` branch below.
 
     Byte 0xB9 is "№" in cp1251 but "¹" (superscript one) in cp1252 — a
     Western footnote "¹" adjacent to an accented run ("Nota¹ Ñáñez") must
@@ -405,7 +409,22 @@ def _window_has_numero_prefix(window: bytes) -> bool:
             # convention ("№ 1 СКВ", "№1 СКВ" — possibly after leading  # noqa: RUF003
             # whitespace on the line).
             if prev < 0:
-                return True
+                # M-08 (window-slice boundary): "prev < 0" is only a
+                # genuine data start when the window begins at the TRUE
+                # start of the data.  The caller slices a window around
+                # each 3-byte run (window_start = max(0, match.start() -
+                # _NUMERO_ADJACENCY_WINDOW)), so a 0xB9 exactly
+                # _NUMERO_ADJACENCY_WINDOW bytes before a run lands at
+                # window[0] of a mid-file slice — the byte that precedes
+                # it in the data was truncated and is NOT known to be a
+                # line/data start.  Treating that slice boundary as a
+                # line start fired the № rule for a Western "¹1" exactly
+                # 8 bytes before an accent run ("X¹1 ABC Ñáñez") and
+                # flipped the whole file to cp1251 mojibake.  Only when
+                # the slice begins at the true data start (window_start
+                # == 0) does "prev < 0" mean the marker sits at data[0]
+                # (the pinned №-at-start convention).
+                return at_data_start
             if window[prev] in (0x0A, 0x0D):
                 return True
             if window[prev] in _CP1251_CYRILLIC_BYTES:
@@ -441,7 +460,9 @@ def _has_confirmed_cyrillic_run(data: bytes) -> bool:
         for match in _CYRILLIC_RUN_3_RE.finditer(data):
             window_start = max(0, match.start() - _NUMERO_ADJACENCY_WINDOW)
             window_end = min(len(data), match.end() + _NUMERO_ADJACENCY_WINDOW)
-            if _window_has_numero_prefix(data[window_start:window_end]):
+            if _window_has_numero_prefix(
+                data[window_start:window_end], at_data_start=(window_start == 0)
+            ):
                 return True
     for match in _STRONG_CYRILLIC_RUN_RE.finditer(data):
         if len(match.group()) >= _STRONG_RUN_MIN:
@@ -611,7 +632,23 @@ def _is_genuine_word_run(
         # (СКВАЖИНА-class) may be judged genuine at EOF.
         if not allow_rule1:
             return any(raw[t] in _STRICT_CYRILLIC_EVIDENCE_BYTES for t in range(i, j))
-        return True
+        # M-10 (≤64K true-EOF form): the allow_rule1=True EOF branch was
+        # unconditional — a Western typographic-symbol cluster (…†‡ =
+        # 0x85 0x86 0x87 → 'ЕЖЗ' under cp866) sitting at the TRUE EOF of a
+        # ≤64K file is all-ambiguous (rule (1) already passed) and blocked
+        # the ENC-02(b) Western rescue → genuine cp1252 file decoded cp866
+        # mojibake.  Mirror the M-20a truncated gate and the M-07 strict-set
+        # EOF gate: only a run holding a cp1251-Cyrillic byte that is not
+        # an M-19-carved Western symbol (genuine cp866 words like УАЗ =  # noqa: RUF003
+        # 0x93 0x80 0x87 carry 0x80, СКВ = 0x91 0x8A 0x82 carries 0x8A) may  # noqa: RUF003
+        # be judged genuine at EOF.  The no-set-byte 18-letter complement
+        # (ВДЕ == ‚„… — byte-identical to Western punctuation, see the  # noqa: RUF003
+        # E-01 note) is the same irreducible class as the ASCII-letter-
+        # follows shape: with no following bytes there is no LAS context to
+        # fall back on, so the byte-content gate is the only evidence.
+        if all(raw[t] in _WESTERN_STRONG_SYMBOL_BYTES for t in range(i, j)):
+            return False
+        return any(raw[t] in _CP1251_CYRILLIC_BYTES for t in range(i, j))
     b = raw[k]
     if 0x41 <= b <= 0x5A or 0x61 <= b <= 0x7A:
         # An ASCII letter follows (…†‡ and more; УАЗ FIELD).  F-02: a  # noqa: RUF003

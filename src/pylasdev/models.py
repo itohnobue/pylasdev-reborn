@@ -10,7 +10,7 @@ import math
 import re
 import warnings
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from typing import Any, SupportsIndex
 
 import numpy as np
@@ -1189,13 +1189,51 @@ def _validate_from_dict_input(data: dict[str, Any]) -> None:
         # both top-level string_data and data_sections, the top-level
         # value is silently ignored.  Warn so callers know about the
         # data discard.
+        # M-23: Apply the M-28 value-equality discrimination (mirroring
+        # the F-115 logs block above).  The LAS 3.0 parser populates
+        # BOTH the top-level string_data convenience view AND the owning
+        # DataSection's string_data with the SAME values by design
+        # (defensive copies) — every canonical parse→to_dict→from_dict
+        # roundtrip therefore contains the overlap, and warning on it
+        # hard-fails warnings-as-errors automation on the library's own
+        # standard roundtrip.  Warn only when a section's value
+        # genuinely diverges from the top-level string_data value for
+        # the same curve (a manual dict that really would lose data on
+        # write).
         _top_str = data.get("string_data")
         if isinstance(_top_str, dict) and _top_str:
             _top_str_names = {str(k).upper() for k in _top_str.keys()}
             _ds_str_overlap = _top_str_names & _ds_curve_names
-            if _ds_str_overlap:
+            # Build name → section values so the canonical-copy
+            # discrimination can compare actual values.  Both section
+            # data and string_data are collected (the curve's section
+            # copy may live in either), matching F-115.
+            _ds_str_values_by_upper: dict[str, list[Any]] = {}
+            for _ds in data_sections:
+                if not isinstance(_ds, dict):
+                    continue
+                _ds_data = _ds.get("data")
+                if isinstance(_ds_data, dict):
+                    for _k, _v in _ds_data.items():
+                        _ds_str_values_by_upper.setdefault(str(_k).upper(), []).append(_v)
+                _ds_str = _ds.get("string_data")
+                if isinstance(_ds_str, dict):
+                    for _k, _v in _ds_str.items():
+                        _ds_str_values_by_upper.setdefault(str(_k).upper(), []).append(_v)
+            _genuine_str_overlap: list[str] = []
+            for _u in sorted(_ds_str_overlap):
+                _top_str_vals = [_top_str[_k] for _k in _top_str if str(_k).upper() == _u]
+                _section_str_vals = _ds_str_values_by_upper.get(_u, [])
+                if not _section_str_vals:
+                    continue
+                if any(
+                    not all(_array_values_equal(_tv, _sv) for _tv in _top_str_vals)
+                    for _sv in _section_str_vals
+                ):
+                    _genuine_str_overlap.append(_u)
+            if _genuine_str_overlap:
                 warnings.warn(
-                    f"Curve(s) {sorted(_ds_str_overlap)} appear in "
+                    f"Curve(s) {_genuine_str_overlap} appear in "
                     f"both top-level 'string_data' and "
                     f"'data_sections'.  The writer uses "
                     f"data_sections when both are present, ignoring "
@@ -1278,6 +1316,16 @@ class VersionSection:
     vers: str = "2.0"
     wrap: str = "NO"
     dlm: str = "SPACE"  # LAS 2.0+: SPACE, TAB, or COMMA
+    # M-20: Non-stored InitVar.  The from_dict VERS-normalization block
+    # (models.py from_dict) warns with parser-equivalent text for a
+    # non-standard VERS value BEFORE constructing VersionSection; this
+    # flag tells __post_init__ to pre-set the _vers_warned latch so
+    # construction does not emit a second "Unrecognized VERS" warning
+    # for the same condition (2 warnings for 1 condition broke -W error
+    # automation).  InitVar fields are never stored — they do not appear
+    # in to_dict()/eq/repr and are invisible to callers who do not pass
+    # the flag (direct construction still warns exactly once).
+    _vers_already_warned: InitVar[bool] = False
 
     def validate(self, complete: bool = False) -> list[str]:
         """Validate version section fields.
@@ -1398,7 +1446,7 @@ class VersionSection:
                 )
         super().__setattr__(name, value)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _vers_already_warned: bool) -> None:
         """Validate VERS, WRAP, and DLM after construction.
 
         from_dict and the parser apply these checks before construction;
@@ -1483,6 +1531,14 @@ class VersionSection:
                     f"VersionSection: invalid DLM value "
                     f"{self.dlm!r}.  Expected SPACE, TAB, or COMMA."
                 )
+        # M-20: The from_dict VERS-normalization block already warned
+        # about this non-standard value (first emission) with
+        # parser-equivalent text; pre-set the _vers_warned latch so the
+        # construction-time validate() below does not emit a second
+        # "Unrecognized VERS" warning for the same condition.  Direct
+        # construction (flag defaults False) still warns exactly once.
+        if _vers_already_warned:
+            object.__setattr__(self, "_vers_warned", True)
         # Run warning-producing checks via validate().
         for issue in self.validate(complete=False):
             warnings.warn(issue, stacklevel=2)
@@ -2167,6 +2223,40 @@ class CurveDefinition:
                     f"CurveDefinition: mnemonic length {len(value)} exceeds "
                     f"maximum allowed ({MAX_FIELD_LENGTH})"
                 )
+            # M-18 (validate twin): re-apply the M-17/M-18 bracket-vs-
+            # array_info cross-checks on post-construction assignment.
+            # The __post_init__ cross-checks are construction-only;
+            # ``cd.mnemonic = 'NMR[2]'`` on a curve with
+            # array_info.index=1 passes and the writer emits the NEW
+            # bracket index, silently diverging from array_info.index on
+            # re-parse.  (During dataclass __init__ array_info is not yet
+            # assigned — getattr defaults to None — so construction is
+            # unaffected; __post_init__ handles that path.)  Warn,
+            # mirroring the construction-time contract.
+            _ai = getattr(self, "array_info", None)
+            if "[" in value and _ai is not None:
+                _mnem_base = value.split("[", 1)[0]
+                if _case_key(_mnem_base) != _case_key(_ai.base_name):
+                    warnings.warn(
+                        f"CurveDefinition: mnemonic {value!r} uses "
+                        f"array notation but array_info.base_name is "
+                        f"{_ai.base_name!r}.  Cross-check "
+                        f"mismatch may indicate malformed input.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                _mnem_index = value.split("[", 1)[1].rstrip("]")
+                if _mnem_index.isdigit() and int(_mnem_index) != _ai.index:
+                    warnings.warn(
+                        f"CurveDefinition: mnemonic {value!r} uses "
+                        f"array notation with index {_mnem_index} but "
+                        f"array_info.index is {_ai.index!r}.  "
+                        f"The writer emits the mnemonic's bracket index; "
+                        f"the array_info.index field will diverge on "
+                        f"re-parse.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
         elif name == "data_format" and value is not None:
             if not isinstance(value, str):
                 raise TypeError(
@@ -2560,7 +2650,24 @@ class ParameterZone:
                     raise ValueError(
                         f"ParameterZone: zone_index must be >= 0, got {value!r}"
                     )
-        elif name == "zone_name" and isinstance(value, str):
+        elif name == "zone_name":
+            # M-22 (F-37/F-38 family): str-type guard for zone_name.
+            # The pre-fix ``and isinstance(value, str)`` guard let a
+            # non-str value fall through to super().__setattr__ UNVALIDATED
+            # at both construction and mutation —
+            # ``ParameterZone(zone_name=42)`` was accepted, validate()
+            # reported clean, and the writer crashed with an opaque
+            # LASWriteError ('int' object has no attribute 'replace').
+            # All sibling leaf classes (CurveDefinition mnemonic,
+            # ParameterEntry mnemonic, ArrayElementInfo.base_name) reject
+            # non-str with a clean TypeError; ParameterZone was the only
+            # one missing the guard.  The dataclass __init__ assigns
+            # fields through __setattr__, so this covers construction and
+            # mutation alike.
+            if not isinstance(value, str):
+                raise TypeError(
+                    f"ParameterZone: zone_name must be str, got {type(value).__name__}"
+                )
             _normalized = value.strip()
             if _normalized != value:
                 warnings.warn(
@@ -2675,6 +2782,29 @@ class ParameterEntry:
                     f"ParameterEntry: mnemonic length {len(value)} exceeds "
                     f"maximum allowed ({MAX_FIELD_LENGTH})"
                 )
+            # M-42 (validate twin): re-apply the M-42 bracket-vs-
+            # array_index cross-check on post-construction assignment.
+            # The __post_init__ cross-check is construction-only;
+            # ``p.mnemonic = 'RUN[3]'`` on a parameter with
+            # array_index=1 passes and the writer emits the NEW bracket
+            # index, silently diverging from array_index on re-parse.
+            # (During dataclass __init__ array_index is not yet assigned
+            # — getattr defaults to None — so construction is unaffected;
+            # __post_init__ handles that path.)  Warn, mirroring the
+            # construction-time contract.
+            _ai_idx = getattr(self, "array_index", None)
+            if "[" in value and _ai_idx is not None:
+                _mnem_index = value.split("[", 1)[1].rstrip("]")
+                if _mnem_index.isdigit() and int(_mnem_index) != _ai_idx:
+                    warnings.warn(
+                        f"ParameterEntry: mnemonic {value!r} uses "
+                        f"array notation with index {_mnem_index} but "
+                        f"array_index is {_ai_idx!r}.  The writer "
+                        f"emits the mnemonic's bracket index; the array_index "
+                        f"field will diverge on re-parse.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
         elif name == "data_format" and value is not None:
             if not isinstance(value, str):
                 raise TypeError(
@@ -3087,8 +3217,63 @@ class DataSection:
     # representation in LAS.  Consistent with LASFile._from_dict.
     _from_dict: bool = field(default=False, repr=False)
 
+    def _reconcile_dedup_renamed_curves(self) -> None:
+        """F-152: heal a section whose shared global curve was renamed by
+        the LAS 3.0 F2-07 dedup writeback AFTER the section was built.
+
+        When two ``_Definition`` blocks declare the same mnemonic (e.g.
+        the NI04 fixture's MUD_DEFINITION and CORE_DEFINITION both declare
+        ``DEPTH``), the parser's F2-07 global writeback renames the SHARED
+        ``CurveDefinition`` object ``DEPTH``→``DEPTH_2``.  Because
+        ``section_curves`` holds a reference to that same object, an
+        EARLIER-built ``DataSection`` (e.g. ``CORE_DATA``) sees its
+        ``section_curves[i].mnemonic`` change to ``DEPTH_2`` while its
+        ``curves_order`` (a plain string list) and ``data``/``string_data``
+        keys keep the pre-rename ``DEPTH`` — an internally inconsistent
+        section that makes the writer raise ``LASWriteError`` and
+        ``to_dict→from_dict`` raise ``LASDataError``.  Order-dependent:
+        reversing the section order makes the later section read the
+        already-renamed global object and the model round-trips.
+
+        This method renames ``curves_order[i]`` and re-keys
+        ``data``/``string_data`` to the section_curves mnemonic when
+        ``curves_order[i]`` matches ``section_curves[i].original_mnemonic``
+        (the dedup-rename signature) but differs from the current mnemonic.
+        Genuine user reorders (no ``original_mnemonic`` match) are left
+        untouched — validate() still flags them as desyncs (I2-13).
+        Idempotent: after healing, ``curves_order`` matches the
+        section_curves mnemonics.
+        """
+        if not self.section_curves or not self.curves_order:
+            return
+        for _i, _sc in enumerate(self.section_curves):
+            if _i >= len(self.curves_order):
+                break
+            _order_name = self.curves_order[_i]
+            if _order_name.upper() == _sc.mnemonic.upper():
+                continue
+            _orig = _sc.original_mnemonic
+            if not _orig or _order_name.upper() != _orig.upper():
+                # Not a dedup rename — a genuine order/name mismatch.
+                # Leave it for the I2-13 desync check to report.
+                continue
+            # Dedup rename: adopt the section_curves mnemonic in the
+            # order and re-key the data containers.
+            self.curves_order[_i] = _sc.mnemonic
+            if _order_name in self.data and _sc.mnemonic not in self.data:
+                self.data[_sc.mnemonic] = self.data.pop(_order_name)
+            if _order_name in self.string_data and _sc.mnemonic not in self.string_data:
+                self.string_data[_sc.mnemonic] = self.string_data.pop(_order_name)
+
     def to_dict(self) -> dict[str, Any]:
         """Convert DataSection to dict for serialization."""
+        # F-152: serialize the healed state — a section desynced by the
+        # parser's F2-07 dedup writeback (curves_order keeps the
+        # pre-rename name while section_curves carries the renamed
+        # mnemonic) would otherwise emit a dict whose curves_order and
+        # data keys do not match section_curves mnemonics, making
+        # LASFile.from_dict raise LASDataError on re-ingestion.
+        self._reconcile_dedup_renamed_curves()
         return {
             "name": self.name,
             "section_type": self.section_type,
@@ -3119,6 +3304,15 @@ class DataSection:
             Basic structural checks (type, keys, lengths, data_format)
             raise during construction and are not duplicated here.
         """
+        # F-152: heal a section desynced by the parser's F2-07 dedup
+        # writeback BEFORE running the I2-13 positional-alignment check.
+        # The writer calls validate(complete=True) before emitting
+        # (_WriterBase.write → _section_emission_pairs), so without this
+        # reconcile the earlier-built section (curves_order 'DEPTH' vs
+        # section_curves 'DEPTH_2') fails the desync check and the writer
+        # raises LASWriteError.  Genuine user reorders (no
+        # original_mnemonic match) are NOT healed and are still flagged.
+        self._reconcile_dedup_renamed_curves()
         issues: list[str] = []
         # --- dtype validation for data arrays ---
         # EXT-04: {I} curves with a fractional declared NULL are stored as
@@ -3230,6 +3424,30 @@ class DataSection:
         # --- uncovered curves ---
         data_keys = set(self.data.keys())
         string_keys = set(self.string_data.keys())
+        # F-105 (validate twin): duplicate curve names in curves_order.
+        # The __post_init__ F-105 raise is construction-only; a post-
+        # construction injection (``ds.curves_order.append('DEPT')``)
+        # bypasses it and the LAS 3.0 section writer silently dedups the
+        # duplicate column while the legacy top-level twin raises
+        # LASWriteError (asymmetric).  validate(complete=True) runs on
+        # post-construction state (the writer calls it before emitting),
+        # so the invariant must be re-checked here as an issue.  Compare
+        # via _case_key (the writer resolves per-section curves_order
+        # case-insensitively), matching the LASFile per-section check at
+        # __post_init__.
+        if self.curves_order:
+            _co_seen: set[str] = set()
+            for _cn in self.curves_order:
+                _cnk = _case_key(_cn)
+                if _cnk in _co_seen:
+                    issues.append(
+                        f"DataSection '{self.name}': duplicate curve "
+                        f"name {_cn!r} in curves_order.  Curve names "
+                        f"must be unique; the writer will silently "
+                        f"drop the duplicate column on write→re-read."
+                    )
+                    break
+                _co_seen.add(_cnk)
         # N-12: cross-group row-count re-check (twin of the F-M22
         # construction check in __post_init__).  Post-construction
         # replacement of the ONLY key in a group (e.g.
@@ -3287,6 +3505,30 @@ class DataSection:
                         )
                         break
                     _sec_seen_ci[_ck] = _k
+
+        # N-13 (DataSection twin of LASFile.validate): re-check the
+        # data∩string_data overlap on post-construction state.  The
+        # __post_init__ II-2 raise is construction-only; post-
+        # construction mutation (``ds.string_data['GR'] = ...`` added
+        # next to ``ds.data['GR']``) bypasses it and the writer's
+        # per-section data lookup prefers string_data (_lookup_data_array
+        # exact-case first) — the numeric value is SILENTLY destroyed on
+        # write→read with zero validation feedback.  Re-check regardless
+        # of data_format (port of the LASFile.validate N-13 re-check).
+        if self.data and self.string_data:
+            _ov_ci = data_keys_ci & string_keys_ci
+            if _ov_ci:
+                _overlap = sorted(
+                    {k for k in data_keys if _case_key(k) in _ov_ci}
+                    | {k for k in string_keys if _case_key(k) in _ov_ci}
+                )
+                issues.append(
+                    f"DataSection '{self.name}': curves {_overlap} "
+                    f"appear in both 'data' and 'string_data'.  Each "
+                    f"curve may only be stored in one location; the "
+                    f"writer will use the string_data value and the "
+                    f"numeric data value will be dropped."
+                )
 
         if self.data or self.string_data:
             # WL-M1 (M13 twin of _writer_las30.py:1085-1093): the writer's
@@ -3379,6 +3621,13 @@ class DataSection:
             _mnem = _sc.mnemonic
             if not _df:
                 continue
+            # N-13: a curve present in BOTH containers was already
+            # flagged by the overlap re-check above — skip the
+            # format-vs-placement diagnostic so the overlap is not
+            # double-reported with a misleading placement message
+            # (mirror of LASFile.validate's N-13 skip).
+            if _case_key(_mnem) in data_keys_ci and _case_key(_mnem) in string_keys_ci:
+                continue
             if _case_key(_mnem) in data_keys_ci and (
                 _df == "S" or (_df == "A" and not _sc.is_array_element)
             ):
@@ -3424,6 +3673,20 @@ class DataSection:
                 return
             if not isinstance(value, dict):
                 raise TypeError(f"DataSection: {name} must be a dict, got {type(value).__name__}")
+            # F-75: wholesale reassignment must not alias the caller's
+            # arrays.  _GuardedDict.__init__ wraps via a SHALLOW
+            # ``dict(*args)`` — a plain-dict wholesale assignment
+            # (``ds.data = {'D': arr}``) stored the caller's arrays BY
+            # REFERENCE (np.shares_memory True), so caller-side mutation
+            # corrupted internal data.  The F-17 contract documents that
+            # "construction/wholesale paths deepcopy (N-I-11/F-002)".
+            # M-14 (F-75 residual): the ``isinstance(value, _GuardedDict)``
+            # skip left the ALREADY-guarded source aliasing caller arrays
+            # (cross-model ``ds2.data = ds1.data``, user-constructed
+            # _GuardedDict) — _GuardedDict.__init__ wraps via a SHALLOW
+            # dict(*args) and never detaches the values.  Always deepcopy,
+            # including guarded-dict sources.
+            value = copy.deepcopy(value)
             super().__setattr__(
                 name,
                 _GuardedDict(value, _container_name=f"DataSection.{name}"),
@@ -3442,6 +3705,32 @@ class DataSection:
                     value,
                     _container_name="DataSection.curves_order",
                     _expected_type=str,
+                )
+            super().__setattr__(name, value)
+            return
+        if name == "section_curves":
+            # F-76: ``section_curves`` was a plain list field whose
+            # __post_init__ element-type guard is bypassed by
+            # post-construction mutation (``ds.section_curves.append(
+            # "not-a-curve")``) AND by wholesale reassignment (which
+            # previously fell through to super().__setattr__).  validate()
+            # then crashed with a raw AttributeError ('str' object has no
+            # attribute 'mnemonic') even on validate(complete=False).
+            # Re-wrap wholesale list assignments through _GuardedList so
+            # element types are validated at every mutation entry point,
+            # mirroring the curves_order branch above.
+            if value is None:
+                super().__setattr__(name, None)
+                return
+            if not isinstance(value, list):
+                raise TypeError(
+                    f"DataSection: section_curves must be a list, got {type(value).__name__}"
+                )
+            if not isinstance(value, _GuardedList):
+                value = _GuardedList(
+                    value,
+                    _container_name="DataSection.section_curves",
+                    _expected_type=CurveDefinition,
                 )
             super().__setattr__(name, value)
             return
@@ -3827,6 +4116,20 @@ class DataSection:
                 _container_name="DataSection.curves_order",
                 _expected_type=str,
             )
+        # F-76: Wrap section_curves in a guarded list so post-construction
+        # mutations (append/insert/extend/__setitem__) validate element
+        # types.  The __post_init__ element-type guards above only ran at
+        # construction; a plain list accepted
+        # ``ds.section_curves.append("not-a-curve")`` which validate()
+        # then crashed on with a raw AttributeError.  __setattr__ keeps
+        # the guard self-healing across wholesale assignment (mirroring
+        # the curves_order wrap above).
+        if not isinstance(self.section_curves, _GuardedList):
+            self.section_curves = _GuardedList(
+                self.section_curves,
+                _container_name="DataSection.section_curves",
+                _expected_type=CurveDefinition,
+            )
 
 
 def _validate_array_continuity(
@@ -3994,6 +4297,22 @@ class LASFile:
                 return
             if not isinstance(value, dict):
                 raise TypeError(f"LASFile: {name} must be a dict, got {type(value).__name__}")
+            # F-75: wholesale reassignment must not alias the caller's
+            # arrays.  _GuardedDict.__init__ wraps via a SHALLOW
+            # ``dict(*args)`` — a plain-dict wholesale assignment
+            # (``las.logs = {'A': arr}``) stored the caller's arrays BY
+            # REFERENCE (np.shares_memory True), so caller-side mutation
+            # corrupted internal data.  The F-17 contract documents that
+            # "construction/wholesale paths deepcopy (N-I-11/F-002)" —
+            # construction deepcopies in __post_init__, wholesale
+            # __setattr__ did not.  Deepcopy the incoming dict here.
+            # M-14 (F-75 residual): the ``isinstance(value, _GuardedDict)``
+            # skip left the ALREADY-guarded source aliasing caller arrays
+            # (cross-model ``las2.logs = las1.logs``, user-constructed
+            # _GuardedDict) — _GuardedDict.__init__ wraps via a SHALLOW
+            # dict(*args) and never detaches the values.  Always deepcopy,
+            # including guarded-dict sources.
+            value = copy.deepcopy(value)
             super().__setattr__(
                 name,
                 _GuardedDict(value, _container_name=f"LASFile.{name}"),
@@ -4010,6 +4329,68 @@ class LASFile:
                     value,
                     _container_name="LASFile.curves_order",
                     _expected_type=str,
+                )
+            super().__setattr__(name, value)
+            return
+        if name in ("curves", "parameters"):
+            # F-76: wholesale reassignment of ``curves``/``parameters``
+            # previously fell through to ``super().__setattr__`` and
+            # replaced the ``_GuardedList`` installed by __post_init__
+            # with a plain list — bypassing every item-type guard.  A
+            # bad item then crashed validate() with a raw AttributeError
+            # ('str' object has no attribute 'mnemonic') instead of a
+            # clean TypeError.  Re-wrap wholesale list assignments through
+            # ``_GuardedList`` (mirroring the ``curves_order`` branch
+            # above), so element types are validated at every mutation
+            # entry point — including the writer's save/restore snapshots
+            # and the parser's order rewrites.
+            if value is None:
+                super().__setattr__(name, None)
+                return
+            if not isinstance(value, list):
+                raise TypeError(f"LASFile: {name} must be a list, got {type(value).__name__}")
+            if not isinstance(value, _GuardedList):
+                value = _GuardedList(
+                    value,
+                    _container_name=f"LASFile.{name}",
+                    _expected_type=CurveDefinition if name == "curves" else ParameterEntry,
+                )
+            super().__setattr__(name, value)
+            return
+        if name == "data_sections":
+            # MOD-B-PROD (F-76 residual): ``data_sections`` was never
+            # wrapped in ``_GuardedList`` — F-76 covered
+            # curves/parameters/section_curves only.  Wholesale
+            # reassignment (``las.data_sections = [1, 2]``) fell through
+            # to ``super().__setattr__`` and replaced the guarded
+            # container with a plain list; ``.append("not-a-section")``
+            # was accepted because data_sections was a plain list.
+            # validate(complete=True) then crashed with a raw
+            # AttributeError ('int' object has no attribute 'validate'),
+            # to_dict() / write_las_file crashed with raw AttributeError,
+            # and validate(complete=False) silently reported 0 issues on
+            # a corrupt model.  Re-wrap wholesale list assignments through
+            # ``_GuardedList`` (mirroring the curves/parameters branch
+            # above) so element types are validated at every mutation
+            # entry point.
+            if not isinstance(value, list):
+                raise TypeError(
+                    f"LASFile: data_sections must be a list, got {type(value).__name__}"
+                )
+            # M-16 (MOD-B-PROD residual): wholesale assignment must not
+            # store the caller's DataSection objects BY REFERENCE — the
+            # construction path deepcopies (M-19/N-I-11), the wholesale
+            # branch previously only wrapped in _GuardedList, so caller
+            # mutation of a directly-assigned section (``las.data_sections
+            # = [ds]`` → ``ds.name = ...``) propagated into the model.
+            # Deepcopy the incoming list (elements included), mirroring
+            # the F-17 no-shared-reference contract.
+            value = copy.deepcopy(value)
+            if not isinstance(value, _GuardedList):
+                value = _GuardedList(
+                    value,
+                    _container_name="LASFile.data_sections",
+                    _expected_type=DataSection,
                 )
             super().__setattr__(name, value)
             return
@@ -4657,6 +5038,22 @@ class LASFile:
             _container_name="LASFile.parameters",
             _expected_type=ParameterEntry,
         )
+        # MOD-B-PROD (F-76 residual): Wrap data_sections in a guarded
+        # list so post-construction mutations (append/insert/extend/
+        # __setitem__) validate element types — mirroring the
+        # curves/parameters wrap above.  F-76 wrapped
+        # curves/parameters/section_curves but never data_sections; a
+        # plain list accepted ``las.data_sections.append("not-a-
+        # section")`` and validate() crashed with a raw AttributeError
+        # ('str' object has no attribute 'name') instead of a clean
+        # TypeError.  __setattr__ keeps the guard self-healing across
+        # wholesale assignment (mirroring the curves_order wrap below).
+        if not isinstance(self.data_sections, _GuardedList):
+            self.data_sections = _GuardedList(
+                self.data_sections,
+                _container_name="LASFile.data_sections",
+                _expected_type=DataSection,
+            )
         # I2-12: Wrap curves_order in a guarded list so post-construction
         # mutations validate element types (mirroring curves/parameters
         # above).  A plain list accepted ``lf.curves_order.append(42)``
@@ -4669,6 +5066,65 @@ class LASFile:
                 _container_name="LASFile.curves_order",
                 _expected_type=str,
             )
+
+    def _reconcile_dedup_renamed_curves(self) -> None:
+        """F-152 (top-level twin): heal the top-level ``logs``/``string_data``
+        views when a data section's shared global curve was renamed by the
+        LAS 3.0 F2-07 dedup writeback AFTER the top-level views were
+        populated.
+
+        ``DataSection._reconcile_dedup_renamed_curves`` heals the SECTION's
+        ``curves_order``/``data``/``string_data``; the top-level
+        ``las.logs``/``las.string_data`` views were populated from the
+        PRE-rename section keys at fill time (``_las30_data.py``) and keep
+        the stale name (e.g. ``DEPTH`` while every healed section declares
+        ``DEPTH_2``) — ``to_dict()`` then emits disagreeing logs/section
+        keys and ``from_dict`` warns.  This method detects the same
+        dedup-rename signature across sections (a ``curves_order`` entry
+        matching ``section_curves[i].original_mnemonic`` but differing
+        from the current mnemonic — the F-152 heal signature) and re-keys
+        the top-level views, dropping the stale pre-rename key.
+
+        MUST run before the per-section heal (``DataSection.to_dict`` /
+        ``DataSection.validate``) in the same call — once a section is
+        healed its ``curves_order`` carries the renamed mnemonic and the
+        signature is gone.  Idempotent: after healing, no section shows
+        the signature and the views carry the healed keys.
+        """
+        if not self.data_sections:
+            return
+        _renames: dict[str, str] = {}
+        for _ds in self.data_sections:
+            for _i, _sc in enumerate(_ds.section_curves):
+                if _i >= len(_ds.curves_order):
+                    break
+                _order_name = _ds.curves_order[_i]
+                if _order_name.upper() == _sc.mnemonic.upper():
+                    continue
+                _orig = _sc.original_mnemonic
+                if not _orig or _order_name.upper() != _orig.upper():
+                    # Not a dedup rename — a genuine order/name mismatch.
+                    # Leave it for the I2-13 desync check to report.
+                    continue
+                _renames.setdefault(_order_name.upper(), _sc.mnemonic)
+        if not _renames:
+            return
+        # The loop iterates the heterogeneous (logs, string_data) pair
+        # (dict[str, np.float64] | dict[str, np.object_]); mypy cannot
+        # unify _VT for the raw dict.__setitem__ re-key below across the
+        # union.  Typing the container as dict[str, Any] resolves the
+        # inference while keeping the deliberate bypass of the _GuardedDict
+        # validation/copy path (the moved value is a same-length sibling
+        # array — a pure re-key, no copy or length re-check wanted).
+        _containers: list[dict[str, Any]] = [self.logs, self.string_data]
+        for _container in _containers:
+            if not _container:
+                continue
+            for _old in list(_container.keys()):
+                _new = _renames.get(_old.upper())
+                if _new is None or _new in _container:
+                    continue
+                dict.__setitem__(_container, _new, dict.pop(_container, _old))
 
     def validate(self, complete: bool = False) -> list[str]:
         """Validate LASFile state.
@@ -4691,6 +5147,14 @@ class LASFile:
             Basic structural checks (type, keys, lengths) raise during
             construction and are not duplicated here.
         """
+        # F-152 (top-level twin): heal the top-level logs/string_data
+        # views BEFORE the complete-path per-section heal (the delegation
+        # to DataSection.validate below) — a section desynced by the
+        # parser's F2-07 dedup writeback would otherwise leave the
+        # top-level views exposing the stale pre-rename key while the
+        # healed section carries the renamed mnemonic.  See
+        # _reconcile_dedup_renamed_curves.
+        self._reconcile_dedup_renamed_curves()
         issues: list[str] = []
 
         # --- index curve check (LAS 2.0) ---
@@ -4832,6 +5296,32 @@ class LASFile:
                 issues.extend(_pe.validate(complete=True))
             for _ds in self.data_sections:
                 issues.extend(_ds.validate(complete=True))
+
+            # F-105 (validate twin): duplicate curve names in the
+            # top-level curves_order.  The __post_init__ F-105 raise is
+            # construction-only; a post-construction injection
+            # (``las.curves_order.append('DEPT')``) bypasses it and the
+            # legacy writer raises LASWriteError only in its own ~A-header
+            # check — validate(complete=True) must report the state too.
+            # Mirror the __post_init__ gate: for LAS 3.0 files with
+            # data_sections the same curve name legitimately appears in
+            # each section's curves_order, producing duplicates at top
+            # level (the per-section duplicates are caught by each
+            # DataSection.validate delegation above).  Compare via
+            # _case_key, matching the N1b-3 construction check.
+            if self.curves_order and not self.data_sections:
+                _co_seen: set[str] = set()
+                for _cn in self.curves_order:
+                    _cnk = _case_key(_cn)
+                    if _cnk in _co_seen:
+                        issues.append(
+                            f"LASFile: duplicate curve name {_cn!r} in "
+                            f"curves_order.  Curve names must be unique; "
+                            f"the writer will silently drop the "
+                            f"duplicate column on write→re-read."
+                        )
+                        break
+                    _co_seen.add(_cnk)
 
             # I2-13 (models side): post-construction curves_order mutation
             # (reverse/insert/reorder) desyncs the top-level order from
@@ -5098,7 +5588,17 @@ class LASFile:
             # _parse_well.  validate(complete=True) previously delegated
             # to WellSection.validate which does NOT check mandatory well
             # field presence (only STEP=0, NULL empty, STRT==STOP).
-            if self.well.entries:
+            # F-66: gate on `not self._from_dict` so from_dict's final
+            # re-validation (which runs validate(complete=True) with
+            # _from_dict=True) does NOT emit this issue a SECOND time —
+            # _validate_from_dict_input already warned once with the same
+            # content (capital-M "Mandatory well field(s) missing").
+            # Pre-fix, the F-067 issue fired here and produced TWO
+            # warnings for one condition; the test suite's case-sensitive
+            # filter (capital M) masked the duplicate.  Direct
+            # validate(complete=True) calls (user or writer, _from_dict
+            # False) still report the issue.
+            if self.well.entries and not self._from_dict:
                 _spec = _LASVersionSpec(self.version.vers)
                 _mandatory = set(_spec.mandatory_well_fields)
                 _well_keys = {k.upper() for k in self.well.entries}
@@ -5123,6 +5623,13 @@ class LASFile:
         raise ``MemoryError``.  Consider using the ``LASFile`` dataclass
         directly to avoid the copy overhead.
         """
+        # F-152 (top-level twin): heal the top-level logs/string_data
+        # views BEFORE the per-section heal (``ds.to_dict()`` below) — a
+        # section desynced by the parser's F2-07 dedup writeback would
+        # otherwise emit logs/section keys that disagree (the top-level
+        # view keeps the stale pre-rename key), making from_dict warn.
+        # See _reconcile_dedup_renamed_curves.
+        self._reconcile_dedup_renamed_curves()
         params_dict: dict[str, str] = {}
         _seen_param_keys: set[str] = set()
         for p in self.parameters:
@@ -5457,7 +5964,25 @@ class LASFile:
             # produce writable models.
             _vers_raw = _safe_str(version.get("VERS"), "2.0")
             _vers_norm = _vers_raw.strip()
+            # M-21: Colon-free VERS values ("1.2 CWLS LOG ASCII
+            # STANDARD", "3.0 CWLS LOG ASCII STANDARD") carry the LAS
+            # description as trailing text.  The version is the leading
+            # whitespace-delimited token when it is version-like;
+            # mirror the parser's F-151 extraction (parser.py
+            # _parse_version) so from_dict produces the same version the
+            # parser does.  Non-numeric values ("CWLS LOG ASCII
+            # STANDARD") are preserved whole below for the LAS 1.2
+            # CWLS/lasio swap heuristics.
+            if _vers_norm and _vers_norm[0].isdigit():
+                _first_token = _vers_norm.split(None, 1)[0]
+                if re.match(r"^\d+\.\d+", _first_token):
+                    _vers_norm = _first_token
             _vers_norm = re.sub(r"^(\d+\.\d+)\.\d+$", r"\1", _vers_norm)
+            # M-20: the normalization block is the FIRST warning
+            # emission for a preserved non-standard value.  Pass the
+            # flag to VersionSection so __post_init__ does not emit a
+            # second "Unrecognized VERS" warning for the same condition.
+            _vers_already_warned = False
             if _vers_norm not in {"1.2", "2.0", "3.0"}:
                 if _vers_norm.startswith("3."):
                     warnings.warn(
@@ -5467,6 +5992,7 @@ class LASFile:
                         UserWarning,
                         stacklevel=2,
                     )
+                    _vers_already_warned = True
                 elif re.match(r"^\d+\.\d+$", _vers_norm):
                     warnings.warn(
                         f"Non-standard VERS value {_vers_raw!r}. "
@@ -5475,6 +6001,7 @@ class LASFile:
                         UserWarning,
                         stacklevel=2,
                     )
+                    _vers_already_warned = True
                 elif _vers_norm and not _vers_norm[0].isdigit():
                     pass  # non-numeric — preserve as-is (parser-compatible)
                 else:
@@ -5489,6 +6016,7 @@ class LASFile:
                 vers=_vers_norm,
                 wrap=_safe_str(version.get("WRAP"), "NO"),
                 dlm=_safe_str(version.get("DLM"), "SPACE"),
+                _vers_already_warned=_vers_already_warned,
             )
 
             well = _resolve_dict_entry(data, "well", dict, dict)
@@ -6867,11 +7395,45 @@ class _DevColumns(dict[str, NDArray[np.float64]]):
         self, dev: DevFile, mapping: dict[str, NDArray[np.float64]] | None = None, /, **kwargs: Any
     ) -> None:
         self._dev = dev
-        super().__init__(mapping or {}, **kwargs)
+        _mapping = dict(mapping or {}, **kwargs)
+        # M-27: mirror the from_dict _norm_map collision check on the
+        # wholesale/construction paths.  A case-variant pair ('MD'+'md')
+        # is ambiguous: the writer's case-insensitive column lookup emits
+        # one column and silently drops the other's data, and
+        # to_dict→from_dict raises a collision.  Case-insensitive via
+        # _case_key only (the E-13 guard family) — alias variants
+        # (AZI+AZIM, TVDKB+TVDSS) are deliberately allowed, matching the
+        # reader's normalize_aliases=False support.
+        _seen_ci: dict[str, str] = {}
+        for _k in _mapping:
+            _ck = _case_key(_k)
+            if _ck in _seen_ci:
+                from .exceptions import LASDataError
+
+                raise LASDataError(
+                    f"DevFile: columns contain case-variant duplicate "
+                    f"keys {_seen_ci[_ck]!r} and {_k!r}.  Each column "
+                    f"may only be stored once."
+                )
+            _seen_ci[_ck] = _k
+        super().__init__(_mapping)
 
     def __setitem__(self, key: str, value: Any) -> None:
         if not isinstance(key, str):
             raise TypeError(f"DevFile column keys must be str, got {type(key).__name__}")
+        # M-27: case-insensitive duplicate guard (E-13 mirror).  A
+        # case-variant key ('md') inserted next to an existing 'MD' is
+        # ambiguous on roundtrip and the writer's case-insensitive column
+        # lookup drops one column's data.  from_dict rejects the same
+        # state; reject it on the mutation path too.  Exact-case
+        # replacement (same key) remains allowed.
+        _ci_match = next((_k for _k in self if _case_key(_k) == _case_key(key)), None)
+        if _ci_match is not None and _ci_match != key:
+            raise ValueError(
+                f"DevFile: columns contain case-variant duplicate keys "
+                f"{_ci_match!r} and {key!r}.  Each column may only be "
+                f"stored once."
+            )
         # Convert to numpy array matching from_dict behaviour.
         # MOD-17: reject ndim>=2 before coercion — a 2-D column (e.g. a
         # transposed matrix) would otherwise pass the length guards and
@@ -7068,9 +7630,23 @@ class _DevColumnOrder(list[str]):
         if not isinstance(item, str):
             raise TypeError(f"DevFile column_order entries must be str, got {type(item).__name__}")
 
-    def _check_add(self, item: Any) -> None:
+    def _check_add(self, item: Any, _pending: set[str] | None = None) -> None:
+        """Validate a single addition.
+
+        Args:
+            item: Candidate column_order entry.
+            _pending: Set of entries already accepted by the caller for
+                the current batch mutation (extend/__iadd__/slice-set).
+                M-26: without it, batch operations validated every item
+                against the PRE-mutation list, so a same-batch duplicate
+                (``extend(['TVD','TVD'])``) passed twice and was silently
+                inserted.  Single-item paths (append/insert/non-slice
+                __setitem__) pass None and validate against the current
+                list, as before.
+        """
         self._validate_item(item)
-        if item in self:
+        _occupied = set(self) | (_pending or set())
+        if item in _occupied:
             raise ValueError(
                 f"DevFile: column_order already contains '{item}'.  "
                 f"Each column may only appear once."
@@ -7100,14 +7676,24 @@ class _DevColumnOrder(list[str]):
 
     def extend(self, items: Iterable[Any]) -> None:
         _items = list(items)
+        # M-26: batch-aware duplicate rejection — track items as they are
+        # accepted so a same-batch duplicate is rejected (see _check_add).
+        _pending: set[str] = set()
         for _item in _items:
-            self._check_add(_item)
+            self._check_add(_item, _pending)
+            _pending.add(_item)
         super().extend(_items)
 
     def __iadd__(self, other: Any) -> _DevColumnOrder:  # type: ignore[misc,override]
         _other = list(other)
+        # M-26: batch-aware duplicate rejection (see extend).  Fully
+        # validating the batch BEFORE super().__iadd__ also prevents the
+        # in-place mutation from corrupting state before the __setattr__
+        # re-wrap raise (the s9 F-M1 residual).
+        _pending: set[str] = set()
         for _item in _other:
-            self._check_add(_item)
+            self._check_add(_item, _pending)
+            _pending.add(_item)
         return super().__iadd__(_other)
 
     def __setitem__(self, index: Any, item: Any) -> None:
@@ -7125,8 +7711,11 @@ class _DevColumnOrder(list[str]):
             for _old_item in _old:
                 if _old_item not in _items:
                     self._check_remove(_old_item)
+            # M-26: batch-aware duplicate rejection (see extend).
+            _pending: set[str] = set()
             for _it in _items:
-                self._check_add(_it)
+                self._check_add(_it, _pending)
+                _pending.add(_it)
             item = _items
         else:
             self._check_add(item)
@@ -7547,6 +8136,16 @@ class DevFile:
             return
 
         from .exceptions import LASDataError
+
+        # M-24: Auto-infer column_order from the columns insertion order
+        # when it was NOT provided (empty default).  Direct construction
+        # ``DevFile(columns={'MD': ...})`` previously raised LASDataError
+        # because the empty default column_order mismatched the non-empty
+        # columns, while from_dict (:8533) and wholesale __setattr__
+        # (:7817-7823) both auto-infer.  Explicit (non-empty) order is
+        # still validated strictly below.
+        if not self.column_order:
+            self.column_order = list(self.columns.keys())
 
         # column_order must match columns keys exactly
         # I2F-024: Reject duplicate entries in column_order.

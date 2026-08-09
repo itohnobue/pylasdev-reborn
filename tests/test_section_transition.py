@@ -23,7 +23,12 @@ class TestProcessConsecutiveData:
     """
 
     def test_consecutive_a_to_a_stores_both_sections(self) -> None:
-        """Two consecutive ~A sections produce two data sections in the LASFile."""
+        """Two consecutive ~A sections produce two data sections in the LASFile.
+
+        Also asserts the per-section section_type (LOG_DATA) survives the
+        A→A swap (F-254 — folded from the former
+        test_consecutive_a_to_a_section_type_preserved).
+        """
         content = """~VERSION INFORMATION
  VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
  WRAP.   NO   :
@@ -42,6 +47,8 @@ class TestProcessConsecutiveData:
         assert len(las.data_sections) == 2
         assert las.data_sections[0].data["DEPT"][0] == 100.0
         assert las.data_sections[1].data["DEPT"][0] == 200.0
+        assert las.data_sections[0].section_type == "LOG_DATA"
+        assert las.data_sections[1].section_type == "LOG_DATA"
 
     def test_consecutive_a_to_a_with_different_data_counts(self) -> None:
         """A→A swap preserves per-section data integrity.
@@ -81,30 +88,6 @@ class TestProcessConsecutiveData:
         assert len(sec2.data["DEPT"]) == 1
         assert sec2.data["DEPT"][0] == 300.0
         assert sec2.data["GR"][0] == 70.0
-
-    def test_consecutive_a_to_a_section_type_preserved(self) -> None:
-        """A→A swap preserves correct section_type for each data section.
-
-        LOG_DATA sections should remain LOG_DATA; CORE_DATA sections
-        should remain CORE_DATA after the A→A swap.
-        """
-        content = """~VERSION INFORMATION
- VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
- WRAP.   NO   :
- DLM.   COMMA :
-~WELL INFORMATION
- NULL.    -999.25 : NULL VALUE
-~CURVE INFORMATION
- DEPT.M       : DEPTH  {F}
-~A Section1
-100.0
-~A Section2
-200.0
-"""
-        parser = LASParser()
-        las = parser.parse(content)
-        assert las.data_sections[0].section_type == "LOG_DATA"
-        assert las.data_sections[1].section_type == "LOG_DATA"
 
     def test_consecutive_a_to_a_with_three_sections(self) -> None:
         """Three consecutive ~A sections produce three data sections."""

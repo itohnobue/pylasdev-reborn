@@ -285,6 +285,7 @@ def _format_curve_line(
     is_las30: bool,
     string_mnemonics: frozenset[str] | None = None,
     mnemonic_override: str | None = None,
+    string_union_mnemonics: frozenset[str] | None = None,
 ) -> str:
     """Format a single CurveDefinition as a LAS curve line.
 
@@ -297,11 +298,13 @@ def _format_curve_line(
             silently destroying the values.  Callers with string_data
             context pass this set so the writer forces the {S} marker.
             The membership tests the curve's EMITTED name (M-59
-            original_mnemonic reconstruction) uppercased, so a case-variant
-            string_data key ('dept_str' vs curve 'DEPT_STR') and an
-            emitted-name difference ('LLD' for a BFV curve) both resolve
-            the marker (N2b-1/II-7).  All 4 call sites build the set
-            upper-cased.
+            original_mnemonic reconstruction) uppercased AND the curve's
+            OWN storage mnemonic (``curve.mnemonic``): a case-variant
+            string_data key ('dept_str' vs curve 'DEPT_STR') resolves via
+            the upper-cased emitted name, and a renamed curve whose
+            string_data is keyed by its STORAGE name ('BFV' storage key,
+            emitted 'LLD') resolves via the storage key (N2b-1/II-7 +
+            M-35).  All 4 call sites build the set upper-cased.
         mnemonic_override: When set, emit THIS mnemonic instead of the
             M-59 original_mnemonic reconstruction.  W-10: a
             reader-renamed duplicate (IK_2 with original_mnemonic='IK')
@@ -310,6 +313,23 @@ def _format_curve_line(
             the same block, producing duplicate ~C/Definition lines.  The
             collision-free emission plan falls back to the curve's own
             mnemonic to keep the block valid and the roundtrip stable.
+        string_union_mnemonics: UPPER-CASED mnemonics of curves whose DATA
+            lives in a string_data container in ANY scope (top-level
+            string_data plus every data section), WITHOUT the
+            numeric-placement exclusion that ``string_mnemonics`` applies.
+            F-01: when the same mnemonic is placed string in one scope and
+            numeric in another, the main ~C line must not carry the
+            curve's explicit numeric format token for the numeric
+            placement — the parser's format-vs-placement check
+            (parser.py:1393-1398) rejects a numeric-format curve whose
+            first occurrence lands in string_data, making the written file
+            self-unreadable.  A curve is "mixed" when it appears in this
+            union (string somewhere) but NOT in ``string_mnemonics`` (the
+            union minus numeric placements — i.e. not string in the
+            emitted scope).  Purely-numeric curves never appear in the
+            union and keep their format token.  Only the main ~C call
+            sites pass this; per-section Definitions keep the section's
+            own format so the numeric section's metadata survives re-read.
     """
     unit = _sanitize_las_value(curve.unit) if curve.unit else ""
     unit = _escape_colons_for_las_value(unit) if unit else ""
@@ -357,7 +377,60 @@ def _format_curve_line(
     # sets are built UPPER-CASED at every call site (all 4 builders), so
     # a case-variant string_data key ('dept_str' vs curve 'DEPT_STR')
     # still resolves the marker.
-    is_string_curve = string_mnemonics is not None and _mnem_key(_emit_mnem) in string_mnemonics
+    # M-35: the sets are built from the string_data CONTAINER KEYS (the
+    # STORAGE names).  A renamed curve (storage key 'BFV',
+    # original_mnemonic='LLD') emits 'LLD' and would MISS a set keyed
+    # only by the storage name — the {S} marker is not forced and the
+    # string values are destroyed on write→read.  Test the curve's OWN
+    # storage mnemonic as well so the renamed curve resolves via the key
+    # its data is actually stored under.
+    is_string_curve = string_mnemonics is not None and (
+        _mnem_key(_emit_mnem) in string_mnemonics
+        or _mnem_key(curve.mnemonic) in string_mnemonics
+    )
+    # H-02: suppress the spurious {S} for a curve that DECLARES
+    # data_format='S' but whose mnemonic is NOT in this scope's
+    # string_data set — the section places the mnemonic NUMERICALLY.
+    # The pre-fix code emitted {S} from the curve OBJECT's data_format
+    # unconditionally, so a numeric column was re-read as STRING on
+    # write→read (silent type corruption, zero warnings; the LAS 3.0
+    # no-data_sections and no-section_curves shapes bypass every
+    # construction guard).  Placement context exists only when
+    # string_mnemonics is not None (all 4 call sites pass a set,
+    # possibly empty); without context the old behavior is preserved.
+    # F-01: extend the suppression to ANY explicit numeric format
+    # ('F'/'E'/'A'/'I'...), not just 'S'.  When the same mnemonic is
+    # placed string in one scope and numeric in another, the main ~C
+    # must not carry the curve's top-level data_format token for the
+    # numeric placement — the parser's format-vs-placement check
+    # (parser.py:1393-1398: `_df not in ("S","A")` + mnemonic in
+    # string_data → LASParseError) would reject the numeric-format
+    # first occurrence that lands in the string_data mirror, making the
+    # written file SELF-UNREADABLE (the H-01 explicit-format sub-variant;
+    # the H-01 consumer-side `if not _df: continue` rescue only covers
+    # the empty-format case).  The mixed-placement signal is
+    # string_union_mnemonics: the mnemonic appears in SOME scope's
+    # string_data (string somewhere) while not being in THIS scope's
+    # string set (numeric here).  Purely-numeric curves (never string
+    # anywhere) are absent from the union and keep their format token
+    # (the format metadata must survive roundtrip for them — pinned by
+    # the all-numeric explicit-'F'/'E' tests).
+    _suppress_s_marker = (
+        is_las30
+        and string_mnemonics is not None
+        and not is_string_curve
+        and (
+            (curve.data_format or "").upper() == "S"
+            or (
+                curve.data_format
+                and string_union_mnemonics is not None
+                and (
+                    _mnem_key(_emit_mnem) in string_union_mnemonics
+                    or _mnem_key(curve.mnemonic) in string_union_mnemonics
+                )
+            )
+        )
+    )
     if is_las30 and is_string_curve and (curve.data_format or "").upper() != "S":
         # M-77: a string-data curve without data_format='S' would be
         # emitted markerless; the parser classifies columns by the {S}
@@ -378,7 +451,7 @@ def _format_curve_line(
             )
         format_str = "{S}"
         desc = f"{desc}  {format_str}"
-    elif curve.data_format and (is_las30 or curve.data_format == "I"):
+    elif curve.data_format and (is_las30 or curve.data_format == "I") and not _suppress_s_marker:
         # EXT-04: the braced {I} marker is emitted for integer-format
         # curves on ALL versions.  LAS 1.2/2.0 have no format-specifier
         # convention, but without the marker a >2^53 {I} value (e.g.
@@ -427,9 +500,13 @@ def _format_curve_line(
                     format_str += f":{_format_offset_plain(offset)}"
         format_str += "}"
         desc = f"{desc}  {format_str}"
-    elif curve.data_format:
+    elif curve.data_format and not _suppress_s_marker:
         # M-27: non-LAS-3.0 output cannot represent a non-{I} format
         # specifier — the metadata is silently dropped on write→read.
+        # The H-02-suppressed case (data_format='S' placed numerically on
+        # LAS 3.0) is excluded: the column IS numeric, so no format is
+        # emitted and the DATA round-trips — not a "dropped on write→read"
+        # loss, and the message is 1.2/2.0-specific.
         import warnings
 
         warnings.warn(
@@ -833,6 +910,29 @@ def _format_data_rows(
                 else:
                     row_values.append(_format_number(val, precision, null_value))
         line = delimiter.join(row_values)
+        # M-29: the M-78 empty-value guard above covers SPACE only.  For
+        # COMMA/TAB an entirely-empty (or whitespace-only) row — a
+        # single-column string section whose value is empty/blank — emits
+        # a BLANK line the reader skips silently (data_reader / _data_
+        # section_reader: ``not stripped: continue``), dropping the row
+        # on write→read (2→1).  A multi-column row with an empty CELL is
+        # deliberately preserved (',1000' re-reads DESC='' correctly), so
+        # the per-value replacement cannot fire here — route the blank
+        # ROW through the same '-' sentinel the M-78 guard uses.
+        if delimiter != " " and not line.strip():
+            if not warned_empty_str:
+                import warnings
+
+                warnings.warn(
+                    "Empty string curve value replaced by "
+                    "'-' sentinel — roundtrip fidelity is "
+                    "lost: parser cannot distinguish original "
+                    "'-' from originally-empty value.",
+                    stacklevel=4,
+                )
+                warned_empty_str = True
+            row_values = ["-" if not v.strip() else v for v in row_values]
+            line = delimiter.join(row_values)
         if is_las12 and len(line) > MAX_LINE_LENGTH_LAS12:
             if not warned_long:
                 import warnings
@@ -1075,8 +1175,18 @@ class _WriterMutationGuard:
         self._suppress_validate = suppress_validate
         self._saved_wrap: str = las_file.version.wrap
         self._saved_dlm: str = las_file.version.dlm
-        self._saved_logs = dict(las_file.logs)
-        self._saved_string_data = dict(las_file.string_data)
+        # M-30: None containers are a documented-valid state for
+        # directly-constructed files (models.py __setattr__ accepts
+        # logs=None / string_data=None post-construction).  The raw
+        # ``dict(las_file.logs)`` calls below ran BEFORE the write try
+        # block, leaking a bare TypeError instead of the documented
+        # LASWriteError from write_las_file's "Raises" contract.  Guard
+        # the snapshot like the sibling curves/curves_order fields do;
+        # _restore_saved_state / _rewrap_guards already handle None.
+        self._saved_logs = dict(las_file.logs) if las_file.logs is not None else None
+        self._saved_string_data = (
+            dict(las_file.string_data) if las_file.string_data is not None else None
+        )
         self._saved_curves_order = (
             list(las_file.curves_order) if las_file.curves_order is not None else None
         )
@@ -1573,7 +1683,18 @@ class _WriterBase:
                 if curve.original_mnemonic and curve.original_mnemonic != curve.mnemonic
                 else curve.mnemonic
             )
-            if _mnem_key(_emit_name) in emitted_str_mnems:
+            # M-35: the {S}-forcing membership in _format_curve_line
+            # tests BOTH the emitted name and the curve's storage
+            # mnemonic (the string_mnemonics sets are built from the
+            # string_data CONTAINER KEYS).  This warning must agree: a
+            # renamed curve (storage key 'BFV', emitted 'LLD') HAS its
+            # marker forced via the storage key, so warning here would
+            # falsely claim "the string values are lost" exactly when
+            # they round-trip intact.
+            if (
+                _mnem_key(_emit_name) in emitted_str_mnems
+                or _mnem_key(curve.mnemonic) in emitted_str_mnems
+            ):
                 return
             warnings.warn(
                 f"LAS 3.0 string curve '{mnem}' has "
@@ -1913,20 +2034,25 @@ class _WriterBase:
             # from ~C, but curves_order can still carry BOTH names — the
             # ~A header then emits more columns than ~C declares and
             # re-read DISCARDS the undeclared column's data ("Extra columns
-            # are discarded").  This is the legacy-path twin of the LAS 3.0
-            # per-section W-12 contract ("only refuses LASWriteError when
-            # that data would actually be dropped"): refuse when the dropped
-            # curve carries a DISTINCT data array; a dropped curve whose
-            # data is SHARED with a surviving pair (case-variant alias of
-            # the same array) or absent loses nothing and only warns.  The
-            # ~C-side W-01 warning above is accurate for that shared/absent
-            # branch.  Scoped to LAS 1.2/2.0 (legacy ~A): the LAS 3.0
-            # top-level fall-through keeps its historical behavior (it does
-            # not raise; its per-section path enforces the same contract).
-            if not self._spec.is_las30 and _c_dropped:
+            # are discarded").  Refuse when the dropped curve carries a
+            # DISTINCT data array; a dropped curve whose data is SHARED
+            # with a surviving pair (case-variant alias of the same array)
+            # or absent loses nothing and only warns.  The ~C-side W-01
+            # warning above is accurate for that shared/absent branch.
+            # M-28: the refusal previously fired ONLY on LAS 1.2/2.0 — the
+            # LAS 3.0 top-level (no-data_sections) path fell through to
+            # ~A and wrote a file whose re-read discards the duplicate's
+            # distinct data (warned at write time, but the write succeeds
+            # and the data is gone).  The LAS 3.0 per-section path already
+            # enforces this same refusal, so the top-level path must match:
+            # the refusal now applies on every version.  The emitted-
+            # mnemonic lookups pass self._spec.is_las30 so the ~C emission
+            # (which appends the [N] bracket for LAS 3.0 array curves)
+            # stays the dedup identity.
+            if _c_dropped:
                 for _dc in _c_dropped:
                     _lost_arr, _ = _lookup_data_array(
-                        _emitted_mnemonic(_dc, False),
+                        _emitted_mnemonic(_dc, self._spec.is_las30),
                         self._las_file.logs or {},
                         self._las_file.string_data or {},
                     )
@@ -1935,7 +2061,8 @@ class _WriterBase:
                     _shared = False
                     for _kept_c, _kept_o in _c_pairs:
                         _kept_arr, _ = _lookup_data_array(
-                            _kept_o or _emitted_mnemonic(_kept_c, False),
+                            _kept_o
+                            or _emitted_mnemonic(_kept_c, self._spec.is_las30),
                             self._las_file.logs or {},
                             self._las_file.string_data or {},
                         )
@@ -1944,9 +2071,9 @@ class _WriterBase:
                             break
                     if not _shared:
                         raise LASWriteError(
-                            f"Curve '{_emitted_mnemonic(_dc, False)}' emits "
-                            f"the same mnemonic as another curve in ~C and "
-                            f"has data.  The legacy single-block format "
+                            f"Curve '{_emitted_mnemonic(_dc, self._spec.is_las30)}' "
+                            f"emits the same mnemonic as another curve in ~C "
+                            f"and has data.  The single-block ~A format "
                             f"cannot represent both columns: ~A would emit "
                             f"{len(_header_names)} data column(s) but ~C "
                             f"declares only {len(_c_emitted)} curve(s), and "
@@ -2091,6 +2218,21 @@ def write_las_file(
 
     with _WriterMutationGuard(las_file, suppress_validate=True):
         try:
+            # F-152: reconcile data_sections desynced by the LAS 3.0
+            # parser's F2-07 dedup writeback BEFORE the writer resolves
+            # per-section emission pairs.  Two _Definition blocks
+            # declaring the same mnemonic (e.g. DEPTH) rename the shared
+            # global curve object DEPTH→DEPTH_2 AFTER an earlier
+            # DataSection was built; that section's curves_order/data
+            # keys keep the pre-rename name while its section_curves
+            # carries the renamed mnemonic — a desync that made the
+            # writer raise LASWriteError (and to_dict→from_dict raise
+            # LASDataError).  _WriterBase.write() also runs
+            # validate(complete=True), which heals the same state via
+            # DataSection.validate(); the explicit loop here guarantees
+            # the reconcile even for write paths that skip validation.
+            for _ds in las_file.data_sections:
+                _ds._reconcile_dedup_renamed_curves()
             content = writer.write()
         except (ValueError, TypeError, KeyError, AttributeError, OverflowError, PylasdevError) as e:
             raise LASWriteError(f"Failed to generate LAS file content: {e}") from e

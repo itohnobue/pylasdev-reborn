@@ -34,17 +34,6 @@ class TestReadDEVFile:
         with pytest.raises(DEVReadError, match="File not found"):
             read_dev_file(tmp_path / "nonexistent.dev")
 
-    def test_sample_dev_columns(self, test_data_dir: Path) -> None:
-        """Test that sample.dev has expected columns."""
-        sample_dev = test_data_dir / "sample.dev"
-        if not sample_dev.exists():
-            pytest.skip(f"Required test data missing: {sample_dev}")
-        data = read_dev_file(sample_dev)
-        assert "MD" in data
-        assert "TVD" in data
-        assert "X" in data
-        assert "Y" in data
-
     def test_sample_dev_data_shape(self, test_data_dir: Path) -> None:
         """Test that all columns have the same length."""
         sample_dev = test_data_dir / "sample.dev"
@@ -54,14 +43,6 @@ class TestReadDEVFile:
         sizes = [len(arr) for arr in data.values()]
         assert len(set(sizes)) == 1, f"Column sizes differ: {sizes}"
 
-    def test_sample_dev_md_starts_at_zero(self, test_data_dir: Path) -> None:
-        """Test that MD column starts at 0."""
-        sample_dev = test_data_dir / "sample.dev"
-        if not sample_dev.exists():
-            pytest.skip(f"Required test data missing: {sample_dev}")
-        data = read_dev_file(sample_dev)
-        assert data["MD"][0] == 0.0
-
     def test_sample_dev_has_multiple_rows(self, test_data_dir: Path) -> None:
         """Test that sample.dev has multiple data rows."""
         sample_dev = test_data_dir / "sample.dev"
@@ -69,6 +50,48 @@ class TestReadDEVFile:
             pytest.skip(f"Required test data missing: {sample_dev}")
         data = read_dev_file(sample_dev)
         assert len(data["MD"]) > 1
+
+    def test_sample_dev_trajectory_sign_conventions(self, test_data_dir: Path) -> None:
+        """F-27: sample.dev trajectory values and sign conventions pinned.
+
+        The real fixture is the only end-to-end guard for the F-05/M-21
+        defect class: DX/DY must NOT alias to X/Y (that would fabricate
+        X_2/Y_2 with factually-wrong duplicate warnings and destroy the
+        offset-vs-absolute distinction — a documented, previously-fixed
+        production defect, see dev_reader.py _DEV_ALIASES comments).
+        Also pins the negative-downward TVD / positive-upward Z sign
+        conventions and the AZIM→AZI alias normalization on real data.
+        """
+        sample_dev = test_data_dir / "sample.dev"
+        if not sample_dev.exists():
+            pytest.skip(f"Required test data missing: {sample_dev}")
+        data = read_dev_file(sample_dev)
+
+        # 10-column layout: MD, X, Y, Z, TVD, DX, DY, AZI, INC, DLS
+        assert list(data.keys()) == [
+            "MD", "X", "Y", "Z", "TVD", "DX", "DY", "AZI", "INC", "DLS",
+        ], f"Unexpected columns: {list(data.keys())}"
+
+        # Sign conventions: TVD is negative-downward (referenced at KB),
+        # Z is positive-upward; TVD[0] == -53.9, Z[0] == +53.9.
+        assert data["TVD"][0] == -53.9, f"TVD[0] must be -53.9, got {data['TVD'][0]}"
+        assert data["Z"][0] == 53.9, f"Z[0] must be +53.9, got {data['Z'][0]}"
+        assert data["MD"][0] == 0.0
+
+        # F-05/M-21 defect class: DX/DY are OFFSET columns, NOT aliases of
+        # the absolute X/Y coordinates.  X[0]=47707.45 (UTM easting),
+        # DX[0]=0.0 (offset); on real Petrel data the values diverge.
+        assert data["X"][0] == 47707.45, f"X[0] must be 47707.45, got {data['X'][0]}"
+        assert data["DX"][0] == 0.0, f"DX[0] must be 0.0, got {data['DX'][0]}"
+        assert data["Y"][0] == 41152.2, f"Y[0] must be 41152.2, got {data['Y'][0]}"
+        assert data["DY"][0] == 0.0, f"DY[0] must be 0.0, got {data['DY'][0]}"
+        # The offset columns must remain distinct from the absolute ones —
+        # a DX→X alias regression fabricates X_2/Y_2 with duplicate warnings.
+        assert "X_2" not in data, f"DX must not alias to X, got keys {list(data.keys())}"
+        assert "Y_2" not in data, f"DY must not alias to Y, got keys {list(data.keys())}"
+
+        # AZIM→AZI alias normalization on real data (fixture header is AZIM).
+        assert data["AZI"][0] == 0.0, f"AZI[0] must be 0.0, got {data['AZI'][0]}"
 
     def test_dev_values_are_numeric(self, all_dev_files: list[Path]) -> None:
         """Test that all values are numeric (float64)."""
@@ -108,16 +131,6 @@ class TestReadDEVFile:
         # Filled values should be correct
         assert data["MD"][1] == 100.0
         assert data["TVD"][2] == 198.0
-
-    def test_dev_file_model(self) -> None:
-        """Test DevFile model to_dict."""
-        dev = DevFile()
-        dev.columns["MD"] = np.array([0.0, 100.0, 200.0])
-        dev.columns["TVD"] = np.array([0.0, 99.0, 198.0])
-        d = dev.to_dict()
-        assert "MD" in d
-        assert "TVD" in d
-        np.testing.assert_array_equal(d["MD"], np.array([0.0, 100.0, 200.0]))
 
     def test_directory_input_raises_error(self, tmp_path: Path) -> None:
         """Test that passing a directory path raises DEVReadError."""
@@ -218,30 +231,6 @@ class TestReadDEVFile:
         assert data["MD"][0] == 0.0
         assert data["TVD"][0] == 0.0
         assert data["MD"][1] == 100.0
-
-
-class TestDevIndexErrorHandler:
-    """CF-022: DEV reader IndexError handler tests."""
-
-    def test_normal_parsing_handled_gracefully(self, tmp_path: Path) -> None:
-        """Test DEV reader handles normal data without errors.
-
-        The IndexError handler (dev_reader.py:191-192) is a safety net for
-        pass-1/pass-2 data-line count inconsistency. In practice, both
-        passes count the same data, so the handler is unreachable under
-        normal conditions. This test verifies that normal parsing works
-        correctly.
-        """
-        content = "MD TVD X\n0.0 0.0 100.0\n100.0 99.0 101.0\n200.0 198.0 102.0\n"
-        test_file = tmp_path / "normal.dev"
-        test_file.write_text(content, encoding="utf-8")
-
-        data = read_dev_file(test_file)
-        assert len(data["MD"]) == 3
-        assert data["MD"][0] == 0.0
-        assert data["MD"][2] == 200.0
-        assert data["X"][0] == 100.0
-        assert data["X"][2] == 102.0
 
 
 class TestDevDedup:
@@ -475,29 +464,39 @@ class TestDevSafetyGuards:
     # ── F-R-04: SPLITLINES_CHARS_RE full character class ─────────────
 
     def test_splitlines_chars_nul_byte_sanitized(self, tmp_path: Path) -> None:
-        """NUL byte (\\x00) in DEV content is sanitized — no spurious splits.
+        """NUL byte (\\x00) in DEV content is sanitized — value parses.
 
         F-R-04: dev_reader._SPLITLINES_CHARS_RE previously covered only 8
-        control chars, missing NUL and 24 others.  A NUL byte in a data
-        value would cause splitlines() to produce a fake line break,
-        corrupting parsed data.  The fix expands coverage to 33 chars
-        matching parser.py:102 and reader.py:29.
+        control chars, missing NUL and 24 others.  A NUL byte embedded in
+        a data value (``0.0\\x000.0``) is carried through as part of the
+        token, which fails float() conversion and silently becomes NaN —
+        a len()-only assertion cannot detect that.  The fix expands the
+        character class to 33 chars matching parser.py:102 and
+        reader.py:29; the sanitized space splits the value into columns.
         """
-        # NUL byte embedded in data — without sanitization this would
-        # produce spurious line breaks via splitlines()
+        # NUL byte embedded in data — without sanitization the token
+        # "0.0\x000.0" is one non-parseable value → NaN.
         content = "MD TVD INC\n0.0\x000.0 0.0\n"
         test_file = tmp_path / "nul_byte.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        # Must not raise; must produce valid 1-row output
+        # Must not raise; must produce valid 1-row output where the
+        # sanitized value parses as separate columns (0.0, 0.0, 0.0),
+        # not NaN (pre-fix: "0.0\x000.0" is one token → float() fails).
         data = read_dev_file(test_file)
         assert "MD" in data, "Expected MD column in output"
         assert len(data["MD"]) == 1
+        assert data["MD"][0] == 0.0
+        assert data["TVD"][0] == 0.0
+        assert data["INC"][0] == 0.0
 
     def test_splitlines_chars_del_byte_sanitized(self, tmp_path: Path) -> None:
         """DEL byte (\\x7F) in DEV content is sanitized — no spurious splits.
 
-        Part of F-R-04 character class expansion.
+        Part of F-R-04 character class expansion.  Without sanitization
+        the embedded DEL byte ("0.0\\x7f0.0", no space) produces a single
+        token against 2 declared columns → delimiter mismatch DEVReadError.
+        The sanitized space lets the value split into the declared columns.
         """
         content = "MD TVD\n0.0\x7f0.0\n"
         test_file = tmp_path / "del_byte.dev"
@@ -776,20 +775,6 @@ class TestHeaderlessFormat:
         np.testing.assert_array_equal(
             data["col_2"],
             [0.0, 45.0, 48.0],
-        )
-
-    def test_headerless_format_as_object(self, tmp_path: Path) -> None:
-        """Parse headerless via read_dev_file_as_object."""
-        content = "0.0 0.0\n100.0 99.0\n200.0 198.0\n"
-        test_file = tmp_path / "noheader_obj.dev"
-        test_file.write_text(content, encoding="utf-8")
-
-        dev = read_dev_file_as_object(test_file)
-        assert dev.column_order == ["col_0", "col_1"]
-        assert len(dev.columns["col_0"]) == 3
-        np.testing.assert_array_equal(
-            dev.columns["col_0"],
-            [0.0, 100.0, 200.0],
         )
 
     def test_headerless_single_column(self, tmp_path: Path) -> None:
@@ -1086,15 +1071,6 @@ class TestFormatAutoDetection:
         assert data["MD"][0] == 0.0
         assert data["TVD"][0] == -20.0
 
-    def test_alias_normalization_as_object(self, tmp_path: Path) -> None:
-        """Alias normalization works via read_dev_file_as_object API."""
-        content = "MDKB TVDSS X Y\n0.0 0.0 100.0 200.0\n"
-        test_file = tmp_path / "alias_obj.dev"
-        test_file.write_text(content, encoding="utf-8")
-
-        dev = read_dev_file_as_object(test_file)
-        assert dev.column_order == ["MD", "TVD", "X", "Y"]
-
     # F-093: Petrel well-header regression tests
     def test_petrel_well_header_detected_and_skipped(self, tmp_path: Path) -> None:
         """F-093 HIGH: Petrel well-header line detected and data parsed correctly.
@@ -1199,16 +1175,6 @@ class TestExplicitDelimiterParameter:
         assert "X" in data
         assert data["MD"][0] == 0.0
         assert data["MD"][1] == 100.0
-
-    def test_explicit_delimiter_as_object(self, tmp_path: Path) -> None:
-        """Explicit delimiter via read_dev_file_as_object API."""
-        content = "MD,TVD,X\n0.0,0.0,100.0\n100.0,99.0,101.0\n"
-        test_file = tmp_path / "delim_obj.dev"
-        test_file.write_text(content, encoding="utf-8")
-        dev = read_dev_file_as_object(test_file, delimiter=",")
-        assert dev.column_order == ["MD", "TVD", "X"]
-        assert len(dev.columns["MD"]) == 2
-        assert dev.columns["MD"][0] == 0.0
 
     def test_explicit_delimiter_overrides_auto_detection(self, tmp_path: Path) -> None:
         """Explicit delimiter overrides auto-detection when both possible."""
@@ -1484,17 +1450,6 @@ class TestColumnsKeywordFormat:
         assert len(data["MD"]) == 2
         assert data["MD"][0] == 0.0
 
-    def test_columns_as_object(self, tmp_path: Path) -> None:
-        """*COLUMNS format via read_dev_file_as_object API."""
-        content = "*COLUMNS *MD *TVD *X\n0.0 0.0 100.0\n100.0 99.0 101.0\n"
-        test_file = tmp_path / "columns_obj.dev"
-        test_file.write_text(content, encoding="utf-8")
-
-        dev = read_dev_file_as_object(test_file)
-        assert dev.column_order == ["MD", "TVD", "X"]
-        assert len(dev.columns["MD"]) == 2
-        np.testing.assert_array_equal(dev.columns["MD"], [0.0, 100.0])
-
 
 class TestEmptyDelimiterGuard:
     """M60: Tests for empty delimiter guard at dev_reader.py:674-678.
@@ -1511,31 +1466,6 @@ class TestEmptyDelimiterGuard:
 
         with pytest.raises(DEVReadError, match="Delimiter must be a non-empty string"):
             read_dev_file(test_file, delimiter="")
-
-    def test_empty_delimiter_as_object(self, tmp_path: Path) -> None:
-        """Passing delimiter="" to read_dev_file_as_object raises DEVReadError."""
-        content = "MD TVD\n0.0 0.0\n"
-        test_file = tmp_path / "empty_delim_obj.dev"
-        test_file.write_text(content, encoding="utf-8")
-
-        with pytest.raises(DEVReadError, match="Delimiter must be a non-empty string"):
-            read_dev_file_as_object(test_file, delimiter="")
-
-    def test_multi_char_delimiter_not_rejected_by_guard(self, tmp_path: Path) -> None:
-        """Multi-char delimiter (e.g. "::") passes the empty guard.
-
-        The guard at 674 only checks truthiness — not single-char validation.
-        csv.reader(delimiter="::") raises TypeError which may or may not
-        be caught. This test documents current behavior with a valid
-        single-char delimiter.
-        """
-        content = "MD,TVD,X\n0.0,0.0,100.0\n"
-        test_file = tmp_path / "good_delim.dev"
-        test_file.write_text(content, encoding="utf-8")
-
-        # Valid single-char delimiter should work
-        data = read_dev_file(test_file, delimiter=",")
-        assert list(data.keys()) == ["MD", "TVD", "X"]
 
 
 class TestMultiCharDelimiterGuard:
@@ -1557,18 +1487,6 @@ class TestMultiCharDelimiterGuard:
             match="Delimiter must be a single character",
         ):
             read_dev_file(test_file, delimiter="::")
-
-    def test_multi_char_delimiter_as_object(self, tmp_path: Path) -> None:
-        """Passing delimiter='::' to read_dev_file_as_object raises DEVReadError."""
-        content = "MD::TVD\n0.0::0.0\n"
-        test_file = tmp_path / "multi_char_delim_obj.dev"
-        test_file.write_text(content, encoding="utf-8")
-
-        with pytest.raises(
-            DEVReadError,
-            match="Delimiter must be a single character",
-        ):
-            read_dev_file_as_object(test_file, delimiter="::")
 
     def test_single_char_delimiter_still_works(self, tmp_path: Path) -> None:
         """Single-char delimiter (',') still works after adding the guard."""
@@ -1623,19 +1541,6 @@ class TestDelimiterAutoCorrectionHeader:
         assert len(data["MD"]) == 2
         assert data["MD"][0] == 1000.0
         assert data["MD"][1] == 1100.0
-
-    def test_auto_correction_disk_as_object(self, tmp_path: Path) -> None:
-        """Read via read_dev_file_as_object API — columns correct."""
-        content = "X,Y,Z\n100.0 200.0 300.0\n150.0 250.0 350.0\n"
-        test_file = tmp_path / "obj_mix_delim.dev"
-        test_file.write_text(content, encoding="utf-8")
-
-        dev = read_dev_file_as_object(test_file)
-        assert dev.column_order == ["X", "Y", "Z"], (
-            f"Expected ['X','Y','Z'], got {dev.column_order}"
-        )
-        assert len(dev.columns["X"]) == 2
-        assert dev.columns["X"][0] == 100.0
 
     def test_auto_correction_with_columns_keyword(self, tmp_path: Path) -> None:
         """*COLUMNS header with space data — raises DEVReadError.
@@ -1783,6 +1688,32 @@ class TestValidateDevData:
         with pytest.warns(UserWarning, match="Azimuth.*outside.*0, 360"):
             _validate_dev_data(dev)
 
+    def test_inclination_out_of_range_warns_on_read(self, tmp_path: Path) -> None:
+        """F-28/F-46: INC outside [0, 180] warns on the READER path.
+
+        The INC∈[0,180] range check in _validate_dev_data (dev_reader.py)
+        had zero reader-path test — AZI range is tested (E-34, 1776) but
+        INC was not.  A regression of the INC check would pass silently.
+        This mirrors E-34's AZI assertion on an out-of-range inclination
+        value (190.0 > 180).
+        """
+        content = "MD,INC,AZI\n0.0,190.0,90.0\n100.0,45.0,90.0\n"
+        test_file = tmp_path / "inc_range.dev"
+        test_file.write_text(content, encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            read_dev_file(test_file)
+
+        inc_warnings = [str(x.message) for x in w if "Inclination column" in str(x.message)]
+        assert len(inc_warnings) == 1, (
+            f"Expected 1 INC range warning, got {len(inc_warnings)}: "
+            f"{[str(x.message) for x in w]}"
+        )
+        assert "outside [0, 180]" in inc_warnings[0], (
+            f"INC warning must state the [0, 180] range, got: {inc_warnings[0]}"
+        )
+
     # ── clean data (no warnings) ────────────────────────────────────
 
     def test_clean_data_no_warnings(self) -> None:
@@ -1855,8 +1786,10 @@ class TestF035FailureCounterRegression:
         test_file = tmp_path / "f035_all_bad.dev"
         test_file.write_text(content, encoding="utf-8")
 
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
         # Should not crash; non-numeric values become NaN
-        data = read_dev_file(test_file)
         assert np.isnan(data["TVD"][0])
         assert np.isnan(data["TVD"][1])
         assert np.isnan(data["X"][0])
@@ -1864,6 +1797,20 @@ class TestF035FailureCounterRegression:
         # MD should parse correctly
         assert data["MD"][0] == 100.0
         assert data["MD"][1] == 200.0
+        # F-035: the shared _failure_counter must produce the end-of-section
+        # summary — 6 BAD tokens across TVD/X/Y both rows are counted in a
+        # single summary warning (pre-fix: counter was None at these sites,
+        # so the summary silently never fired).
+        conv_warnings = [
+            str(x.message) for x in w if "could not be converted to finite float" in str(x.message)
+        ]
+        assert len(conv_warnings) == 1, (
+            f"Expected 1 conversion-failure summary, got {len(conv_warnings)}: "
+            f"{[str(x.message) for x in w]}"
+        )
+        assert "6 value(s)" in conv_warnings[0], (
+            f"Summary must count all 6 bad tokens, got: {conv_warnings[0]}"
+        )
 
 
 # ============================================================
@@ -1903,6 +1850,9 @@ class TestProductionCheckDevReaderFixes:
 
         data = read_dev_file(test_file)
         assert "col_0" in data
+        # '-inf' maps to NaN (sentinel), not a header or a real value.
+        assert np.isnan(data["col_0"][0])
+        assert data["col_1"][0] == 2.0
 
     # --- F-021 (MEDIUM): Whitespace path sentinel detection ---
 
@@ -1919,7 +1869,14 @@ class TestProductionCheckDevReaderFixes:
 
         data = read_dev_file(test_file)
         # Should produce 3 columns (headerless), not try to parse line as header
-        assert len(data) == 3
+        assert list(data.keys()) == ["col_0", "col_1", "col_2"], (
+            f"Expected headerless columns, got {list(data.keys())}"
+        )
+        # The 'na' token must convert to NaN, not survive as a value or
+        # force the line into simple-format header handling.
+        assert data["col_0"][0] == 100.0
+        assert np.isnan(data["col_1"][0])
+        assert data["col_2"][0] == 200.0
 
     def test_whitespace_null_sentinel_headerless(self, tmp_path: Path) -> None:
         """F-021: Whitespace line with 'null' sentinel is headerless."""
@@ -1928,7 +1885,13 @@ class TestProductionCheckDevReaderFixes:
         test_file.write_text(content, encoding="utf-8")
 
         data = read_dev_file(test_file)
-        assert len(data) == 3
+        assert list(data.keys()) == ["col_0", "col_1", "col_2"], (
+            f"Expected headerless columns, got {list(data.keys())}"
+        )
+        # 'null' converts to NaN (sentinel), values parse correctly.
+        assert data["col_0"][0] == 100.0
+        assert np.isnan(data["col_1"][0])
+        assert data["col_2"][0] == 200.0
 
     # --- F-213 (MEDIUM): All-zero first row heuristic ---
 
@@ -2054,36 +2017,6 @@ class TestProductionCheckDevReaderFixes:
         assert "col_0" in data
         assert data["col_0"][0] == 100.0
         assert np.isnan(data["col_1"][0])  # -nan → NaN
-
-    # === F-042: MD NaN/Inf validation ===
-
-    def test_single_nan_md_suppressed_on_read(self, tmp_path: Path) -> None:
-        """F-042/M-01: NaN in MD does NOT trigger the non-finite
-        corruption warning on the READ path.
-
-        M-01: NaN is the reader's OWN designed missing-data
-        representation (conversion of the ``nan`` token via
-        ``_dev_to_finite_float`` with null_value=NaN).  The reader marks
-        its DevFile with ``_designed_nan=True``, so the read-path
-        non-finite check suppresses NaN (Inf would still warn — the
-        reader never produces Inf).  Pre-fix: the NaN/Inf check in
-        _validate_dev_data warned unconditionally, firing a false
-        "corruption" warning on every sentinel-bearing file.
-        """
-        content = "MD,AZIM\n100.0,10.0\nnan,20.0\n200.0,30.0\n300.0,40.0\n"
-        test_file = tmp_path / "single_nan_md.dev"
-        test_file.write_text(content, encoding="utf-8")
-
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            read_dev_file_as_object(test_file)
-
-        non_finite = [x for x in w if "non-finite values" in str(x.message)]
-        assert len(non_finite) == 0, (
-            f"Designed NaN on the read path must NOT fire the non-finite "
-            f"corruption warning, got {len(non_finite)}: "
-            f"{[str(x.message) for x in w]}"
-        )
 
     # === F-043: Case-insensitive column lookups ===
 
@@ -2241,10 +2174,14 @@ class TestProductionCheckDevReaderFixes:
         assert data["MD"][1] == 100.0
 
     def test_semicolon_delimited_single_column(self, tmp_path: Path) -> None:
-        """F-046: Semicolon-delimited file with a single column.
+        """F-046: Single-column file parses correctly (no delimiter needed).
 
-        Single-column files have only 1 semicolon token, so the
-        auto-detection falls back to other delimiter checks.
+        The fixture has no semicolons at all — a single-column file has no
+        delimiter to auto-detect, so the semicolon pre-check is not
+        exercised here; the whitespace/simple path handles the single
+        token per line.  (Named for the F-046 family: single-column files
+        have only 1 token per line, so delimiter auto-detection falls back
+        to the single-column path.)
         """
         content = "MD\n0.0\n100.0\n"
         test_file = tmp_path / "semicolon_single.dev"
@@ -2426,9 +2363,15 @@ class TestProductionCheckDevReaderFixes:
         with pytest.warns(UserWarning) as w:
             _validate_dev_data(dev)
 
-        # TVDSS has >50% NaN → NaN density warning expected
+        # TVDSS has >50% NaN → NaN density warning expected.
+        # Filter on the TVD NaN-density check's own wording ("TVD column ...
+        # NaN values"), NOT the generic top-of-function non-finite check
+        # ("DevFile: column ... non-finite values (NaN/Inf)") which fires on
+        # any NaN column regardless of the I2F-004 TVD-variant loop.
         tvd_nan_warnings = [
-            str(x.message) for x in w if "TVD" in str(x.message) and "NaN" in str(x.message)
+            str(x.message)
+            for x in w
+            if "TVD column" in str(x.message) and "NaN values" in str(x.message)
         ]
         assert len(tvd_nan_warnings) >= 1, (
             f"Expected at least 1 TVD NaN warning, got "
@@ -2658,7 +2601,35 @@ class TestFixGroupG10:
 
     # === V-13 (MEDIUM): headerless all-integer first row consumed as names ===
 
-    def test_v13_all_integer_first_row_preserved_as_data(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            # Surface station "0 0 45" — the F-92 integer heuristic consumed
+            # any all-integer first row as numeric column names whenever the
+            # second line's token count matched (only the all-zero row was
+            # protected by F-213).  Realistic surface station: must be the
+            # first data row, not columns "0"/"0_2"/"45".
+            (
+                "0 0 45\n100 5 90\n200 8 120\n",
+                {"col_0": [0.0, 100.0, 200.0], "col_1": [0.0, 5.0, 8.0], "col_2": [45.0, 90.0, 120.0]},
+            ),
+            # EXT: the bug is broader than the all-zero F-213 gap — ANY
+            # all-integer headerless first row with a matching second-row
+            # count was consumed as column names.  All rows survive as data.
+            (
+                "100 200 300 400\n1.0 2.0 3.0 4.0\n5.0 6.0 7.0 8.0\n",
+                {
+                    "col_0": [100.0, 1.0, 5.0],
+                    "col_1": [200.0, 2.0, 6.0],
+                    "col_2": [300.0, 3.0, 7.0],
+                    "col_3": [400.0, 4.0, 8.0],
+                },
+            ),
+        ],
+    )
+    def test_v13_all_integer_first_row_preserved_as_data(
+        self, tmp_path: Path, content: str, expected: dict[str, list[float]]
+    ) -> None:
         """V-13: `0 0 45` surface station is data, not column names.
 
         The F-92 integer heuristic consumed any all-integer first row as
@@ -2667,37 +2638,15 @@ class TestFixGroupG10:
         MD0/INC0/AZI45 is a realistic surface station — it must be parsed
         as the first data row, not fabricated into columns "0"/"0_2"/"45".
         """
-        content = "0 0 45\n100 5 90\n200 8 120\n"
         test_file = tmp_path / "v13_surface_station.dev"
         test_file.write_text(content, encoding="utf-8")
 
         data = read_dev_file(test_file)
-        assert list(data.keys()) == ["col_0", "col_1", "col_2"], (
-            f"Expected headerless columns, got {list(data.keys())}"
+        assert list(data.keys()) == list(expected.keys()), (
+            f"Expected headerless columns {list(expected.keys())}, got {list(data.keys())}"
         )
-        np.testing.assert_array_equal(data["col_0"], [0.0, 100.0, 200.0])
-        np.testing.assert_array_equal(data["col_1"], [0.0, 5.0, 8.0])
-        np.testing.assert_array_equal(data["col_2"], [45.0, 90.0, 120.0])
-
-    def test_v13_non_zero_integer_first_row_preserved(self, tmp_path: Path) -> None:
-        """V-13: `100 200 300 400` all-integer first row is data, not names.
-
-        EXT: the bug is broader than the all-zero F-213 gap — ANY
-        all-integer headerless first row with a matching second-row count
-        was consumed as column names.  All rows must survive as data.
-        """
-        content = "100 200 300 400\n1.0 2.0 3.0 4.0\n5.0 6.0 7.0 8.0\n"
-        test_file = tmp_path / "v13_integer_row.dev"
-        test_file.write_text(content, encoding="utf-8")
-
-        data = read_dev_file(test_file)
-        assert list(data.keys()) == ["col_0", "col_1", "col_2", "col_3"], (
-            f"Expected headerless columns, got {list(data.keys())}"
-        )
-        np.testing.assert_array_equal(data["col_0"], [100.0, 1.0, 5.0])
-        np.testing.assert_array_equal(data["col_1"], [200.0, 2.0, 6.0])
-        np.testing.assert_array_equal(data["col_2"], [300.0, 3.0, 7.0])
-        np.testing.assert_array_equal(data["col_3"], [400.0, 4.0, 8.0])
+        for col, vals in expected.items():
+            np.testing.assert_array_equal(data[col], vals)
 
     # === V-17 (MEDIUM): MD dedup survivor escapes ALL MD validation ===
 
@@ -2830,50 +2779,6 @@ class TestFixGroupG10:
             )
             assert "DEVReadError" in doc, f"{fn.__name__} docstring must document DEVReadError"
 
-    # === N-I-24 (MEDIUM, PFA): whitespace count-prefix data loss ===
-
-    def test_n_i24_whitespace_count_prefix_preserves_all_columns(self, tmp_path: Path) -> None:
-        """N-I-24: whitespace count-prefix file keeps all columns/rows.
-
-        `4\\n1.0 2.0 3.0 4.0\\n...` — the count line is a column-count
-        PREFIX, not data.  Before the fix the headerless path derived 1
-        column from the count line, silently losing 3 of 4 columns (the
-        I2F-001 test asserted that wrong result).  After the fix the count
-        line is skipped and all 3 data rows are preserved in 4 columns.
-        """
-        content = "4\n1.0 2.0 3.0 4.0\n5.0 6.0 7.0 8.0\n9.0 10.0 11.0 12.0\n"
-        test_file = tmp_path / "n_i24_count_prefix.dev"
-        test_file.write_text(content, encoding="utf-8")
-
-        data = read_dev_file(test_file)
-        assert list(data.keys()) == ["col_0", "col_1", "col_2", "col_3"], (
-            f"Expected 4 columns, got {list(data.keys())}"
-        )
-        np.testing.assert_array_equal(data["col_0"], [1.0, 5.0, 9.0])
-        np.testing.assert_array_equal(data["col_1"], [2.0, 6.0, 10.0])
-        np.testing.assert_array_equal(data["col_2"], [3.0, 7.0, 11.0])
-        np.testing.assert_array_equal(data["col_3"], [4.0, 8.0, 12.0])
-
-    def test_n_i24_comma_count_prefix_consistent_with_whitespace(self, tmp_path: Path) -> None:
-        """N-I-24: comma count-prefix file matches the whitespace contract.
-
-        The comma twin must produce the same 4-column / all-rows-preserved
-        result as the whitespace side (the asymmetry was the finding's
-        crux; G9's V-02 fix aligned it with the wrong I2F-001 result).
-        """
-        content = "4\n1.0,2.0,3.0,4.0\n5.0,6.0,7.0,8.0\n9.0,10.0,11.0,12.0\n"
-        test_file = tmp_path / "n_i24_comma_prefix.dev"
-        test_file.write_text(content, encoding="utf-8")
-
-        data = read_dev_file(test_file)
-        assert list(data.keys()) == ["col_0", "col_1", "col_2", "col_3"], (
-            f"Expected 4 columns, got {list(data.keys())}"
-        )
-        np.testing.assert_array_equal(data["col_0"], [1.0, 5.0, 9.0])
-        np.testing.assert_array_equal(data["col_1"], [2.0, 6.0, 10.0])
-        np.testing.assert_array_equal(data["col_2"], [3.0, 7.0, 11.0])
-        np.testing.assert_array_equal(data["col_3"], [4.0, 8.0, 12.0])
-
     # === N-I-25 (MEDIUM): mixed-delimiter headerless → single col_0 ===
 
     def test_n_i25_mixed_delimiter_first_line_delimiter_governs(self, tmp_path: Path) -> None:
@@ -2890,7 +2795,7 @@ class TestFixGroupG10:
         test_file = tmp_path / "n_i25_mixed.dev"
         test_file.write_text(content, encoding="utf-8")
 
-        with warnings.catch_warnings(record=True):
+        with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             data = read_dev_file(test_file)
 
@@ -2901,6 +2806,23 @@ class TestFixGroupG10:
         assert data["col_0"][0] == 1.0
         assert data["col_1"][0] == 2.0
         assert data["col_2"][0] == 3.0
+        # The comma lines become ragged rows — NaN-filled with warnings
+        assert np.isnan(data["col_0"][1])
+        assert np.isnan(data["col_1"][1])
+        assert np.isnan(data["col_2"][1])
+        assert np.isnan(data["col_0"][2])
+        assert np.isnan(data["col_1"][2])
+        assert np.isnan(data["col_2"][2])
+        # The ragged-row behavior must be surfaced with warnings
+        ragged_warnings = [
+            str(x.message)
+            for x in w
+            if "fewer values than expected" in str(x.message)
+            or "Missing values are filled with NaN" in str(x.message)
+        ]
+        assert len(ragged_warnings) >= 1, (
+            f"Expected ragged-row warning for comma lines, got: {[str(x.message) for x in w]}"
+        )
 
     # === N-I-26 (MEDIUM): unbounded str.split DoS bypass ===
 
@@ -3156,6 +3078,182 @@ class TestFixDev05SpaceHeaderlessThousandsFirstRow:
         )
 
 
+# ──────────────────────────────────────────────────────────────
+# Stage 12 fix regression pins — dev_reader thousands family
+# (H-03, M-31..M-34, F-02 shapes (a)/(b) + M-33 primary).  Each
+# FAILS on pre-fix code and PASSES on post-fix.  Adversarial
+# evidence: tmp/s11-adv-h1-report.md, tmp/s11-adv-m2-report.md,
+# tmp/s11-adv-m3-report.md.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestH03HeaderlessThreeDigitLeadingTwoCol:
+    """H-03 (HIGH, CONFIRMED): a headerless comma file whose FIRST row is
+    a genuine multi-column shape with a 3-digit leading group
+    ("100,250.5") merged the columns (100250.5) because the headerless
+    `-1` derivation defeated the DEV-02 exact-fit gate.  The derivation
+    now uses the full count for 3-digit leading groups (mirroring the F-07
+    4+ guard) so the gate must genuinely satisfy the full token count."""
+
+    def test_headerless_three_digit_leading_two_columns(self, tmp_path: Path) -> None:
+        content = "100,250.5\n101,260.5\n102,270.5\n"
+        test_file = tmp_path / "h03_headerless.dev"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+        # Two genuine columns — 100/101/102 and 250.5/260.5/270.5.
+        assert list(data.keys()) == ["col_0", "col_1"], (
+            f"H-03 merged columns: {list(data.keys())}"
+        )
+        np.testing.assert_array_equal(data["col_0"], [100.0, 101.0, 102.0])
+        np.testing.assert_array_equal(data["col_1"], [250.5, 260.5, 270.5])
+
+
+class TestM31WhitespaceThousandsSentinelHeaderless:
+    """M-31 (CONFIRMED MEDIUM): the whitespace F-021 gate widened the
+    positive comprehension with _is_thousands_number but NOT the
+    _non_float_tokens exclusion — a whitespace thousands+sentinel first
+    row ("1,234 na 5,678") misdetected as simple format and the first
+    data row was consumed as fabricated column names.  The exclusion is
+    now widened identically."""
+
+    def test_whitespace_thousands_sentinel_headerless(self, tmp_path: Path) -> None:
+        content = "1,234 na 5,678\n2,345 na 6,789\n3,456 na 7,890\n"
+        test_file = tmp_path / "m31_ws_sentinel.dev"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+        # Headerless col_0/col_1/col_2 with 3 rows — the first row must
+        # NOT be consumed as fabricated column names ('1','234 NA 5','678').
+        assert list(data.keys()) == ["col_0", "col_1", "col_2"], (
+            f"M-31 fabricated header: {list(data.keys())}"
+        )
+        assert len(data["col_0"]) == 3, f"M-31 row lost: {len(data['col_0'])}"
+
+
+class TestM32DecimalExponentThousands:
+    """M-32 (CONFIRMED MEDIUM): _THOUSANDS_NUMBER_RE accepts
+    decimal+exponent ("1,234.5E3") but _THOUSANDS_FRAG_RE accepted only
+    decimal OR exponent — the fragment could not merge → silent column
+    shift with zero thousands warning.  The fragment grammar now accepts
+    both (requiring at least one, preserving the M-23 bare-fragment
+    protection)."""
+
+    def test_decimal_exponent_thousands_recombined(self, tmp_path: Path) -> None:
+        content = "MD,TVD\n1,234.5E3,5.0\n2,345.6E3,6.0\n"
+        test_file = tmp_path / "m32_decexp.dev"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+        np.testing.assert_allclose(data["MD"], [1234500.0, 2345600.0])
+        np.testing.assert_allclose(data["TVD"], [5.0, 6.0])
+        thousands = [str(w.message) for w in rec if "thousands separator" in str(w.message)]
+        assert len(thousands) >= 1, (
+            f"M-32 no thousands warning: {[str(w.message) for w in rec]}"
+        )
+
+
+class TestM33TwoSingleGroupThousands:
+    """M-33 (CONFIRMED MEDIUM): TWO single-comma-group thousands values
+    ("1,234.5,2,345.6") each failed the DEV-02 exact-fit gate individually
+    though full-row recombination satisfies it — silent column shift with
+    zero thousands warning.  The gate now computes the FULL-ROW post-merge
+    token count.  F-02's hybrid keeps the full-row gate as primary with a
+    per-run fallback (shapes (a)/(b) restored)."""
+
+    def test_two_single_group_thousands_recombined(self, tmp_path: Path) -> None:
+        content = "MD,TVD\n1,234.5,2,345.6\n3,456.7,4,567.8\n"
+        test_file = tmp_path / "m33_two_single.dev"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+        np.testing.assert_allclose(data["MD"], [1234.5, 3456.7])
+        np.testing.assert_allclose(data["TVD"], [2345.6, 4567.8])
+        thousands = [str(w.message) for w in rec if "thousands separator" in str(w.message)]
+        assert len(thousands) >= 2, (
+            f"M-33 fewer than 2 thousands warnings: {[str(w.message) for w in rec]}"
+        )
+
+
+class TestM34ShortRowThousands:
+    """M-34 (CONFIRMED MEDIUM): a short row carrying a thousands value
+    ("1,234.5" in a 3-col file) skipped recombination entirely (call-site
+    gate + function guard both blocked) → column shift + spurious
+    TVD-monotonicity warning.  The call site now passes allow_short=True
+    for unambiguous thousands runs."""
+
+    def test_short_row_thousands_recombined(self, tmp_path: Path) -> None:
+        content = "MD,TVD,X\n1,234.5\n2.0,3.0,4.0\n"
+        test_file = tmp_path / "m34_short.dev"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+        np.testing.assert_allclose(data["MD"], [1234.5, 2.0])
+        assert np.isnan(data["TVD"][0]), f"M-34 TVD column-shifted: {data['TVD']}"
+        assert np.isnan(data["X"][0]), f"M-34 X column-shifted: {data['X']}"
+        # No spurious TVD-monotonicity warning on the misparse.
+        tvd_mono = [str(w.message) for w in rec if "TVD" in str(w.message) and "decreases" in str(w.message)]
+        assert tvd_mono == [], f"M-34 spurious TVD warning: {tvd_mono}"
+        thousands = [str(w.message) for w in rec if "thousands separator" in str(w.message)]
+        assert thousands, f"M-34 no thousands warning: {[str(w.message) for w in rec]}"
+
+
+class TestF02HybridGateShapes:
+    """F-02 (pass-2, CONFIRMED): M-33's all-or-nothing full-row gate
+    regressed two multi-run shapes the old per-run gate handled.  The
+    hybrid keeps the full-row gate as PRIMARY but falls back to the
+    per-run snapshot when the full-row post-merge count != expected.
+    Shapes (a) and (b) are restored while the M-33 primary stays fixed."""
+
+    def test_shape_a_headerless_two_runs(self, tmp_path: Path) -> None:
+        """Headerless first row with two single-comma-group thousands —
+        OLD per-run behavior: 3 consistent columns."""
+        content = "1,234.5,2,345.6\n3,456.7,4,567.8\n"
+        test_file = tmp_path / "f02a_headerless.dev"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+        assert list(data.keys()) == ["col_0", "col_1", "col_2"], (
+            f"F-02a columns: {list(data.keys())}"
+        )
+        np.testing.assert_array_equal(data["col_0"], [1234.5, 3456.7])
+        np.testing.assert_array_equal(data["col_1"], [2.0, 4.0])
+        np.testing.assert_array_equal(data["col_2"], [345.6, 567.8])
+
+    def test_shape_b_surplus_mixed_run(self, tmp_path: Path) -> None:
+        """Surplus row mixing an unambiguous run with a genuine 3-digit
+        pair — OLD per-run behavior: all three values preserved."""
+        content = "MD,TVD,X\n1,234.5,100,250.5\n2.0,3.0,4.0\n"
+        test_file = tmp_path / "f02b_surplus.dev"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            data = read_dev_file(test_file)
+        np.testing.assert_allclose(data["MD"], [1234.5, 2.0])
+        np.testing.assert_allclose(data["TVD"], [100.0, 3.0])
+        np.testing.assert_allclose(data["X"], [250.5, 4.0])
+        thousands = [str(w.message) for w in rec if "thousands separator" in str(w.message)]
+        assert len(thousands) >= 1, f"F-02b no thousands warning: {[str(w.message) for w in rec]}"
+
+    def test_m33_primary_stays_fixed(self, tmp_path: Path) -> None:
+        """The M-33 primary (headered 2-col two-single-group) stays
+        fixed under the hybrid."""
+        content = "MD,TVD\n1,234.5,2,345.6\n3,456.7,4,567.8\n"
+        test_file = tmp_path / "f02_m33primary.dev"
+        test_file.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_dev_file(test_file)
+        np.testing.assert_allclose(data["MD"], [1234.5, 3456.7])
+        np.testing.assert_allclose(data["TVD"], [2345.6, 4567.8])
+
+
 class TestFixI2_14SpaceCommaDecimalHeaderless:
     """I2-14 (MEDIUM): space-delimited comma-decimal headerless file.
 
@@ -3288,22 +3386,6 @@ class TestFixI2_17SemicolonUSThousands:
             f"Warning must state the thousands reading, got: {thousands_warnings[0]}"
         )
 
-    def test_semicolon_v07_locale_decimals_still_convert(self, tmp_path: Path) -> None:
-        """V-07 regression guard: 1-2 digit comma decimals still convert."""
-        content = "MD;TVD;INC;AZI\n1,00;2,00;3,00;4,00\n5,00;6,00;7,00;8,00\n"
-        test_file = tmp_path / "i217_v07_guard.dev"
-        test_file.write_text(content, encoding="utf-8")
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            data = read_dev_file(test_file)
-
-        assert list(data.keys()) == ["MD", "TVD", "INC", "AZI"]
-        np.testing.assert_array_equal(data["MD"], [1.0, 5.0])
-        np.testing.assert_array_equal(data["TVD"], [2.0, 6.0])
-        np.testing.assert_array_equal(data["INC"], [3.0, 7.0])
-        np.testing.assert_array_equal(data["AZI"], [4.0, 8.0])
-
 
 class TestFixI2_18LinearThousandsRecombine:
     """I2-18 (MEDIUM): O(n²) hang in _recombine_thousands_separators.
@@ -3317,6 +3399,7 @@ class TestFixI2_18LinearThousandsRecombine:
     FAILS on pre-fix code (44.5s at n=20000 end-to-end), PASSES on post-fix.
     """
 
+    @pytest.mark.slow
     def test_large_bare_three_digit_row_is_linear(self, tmp_path: Path) -> None:
         import time
 
@@ -3335,12 +3418,17 @@ class TestFixI2_18LinearThousandsRecombine:
             f"{n}-token bare row — must be linear, not O(n²) (I2-18)"
         )
 
+    @pytest.mark.slow
     def test_large_bare_three_digit_row_end_to_end(self, tmp_path: Path) -> None:
         """End-to-end through the reader on a headerless comma file with 2
         rows of n bare 3-digit tokens (finding baseline: 29.28s at n=16000).
-        """
-        import time
 
+        No wall-clock bound: the deterministic sibling
+        ``test_large_bare_three_digit_row_is_linear`` pins the O(n²)
+        regression directly at a ~506x margin.  This test asserts the
+        structural contract — all n columns preserved end-to-end — without
+        the flaky timing assert (F-44).
+        """
         n = 8000
         row = ",".join(["234"] * n)
         content = f"{row}\n{row}\n"
@@ -3349,17 +3437,10 @@ class TestFixI2_18LinearThousandsRecombine:
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            t0 = time.perf_counter()
             data = read_dev_file(test_file)
-            elapsed = time.perf_counter() - t0
 
         assert list(data.keys()) == [f"col_{i}" for i in range(n)], (
             f"Expected {n} columns, got {len(list(data.keys()))}"
-        )
-        assert elapsed < 5.0, (
-            f"End-to-end read took {elapsed:.2f}s for n={n} bare tokens — "
-            f"must be linear (pre-fix: 7.30s at n=8000, 29.28s at n=16000; "
-            f"post-fix: ~0.5s at n=8000)"
         )
 
 
@@ -3592,25 +3673,6 @@ class TestF03DugPatternBDataPreservingGuards:
         np.testing.assert_array_equal(data["col_1"], [200.0, 6.0])
         np.testing.assert_array_equal(data["col_2"], [300.0, 7.0])
         np.testing.assert_array_equal(data["col_3"], [400.0, 8.0])
-
-    def test_real_header_over_all_float_third_line_stays_simple(self, tmp_path: Path) -> None:
-        """F-03 control: the V-03 contract is preserved — a real column
-        header ("MD TVD X Y") over an all-float third line stays SIMPLE
-        (ragged data rows), it is NOT reinterpreted as a title."""
-        content = (
-            "MD TVD X Y\n4\n0.0 0.0 0.0 0.0\n100.0 1000.0 100.0 200.0\n200.0 1100.0 150.0 250.0\n"
-        )
-        test_file = tmp_path / "f03_v03_control.dev"
-        test_file.write_text(content, encoding="utf-8")
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            data = read_dev_file(test_file)
-
-        assert list(data.keys()) == ["MD", "TVD", "X", "Y"], (
-            f"Expected real column names, got {list(data.keys())}"
-        )
-        np.testing.assert_array_equal(data["MD"], [4.0, 0.0, 100.0, 200.0])
 
 
 class TestF04NumericNullSentinels:

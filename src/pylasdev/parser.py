@@ -888,6 +888,12 @@ class LASParser:
         "P": "_parse_parameter",
         "O": "_parse_other",
         "A": "_parse_ascii_data",
+        # M-02..M-05 (version_pending): pre-~V curve/definition/parameter
+        # sections are buffered RAW under this handler and re-classified
+        # once the version is known (_resolve_version_pending at
+        # _parse_version).  The deferred-data machinery
+        # (deferred_ascii_data_lines) is the proof-of-pattern.
+        "D": "_parse_deferred_section",
     }
 
     def __init__(self, mnem_base: dict[str, str] | None = None, well_format: str = "auto") -> None:
@@ -934,6 +940,17 @@ class LASParser:
         # so a directly-following units row can also be skipped on the
         # first data line only.  Same monkeypatch-safe pattern as above.
         self._skipped_mnemonic_header = False
+        # M-02..M-05 (version_pending, ACCEPTED pre-fix audit): pre-~V
+        # curve/definition and parameter sections are buffered RAW and
+        # re-classified once the version is known (_resolve_version_pending
+        # at _parse_version).  State lives on the parser instance (not
+        # _ParserState) so the audit's design ships without touching
+        # _parser_state.py; same monkeypatch-safe init-before-_reset
+        # pattern as _deferred_pipe_targets/_section_pipe_targets.
+        self._pending_version_sections: list[dict[str, Any]] = []
+        self._pending_def_current: dict[str, Any] | None = None
+        self._pending_version_curves: list[tuple[CurveDefinition, str, str]] = []
+        self._version_pending_resolved = False
         self._reset()
 
     def _reset(self) -> None:
@@ -977,6 +994,22 @@ class LASParser:
         # itself only stores int|None in curve_end, so the target name is
         # recorded here, parallel to the tuple.
         self._deferred_pipe_targets: dict[tuple[str, str, int], str] = {}
+        # M-02..M-05 (version_pending): pre-~V curve/definition/parameter
+        # sections buffered RAW for _resolve_version_pending.  Each entry:
+        # {kind: "curve"|"definition"|"param", section_word, section_name,
+        # header_line, lines}.  _pending_def_current points at the entry
+        # whose body lines are being accumulated by _parse_deferred_section.
+        self._pending_version_sections = []
+        self._pending_def_current = None
+        # M-04 (version_pending): plain ~C curves parsed pre-~V are COMMITTED
+        # immediately (so pre-~V data scope capture works) but their format
+        # interpretation is deferred: (curve, raw_mnemonic, raw_description)
+        # records are fixed up at _resolve_version_pending with the version
+        # known.  Bounded implicitly by the MAX_CURVES check in _parse_curve.
+        # Annotated only in __init__ (mypy no-redef); per-file reset
+        # assignment.
+        self._pending_version_curves = []
+        self._version_pending_resolved = False
         # PARS-02: Parallel-to-_state.section_sequence pipe targets.  The
         # section label loses the pipe target (e.g. "~ASCII | CURVE" is
         # labelled "ASCII"), so the cross-section consistency checker could
@@ -1309,7 +1342,40 @@ class LASParser:
             _str_keys = (
                 set(self.las_file.string_data.keys()) if self.las_file.string_data else set()
             )
-            for _sc in self.las_file.curves:
+            # H-01: For LAS 3.0 files with data sections, run the
+            # format-vs-placement check on the post-EXT-03-dedup
+            # first-occurrence curve list, NOT the raw pre-dedup list.
+            # Every per-section ~*_Definition re-declares its curves into
+            # the global curves/curves_order (_parse_curve appends them;
+            # see the EXT-03 comment at :1396-1406), so a STRING section's
+            # Definition {S} declaration survives in the pre-dedup list
+            # when the FIRST LOG_DATA section places the same mnemonic
+            # NUMERICALLY and mirrors it into top-level logs
+            # (_las30_data.py:1361-1365) — the check then raises
+            # "string-format ... but is in logs (numeric)" on the
+            # library's own writer output (H-01 self-unreadable file).
+            # The EXT-03 dedup below collapses to the first-occurrence
+            # (main ~C) declaration, which the H-01 writer fix leaves
+            # MARKERLESS (data_format='') → ``if not _df: continue``
+            # skips it → no false positive.  A genuinely-malformed main
+            # ~C declaring {S} while the first LOG_DATA section is
+            # numeric is still the first occurrence and still raises.
+            # Mirror EXT-03's first-occurrence algorithm exactly
+            # (curves_order name + the parallel curves[_i] object, same
+            # length guard) so the scoped list is identical to the
+            # post-dedup model.
+            _check_curves: list[CurveDefinition] = self.las_file.curves
+            if self.las_file.version.is_las30 and self.las_file.data_sections:
+                _check_seen_mnems: set[str] = set()
+                _first_curves: list[CurveDefinition] = []
+                for _i, _name in enumerate(self.las_file.curves_order):
+                    if _name in _check_seen_mnems:
+                        continue
+                    _check_seen_mnems.add(_name)
+                    if _i < len(self.las_file.curves):
+                        _first_curves.append(self.las_file.curves[_i])
+                _check_curves = _first_curves
+            for _sc in _check_curves:
                 _df = _sc.data_format
                 _mnem = _sc.mnemonic
                 if not _df:
@@ -1746,8 +1812,20 @@ class LASParser:
             elif section_word in {"W", "WELL"}:
                 new_section = "W"
                 section_name = section_rest or ""
-            elif section_word in {"C", "CURVE"} or (
-                re.search(r"_DEFINITION(_\d+)?$", section_word)
+            elif section_word in {"C", "CURVE"}:
+                # M-04 (version_pending): a plain ~C/~CURVE section parsed
+                # BEFORE ~V commits its CurveDefinitions immediately (so
+                # pre-~V data sections capture the correct __MAIN__ scope at
+                # defer time) but DEFERS the format interpretation — the
+                # curve is built with data_format="" and the raw description,
+                # and a pending record is fixed up at _resolve_version_pending
+                # with the true version ({F}/{E}/{D} user text preserved on
+                # genuine 2.0; {A:N} spec-form markers kept on genuine 3.0).
+                new_section = "C"
+                section_name = section_rest or ""
+                # G-02: Regular ~C or ~CURVE section — no definition name.
+                self._state.current_definition_name = None
+            elif re.search(r"_DEFINITION(_\d+)?$", section_word) and (
                 # N-08: ~{Name}_DEFINITION is a LAS 3.0 structured section.
                 # On a KNOWN non-3.0 file it is a CUSTOMER section per the
                 # LAS 2.0 spec (between ~V and ~A) — routing it to the curve
@@ -1755,10 +1833,30 @@ class LASParser:
                 # fabricated columns on read).  When the version is not yet
                 # known (pre-~V) the 3.0-capable dispatch is kept — the
                 # deferral machinery owns those sections.
-                and (self.las_file.version.is_las30 or not self._state.version_found)
+                self.las_file.version.is_las30 or not self._state.version_found
             ):
-                new_section = "C"
-                if re.search(r"_DEFINITION(_\d+)?$", section_word):
+                if not self._state.version_found:
+                    # M-02 (version_pending): pre-~V ~{Name}_DEFINITION is
+                    # buffered RAW (never dispatched to the curve handler —
+                    # that committed PHANTOM curves on genuine 2.0).  At ~V
+                    # resolution: 3.0 → dispatched through _parse_curve;
+                    # 1.2/2.0 → preserved in other_lines with the N-08
+                    # warning.
+                    new_section = "D"
+                    section_name = f"{section_word} {section_rest}".strip()
+                    self._state.current_definition_name = None
+                    self._pending_version_sections.append(
+                        {
+                            "kind": "definition",
+                            "section_word": section_word,
+                            "section_name": section_name,
+                            "header_line": line,
+                            "lines": [],
+                        }
+                    )
+                    self._pending_def_current = self._pending_version_sections[-1]
+                else:
+                    new_section = "C"
                     section_name = f"{section_word} {section_rest}".strip()
                     # F-01: When the first _Definition section is encountered,
                     # freeze the main curve block endpoint so pipe "| CURVE"
@@ -1775,10 +1873,6 @@ class LASParser:
                     # can be saved per-definition type (prevents overwrite
                     # by consecutive _Definition sections).
                     self._state.current_definition_name = section_word.upper()
-                else:
-                    section_name = section_rest or ""
-                    # G-02: Regular ~C or ~CURVE section — no definition name.
-                    self._state.current_definition_name = None
             elif (
                 section_word in {"P", "PARAMETER", "PARAMETERS"}
                 or section_word.endswith("_PARAMETER")
@@ -1787,8 +1881,27 @@ class LASParser:
                 # F-M-01: LAS 3.0 typed parameter sections (e.g.,
                 # ~Core_Parameter, ~Drilling_Parameter) route to the
                 # parameter parser like standard ~P/~Parameter sections.
-                new_section = "P"
-                section_name = section_rest or ""
+                if not self._state.version_found:
+                    # M-05 (version_pending): a ~P/~X_PARAMETER section parsed
+                    # BEFORE ~V committed the optimistic 3.0 interpretation
+                    # ({F} stripped + data_format fabricated on genuine 2.0;
+                    # pipe text consumed as a bogus ParameterZone).  Buffer
+                    # RAW and re-classify at ~V.
+                    new_section = "D"
+                    section_name = section_rest or ""
+                    self._pending_version_sections.append(
+                        {
+                            "kind": "param",
+                            "section_word": section_word,
+                            "section_name": section_name,
+                            "header_line": line,
+                            "lines": [],
+                        }
+                    )
+                    self._pending_def_current = self._pending_version_sections[-1]
+                else:
+                    new_section = "P"
+                    section_name = section_rest or ""
             elif section_word in {"O", "OTHER"}:
                 new_section = "O"
                 section_name = section_rest or ""
@@ -2460,6 +2573,23 @@ class LASParser:
             # For completely non-standard values (commas, no dot, etc.),
             # warn and default to "2.0".
             vers_normalized = value.strip()
+            # F-151: Colon-free VERS lines (e.g., " VERS.   1.2  CWLS LOG
+            # ASCII STANDARD" without a colon) are matched by
+            # VALUE_ONLY_PATTERN, whose value group captures the ENTIRE
+            # remainder of the line — including the description text.  The
+            # version is the leading whitespace-delimited token when it is
+            # version-like; the trailing description must not become part of
+            # the version value.  Previously the trailing text made the value
+            # fail every version check, so colon-free "1.2" silently defaulted
+            # to 2.0 (6+ spurious LAS-2.0 mandatory-well-field warnings, VERS
+            # re-label to 2.0 on write) and colon-free "3.0" kept the
+            # description verbatim inside the version value.  Non-numeric
+            # values ("CWLS LOG ASCII STANDARD") are preserved whole below for
+            # the LAS 1.2 CWLS/lasio swap heuristics.
+            if vers_normalized and vers_normalized[0].isdigit():
+                _first_token = vers_normalized.split(None, 1)[0]
+                if re.match(r"^\d+\.\d+", _first_token):
+                    vers_normalized = _first_token
             # F-03: Normalize three-segment versions (e.g., "1.2.0" → "1.2",
             # "2.0.1" → "2.0") by stripping the third segment before the
             # regex check.  Only three-dot-segment strings are affected;
@@ -2537,6 +2667,11 @@ class LASParser:
                     stacklevel=2,
                 )
                 self.las_file.version.vers = "2.0"
+            # M-02..M-05 (version_pending): the VERS line has now resolved
+            # the version — re-classify every pre-~V curve/definition/
+            # parameter section that was buffered raw.  Runs exactly once
+            # (guarded inside); a second ~V (M-39) is handled above.
+            self._resolve_version_pending()
             # F-020 pt2: Deferred DLM re-check.  If DLM was parsed BEFORE
             # VERS in non-standard ~V ordering, the DLM version guard at
             # L1501 uses the default "2.0" and incorrectly allows
@@ -2555,7 +2690,18 @@ class LASParser:
                     stacklevel=2,
                 )
         elif mnemonic == "WRAP":
+            # M-01 (F-151 sibling): colon-free WRAP lines (e.g.
+            # " WRAP.   YES  data wrapped one line per depth" without a
+            # colon) are matched by VALUE_ONLY_PATTERN, whose value group
+            # captures the ENTIRE remainder of the line — including the
+            # trailing description.  The wrap keyword is the leading
+            # whitespace-delimited token; previously the trailing text made
+            # the value fail the YES/NO membership test and WRAP silently
+            # defaulted to NO (end-to-end: declared wrap re-labelled on
+            # roundtrip).
             wrap_upper = value.upper()
+            if wrap_upper:
+                wrap_upper = wrap_upper.split(None, 1)[0]
             if wrap_upper in {"YES", "NO"}:
                 self.las_file.version.wrap = wrap_upper
                 # F-051: WRAP is a LAS 1.2/2.0 concept — it is not valid
@@ -2590,7 +2736,16 @@ class LASParser:
                 )
                 self.las_file.version.wrap = "NO"
         elif mnemonic == "DLM":
+            # M-01 (F-151 sibling): colon-free DLM lines (e.g.
+            # " DLM.    COMMA  comma delimited columns" without a colon)
+            # capture the ENTIRE remainder as the value — the delimiter
+            # keyword is the leading whitespace-delimited token.  Previously
+            # the trailing description made the value fail the SPACE/TAB/
+            # COMMA membership test and DLM silently defaulted to SPACE
+            # (end-to-end: comma-delimited data read as space → all-null).
             dlm_upper = value.upper()
+            if dlm_upper:
+                dlm_upper = dlm_upper.split(None, 1)[0]
             if dlm_upper in {"SPACE", "TAB", "COMMA"}:
                 if not _LASVersionSpec(self.las_file.version.vers).is_las12 or dlm_upper == "SPACE":
                     self.las_file.version.dlm = dlm_upper
@@ -2623,6 +2778,156 @@ class LASParser:
                 UserWarning,
                 stacklevel=2,
             )
+
+    def _resolve_version_pending(self) -> None:
+        """Resolve version-dependent classification for pre-~V sections.
+
+        M-02..M-05 (version_pending design — ACCEPTED pre-fix audit):
+        curve/definition and parameter sections parsed before ~V was known
+        are buffered RAW (``_pending_version_sections``) and re-classified
+        here with the true version, so format extraction, ``{A:N}`` marker
+        preservation, parameter-zone parsing and customer-section routing
+        are version-order-independent.  The existing deferred-data machinery
+        (``deferred_ascii_data_lines`` + ``_replay_deferred_well``) is the
+        proof-of-pattern in the codebase.
+
+        Plain ``~C`` curves are COMMITTED at parse time (so pre-~V data
+        sections capture the correct ``__MAIN__`` scope) but their format
+        interpretation is deferred in ``_pending_version_curves`` and fixed
+        up here with the true version.
+
+        Called ONCE from ``_parse_version`` when the VERS line resolves the
+        version (guarded by ``_version_pending_resolved`` so a second ~V per
+        M-39 does not re-run).
+        """
+        if self._version_pending_resolved:
+            return
+        self._version_pending_resolved = True
+        # M-04: fix up the format interpretation of pre-~V plain ~C curves
+        # with the now-known version.  Runs BEFORE the deferred section
+        # dispatch below so later replayed sections see resolved curves.
+        if self._pending_version_curves:
+            _pending_curves = self._pending_version_curves
+            self._pending_version_curves = []
+            for _curve, _raw_mnemonic, _raw_desc in _pending_curves:
+                _df, _off, _desc = self._extract_curve_format(_raw_desc, _raw_mnemonic)
+                _curve.data_format = _df
+                _curve.description = _desc
+                if _curve.array_info is not None:
+                    _curve.array_info.time_offset = _off
+        pending = self._pending_version_sections
+        if not pending:
+            return
+        self._pending_version_sections = []
+        is_las30 = self.las_file.version.is_las30
+        for entry in pending:
+            kind = entry["kind"]
+            if kind == "param":
+                if entry["lines"]:
+                    self._replay_pending_param_section(entry)
+                continue
+            # curve / definition
+            if kind == "definition" and not is_las30:
+                # M-02: a customer ~{Name}_DEFINITION on a genuine 1.2/2.0
+                # file is preserved in other_lines with the N-08 warning —
+                # mirroring the KNOWN-non-3.0 classification branch.
+                self._append_other_line(entry["header_line"])
+                for _ln in entry["lines"]:
+                    self._append_other_line(_ln)
+                warnings.warn(
+                    f"~{entry['section_word']} is a LAS 3.0 structured "
+                    f"section but this file declares VERS "
+                    f"'{self.las_file.version.vers}'.  Treating it as a "
+                    f"customer section: content is preserved in the 'other' "
+                    f"field instead of being parsed as curve definitions.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            else:
+                self._replay_pending_curve_section(entry)
+
+    def _replay_pending_curve_section(self, entry: dict[str, Any]) -> None:
+        """Dispatch a deferred pre-~V curve/definition section through
+        ``_parse_curve`` with the version known.
+
+        ``_parse_curve`` runs its format extraction against the RESOLVED
+        version (``_state.version_found`` is True and
+        ``las_file.version.vers`` is set), so M-04 ({F} user text on 2.0),
+        M-03 ({A:N} spec-form marker on 3.0) and the N-15/N-16
+        order-invariance contracts are satisfied by construction.  The
+        section's curve range is recorded afterward exactly as
+        ``_save_c_curve_range`` would on a normal section leave.
+        """
+        section_word = entry["section_word"]
+        is_definition = entry["kind"] == "definition"
+        start = len(self.las_file.curves)
+        _saved_state = (
+            self._state.current_section,
+            self._state.current_definition_name,
+            self._state.section_curve_start_idx,
+            self._state.section_curve_end_idx,
+            self._state.current_section_name,
+        )
+        try:
+            self._state.current_section = "C"
+            self._state.current_section_name = entry["section_name"]
+            if is_definition:
+                self._state.current_definition_name = section_word.upper()
+                # M-67: only freeze when curves already exist (see
+                # classification comment at ~:1772).
+                if self._state.main_curve_end == -1 and len(self.las_file.curves) > 0:
+                    self._state.main_curve_end = len(self.las_file.curves)
+            else:
+                self._state.current_definition_name = None
+            self._state.section_curve_start_idx = start
+            self._state.section_curve_end_idx = None
+            for _ln in entry["lines"]:
+                self._parse_curve(_ln)
+        finally:
+            (
+                self._state.current_section,
+                self._state.current_definition_name,
+                self._state.section_curve_start_idx,
+                self._state.section_curve_end_idx,
+                self._state.current_section_name,
+            ) = _saved_state
+        # Record the curve range like _save_c_curve_range would.
+        _end = len(self.las_file.curves)
+        if is_definition:
+            self._state.definition_curve_ranges[section_word.upper()] = (start, _end)
+        else:
+            # H-01/PARS-09: plain ~C — __MAIN__ last-writer-wins (bare-~A
+            # fallback), __MAIN_ALL__ accumulates the CONTIGUOUS union.
+            _prev_all = self._state.definition_curve_ranges.get("__MAIN_ALL__")
+            if _prev_all is not None and start <= _prev_all[1]:
+                _all_start = min(_prev_all[0], start)
+                _all_end = max(_prev_all[1], _end)
+            elif _prev_all is not None:
+                _all_start, _all_end = _prev_all
+            else:
+                _all_start, _all_end = start, _end
+            self._state.definition_curve_ranges["__MAIN_ALL__"] = (_all_start, _all_end)
+            self._state.definition_curve_ranges["__MAIN__"] = (start, _end)
+
+    def _replay_pending_param_section(self, entry: dict[str, Any]) -> None:
+        """Dispatch a deferred pre-~V parameter section through
+        ``_parse_parameter`` with the version known.
+
+        ``_parse_parameter`` runs its format extraction and zone parsing
+        against the RESOLVED version, so M-05 ({F} user text kept + no bogus
+        ParameterZone on 2.0; zone extracted on 3.0 per N-16) is satisfied
+        by construction.
+        """
+        _saved = (self._state.current_section, self._state.current_section_name)
+        try:
+            self._state.current_section = "P"
+            # The section_word (e.g. "PARAMETER", "CORE_PARAMETER") drives
+            # _parse_parameter's _section_type derivation (F-053).
+            self._state.current_section_name = entry["section_word"]
+            for _ln in entry["lines"]:
+                self._parse_parameter(_ln)
+        finally:
+            (self._state.current_section, self._state.current_section_name) = _saved
 
     def _normalize_well_mnemonic(self, raw_mnemonic: str) -> str:
         """Collision-aware well mnemonic resolution (PXM-01 parity with
@@ -3230,6 +3535,13 @@ class LASParser:
                         # auto-generation produces unique Section_N names.
                         # Real user-provided names (e.g., "Main Log" from
                         # "~A Main Log") are preserved across replay.
+                        # PARS-C-PROD: the DIRECT path now applies the same
+                        # Section_N auto-naming for standard ~A/~ASCII via
+                        # _section_transition._ascii_section_display_name at
+                        # enter_new_section, so the stored name for that
+                        # family is already '' here; this broader blanking
+                        # remains for the other bare keywords (indexed /
+                        # *_DATA written forms).
                         _is_bare_keyword = (
                             _section_name in _DATA_SECTION_WORDS
                             or _is_indexed_data_section(_section_name)
@@ -3361,6 +3673,46 @@ class LASParser:
                 # prevent false-positive _ParserState.validate() warnings
                 # about "dangling data."  Without this, the deferred buffer
                 # persists across file boundaries (only _reset() clears it).
+                # M-02: EXCEPT customer ~{Name}_DATA sections.  Pre-~V the
+                # _DATA-suffix dispatch could not know the version, so a
+                # customer section (per the LAS 2.0 spec, between ~V and ~A)
+                # was buffered with the standard ~A data; once the version is
+                # known to be non-3.0 its content must be PRESERVED in
+                # other_lines with the N-07 warning — never silently cleared
+                # (the pre-fix path discarded the body with only a deceptive
+                # "preserving" warning).  Standard ~A/LOG_DATA groups are
+                # still dropped (the 1.2/2.0 data reader owns them).
+                if self._state.deferred_ascii_data_lines:
+                    _std_types = set(_SECTION_TYPE_MAP.values())
+                    _groups: dict[tuple[str, str, int], list[str]] = {}
+                    _order: list[tuple[str, str, int]] = []
+                    for _t in self._state.deferred_ascii_data_lines:
+                        _key = (_t[0], _t[1], _t[2])
+                        if _key not in _groups:
+                            _groups[_key] = []
+                            _order.append(_key)
+                        _groups[_key].append(_t[3])
+                    for _key in _order:
+                        _stype, _sname, _sidx = _key
+                        if _stype in _std_types:
+                            continue  # standard ~A/LOG_DATA → dropped (F-021)
+                        # Customer section — reconstruct the header from the
+                        # stored section_type/section_name and preserve.
+                        _header = f"~{_stype}"
+                        if _sname and _sname != _stype:
+                            _header += f" {_sname}"
+                        self._append_other_line(_header)
+                        for _ln in _groups[_key]:
+                            self._append_other_line(_ln)
+                        warnings.warn(
+                            f"~{_stype} is a LAS 3.0 structured section "
+                            f"but this file declares VERS "
+                            f"'{self.las_file.version.vers}'.  Treating it "
+                            f"as a customer section: content is preserved in "
+                            f"the 'other' field instead of being discarded.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
                 self._state.deferred_ascii_data_lines.clear()
 
     def _parse_well(self, line: str) -> None:
@@ -3614,8 +3966,131 @@ class LASParser:
         description = _desanitize_las_value(_unescape_colons_for_las_value(description))
 
         # LAS 3.0: Extract format specifier from description
-        data_format = ""
-        array_time_offset: float | None = None
+        # M-04 (version_pending): pre-~V the format interpretation is
+        # DEFERRED — the curve is built with data_format="" and the raw
+        # description, and a pending record is fixed up at
+        # _resolve_version_pending once the true version is known.  This
+        # keeps format extraction version-order-independent ({F}/{E}/{D}
+        # user text preserved on genuine 2.0; {A:N} spec-form markers kept
+        # on genuine 3.0) while STILL committing the curve immediately so
+        # pre-~V data sections capture the correct __MAIN__ scope at defer
+        # time (the pre-fix semantics that record-and-fixup preserves).
+        _defer_curve_format = not self._state.version_found
+        if _defer_curve_format:
+            data_format = ""
+            array_time_offset: float | None = None
+            _pending_raw_description = description
+        else:
+            data_format, array_time_offset, description = self._extract_curve_format(
+                description, raw_mnemonic
+            )
+
+        # LAS 3.0: Check for array notation in mnemonic
+        array_info: ArrayElementInfo | None = None
+        array_match = ARRAY_MNEMONIC_PATTERN.match(raw_mnemonic)
+        if array_match:
+            base_name = array_match.group("base").upper()
+            try:
+                index = int(array_match.group("index"))
+            except ValueError as exc:
+                raise LASParseError(
+                    f"Line {self._line_no}: invalid array index "
+                    f"'{array_match.group('index')}' in curve "
+                    f"mnemonic '{raw_mnemonic}'"
+                ) from exc
+            # P-11/M-26: ArrayElementInfo.__post_init__ raises bare
+            # ValueError (e.g. negative {A:-5} time_offset) which must
+            # not escape parse() — normalize to LASParseError.
+            try:
+                array_info = ArrayElementInfo(
+                    base_name=base_name,
+                    index=index,
+                    time_offset=array_time_offset,
+                )
+            except ValueError as exc:
+                raise LASParseError(
+                    f"Line {self._line_no}: invalid array element info "
+                    f"for curve '{raw_mnemonic}': {exc}"
+                ) from exc
+        elif "[" in raw_mnemonic:
+            # F-M-007: Warn when mnemonic contains "[" but doesn't match
+            # ARRAY_MNEMONIC_PATTERN (e.g., NMR[-1], NMR[abc], NMR[]).
+            logger.warning(
+                "Mnemonic %r contains '[' but does not match array notation "
+                "pattern; treated as standalone curve.",
+                raw_mnemonic,
+            )
+
+        # Apply mnemonic normalization from mnem_base.
+        # M-36: Collision-aware — when two distinct raw mnemonics resolve
+        # to the same canonical (e.g. LLD/LLS → BFV), keep the ORIGINAL
+        # mnemonic for the colliding curve so the model stays roundtrip-able.
+        normalized = self._normalize_curve_mnemonic(raw_mnemonic)
+
+        # F-M-026: Wrap CurveDefinition construction to catch ValueError
+        # from __post_init__ validation (e.g., empty mnemonic after
+        # mnem_base normalization) and re-raise as LASParseError.
+        # F-34: Preserve case-only original mnemonics.  ``normalized`` is
+        # always uppercase (raw_mnemonic = _original_cased.upper(), and
+        # mnem_base resolution is case-insensitive), so comparing the
+        # file's original casing DIRECTLY against it keeps original_mnemonic
+        # whenever the file casing differs in ANY way — mnem_base
+        # normalization ("AK"→"DT") OR case alone ('dept'→'DEPT').  The
+        # previous ``_original_cased.upper() != normalized`` guard erased
+        # the case signal and cleared original_mnemonic for case-only
+        # differences, so the writer re-emitted the canonical casing
+        # instead of the file's (contradicting the F-01 comment above:
+        # "CurveDefinition.original_mnemonic reflects the file's casing").
+        # original_mnemonic is cleared only when it is byte-identical to
+        # the canonical mnemonic.
+        try:
+            curve = CurveDefinition(
+                mnemonic=normalized,
+                unit=unit,
+                api_code=api_code,
+                description=description,
+                original_mnemonic=_original_cased if _original_cased != normalized else "",
+                data_format=data_format,
+                array_info=array_info,
+            )
+        except ValueError as e:
+            raise LASParseError(
+                f"Line {self._line_no}: invalid curve definition for mnemonic {raw_mnemonic!r}: {e}"
+            ) from e
+        # F-28: Guard against unbounded curve accumulation during ~C parsing.
+        # Without this check, a metadata-only LAS 3.0 file can accumulate
+        # unlimited CurveDefinition objects without triggering any bounds
+        # check (_data_reader.MAX_CURVES was only checked later in _process_ascii_data,
+        # which early-returns when no data section exists).
+        if len(self.las_file.curves) >= _data_reader.MAX_CURVES:
+            raise LASParseError(
+                f"Line {self._line_no}: curve count "
+                f"({len(self.las_file.curves) + 1}) exceeds maximum "
+                f"allowed ({_data_reader.MAX_CURVES}). "
+                f"The file may be malformed or corrupt."
+            )
+        self.las_file.curves.append(curve)
+        self.las_file.curves_order.append(normalized)
+        # M-04 (version_pending): record the raw description for the
+        # resolution-time format fixup when the curve was parsed pre-~V.
+        if _defer_curve_format:
+            self._pending_version_curves.append((curve, raw_mnemonic, _pending_raw_description))
+
+    def _extract_curve_format(
+        self,
+        description: str,
+        raw_mnemonic: str,
+    ) -> tuple[str, float | None, str]:
+        """Extract the LAS 3.0 format specifier from a curve description.
+
+        Shared by ``_parse_curve`` (version known) and the M-04
+        ``_resolve_version_pending`` fixup (pre-~V deferred curves re-
+        interpreted with the true version).  Returns
+        ``(data_format, array_time_offset, description)`` where
+        *description* has the functional format tokens stripped per the
+        CURRENT version state (``_state.version_found`` /
+        ``las_file.version.is_las30``).
+        """
         # F-M18: Use findall() to capture ALL format specifiers.  The old
         # search() only found the first, but sub() removed them all —
         # creating an asymmetry where extra format specifiers were silently
@@ -3640,6 +4115,8 @@ class LASParser:
             # as numeric either way) and must be preserved.  Filter the
             # extraction candidates to the functional markers only.
             format_matches = [m for m in format_matches if m[0].upper() in ("I", "S", "A")]
+        data_format = ""
+        array_time_offset: float | None = None
         if format_matches:
             # N-I-18: Prefer the TRAILING (last) format specifier.  The
             # writer appends the curve's real data_format at the END of the
@@ -3795,93 +4272,7 @@ class LASParser:
         # empties the match list) with literal backslashes that
         # accumulated on every write→read roundtrip.
         description = _unescape_braces_for_las_value(description)
-
-        # LAS 3.0: Check for array notation in mnemonic
-        array_info: ArrayElementInfo | None = None
-        array_match = ARRAY_MNEMONIC_PATTERN.match(raw_mnemonic)
-        if array_match:
-            base_name = array_match.group("base").upper()
-            try:
-                index = int(array_match.group("index"))
-            except ValueError as exc:
-                raise LASParseError(
-                    f"Line {self._line_no}: invalid array index "
-                    f"'{array_match.group('index')}' in curve "
-                    f"mnemonic '{raw_mnemonic}'"
-                ) from exc
-            # P-11/M-26: ArrayElementInfo.__post_init__ raises bare
-            # ValueError (e.g. negative {A:-5} time_offset) which must
-            # not escape parse() — normalize to LASParseError.
-            try:
-                array_info = ArrayElementInfo(
-                    base_name=base_name,
-                    index=index,
-                    time_offset=array_time_offset,
-                )
-            except ValueError as exc:
-                raise LASParseError(
-                    f"Line {self._line_no}: invalid array element info "
-                    f"for curve '{raw_mnemonic}': {exc}"
-                ) from exc
-        elif "[" in raw_mnemonic:
-            # F-M-007: Warn when mnemonic contains "[" but doesn't match
-            # ARRAY_MNEMONIC_PATTERN (e.g., NMR[-1], NMR[abc], NMR[]).
-            logger.warning(
-                "Mnemonic %r contains '[' but does not match array notation "
-                "pattern; treated as standalone curve.",
-                raw_mnemonic,
-            )
-
-        # Apply mnemonic normalization from mnem_base.
-        # M-36: Collision-aware — when two distinct raw mnemonics resolve
-        # to the same canonical (e.g. LLD/LLS → BFV), keep the ORIGINAL
-        # mnemonic for the colliding curve so the model stays roundtrip-able.
-        normalized = self._normalize_curve_mnemonic(raw_mnemonic)
-
-        # F-M-026: Wrap CurveDefinition construction to catch ValueError
-        # from __post_init__ validation (e.g., empty mnemonic after
-        # mnem_base normalization) and re-raise as LASParseError.
-        # F-34: Preserve case-only original mnemonics.  ``normalized`` is
-        # always uppercase (raw_mnemonic = _original_cased.upper(), and
-        # mnem_base resolution is case-insensitive), so comparing the
-        # file's original casing DIRECTLY against it keeps original_mnemonic
-        # whenever the file casing differs in ANY way — mnem_base
-        # normalization ("AK"→"DT") OR case alone ('dept'→'DEPT').  The
-        # previous ``_original_cased.upper() != normalized`` guard erased
-        # the case signal and cleared original_mnemonic for case-only
-        # differences, so the writer re-emitted the canonical casing
-        # instead of the file's (contradicting the F-01 comment above:
-        # "CurveDefinition.original_mnemonic reflects the file's casing").
-        # original_mnemonic is cleared only when it is byte-identical to
-        # the canonical mnemonic.
-        try:
-            curve = CurveDefinition(
-                mnemonic=normalized,
-                unit=unit,
-                api_code=api_code,
-                description=description,
-                original_mnemonic=_original_cased if _original_cased != normalized else "",
-                data_format=data_format,
-                array_info=array_info,
-            )
-        except ValueError as e:
-            raise LASParseError(
-                f"Line {self._line_no}: invalid curve definition for mnemonic {raw_mnemonic!r}: {e}"
-            ) from e
-        # F-28: Guard against unbounded curve accumulation during ~C parsing.
-        # Without this check, a metadata-only LAS 3.0 file can accumulate
-        # unlimited CurveDefinition objects without triggering any bounds
-        # check (_data_reader.MAX_CURVES was only checked later in _process_ascii_data,
-        # which early-returns when no data section exists).
-        if len(self.las_file.curves) >= _data_reader.MAX_CURVES:
-            raise LASParseError(
-                f"Line {self._line_no}: curve count "
-                f"({len(self.las_file.curves) + 1}) exceeds maximum "
-                f"allowed ({_data_reader.MAX_CURVES}). "
-                f"The file may be malformed or corrupt."
-            )
-        self.las_file.curves.append(curve)
-        self.las_file.curves_order.append(normalized)
+        return data_format, array_time_offset, description
 
     def _parse_parameter(self, line: str) -> None:
         """Parse ~P (parameter) section line.
@@ -4217,6 +4608,30 @@ class LASParser:
                 f"The file may be malformed or corrupt."
             )
         self.las_file.parameters.append(param)
+
+    def _parse_deferred_section(self, line: str) -> None:
+        """Accumulate raw lines of a pre-~V curve/definition/parameter section.
+
+        M-02..M-05 (version_pending): curve-defining and parameter sections
+        parsed before ~V was known are buffered RAW here and re-classified
+        once the version is resolved (``_resolve_version_pending`` at
+        ``_parse_version``) — the same buffer-and-replay pattern as the
+        deferred-data machinery (``deferred_ascii_data_lines``).
+        """
+        entry = getattr(self, "_pending_def_current", None)
+        if entry is None:
+            # Defensive: a body line with no recorded section header is
+            # unreachable (classification always records an entry before
+            # entering "D"); treat it as free-form other text.
+            self._append_other_line(line)
+            return
+        if len(entry["lines"]) >= MAX_OTHER_LINES:
+            raise LASParseError(
+                f"Line {self._line_no}: deferred section line count "
+                f"({len(entry['lines']) + 1}) exceeds maximum allowed "
+                f"({MAX_OTHER_LINES}). The file may be malformed or corrupt."
+            )
+        entry["lines"].append(line)
 
     def _parse_other(self, line: str) -> None:
         """Parse ~O (other) section — free-form text, accumulated.
@@ -4608,8 +5023,21 @@ class LASParser:
                         f"allowed ({_data_reader.MAX_DATA_LINES}). "
                         f"The file may be malformed or corrupt."
                     )
-                self._state.current_data_section_idx += 1
-                _defer_idx = self._state.current_data_section_idx
+                # M-12: capture the section index BEFORE incrementing so the
+                # first re-queued (data-before-curves) section is named
+                # Section_0 like the direct path — the pre-fix increment-then-
+                # capture produced Section_1, breaking order-invariance and
+                # by-name lookup (~V ~A ~C vs ~V ~C ~A).  When pre-~V
+                # deferred groups already exist (e.g. ~A(1) ~V ~A(2) ~C) the
+                # re-queued section must continue from the max deferred idx
+                # + 1 — otherwise it collides with the earlier group and the
+                # two sections merge into one (S8I208).
+                _max_deferred_idx = max(
+                    (_t[2] for _t in self._state.deferred_ascii_data_lines),
+                    default=-1,
+                )
+                _defer_idx = max(self._state.current_data_section_idx, _max_deferred_idx + 1)
+                self._state.current_data_section_idx = _defer_idx + 1
                 _deferred_curve_end = section_curve_end_idx
                 if self._current_pipe_target in {"CURVE", "C"} and _deferred_curve_end is None:
                     _deferred_curve_end = _DEFERRED_MAIN_CURVE_SCOPE
@@ -4689,7 +5117,9 @@ class LASParser:
         Four dimensions checked:
         (1) Curve count vs data column count for each data section.
         (2) LAS 3.0 section ordering — data sections before curve
-            definitions have no curves to reference.
+            definitions are buffered and attached once the definitions
+            are parsed; if the definitions never appear, the data
+            cannot be attached.
         (3) Duplicate section headers.
         (4) Per-section data_format x placement validation (F-28).
         """
@@ -4853,6 +5283,29 @@ class LASParser:
                     # M-08: Track which definition types have data sections
                     # for forward validation (Definition→Data).
                     _data_types_seen.add(_def_type)
+                    # M-11: bare LOG-family fallback to __MAIN__ (H-01
+                    # mirror).  A bare (no-pipe) ~A/~ASCII/~LOG/~LOG_DATA
+                    # section whose derived LOG_DEFINITION is not (yet) in
+                    # _defs_seen is bound to __MAIN__ by the resolver's H-01
+                    # fallback (parser.py ~1948-1953) — the F-20 fallback
+                    # above only rewrites _def_type to __MAIN__ when __MAIN__
+                    # is already seen (the curve-first shape).  On the
+                    # data-first shape (data before ~CURVE) neither is seen,
+                    # so _data_types_seen got LOG_DEFINITION and __MAIN__ was
+                    # never tracked — the forward check then emitted a FALSE
+                    # "main curve definition has no corresponding data
+                    # section" warning although the data IS attached.  Track
+                    # __MAIN__ as covered for the LOG-family only; typed
+                    # sections (CORE/DRILLING/...) still warn via their own
+                    # definition type (test_parser.py:3413 CORE_DEFINITION
+                    # pin unaffected).
+                    if (
+                        _pipe_target is None
+                        and _def_type == "LOG_DEFINITION"
+                        and "LOG_DEFINITION" not in _defs_seen
+                        and _type_word in {"A", "ASCII", "LOG", "LOG_DATA"}
+                    ):
+                        _data_types_seen.add("__MAIN__")
 
                 if is_curve:
                     # Mark this definition type as seen.
@@ -4883,9 +5336,10 @@ class LASParser:
             for msg in per_type_data_before_def:
                 logger.warning(
                     "LAS 3.0 data section %s. "
-                    "Data sections without preceding curve definitions "
-                    "will have no curves to reference and may produce "
-                    "empty or truncated output.",
+                    "Data sections appearing before their curve definitions "
+                    "are buffered and attached once the definitions are "
+                    "parsed; if the definitions never appear, the data "
+                    "cannot be attached.",
                     msg,
                 )
 

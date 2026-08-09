@@ -155,37 +155,12 @@ class TestMnemBase:
 
 
 class TestResolveMnemonic:
-    """F-022+F-032: Direct tests for resolve_mnemonic function."""
+    """F-022+F-032: Direct tests for resolve_mnemonic function.
 
-    def test_single_hop_resolution(self) -> None:
-        """Single-hop: AK → DT."""
-        mnem_base = {"AK": "DT"}
-        result = resolve_mnemonic(mnem_base, "AK")
-        assert result == "DT"
-
-    def test_non_existent_key_returns_self(self) -> None:
-        """Key not in base returns itself."""
-        mnem_base = {"AK": "DT"}
-        result = resolve_mnemonic(mnem_base, "ZZZ")
-        assert result == "ZZZ"
-
-    def test_multi_hop_chain_resolution(self) -> None:
-        """Multi-hop chain: BK-3 → BK → BFV."""
-        mnem_base = {"BK-3": "BK", "BK": "BFV"}
-        result = resolve_mnemonic(mnem_base, "BK-3")
-        assert result == "BFV"
-
-    def test_three_hop_chain_resolution(self) -> None:
-        """Three-hop chain: A → B → C → D."""
-        mnem_base = {"A": "B", "B": "C", "C": "D"}
-        result = resolve_mnemonic(mnem_base, "A")
-        assert result == "D"
-
-    def test_chain_terminates_at_terminal(self) -> None:
-        """Chain stops when a target is not itself a key."""
-        mnem_base = {"X": "Y"}  # Y is not a key
-        result = resolve_mnemonic(mnem_base, "X")
-        assert result == "Y"
+    The 5 simple chain cases (single-hop, non-existent, two-hop, three-hop,
+    terminal) are covered row-for-row by the parametrized test below
+    (F-252) — the standalone duplicates were removed.
+    """
 
     def test_cycle_detection(self) -> None:
         """Cycle A→B→A returns current value when cycle detected."""
@@ -331,37 +306,18 @@ class TestMnemBaseDualLaterologCollision:
         assert "BFV" in data["logs"]
 
 
-class TestGzFamilyTerminalCanonicals:
-    """F-12: the former GZ2-GZ5 → PZ entries silently renamed 92 keys
-    (GZ21, GZ210, ГЗ2, ...) to PZ — the I2-19 comment/test claim that "no
-    other mnemonic targets them" was false.  GZ2-GZ5 are terminal canonicals
-    like GZ1: GZ21 → GZ2, ГЗ3 → GZ3, never PZ."""  # noqa: RUF002
-
-    def test_gz2_gz5_resolve_to_self(self) -> None:
-        uppered = _build_uppercased_first_wins(MNEM_BASE)
-        assert resolve_mnemonic(uppered, "GZ2") == "GZ2"
-        assert resolve_mnemonic(uppered, "GZ3") == "GZ3"
-        assert resolve_mnemonic(uppered, "GZ4") == "GZ4"
-        assert resolve_mnemonic(uppered, "GZ5") == "GZ5"
-
-    def test_gz_family_keys_resolve_to_own_canonical_not_pz(self) -> None:
-        uppered = _build_uppercased_first_wins(MNEM_BASE)
-        assert resolve_mnemonic(uppered, "GZ21") == "GZ2"
-        assert resolve_mnemonic(uppered, "GZ31") == "GZ3"
-        assert resolve_mnemonic(uppered, "ГЗ2") == "GZ2"  # noqa: RUF001
-        assert resolve_mnemonic(uppered, "ГЗ3вм") == "GZ3"  # noqa: RUF001
-        assert resolve_mnemonic(uppered, "GZ4") != "PZ"
-        assert resolve_mnemonic(uppered, "GZ5") != "PZ"
-
-
 class TestCyrillicRsResistivity:
     """F-13: 'РС':'SP' was the only Cyrillic R-* entry breaking the
     R-*→R-* pattern (РД→RD, РЕЗ→RS, РП→RP, РПЗ→RZP).  РС is the Russian
-    resistivity abbreviation — corrected to RS."""  # noqa: RUF002
+    resistivity abbreviation — corrected to RS.
 
-    def test_rs_maps_to_resistivity_not_sp(self) -> None:
-        uppered = _build_uppercased_first_wins(MNEM_BASE)
-        assert resolve_mnemonic(uppered, "РС") == "RS"  # noqa: RUF001
+    The РС→RS member (test_rs_maps_to_resistivity_not_sp) was deleted as
+    redundant: test_regression.py:3902-3906 asserts the identical check via
+    the production lookup (F-245 partial).  The exhaustive Р-*→R-* sweep
+    below is KEPT — it is the only suite test asserting the R-*→R-* prefix
+    invariant (grep `startswith("R")` = 1 hit) and is NOT covered by the
+    regression class (which only excludes SP).
+    """  # noqa: RUF002
 
     def test_all_cyrillic_r_keys_follow_r_family(self) -> None:
         uppered = _build_uppercased_first_wins(MNEM_BASE)

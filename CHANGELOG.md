@@ -5,6 +5,46 @@ All notable changes to pylasdev will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.7] — 2026-08-09
+
+### Test Suite Optimization
+
+The suite was optimized to the precise/valuable/not-overgrown standard: 2,228 →
+2,240 collected (hundreds of redundant/vacuous/trivial tests deleted across all
+files — 83 deletion proposals adversarially verified, every doctrine pin
+preserved with provably-covering siblings); hardenings made discriminating
+(no-exponent pins with 1e8 values, F-217 cp866 fixture, M-72 advisory pin,
+timing flake eliminated via slow markers + deterministic siblings); high-value
+additions (sample.dev trajectory pin, INC range, MAX-guard exactly-N, container
+guards, inf/NaN compare pins, M-72, parser/writer/compliance pins). Runtime
+120.3s → 96.1s (-20%); coverage 87.57% → 88.41%.
+
+### Fixed
+
+Final production review (38 confirmed findings):
+
+- **H-01**: LAS 3.0 mixed string/numeric sections wrote self-unreadable files —
+  per-section format consistency enforced
+- **H-02**: silent 'S'-variant corruption eliminated
+- **H-03**: headerless first-row thousands recombination destroyed multi-column
+  data — fixed
+- Version-gated classification order-dependence (pre-~V sections deferred until
+  ~V known)
+- Colon-free WRAP/DLM/VERS token extraction everywhere
+- M-13..M-18 fix residuals (top-level views, guarded-dict aliasing, wholesale
+  deepcopy, validate re-checks)
+- DevFile construction/mutation guards
+- Thousands grammar drift across ports
+- Encoding window/EOF boundary fixes
+- `{I}` null-fill double-count
+- Wrapped-path embedded-delimiter warning
+- Units-gate predicate refinement
+- And more
+
+### Testing
+
+- 85 new regression pins added; 5 stale pins updated
+
 ## [2.0.6] — 2026-08-06
 
 ### Production Check

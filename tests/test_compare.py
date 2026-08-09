@@ -43,12 +43,6 @@ class TestCompareLasDicts:
         d2 = {"version": {"VERS": "2.0"}, "extra": "value"}
         assert compare_las_dicts(d1, d2) is False
 
-    def test_missing_nested_key(self) -> None:
-        """Test comparing dicts where nested key is missing."""
-        d1 = {"well": {"STRT": "100"}}
-        d2 = {"well": {"STRT": "100", "STOP": "200"}}
-        assert compare_las_dicts(d1, d2) is False
-
     def test_extra_nested_key(self) -> None:
         """Test comparing dicts where first has extra nested key."""
         d1 = {"well": {"STRT": "100", "STOP": "200"}}
@@ -73,13 +67,6 @@ class TestCompareLasDicts:
         d2 = {"logs": {"DEPT": np.array([1.0, 2.0 + 1e-8])}}
         assert compare_las_dicts(d1, d2) is True
 
-    def test_custom_tolerance(self) -> None:
-        """Test comparing with custom tolerance."""
-        d1 = {"logs": {"DEPT": np.array([1.0])}}
-        d2 = {"logs": {"DEPT": np.array([1.01])}}
-        assert compare_las_dicts(d1, d2, atol=0.02) is True
-        assert compare_las_dicts(d1, d2, atol=0.001) is False
-
     def test_list_comparison(self) -> None:
         """Test comparing lists."""
         d1 = {"curves_order": ["A", "B"]}
@@ -97,10 +84,6 @@ class TestCompareLasDicts:
         d1 = {"logs": {"DEPT": np.array([1.0, np.nan, 3.0])}}
         d2 = {"logs": {"DEPT": np.array([1.0, np.nan, 3.0])}}
         assert compare_las_dicts(d1, d2) is True
-
-    def test_empty_dicts(self) -> None:
-        """Test comparing empty dicts."""
-        assert compare_las_dicts({}, {}) is True
 
     def test_key_in_first_not_in_second(self) -> None:
         """Test comparing dicts where dict1 has key not in dict2."""
@@ -124,58 +107,12 @@ class TestCompareLasDicts:
         d1["data"] = ["A", "C"]
         assert compare_las_dicts(d1, d2) is False
 
-    def test_val2_dict_val1_not_dict_mismatch(self) -> None:
-        """Test val2-dict vs val1-non-dict mismatch detected as inequality."""
-        d1 = {"data": ["A"]}
-        d2 = {"data": {0: "B"}}
-        assert compare_las_dicts(d1, d2) is False
-
     # --- TEST-01: nested type mismatch (line 67-74) ---
     def test_nested_type_mismatch_array_vs_scalar(self) -> None:
         """Test detecting type mismatch in nested dict where val1 is ndarray
         but val2 is a scalar (line 67-74 of compare.py)."""
         d1 = {"logs": {"DEPT": np.array([1.0, 2.0])}}
         d2 = {"logs": {"DEPT": 5}}
-        assert compare_las_dicts(d1, d2) is False
-
-    def test_nested_type_mismatch_scalar_vs_array(self) -> None:
-        """Test detecting type mismatch where val2 value is ndarray
-        but val1 value is not (line 64-65 of compare.py).
-
-        The _compare_arrays guard now handles non-ndarray arguments
-        gracefully by logging a type mismatch and returning False.
-        """
-        d1 = {"logs": {"DEPT": 5}}
-        d2 = {"logs": {"DEPT": np.array([1.0, 2.0])}}
-        assert compare_las_dicts(d1, d2) is False
-
-    # --- F-52: Top-level ndarray comparison ---
-    def test_top_level_ndarray_comparison(self) -> None:
-        """Test comparing dicts containing ndarray values at the top level.
-
-        Exercises compare.py:81-83 — the isinstance(val2, np.ndarray) branch
-        for top-level (non-nested) ndarray values.
-        """
-        d1 = {"data": np.array([1.0, 2.0, 3.0])}
-        d2 = {"data": np.array([1.0, 2.0, 3.0])}
-        assert compare_las_dicts(d1, d2) is True
-
-    def test_top_level_ndarray_different_values(self) -> None:
-        """Test top-level ndarray comparison detects different values."""
-        d1 = {"data": np.array([1.0, 2.0, 3.0])}
-        d2 = {"data": np.array([1.0, 2.0, 4.0])}
-        assert compare_las_dicts(d1, d2) is False
-
-    def test_top_level_ndarray_size_mismatch(self) -> None:
-        """Test top-level ndarray comparison detects size mismatch."""
-        d1 = {"data": np.array([1.0, 2.0])}
-        d2 = {"data": np.array([1.0, 2.0, 3.0])}
-        assert compare_las_dicts(d1, d2) is False
-
-    def test_top_level_ndarray_type_mismatch(self) -> None:
-        """Test top-level ndarray vs scalar type mismatch."""
-        d1 = {"data": np.array([1.0])}
-        d2 = {"data": 5}
         assert compare_las_dicts(d1, d2) is False
 
     # --- F-53: Non-standard value types at top level ---
@@ -241,17 +178,22 @@ class TestCompareLasDicts:
             r.levelno == logging.WARNING for r in caplog.records
         ), caplog.text
 
-    def test_scalar_mismatch_missing_key_warns(self) -> None:
-        """E-27: missing scalar key still warns (key-diff path) and is False."""
+    def test_scalar_mismatch_missing_key_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """E-27: missing scalar key warns (key-diff path) and is False.
+
+        The nested-dict key-diff warning (compare.py:342, "Keys only in
+        second dict") fires on the missing key and is asserted here — the
+        E-27 contract that every mismatch path logs at WARNING level.
+        """
         d1 = {"well": {"STRT": "100.0"}}
         d2 = {"well": {"STRT": "100.0", "STOP": "200.0"}}
-        assert compare_las_dicts(d1, d2) is False
-
-    def test_scalar_missing_key_in_first(self) -> None:
-        """Test missing key when comparing scalar-valued dicts."""
-        d1 = {"a": 1}
-        d2 = {"a": 1, "b": 2}
-        assert compare_las_dicts(d1, d2) is False
+        with caplog.at_level(logging.WARNING, logger="pylasdev.compare"):
+            assert compare_las_dicts(d1, d2) is False
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, "missing-key mismatch must emit a WARNING record"
+        assert any("Keys only in second dict" in r.message for r in warnings), caplog.text
 
     # --- T1: _compare_data_sections coverage (compare.py:151-194) ---
 
@@ -295,12 +237,6 @@ class TestCompareLasDicts:
         d2 = {"data_sections": [{"order": ["A", "C"]}]}
         assert compare_las_dicts(d1, d2) is False
 
-    def test_compare_data_sections_scalar_mismatch(self) -> None:
-        """Test _compare_data_sections returns False when scalar values differ."""
-        d1 = {"data_sections": [{"name": "section_a"}]}
-        d2 = {"data_sections": [{"name": "section_b"}]}
-        assert compare_las_dicts(d1, d2) is False
-
     # --- T4: String/object array comparison (compare.py:129-131) ---
 
     def test_compare_string_arrays_match(self) -> None:
@@ -339,30 +275,6 @@ class TestCompareLasDicts:
         d1 = {"logs": {"ID": np.array([b"DEPT", b"GR"], dtype="S")}}
         d2 = {"logs": {"ID": np.array([b"DEPT", b"DT"], dtype="S")}}
         assert compare_las_dicts(d1, d2) is False
-
-    # --- CF-026: rtol parameter with custom value ---
-    def test_rtol_custom_tolerance(self) -> None:
-        """Test rtol parameter with a custom value different from atol."""
-        # Values with ~1% relative difference
-        d1 = {"logs": {"VAL": np.array([100.0, 200.0])}}
-        d2 = {"logs": {"VAL": np.array([101.0, 202.0])}}
-        # rtol=1e-7 (default) should fail — 1% difference > 1e-7
-        assert compare_las_dicts(d1, d2, rtol=1e-7) is False
-        # rtol=1e-3 should also fail — 101/100 - 1 = 0.01 > 1e-3
-        assert compare_las_dicts(d1, d2, rtol=1e-3) is False
-        # rtol=0.02 should pass — 0.01 < 0.02
-        assert compare_las_dicts(d1, d2, rtol=2e-2) is True
-
-    def test_rtol_interaction_with_atol(self) -> None:
-        """Test that rtol and atol work together correctly."""
-        d1 = {"logs": {"V": np.array([1.0, 10.0])}}
-        d2 = {"logs": {"V": np.array([1.01, 10.01])}}
-        # rtol=1e-7 too tight, atol=0.0 too tight
-        assert compare_las_dicts(d1, d2, rtol=1e-7, atol=0.0) is False
-        # rtol=1e-2 gives ~1% tolerance — 0.01/1.0=0.01 passes, 0.01/10.0=0.001 passes
-        assert compare_las_dicts(d1, d2, rtol=1e-2, atol=0.0) is True
-        # atol=0.02 alone passes since all absolute diffs are 0.01
-        assert compare_las_dicts(d1, d2, rtol=0.0, atol=0.02) is True
 
     # --- R-005: Parametrized tolerance comparison ---
     @pytest.mark.parametrize(
@@ -413,6 +325,15 @@ class TestCompareLasDicts:
                 0.0,
                 1e-7,
                 False,
+            ),
+            # rtol=1e-2 gives ~1% tolerance (folded from the former
+            # test_rtol_interaction_with_atol — the unique discriminating row)
+            (
+                {"logs": {"V": np.array([1.0, 10.0])}},
+                {"logs": {"V": np.array([1.01, 10.01])}},
+                0.0,
+                1e-2,
+                True,
             ),
             (
                 {"logs": {"V": np.array([1.0, 10.0])}},
@@ -601,66 +522,41 @@ class TestCompareDataSectionsNestedDict:
 
 
 class TestTypeErrorHandler:
-    """F5: Tests for TypeError handler at compare.py:104-112.
+    """Type-mismatch guards for scalar-vs-dict top-level values.
 
-    When val1 is a non-subscriptable type (e.g., int, float, str) and
-    val2 is a dict, the subscript access `val1[in_key]` raises TypeError,
-    which is caught at line 104 and returns False.
+    All variants exercise the single-side-dict branch in _coerce_and_compare
+    (compare.py:349-357): when one operand is a dict and the other is not,
+    the comparison returns False with a "Type mismatch" warning.  The
+    historical "TypeError handler at compare.py:104-112" mechanism no
+    longer exists — the dispatch hub replaced the subscript-based
+    fallthrough, so the operand types are all equivalent here.
     """
 
-    def test_val1_int_val2_dict(self) -> None:
-        """Test TypeError when val1 is int and val2 is dict."""
-        d1 = {"section": 42}
-        d2 = {"section": {0: "value"}}
-        assert compare_las_dicts(d1, d2) is False
-
-    def test_val1_float_val2_dict(self) -> None:
-        """Test TypeError when val1 is float and val2 is dict."""
-        d1 = {"section": 3.14}
-        d2 = {"section": {0: "value"}}
-        assert compare_las_dicts(d1, d2) is False
-
-    def test_val1_str_val2_dict(self) -> None:
-        """Test TypeError when val1 is str and val2 is dict with non-int keys."""
-        d1 = {"section": "hello"}
-        d2 = {"section": {"key": "value"}}
-        assert compare_las_dicts(d1, d2) is False
-
-    def test_val1_str_val2_dict_with_int_keys(self) -> None:
-        """Test TypeError when val1 is str and val2 dict has int keys.
-
-        str supports integer subscript so val1[0] gives 'h', which falls
-        through to scalar comparison with val2[0] == "hello".  Since 'h'
-        != "hello", the comparison correctly returns False.
-
-        This exercises the subscriptable-with-int-keys path WITHOUT
-        triggering TypeError (str supports integer subscript).
-        """
-        d1 = {"section": "hello"}
-        d2 = {"section": {0: "hello"}}
-        assert compare_las_dicts(d1, d2) is False
-
-        # Matching single-character str vs dict with int keys
-        d1["section"] = "h"
-        d2 = {"section": {0: "h"}}
-        assert compare_las_dicts(d1, d2) is False
-
-    def test_val1_str_val2_dict_multi_key(self) -> None:
-        """Test TypeError when str val1 doesn't match dict val2 with multiple keys."""
-        d1 = {"section": "ab"}
-        d2 = {"section": {0: "a", 1: "c"}}
-        assert compare_las_dicts(d1, d2) is False
+    @pytest.mark.parametrize(
+        "scalar, mapping",
+        [
+            (42, {0: "value"}),
+            (3.14, {0: "value"}),
+            ("hello", {"key": "value"}),
+            ("hello", {0: "hello"}),
+            ("h", {0: "h"}),
+            ("ab", {0: "a", 1: "c"}),
+        ],
+    )
+    def test_scalar_vs_dict_mismatch(self, scalar: Any, mapping: dict) -> None:
+        """Scalar vs dict at the same key returns False (single-side-dict)."""
+        assert compare_las_dicts({"section": scalar}, {"section": mapping}) is False
 
     # --- F19: List with numpy arrays triggers ValueError/TypeError handler ---
     def test_numpy_array_in_list_comparison(self) -> None:
         """Test comparison when non-data_sections list contains numpy arrays.
 
-        Exercises compare.py:129-159 — the except (ValueError, TypeError) block
-        that handles numpy arrays in lists. Direct list equality comparison
-        between lists containing numpy arrays raises ValueError because the
-        element-wise array comparison produces an array of bools with ambiguous
-        truth value. The exception handler falls through to per-element
-        comparison using _compare_arrays for ndarray elements.
+        Exercises the numeric list path: both lists are homogeneous numeric
+        (each converts to a 2x2 float64), so _compare_lists takes the
+        _compare_arrays route and returns the correct verdict.  The
+        historical "except (ValueError, TypeError)" fallback (compare.py:
+        601-631) is NOT reached by this fixture — it only fires when
+        _list_to_numeric_array returns None (ragged/non-numeric lists).
         """
         d1 = {"other_data": [np.array([1.0, 2.0]), np.array([3.0, 4.0])]}
         d2 = {"other_data": [np.array([1.0, 5.0]), np.array([3.0, 4.0])]}
@@ -741,17 +637,29 @@ class TestProductionCheckCompareFix:
     """Regression test for F-005 fix in compare.py."""
 
     def test_nan_guard_covers_all_float_dtypes(self) -> None:
-        """F-005: NaN guard catches np.float32, np.float16, np.longdouble.
+        """F-005: arrays containing NaN of mixed float dtypes compare equal.
 
-        Before the fix, isinstance(x, float) missed numpy float subtypes.
-        Now isinstance(x, (float, np.floating)) catches all.
+        The np.float32/np.float16 elements are promoted to float64 when the
+        array is constructed, so these fixtures exercise the ARRAY path
+        (_compare_arrays -> _allclose_symmetric), where NaN matches NaN via
+        the equal_nan clause (compare.py:186) — NOT the _scalars_equal
+        np.floating guard (compare.py:43), which sees 0 calls here.  The
+        genuine bare-scalar pin of the guard is
+        test_nan_guard_bare_scalar_np_floating below.
         """
         d1 = {"logs": {"VAL": np.array([1.0, np.float32(np.nan), 3.0])}}
         d2 = {"logs": {"VAL": np.array([1.0, np.float32(np.nan), 3.0])}}
         assert compare_las_dicts(d1, d2) is True, "NaN np.float32 comparison must match"
 
     def test_nan_float16_guard(self) -> None:
-        """F-005: NaN in np.float16 is handled correctly."""
+        """F-005: arrays containing np.float16 NaN compare equal.
+
+        Same float64-promotion + equal_nan array path as
+        test_nan_guard_covers_all_float_dtypes: the np.float16 element is
+        erased at array construction, so this guards NaN-in-array handling
+        (compare.py:186), not the _scalars_equal np.floating guard
+        (compare.py:43).
+        """
         d1 = {"logs": {"VAL": np.array([1.0, np.float16(np.nan)])}}
         d2 = {"logs": {"VAL": np.array([1.0, np.float16(np.nan)])}}
         assert compare_las_dicts(d1, d2) is True, "NaN np.float16 comparison must match"
@@ -763,6 +671,20 @@ class TestProductionCheckCompareFix:
         d2 = {"logs": {"VAL": np.array([np.float64(np.nan)])}}
         # Both are NaN → comparison should return True (NaN==NaN via per-element path)
         assert compare_las_dicts(d1, d2) is True
+
+    def test_nan_guard_bare_scalar_np_floating(self) -> None:
+        """F-005/F-26: bare np.floating NaN scalars hit the guard directly.
+
+        The array-form tests above route through _allclose_symmetric's
+        equal_nan path (compare.py:186) and stay green even if the
+        _scalars_equal np.floating guard at compare.py:43 is removed.  A
+        bare np.float32/np.float16/np.longdouble NaN dict value exercises
+        that guard directly: pre-fix (isinstance(x, float) only, which
+        np.floating subtypes fail) it compared False; post-fix True.
+        """
+        assert compare_las_dicts({"x": np.float32(np.nan)}, {"x": np.float32(np.nan)}) is True
+        assert compare_las_dicts({"x": np.float16(np.nan)}, {"x": np.float16(np.nan)}) is True
+        assert compare_las_dicts({"x": np.longdouble(np.nan)}, {"x": np.longdouble(np.nan)}) is True
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1134,34 +1056,6 @@ class TestCompareListsDirect:
             is False
         )
 
-    def test_nested_list_of_arrays(self) -> None:
-        """Nested lists containing numpy arrays match correctly."""
-        # _compare_lists dispatches per-element via _compare_values
-        # which handles ndarray elements via _compare_arrays
-        assert (
-            _compare_lists(
-                [np.array([1.0, 2.0])],
-                [np.array([1.0, 2.0])],
-                "test",
-                1e-7,
-                0.0,
-            )
-            is True
-        )
-
-    def test_nested_list_of_arrays_mismatch(self) -> None:
-        """Nested lists with different arrays return False."""
-        assert (
-            _compare_lists(
-                [np.array([1.0, 2.0])],
-                [np.array([9.0, 10.0])],
-                "test",
-                1e-7,
-                0.0,
-            )
-            is False
-        )
-
     def test_list_of_arrays_within_tolerance(self) -> None:
         """List of arrays matches within floating-point tolerance."""
         assert (
@@ -1231,11 +1125,25 @@ class TestCompareListsDirect:
         """Empty list vs non-empty list returns False."""
         assert _compare_lists([], [np.array([1.0])], "test", 1e-7, 0.0) is False
 
-    def test_large_list_of_arrays(self) -> None:
-        """Larger lists of arrays with many elements match."""
-        arrays1 = [np.array([float(i), float(i + 1)]) for i in range(10)]
-        arrays2 = [np.array([float(i), float(i + 1)]) for i in range(10)]
-        assert _compare_lists(arrays1, arrays2, "test", 1e-7, 0.0) is True
+    @pytest.mark.parametrize(
+        "left, right, expected",
+        [
+            ([np.inf], [np.inf], True),
+            ([-np.inf], [-np.inf], True),
+            ([np.inf], [-np.inf], False),
+            ([np.inf], [1.0], False),
+        ],
+    )
+    def test_inf_handling(self, left: list, right: list, expected: bool) -> None:
+        """+inf == +inf and -inf == -inf, but inf never matches the opposite
+        sign or a finite value.
+
+        Guards the equal_pos_inf/equal_neg_inf branches in _allclose_symmetric
+        (compare.py:187-188): the non-finite exclusion mask excludes inf from
+        the rtol/atol tolerance check, so without those branches inf operands
+        would always compare unequal.
+        """
+        assert _compare_lists(left, right, "test", 1e-7, 0.0) is expected
 
 
 class TestMaskedArrayComparison:
@@ -1274,23 +1182,6 @@ class TestMaskedArrayComparison:
         ma_val = np.ma.array(3.14)
         assert _compare_lists([ma_val], [np.ma.array(2.72)], "test", 1e-7, 0.0) is False
 
-    def test_0d_masked_true_vs_masked_true(self) -> None:
-        """Two 0-d MaskedArrays both with mask=True are considered equal.
-
-        M-33 fix: masked invalid values are unified to NaN-equivalent in
-        the list path, so two masked values compare equal (True) — the
-        same answer the dict/data_sections/nested paths already produced.
-        Pre-fix, ``np.ma.masked == np.ma.masked`` returned np.ma.masked
-        (not True/False) and the scalar fallthrough treated them as a
-        mismatch — the list path alone disagreed with every other path.
-        """
-        ma1 = np.ma.array(42.0, mask=True)
-        ma2 = np.ma.array(99.0, mask=True)
-        assert np.ma.is_masked(ma1), "Precondition: ma1 should be masked"
-        assert np.ma.is_masked(ma2), "Precondition: ma2 should be masked"
-        # Both become NaN-equivalent after the masked→NaN unification.
-        assert _compare_lists([ma1], [ma2], "test", 1e-7, 0.0) is True
-
     def test_0d_masked_vs_regular_scalar_mask_preserved(self) -> None:
         """0-d MaskedArray mask is preserved through nesting in lists."""
         # Two-element list with masked and non-masked values
@@ -1320,39 +1211,35 @@ class TestE08DataSectionsSymmetricGuards:
     return False (or True for genuinely equal operands) without raising.
     """
 
-    def test_sections2_none_returns_false(self) -> None:
-        """E-08: sections2=None returns False instead of raising TypeError."""
-        assert compare_las_dicts({"data_sections": []}, {"data_sections": None}) is False
-
-    def test_sections2_dict_vs_list_returns_false(self) -> None:
-        """E-08: sections2={} vs sections1=[] returns False, not True.
+    @pytest.mark.parametrize(
+        "wrong",
+        [None, {}, (), ""],
+    )
+    def test_sections2_wrong_type_returns_false(self, wrong: Any) -> None:
+        """E-08: malformed sections2 (non-list) returns False, not True/raise.
 
         The empty-container silent FALSE-EQUAL: [] == {} previously
-        returned True because both had length 0 and the loop never ran.
+        returned True because both had length 0 and the loop never ran;
+        sections2=None raised a bare TypeError on len().  All four
+        wrong-type variants hit the identical ``not isinstance(sections2,
+        list)`` guard (compare.py:657-663).
         """
-        assert compare_las_dicts({"data_sections": []}, {"data_sections": {}}) is False
+        assert compare_las_dicts({"data_sections": []}, {"data_sections": wrong}) is False
 
-    def test_sections2_tuple_returns_false(self) -> None:
-        """E-08: sections2=() vs sections1=[] returns False, not True."""
-        assert compare_las_dicts({"data_sections": []}, {"data_sections": ()}) is False
+    @pytest.mark.parametrize(
+        "sections1, sections2",
+        [
+            ({"data_sections": [{"a": 1}]}, {"data_sections": ["notadict"]}),
+            ({"data_sections": ["notadict"]}, {"data_sections": [{"a": 1}]}),
+        ],
+    )
+    def test_non_dict_element_returns_false(self, sections1: dict, sections2: dict) -> None:
+        """E-08: non-dict element returns False instead of AttributeError.
 
-    def test_sections2_string_returns_false(self) -> None:
-        """E-08: sections2='' vs sections1=[] returns False, not True."""
-        assert compare_las_dicts({"data_sections": []}, {"data_sections": ""}) is False
-
-    def test_non_dict_element_returns_false(self) -> None:
-        """E-08: non-dict element returns False instead of AttributeError."""
-        assert (
-            compare_las_dicts({"data_sections": [{"a": 1}]}, {"data_sections": ["notadict"]})
-            is False
-        )
-
-    def test_non_dict_first_element_returns_false(self) -> None:
-        """E-08: non-dict element in sections1 also returns False."""
-        assert (
-            compare_las_dicts({"data_sections": ["notadict"]}, {"data_sections": [{"a": 1}]})
-            is False
-        )
+        The per-element dict guard (compare.py:675-682) fires for either
+        operand order.
+        """
+        assert compare_las_dicts(sections1, sections2) is False
 
     def test_matching_sections_still_equal(self) -> None:
         """E-08: well-formed matching data_sections still compare equal."""
@@ -1432,15 +1319,6 @@ class TestListToNumericMasked:
         """The list path agrees with the array path: a masked position
         never matches a NaN (pre-fix this returned True via NaN-fill)."""
         assert _compare_lists([np.ma.array(2.0, mask=True)], [np.nan], "test", 1e-7, 0.0) is False
-
-    def test_compare_lists_masked_vs_masked_true(self) -> None:
-        """M-33 preserved at the helper level."""
-        assert (
-            _compare_lists(
-                [np.ma.array(2.0, mask=True)], [np.ma.array(99.0, mask=True)], "test", 1e-7, 0.0
-            )
-            is True
-        )
 
 
 class TestMaskedNonNumericArrayComparison:

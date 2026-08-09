@@ -610,14 +610,36 @@ def is_units_header_row(tokens: Sequence[str]) -> bool:
     phantom all-null first row and shifts the whole depth log by one row
     (M-13).
 
-    The predicate is deliberately NARROW (letters-only tokens, M-13 scope):
-    a units row is skipped only when every token is a plain letter string
-    (``"M"``, ``"GAPI"``).  Units containing digits or punctuation
-    (``"K/M3"``, ``"us/ft"``) are not recognized — the narrow match keeps
-    a genuine first data row (e.g. a string value ``"SHALE"`` in a mixed
-    section) from being misclassified as units.  Callers MUST gate the
-    skip on (a) a mnemonic header row having just been skipped and (b)
-    first-line-of-section — the only position where the row can appear.
+    The predicate is deliberately NARROW (units-form token pattern,
+    M-06 scope): a units row is skipped only when every token is a plain
+    letter abbreviation of 1-4 characters (``"M"``, ``"FT"``, ``"GAPI"``,
+    ``"DEGC"``, ``"OHMM"``) AND at least one token is a very short unit
+    (<= 2 letters — the canonical depth/unit forms ``"M"``, ``"FT"``,
+    ``"MS"``, ``"MV"``, ``"IN"``, ``"CM"``, ``"MM"``, ``"US"``).
+
+    The 4-char cap and the short-token requirement keep a genuine
+    letters-only first DATA row from being misclassified as units when NO
+    units row is present (M-06): the mnemonic header row directly precedes
+    a real units row that repeats the ~C units ("M GAPI"), but it equally
+    directly precedes a genuine data row whose string values are words
+    ("ACME SAND", "SHALE SAND").  Units are short abbreviations; data
+    words are typically longer ("ACME" is 4 chars but "SHALE"/"GRANITE"
+    are 5+), and a mixed-section numeric+string first data row ("ACME
+    SAND") carries no 1-2 char token.  Pre-fix, the plain letters-only
+    match consumed "ACME SAND" as units on all 4 read paths and silently
+    dropped it (the same row survives when a units row intervenes — the
+    one-shot gate closes after the real units row).
+
+    Tradeoff (consistent with the documented narrow-match philosophy):
+    a units row composed entirely of 3-4 letter tokens ("DEGC OHMM") is
+    not recognized — it is indistinguishable from a letters-only data row
+    by content alone without the ~C declared-units reference, and the
+    data-preservation bias of M-06 wins.  Units containing digits or
+    punctuation ("K/M3", "us/ft") are likewise not recognized.
+
+    Callers MUST gate the skip on (a) a mnemonic header row having just
+    been skipped and (b) first-line-of-section — the only position where
+    the row can appear.
 
     Shared predicate contract (M-13): the parser pre-scan
     (parser._finalize_pre_scan) subtracts the units row itself using the
@@ -626,7 +648,11 @@ def is_units_header_row(tokens: Sequence[str]) -> bool:
     """
     if not tokens:
         return False
-    return all(_UNITS_TOKEN_RE.fullmatch(tok) is not None for tok in tokens)
+    if not all(_UNITS_TOKEN_RE.fullmatch(tok) is not None for tok in tokens):
+        return False
+    if not all(len(tok) <= 4 for tok in tokens):
+        return False
+    return any(len(tok) <= 2 for tok in tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -651,7 +677,11 @@ def _is_valid_thousands_leading_group(token: str) -> bool:
 # A bare 3-digit group between comma groups (e.g. "234" in "1,234,567.8").
 _THOUSANDS_GROUP_BARE_RE = re.compile(r"^\d{3}$")
 # A final 3-digit group carrying the decimal/exponent part ("234.5", "234E2").
-_THOUSANDS_FRAG_RE = re.compile(r"^\d{3}(?:\.\d+|[eE][+-]?\d+)$")
+# M-32: accepts decimal AND exponent together ("234.5E3" from "1,234.5E3"),
+# matching the detection grammar — the F-06 "never drift" contract.  At
+# least one of decimal/exponent is still required (M-23 bare-fragment
+# protection: a bare 3-digit group is ambiguous with a genuine column).
+_THOUSANDS_FRAG_RE = re.compile(r"^\d{3}(?:(?:\.\d+)(?:[eE][+-]?\d+)?|[eE][+-]?\d+)$")
 
 
 def _recombine_las_thousands_separators(
@@ -703,6 +733,37 @@ def _recombine_las_thousands_separators(
     pairs: list[tuple[str, str]] = []
     i = 0
     n = len(values)
+    # M-33: Pre-scan the row for every mergeable thousands run and compute
+    # the FULL-ROW post-recombination token count (mirror of the DEV twin
+    # dev_reader.py — same defect, same fix).  The DEV-02 exact-fit gate
+    # must compare against this count, not the per-run snapshot
+    # (len(out) + 1 + (n - j)): with two single-comma-group thousands
+    # values ("1,234.5,2,345.6" in a 2-column file) each run's snapshot
+    # assumes the OTHER run stays split, so both fail ``post_count !=
+    # expected`` individually even though the full row recombines to
+    # exactly ``expected`` tokens.  Single-run rows are unaffected (the
+    # full-row count equals the per-run snapshot for one run).  F-02:
+    # when the full-row count does NOT equal ``expected``, the gate falls
+    # back to the per-run snapshot so runs that fit alone still merge
+    # (see the gate site).  Linear: every token is consumed by at most
+    # one leading-group scan.
+    _full_post_count = n
+    _scan = 0
+    while _scan < n:
+        _token = values[_scan]
+        if not _is_valid_thousands_leading_group(_token):
+            _scan += 1
+            continue
+        _j = _scan + 1
+        while _j < n and _THOUSANDS_GROUP_BARE_RE.match(values[_j]):
+            _j += 1
+        if _j < n and _THOUSANDS_FRAG_RE.match(values[_j]):
+            # This run would merge: it contributes 1 token instead of
+            # (_j + 1 - _scan) tokens.
+            _full_post_count -= _j - _scan
+            _scan = _j + 1
+        else:
+            _scan = _j
     while i < n:
         token = values[i]
         if not _is_valid_thousands_leading_group(token):
@@ -731,7 +792,20 @@ def _recombine_las_thousands_separators(
             i = j
             continue
         run_len = j - i
-        post_count = len(out) + 1 + (n - j)
+        # M-33: the gate compares the FULL-ROW post-merge count (all runs
+        # merged), not the per-run snapshot — see the pre-scan above.
+        # F-02 (hybrid, mirror of the DEV twin dev_reader.py): the full-row
+        # gate stays PRIMARY — it fixes the M-33 target (two single-group
+        # thousands in a headered row).  But when the FULL-ROW post-merge
+        # count does NOT equal ``expected``, fall back to the OLD per-run
+        # snapshot evaluation (``len(out) + 1 + (n - j)``) so a run that
+        # satisfies ``expected`` on its own still merges — restoring the
+        # surplus-row shape mixing an unambiguous run with a genuine
+        # 3-digit pair that the all-or-nothing gate regressed.
+        if _full_post_count == expected:
+            post_count = _full_post_count
+        else:
+            post_count = len(out) + 1 + (n - j)
         _body = token[1:] if token[:1] in "+-" else token
         if len(values) == expected:
             # E-24/M-30 equal-count widening: a 1-2 digit leading group at
@@ -747,7 +821,10 @@ def _recombine_las_thousands_separators(
         elif not (len(_body) <= 2 and run_len >= 3) and post_count != expected:
             # DEV-02 first-run gate on surplus rows: only merge when the
             # recombined row exactly satisfies the declared columns (or the
-            # run is an unambiguous multi-group M-76 shape).
+            # run is an unambiguous multi-group M-76 shape).  M-33: for
+            # multi-run rows the gate uses the full-row post-merge count.
+            # F-02: when the full-row count does NOT equal ``expected``
+            # the post_count is the per-run snapshot (see above).
             out.extend(values[i:j])
             i = j
             continue

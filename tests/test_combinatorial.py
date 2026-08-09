@@ -596,36 +596,11 @@ TEST_MATRIX: list[TestSpec] = [
         "dlm": "SPACE",
         "path": "parse",
         "las30_structured": True,
+        "pipe_target": "CURVE",
         "curves": ["DEPT", "DT", "RHOB"],
         "string_curves": set(),
         "well_extra": {"COMP": "PIPE TEST", "WELL": "PIPE-01"},
         "description": "las30 + SPACE + pipe | CURVE + parse + roundtrip",
-    },
-    {
-        "id": "las30_space_pipe_core_def_parse",
-        "vers": "3.0",
-        "wrap": "NO",
-        "dlm": "SPACE",
-        "path": "parse",
-        "las30_structured": True,
-        "core_data": True,
-        "curves": ["DEPT", "DT"],
-        "string_curves": set(),
-        "well_extra": {"COMP": "PIPE CORE", "WELL": "PCORE-01"},
-        "description": "las30 + SPACE + pipe | Core_Def + parse + roundtrip",
-    },
-    {
-        "id": "las30_space_indexed_core_parse",
-        "vers": "3.0",
-        "wrap": "NO",
-        "dlm": "SPACE",
-        "path": "parse",
-        "las30_structured": True,
-        "indexed_core": True,
-        "curves": ["DEPT", "DT"],
-        "string_curves": set(),
-        "well_extra": {"COMP": "INDEX TEST", "WELL": "IDX-01"},
-        "description": "las30 + SPACE + indexed ~Core[1] + parse + roundtrip",
     },
     {
         "id": "las30_space_string_multi_parse",
@@ -868,31 +843,6 @@ class TestCombinatorialRoundtrip:
                 },
             ]
 
-        if spec.get("indexed_core"):
-            core_curves = ["CORET", "COREB"]
-            return [
-                {
-                    "name": "Log",
-                    "section_type": "LOG_DATA",
-                    "curves": curves,
-                    "logs": _make_logs(curves, n_rows=3),
-                },
-                {
-                    "name": "Core[1]",
-                    "section_type": "CORE_DATA",
-                    "pipe_target": "Core_Definition",
-                    "curves": core_curves,
-                    "logs": {
-                        "CORET": np.array([550.0, 551.0, 552.0], dtype=np.float64),
-                        "COREB": np.array([555.0, 556.0, 557.0], dtype=np.float64),
-                    },
-                    "definition_curves": [
-                        ("CORET", "M", "F", "Core Top Depth"),
-                        ("COREB", "M", "F", "Core Bottom Depth"),
-                    ],
-                },
-            ]
-
         # Standard LAS 3.0 with pipe to CURVE
         if spec.get("pipe_target") == "CURVE":
             return [
@@ -1037,7 +987,6 @@ class TestCombinatorialRoundtrip:
             spec.get("multi_section")
             or spec.get("core_data")
             or spec.get("consecutive_sections")
-            or spec.get("indexed_core")
         )
         if has_multi_section:
             # LAS 3.0 multi-section: parser may add curves from _Definition
@@ -1067,15 +1016,6 @@ class TestCombinatorialRoundtrip:
     ) -> None:
         """Validate that roundtrip preserves data."""
         expect_wrap_override = spec.get("expect_wrap_override", False)
-        vers_str = spec["vers"]
-        is_las30 = vers_str.startswith("3.")
-        has_structured = bool(
-            spec.get("multi_section")
-            or spec.get("core_data")
-            or spec.get("consecutive_sections")
-            or spec.get("indexed_core")
-            or spec.get("las30_structured")
-        )
 
         # --- Version preservation ---
         orig_vers = original["version"].get("VERS", "")
@@ -1097,14 +1037,20 @@ class TestCombinatorialRoundtrip:
         for field in ["STRT", "STOP", "STEP", "NULL"]:
             assert field in rt_well, f"Missing well field '{field}' after roundtrip in {spec['id']}"
 
-        # Well extra fields: may be present or re-parsed differently by the reader
-        if orig_well.get("COMP"):
-            # COMP may be in roundtrip
-            pass
+        # Well extra fields (COMP/WELL/FLD/LOC/...): the roundtrip must
+        # preserve their presence AND value — the old pass-only blocks were
+        # dead code (F-253).  All matrix well_extra fields roundtrip with
+        # equal values (verified empirically).
+        for key in spec.get("well_extra") or {}:
+            assert key in rt_well, (
+                f"Well field '{key}' missing after roundtrip in {spec['id']}"
+            )
+            assert rt_well.get(key) == orig_well.get(key), (
+                f"Well field '{key}' changed after roundtrip in {spec['id']}: "
+                f"{orig_well.get(key)!r} -> {rt_well.get(key)!r}"
+            )
 
         # --- Data section count (LAS 3.0) ---
-        if is_las30 and has_structured and not spec.get("las30_structured"):
-            pass  # from_dict path LAS 3.0 with data_sections
         orig_sections = original.get("data_sections", [])
         rt_sections = roundtrip.get("data_sections", [])
         if orig_sections:
@@ -1149,7 +1095,13 @@ class TestCombinatorialRoundtrip:
         section_idx: int,
         test_id: str,
     ) -> None:
-        """Compare data within a single data section."""
+        """Compare data within a single data section.
+
+        A curve present in the original section data MUST be present in the
+        roundtrip section data, and its shape must match — the old
+        ``continue``/``pass`` skip-guards silently swallowed curve-drop and
+        row-drop regressions (F-238).
+        """
         sec_type = orig_sec.get("section_type", f"section_{section_idx}")
 
         # curves_order
@@ -1162,13 +1114,16 @@ class TestCombinatorialRoundtrip:
         orig_data = orig_sec.get("data", {})
         rt_data = rt_sec.get("data", {})
         for curve in orig_data:
-            if curve not in rt_data:
-                continue  # may have moved to a different section
+            assert curve in rt_data, (
+                f"Curve '{curve}' dropped from section {section_idx} ({sec_type}) "
+                f"data in {test_id}"
+            )
             orig_arr = orig_data[curve]
             rt_arr = rt_data[curve]
-            if orig_arr.shape != rt_arr.shape:
-                # Shape mismatch can happen for structured sections
-                continue
+            assert orig_arr.shape == rt_arr.shape, (
+                f"Shape mismatch for '{curve}' in section {section_idx} ({sec_type}) "
+                f"in {test_id}: {orig_arr.shape} vs {rt_arr.shape}"
+            )
             try:
                 np.testing.assert_allclose(
                     orig_arr,
@@ -1177,19 +1132,27 @@ class TestCombinatorialRoundtrip:
                     err_msg=f"Data mismatch for '{curve}' in section {section_idx} ({sec_type}) for {test_id}",
                 )
             except TypeError:
-                # String data — will be in string_data
-                pass
+                # Non-numeric array (e.g. string data carried in ``data``) —
+                # compare element-wise instead of swallowing the mismatch.
+                np.testing.assert_array_equal(
+                    orig_arr,
+                    rt_arr,
+                    err_msg=f"Data mismatch for '{curve}' in section {section_idx} ({sec_type}) for {test_id}",
+                )
 
         # String data
         orig_str = orig_sec.get("string_data", {})
         rt_str = rt_sec.get("string_data", {})
         for key in orig_str:
-            if key in rt_str:
-                np.testing.assert_array_equal(
-                    orig_str[key],
-                    rt_str[key],
-                    err_msg=f"string_data mismatch for '{key}' in section {section_idx} for {test_id}",
-                )
+            assert key in rt_str, (
+                f"string_data key '{key}' dropped from section {section_idx} "
+                f"({sec_type}) in {test_id}"
+            )
+            np.testing.assert_array_equal(
+                orig_str[key],
+                rt_str[key],
+                err_msg=f"string_data mismatch for '{key}' in section {section_idx} for {test_id}",
+            )
 
     def _compare_logs(
         self,
@@ -1197,30 +1160,71 @@ class TestCombinatorialRoundtrip:
         roundtrip: dict[str, Any],
         spec: TestSpec,
     ) -> None:
-        """Compare top-level log data."""
+        """Compare top-level log data.
+
+        A curve present in the original top-level logs MUST be present in
+        the roundtrip logs — the old ``in orig_logs and in rt_logs`` guard
+        silently swallowed a dropped curve (F-239).
+        """
         curves_order = original.get("curves_order", [])
         orig_logs = original.get("logs", {})
         rt_logs = roundtrip.get("logs", {})
 
         for curve in curves_order:
-            if curve in orig_logs and curve in rt_logs:
-                orig_arr = orig_logs[curve]
-                rt_arr = rt_logs[curve]
-                try:
-                    # Try numeric comparison first
-                    np.testing.assert_allclose(
-                        orig_arr,
-                        rt_arr,
-                        rtol=1e-5,
-                        err_msg=f"Data mismatch for '{curve}' in {spec['id']}",
-                    )
-                except TypeError:
-                    # String comparison
-                    np.testing.assert_array_equal(
-                        orig_arr,
-                        rt_arr,
-                        err_msg=f"String data mismatch for '{curve}' in {spec['id']}",
-                    )
+            if curve not in orig_logs:
+                continue  # no original data for this curve (e.g. in data_sections)
+            assert curve in rt_logs, (
+                f"Curve '{curve}' dropped from roundtrip logs in {spec['id']}"
+            )
+            orig_arr = orig_logs[curve]
+            rt_arr = rt_logs[curve]
+            try:
+                # Try numeric comparison first
+                np.testing.assert_allclose(
+                    orig_arr,
+                    rt_arr,
+                    rtol=1e-5,
+                    err_msg=f"Data mismatch for '{curve}' in {spec['id']}",
+                )
+            except TypeError:
+                # String comparison
+                np.testing.assert_array_equal(
+                    orig_arr,
+                    rt_arr,
+                    err_msg=f"String data mismatch for '{curve}' in {spec['id']}",
+                )
+
+
+# =============================================================================
+# Independent test: synthetic single-section curve-drop guard (F-262)
+# =============================================================================
+
+
+def test_curve_drop_detected_in_single_section_roundtrip(tmp_path: Path) -> None:
+    """F-262: a curve dropped from a single-section roundtrip must FAIL.
+
+    Companion to the F-239 HARDEN of ``_compare_logs``.  Pre-fix, the
+    ``in orig_logs and in rt_logs`` guard skipped curves missing from the
+    roundtrip, so a reader/writer regression that silently dropped a curve
+    passed the matrix.  This test simulates that regression on a synthetic
+    single-section file and asserts the hardened guard rejects it.
+    """
+    spec = next(s for s in TEST_MATRIX if s["id"] == "las20_space_numeric_parse")
+    tester = TestCombinatorialRoundtrip()
+    original = tester._build_input(spec, tmp_path)
+    assert original is not None
+
+    temp_file = tmp_path / "curve_drop_guard.las"
+    write_las_file(temp_file, original)
+    roundtrip = read_las_file(temp_file)
+
+    # Simulate a regression: the reader/writer drops the RHOB curve.
+    assert "RHOB" in roundtrip["logs"], "Precondition: RHOB must be present in roundtrip"
+    roundtrip["logs"].pop("RHOB")
+    roundtrip["curves_order"].remove("RHOB")
+
+    with pytest.raises(AssertionError):
+        tester._validate_roundtrip(original, roundtrip, spec)
 
 
 # =============================================================================
@@ -1262,18 +1266,47 @@ def test_las30_multi_section_from_dict_roundtrip(tmp_path: Path) -> None:
 
 
 def test_las30_core_curves_from_dict_roundtrip(tmp_path: Path) -> None:
-    """Test LAS 3.0 per-Core curve set from_dict roundtrip."""
+    """Test LAS 3.0 per-Core curve set from_dict roundtrip.
+
+    F-263: beyond the section count, the section types and the per-Core
+    data values (numeric CORET/COREB + string CDES) must survive the
+    write -> read roundtrip.
+    """
     data = _build_las30_core_curves_dict()
 
     las = LASFile.from_dict(data)
     assert len(las.data_sections) == 2
+    assert las.data_sections[0].section_type == "LOG_DATA"
+    assert las.data_sections[1].section_type == "CORE_DATA"
 
     d = las.to_dict()
     temp_file = tmp_path / "las30_core_from_dict.las"
     write_las_file(temp_file, d)
     parsed = read_las_file(temp_file)
 
-    assert len(parsed.get("data_sections", [])) == 2
+    sections = parsed.get("data_sections", [])
+    assert len(sections) == 2
+    assert sections[0]["section_type"] == "LOG_DATA"
+    assert sections[1]["section_type"] == "CORE_DATA"
+
+    # Core numeric data preserved through the roundtrip.
+    core = sections[1]
+    np.testing.assert_allclose(
+        core["data"]["CORET"],
+        np.array([550.0, 551.0]),
+        rtol=1e-5,
+        err_msg="CORET data not preserved through from_dict roundtrip",
+    )
+    np.testing.assert_allclose(
+        core["data"]["COREB"],
+        np.array([555.0, 556.0]),
+        rtol=1e-5,
+        err_msg="COREB data not preserved through from_dict roundtrip",
+    )
+    # Core string data (CDES) preserved through the roundtrip.
+    assert core["string_data"]["CDES"].tolist() == ["desc_one", "desc_two"], (
+        "CDES string data not preserved through from_dict roundtrip"
+    )
 
 
 def test_las30_per_section_params_from_dict_roundtrip(tmp_path: Path) -> None:

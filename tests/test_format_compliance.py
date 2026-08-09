@@ -33,6 +33,11 @@ class TestFormatCompliance:
 
         CWLS LAS 1.2 §5.6: All data values must be plain decimal numbers.
         Exponent-formatted numbers (e.g., '1e+08') are explicitly forbidden.
+
+        The 1e8-scale DEPT value is the load-bearing member: under ``.8g``
+        it formats as '1e+08', so the writer's fixed-point rewrite
+        (``_format_fixed_precision``) must actually fire for the no-exponent
+        guarantee to hold.  Without the rewrite this test fails.
         """
         data: dict[str, Any] = {
             "version": {"VERS": "1.2", "WRAP": "NO", "DLM": "SPACE"},
@@ -46,7 +51,7 @@ class TestFormatCompliance:
             },
             "parameters": {},
             "logs": {
-                "DEPT": np.array([100000.0, 100001.0, 100002.0]),
+                "DEPT": np.array([100000.0, 100001.0, 1e8]),
                 "DT": np.array([123.45, 123.50, 123.55]),
             },
             "curves_order": ["DEPT", "DT"],
@@ -60,6 +65,10 @@ class TestFormatCompliance:
         data_lines = [
             line for line in data_section.splitlines() if line.strip() and not line.startswith("#")
         ]
+        # At least one data row must exist (header line + data).
+        assert len(data_lines) >= 2, (
+            f"Expected header + at least one data row, got {len(data_lines)}"
+        )
         # Data lines (after header) must not contain exponent notation
         for line in data_lines[1:]:  # Skip header line
             assert not re.search(r"[0-9][eE][+\-]?[0-9]", line), (
@@ -158,6 +167,11 @@ class TestFormatCompliance:
 
         CWLS LAS 2.0 §5.2: Data values are space-delimited; each depth
         step on a single line when WRAP=NO.
+
+        The no-tab assertion discriminates space-vs-tab: ``str.split()``
+        alone is whitespace-agnostic and would accept a TAB-delimited line
+        (F-107).  The row-count assertion also guards against the writer
+        emitting zero data rows (loop no-op vacuity).
         """
         data: dict[str, Any] = {
             "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
@@ -178,8 +192,14 @@ class TestFormatCompliance:
         data_lines = [
             line for line in data_section.splitlines() if line.strip() and not line.startswith("#")
         ]
-        # Data lines (after curve header) should have 3 space-separated values
+        # At least one data row must exist (header line + data).
+        assert len(data_lines) >= 2, (
+            f"Expected header + at least one data row, got {len(data_lines)}"
+        )
+        # Data lines (after curve header) should have 3 space-separated values,
+        # and must NOT be tab-delimited (space is the declared delimiter).
         for line in data_lines[1:]:  # Skip header
+            assert "\t" not in line, f"Tab delimiter found in space-delimited data line: {line!r}"
             parts = line.split()
             assert len(parts) >= 3, f"Expected 3 values in data line, got {len(parts)}: {line!r}"
 
@@ -207,6 +227,9 @@ class TestFormatCompliance:
 
         CWLS LAS 3.0 §3.1: VERSION key is "3.0" with description "CWLS LOG
         ASCII STANDARD -VERSION 3.0". DLM field is required (SPACE / COMMA / TAB).
+        The VERS value must appear BEFORE the colon — a substring-only check
+        would pass a malformed ``VERS. : 3.0`` header because the description
+        text itself contains "VERSION 3.0" (F-108).
         """
         las = LASFile()
         las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
@@ -223,16 +246,43 @@ class TestFormatCompliance:
         assert "DLM" in content
         assert "COMMA" in content
 
-    def test_las30_no_exponents_in_data(self, tmp_path: Path) -> None:
-        """Verify LAS 3.0 output has no exponent notation in data sections."""
+        # VERS value ("3.0") must appear BEFORE the colon.
+        #    Correct:  VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+        #    Malformed: VERS.   : 3.0  (description text would still contain
+        #                              "VERSION 3.0" — the substring checks above)
+        vers_match = re.search(r"VERS\.\s+([\d.]+)\s+:", content)
+        assert vers_match is not None, "VERS line malformed: value must appear BEFORE the colon"
+        assert vers_match.group(1) == "3.0", (
+            f"VERS value should be 3.0, got {vers_match.group(1)!r}"
+        )
+
+    def test_las30_writer_uses_fixed_point_notation(self, tmp_path: Path) -> None:
+        """WRITER DEFAULT: LAS 3.0 output never contains exponent notation.
+
+        This is a *writer policy* pin, NOT a LAS 3.0 spec-compliance pin.
+        The LAS 3.0 spec defines the Exponential (E) data format and its own
+        sample data section contains ``1.45E+12`` for the {E}-format YME
+        curve (see s1-research-las30-report.md) — so emitting E notation
+        would be spec-faithful.  The writer nevertheless rewrites all
+        exponent-formatted values to fixed-point (``_format_fixed_precision``)
+        as a deliberate default.  This test documents and pins that default:
+        it would FAIL a change that started emitting E notation per the spec
+        sample, which is intentional — the pin marks the current writer
+        contract, not the spec.
+
+        The 1.45e12 YME values (the spec sample's own magnitude) are the
+        load-bearing members: under ``.8g`` they format as '1.45e+12', so
+        the fixed-point rewrite must actually fire.
+        """
         las = LASFile()
         las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
         las.well["NULL"] = "-999.25"
-        las.curves_order = ["DEPT", "DT"]
+        las.curves_order = ["DEPT", "YME"]
         las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M", data_format="F"))
-        las.curves.append(CurveDefinition(mnemonic="DT", unit="US/M", data_format="F"))
+        # {E}-format curve carrying the spec sample's 1.45E+12 magnitude.
+        las.curves.append(CurveDefinition(mnemonic="YME", unit="PA", data_format="E"))
         las.logs["DEPT"] = np.array([100000.0, 100001.0])
-        las.logs["DT"] = np.array([123.45, 123.55])
+        las.logs["YME"] = np.array([1.45e12, 1.47e12])
 
         temp_file = tmp_path / "las30_noexp.las"
         write_las_file(temp_file, las)
@@ -248,19 +298,31 @@ class TestFormatCompliance:
         data_lines = [
             line for line in data_section.splitlines() if line.strip() and not line.startswith("#")
         ]
+        # At least one data row must exist (header line + data).
+        assert len(data_lines) >= 2, (
+            f"Expected header + at least one data row, got {len(data_lines)}"
+        )
         for line in data_lines[1:]:
             assert not re.search(r"[0-9][eE][+\-]?[0-9]", line), (
                 f"Exponent notation found in LAS 3.0 data: {line!r}"
             )
 
     def test_las20_no_exponents_in_data_section(self, tmp_path: Path) -> None:
-        """Verify LAS 2.0 written output has no exponent notation in data."""
+        """Verify LAS 2.0 written output has no exponent notation in data.
+
+        CWLS LAS 2.0 §5.2: Exponents are not permitted in data sections.
+
+        The 1e8-scale DEPT value is the load-bearing member: under ``.8g``
+        it formats as '1e+08', so the writer's fixed-point rewrite must
+        actually fire for the no-exponent guarantee to hold.  Without the
+        rewrite this test fails (F-104).
+        """
         data: dict[str, Any] = {
             "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
             "well": {"NULL": "-999.25"},
             "parameters": {},
             "logs": {
-                "DEPT": np.array([100000.0, 100001.0]),
+                "DEPT": np.array([100000.0, 1e8]),
                 "DT": np.array([123.45, 123.55]),
             },
             "curves_order": ["DEPT", "DT"],
@@ -273,14 +335,24 @@ class TestFormatCompliance:
         data_lines = [
             line for line in data_section.splitlines() if line.strip() and not line.startswith("#")
         ]
+        # At least one data row must exist (header line + data).
+        assert len(data_lines) >= 2, (
+            f"Expected header + at least one data row, got {len(data_lines)}"
+        )
         for line in data_lines[1:]:
             assert not re.search(r"[0-9][eE][+\-]?[0-9]", line), (
                 f"Exponent notation found in LAS 2.0 data: {line!r}"
             )
 
     # --- Roundtrip format preservation ---
-    def test_roundtrip_preserves_section_order(self, tmp_path: Path) -> None:
-        """Verify that roundtrip preserves section order: V→W→C→P→O→A."""
+    def test_writer_emits_sections_in_order(self, tmp_path: Path) -> None:
+        """Verify the WRITER emits sections in order: V→W→C→P→A.
+
+        This is a WRITER section-order pin — the written text is inspected
+        directly and never re-read, so the name deliberately avoids
+        "roundtrip" (F-110).  The docstring's earlier "V→W→C→P→O→A" claim
+        was also wrong: no ~Other section is emitted by this fixture.
+        """
         data: dict[str, Any] = {
             "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
             "well": {"NULL": "-999.25", "STRT": "100.0"},

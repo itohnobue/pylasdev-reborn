@@ -63,6 +63,22 @@ class TestRoundTrip:
             # Verify curve count preserved
             assert len(roundtrip["curves_order"]) == len(original["curves_order"])
 
+            # F-112 fold (from test_writer.py test_write_real_files_roundtrip):
+            # VERS must roundtrip exactly for every real file.
+            assert roundtrip["version"]["VERS"] == original["version"]["VERS"], (
+                f"VERS mismatch in {las_path.name}: "
+                f"{roundtrip['version']['VERS']} vs {original['version']['VERS']}"
+            )
+
+            # F-112 fold: STRICT curves_order LIST equality for
+            # non-structured files — len() alone cannot detect a mnemonic
+            # rename that preserves count.
+            if las_path.name not in structured_files:
+                assert roundtrip["curves_order"] == original["curves_order"], (
+                    f"curves_order mismatch in {las_path.name}: "
+                    f"{roundtrip['curves_order']} vs {original['curves_order']}"
+                )
+
             # Verify data shapes match (skip curves not in both logs, e.g. LAS 3.0 string curves)
             for curve in original["curves_order"]:
                 if curve in original["logs"] and curve in roundtrip["logs"]:

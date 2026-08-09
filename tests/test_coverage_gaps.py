@@ -149,23 +149,16 @@ class TestCompareListsEdgeCases:
 
 
 class TestCompareDataSectionsGuards:
-    """_compare_data_sections symmetric type guards."""
+    """_compare_data_sections symmetric type guards.
+
+    F-247: test_sections2_not_list and the two keys-only-in-one-side cases
+    were deleted as duplicates of test_compare.py (E-08 sections2={} case
+    and test_compare_data_sections_key_mismatch).  Only
+    test_sections1_not_list (sections1=None, no public-API sibling) remains.
+    """
 
     def test_sections1_not_list(self) -> None:
         assert _compare_data_sections(None, [], 1e-7, 0.0) is False
-
-    def test_sections2_not_list(self) -> None:
-        assert _compare_data_sections([], {}, 1e-7, 0.0) is False
-
-    def test_keys_only_in_first_section_dict(self) -> None:
-        sections1 = [{"a": 1.0, "b": 2.0}]
-        sections2 = [{"a": 1.0}]
-        assert _compare_data_sections(sections1, sections2, 1e-7, 0.0) is False
-
-    def test_keys_only_in_second_section_dict(self) -> None:
-        sections1 = [{"a": 1.0}]
-        sections2 = [{"a": 1.0, "b": 2.0}]
-        assert _compare_data_sections(sections1, sections2, 1e-7, 0.0) is False
 
 
 class TestCoerceAndCompareMasked:
@@ -420,21 +413,20 @@ class TestSpecFormGroupDataIsNumeric:
 
 
 class TestBuildSpecFormArrayInfo:
-    """_build_spec_form_array_info synthesis and guards."""
+    """_build_spec_form_array_info synthesis and guards.
+
+    F-249: test_synthesis_with_numeric_data was deleted — it is a strict
+    subset of test_regression.py::test_offset_extracted_and_marker_cleaned
+    (same fixture pair, same [NMR[1], NMR[2]] + time_offset 0.0/5.0
+    assertions, and the regression test additionally asserts the marker
+    is stripped from the description).
+    """
 
     def _pair(self) -> list[CurveDefinition]:
         return [
             CurveDefinition(mnemonic="NMR", unit="ms", data_format="A", description="Echo {A:0}"),
             CurveDefinition(mnemonic="NMR", unit="ms", data_format="A", description="Echo {A:5}"),
         ]
-
-    def test_synthesis_with_numeric_data(self) -> None:
-        out = _build_spec_form_array_info(self._pair(), ["1 2"], " ")
-        assert [c.mnemonic for c in out] == ["NMR[1]", "NMR[2]"]
-        assert out[0].array_info is not None
-        assert out[0].array_info.index == 1
-        assert out[0].array_info.time_offset == 0.0
-        assert out[1].array_info.time_offset == 5.0
 
     def test_string_data_leaves_duplicates_untouched(self) -> None:
         out = _build_spec_form_array_info(self._pair(), ["SAND SHALE"], " ")

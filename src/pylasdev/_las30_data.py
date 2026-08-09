@@ -1159,6 +1159,10 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
         # Pad with null values if needed.
         # String curves use "" (empty string) to avoid width-ambiguity
         # from str(null_value) padding (matching data_reader.py:836-840).
+        # M-36: capture the pre-padding token count so the fill loop below
+        # can recognize cells this pass already filled (direct assignment,
+        # no re-parse — see the {I} branch).
+        _padded_from = len(values)
         while len(values) < num_curves:
             _pad_idx = len(values)
             if string_curves.get(_pad_idx, False):
@@ -1239,23 +1243,37 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
                 # exactness above 2^53 (float() would round).  With a
                 # fractional NULL the array is object dtype and failures
                 # return the float sentinel (not int(null_value)).
-                _fc_before = _fc[0]
-                int_val = _to_integer_value(
-                    val_str,
-                    null_value,
-                    _failure_counter=_fc,
-                    _null_as_float=not _null_is_integral,
-                )
-                if track_fill and (_fc[0] > _fc_before or not val_str):
-                    _check_fill_cell_cap()
-                    fill_cells.append((idx, i))
                 arr = numeric_arrays[i]
                 if arr is None:
                     raise LASParseError(
                         f"Internal error: numeric array '{i}' was not pre-allocated"
                     )
-                # L-03: int64-allocated arrays accept int values directly.
-                arr[idx] = int_val
+                if i >= _padded_from:
+                    # M-36: This cell was already filled by the padding
+                    # pass above (str(null_value) appended + tracked in
+                    # fill_cells when track_fill).  Assign the sentinel
+                    # DIRECTLY, mirroring data_reader.py:1244-1247 — do
+                    # NOT re-parse the sentinel text through
+                    # _to_integer_value: a fractional NULL (e.g. -999.25)
+                    # fails int() conversion, increments the failure
+                    # counter (false "could not be converted" warning at
+                    # the summary below) and re-tracks the SAME cell in
+                    # fill_cells (2x fill-cell accounting, prematurely
+                    # consuming _MAX_FILL_CELLS).
+                    arr[idx] = int(null_value) if _null_is_integral else null_value
+                else:
+                    _fc_before = _fc[0]
+                    int_val = _to_integer_value(
+                        val_str,
+                        null_value,
+                        _failure_counter=_fc,
+                        _null_as_float=not _null_is_integral,
+                    )
+                    if track_fill and (_fc[0] > _fc_before or not val_str):
+                        _check_fill_cell_cap()
+                        fill_cells.append((idx, i))
+                    # L-03: int64-allocated arrays accept int values directly.
+                    arr[idx] = int_val
             else:
                 _fc_before = _fc[0]
                 val = _to_finite_float(val_str, null_value, _failure_counter=_fc)

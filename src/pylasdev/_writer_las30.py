@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 
 from ._writer_base import (
+    _LEADING_SECTION_RE,
     _SECTION_TYPE_TO_DEFINITION_PREFIX,
     _emission_plan,
     _emitted_mnemonic,
@@ -136,7 +137,8 @@ class _Las30Writer(_WriterBase):
         self._main_emitted_names: dict[int, str] = {}
 
     def _all_string_mnemonics(self) -> frozenset[str]:
-        """Union of EVERY string_data mnemonic across all scopes.
+        """Union of EVERY string_data mnemonic across all scopes, minus
+        mnemonics placed NUMERICALLY in any data section.
 
         M-77: the parser classifies a column as string ONLY from the {S}
         marker in its ~C/Definition line.  A string curve with an empty
@@ -146,16 +148,51 @@ class _Las30Writer(_WriterBase):
         curve whose DATA lives in string_data in ANY scope must get the
         {S} marker here.  Per-section Definitions use the section's own
         string_data keys instead.
+
+        H-01: a curve whose data is NUMERIC in any section must NOT be
+        forced {S} in the main table.  The main ~C declaration is
+        inherited by every section that pipes ``| CURVE``, and on re-read
+        the FIRST LOG_DATA section's arrays are mirrored into the
+        top-level logs view — a table declaring 'S' for a column whose
+        first-section data is numeric raises LASParseError (the written
+        file is SELF-UNREADABLE, parser.py format-vs-placement check).
+        The N-04 pipe decision (:1125-1139) then gives the STRING
+        sections their own per-section Definitions whose {S} matches
+        their placement, so no scope loses its values.
         """
         # N2b-1: the set is built UPPER-CASED (matching
         # _format_curve_line's _mnem_key membership) so a case-variant
         # string_data key ('dept_str' vs curve 'DEPT_STR') still forces
         # the {S} marker.
-        mnems = (
-            {_mnem_key(k) for k in self._las_file.string_data.keys()}
-            if self._las_file.string_data
-            else set()
-        )
+        mnems = set(self._all_string_mnemonics_union())
+        numeric_mnems: set[str] = set()
+        for ds in self._las_file.data_sections:
+            if ds.data:
+                numeric_mnems.update(_mnem_key(k) for k in ds.data.keys())
+        return frozenset(mnems - numeric_mnems)
+
+    def _all_string_mnemonics_union(self) -> frozenset[str]:
+        """Union of EVERY string_data mnemonic across all scopes
+        (top-level string_data plus every data section's string_data),
+        WITHOUT the numeric-placement exclusion that
+        ``_all_string_mnemonics`` applies.
+
+        F-01: the main ~C line must not carry a curve's explicit numeric
+        format token ('F'/'E'/'A'/'I') when the same mnemonic is placed
+        string in one scope and numeric in another — the parser's
+        format-vs-placement check (parser.py:1393-1398) rejects a
+        numeric-format curve whose first occurrence lands in string_data,
+        making the written file self-unreadable.  The mixed-placement
+        signal is: mnemonic present in this UNION (string somewhere) but
+        absent from ``_all_string_mnemonics`` (the union minus numeric
+        placements — i.e. NOT string in the emitted scope).  Purely-numeric
+        curves never appear in the union and keep their format token.
+        Built UPPER-CASED (matching _format_curve_line's _mnem_key
+        membership), same as _all_string_mnemonics.
+        """
+        mnems: set[str] = set()
+        if self._las_file.string_data:
+            mnems.update(_mnem_key(k) for k in self._las_file.string_data.keys())
         for ds in self._las_file.data_sections:
             if ds.string_data:
                 mnems.update(_mnem_key(k) for k in ds.string_data.keys())
@@ -541,6 +578,7 @@ class _Las30Writer(_WriterBase):
                 for c in self._main_curves
             }
             _all_str = self._all_string_mnemonics()
+            _all_str_union = self._all_string_mnemonics_union()
             for curve in curves_to_emit:
                 lines.append(
                     _format_curve_line(
@@ -548,6 +586,7 @@ class _Las30Writer(_WriterBase):
                         self._spec.is_las30,
                         _all_str,
                         mnemonic_override=_emission_overrides.get(id(curve)),
+                        string_union_mnemonics=_all_str_union,
                     )
                 )
         else:
@@ -596,6 +635,10 @@ class _Las30Writer(_WriterBase):
                         self._spec.is_las30,
                         _top_str,
                         mnemonic_override=_main_overrides.get(id(curve)),
+                        # F-01: no data_sections means top-level string_data
+                        # IS the only string scope, so the union equals the
+                        # scope set; pass it for a uniform main-~C contract.
+                        string_union_mnemonics=_top_str,
                     )
                 )
 
@@ -901,10 +944,68 @@ class _Las30Writer(_WriterBase):
         for section in self._las_file.data_sections:
             sec_type = (section.section_type or "LOG_DATA").upper()
             section_prefix = _section_type_to_prefix(sec_type)
-            raw_section_name = (
-                f" {_sanitize_las_value(section.name).replace('|', '')}" if section.name else ""
-            )
+            # M-38: compute the EMITTED section name ONCE — the raw name
+            # goes through _sanitize_las_value (leading '~'+letter
+            # stripped, whitespace normalized) and pipe-stripping.  The
+            # keyword-collision gate below must test this EMITTED name,
+            # not the raw name: a section named '~A' sanitizes to 'A' and
+            # loses its name exactly like a bare 'A', but the pre-fix
+            # gate tested the raw name and bypassed the warning (silent
+            # name loss on write→read).
+            _sanitized_section_name = _sanitize_las_value(section.name) if section.name else ""
+            _emitted_section_name = _sanitized_section_name.replace("|", "")
+            raw_section_name = f" {_emitted_section_name}" if section.name else ""
             section_name = raw_section_name
+
+            # M-38: warn when a pipe or a leading '~'+letter in the
+            # section name is stripped from the emitted header — the
+            # written name does NOT round-trip ('A|B' → 'AB', '~CURVE' →
+            # 'CURVE').  The sanitize/pipe-strip is unconditional (every
+            # section type), so the warning is not gated on the "A"
+            # prefix like the keyword-collision warning below.
+            if section.name and (
+                "|" in section.name or _LEADING_SECTION_RE.match(section.name)
+            ):
+                import warnings as _w5
+
+                _w5.warn(
+                    f"Data section name {section.name!r} is altered when "
+                    f"written: pipe ('|') characters are removed and/or a "
+                    f"leading '~' is stripped.  The written header name "
+                    f"{_emitted_section_name!r} does not round-trip to the "
+                    f"original name on re-read.  Choose a name without "
+                    f"'|' or a leading '~' to preserve it.",
+                    stacklevel=3,
+                )
+
+            # S8-1: a user-supplied section name that IS the reserved
+            # standard-ASCII keyword ("A"/"ASCII") cannot survive a
+            # write→read roundtrip: the parser treats "~A A"/"~A ASCII"
+            # as a bare keyword and auto-names the section Section_N
+            # (M-22 rename — see
+            # _section_transition._ascii_section_display_name).  Only
+            # prefix-"A" headers (LOG_DATA / bare ASCII / unknown-type
+            # fallback) hit that branch; other section types preserve
+            # the name on the direct path, so the warning is gated on
+            # section_prefix == "A".  M-38: test the EMITTED name
+            # ('~A' sanitizes to 'A' and must warn like a bare 'A').
+            if (
+                section.name
+                and section_prefix == "A"
+                and _emitted_section_name.strip() in {"A", "ASCII"}
+            ):
+                import warnings as _w
+
+                _w.warn(
+                    f"Data section name {section.name!r} collides with the "
+                    f"reserved standard-ASCII section keyword "
+                    f"({_emitted_section_name.strip()!r}).  The written "
+                    f"header will be re-read as a bare keyword and the "
+                    f"section auto-named Section_N — the name will NOT be "
+                    f"preserved on write→read roundtrip.  Choose a "
+                    f"different section name to keep it.",
+                    stacklevel=3,
+                )
 
             # ── W-11/W-12/I2-13/I2-21: resolve the section's live column
             # scope ONCE.  The SAME set drives the pipe target, the

@@ -156,6 +156,12 @@ _SCEN_WRAP_DEPTH_OWN_LINE = (
 )
 
 # Wrap detection: values flowing continuously (multiples of curve count per line)
+# NOTE (X-6, F-111): this scenario is ROUNDTRIP-BLIND to a wrap-detection
+# reader regression — a broken `detect_actual_wrap_from_window` reproduces
+# identically on both parses, so first == second even with corrupted data.
+# Wrap-detection correctness is delegated to the lasio differential
+# (tests/test_lasio_differential.py) and the reader unit tests in
+# tests/test_reader.py; this scenario only guards reader<->writer asymmetry.
 _SCEN_WRAP_FLOWING = (
     _LAS20_BASE.replace(" WRAP.   NO", " WRAP.   YES")
     + """~CURVE INFORMATION
@@ -172,6 +178,12 @@ _SCEN_WRAP_FLOWING = (
 # first line(s), so the mnemonic row here is skipped, not consumed as data.
 # The row must contain the DECLARED mnemonics (DEPT, not the description
 # DEPTH) for the predicate to match.
+# NOTE (X-6, F-111): this scenario is ROUNDTRIP-BLIND to a
+# _is_mnemonic_header_row regression — a broken predicate consumes the
+# header row as data on BOTH parses identically, so first == second still
+# passes with a phantom null row.  The predicate is directly pinned by
+# test_reader.py:3771-3822 and test_regression.py:2142; this scenario only
+# guards reader<->writer asymmetry.
 _SCEN_HEADER_ROW = (
     _LAS20_BASE
     + """~CURVE INFORMATION

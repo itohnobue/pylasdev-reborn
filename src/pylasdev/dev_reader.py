@@ -332,7 +332,13 @@ _THOUSANDS_GROUP_RE = re.compile(r"^([+-]?\d+),(\d{3})$")
 # row — both "100" and "450" are plausible standalone column values, so
 # merging them silently corrupts real data.  Only a fragment carrying a
 # fractional/exponent part is an unambiguous thousands continuation.
-_THOUSANDS_FRAG_RE = re.compile(r"^\d{3}(?:\.\d+|[eE][+-]?\d+)$")
+# M-32: The grammar accepts decimal AND exponent together (e.g. "234.5E3"
+# from "1,234.5E3"), matching _THOUSANDS_NUMBER_RE — the F-06 "never
+# drift" contract.  Previously decimal OR exponent only, so a
+# decimal+exponent thousands value was detected but its fragment could
+# not merge (silent column shift, zero thousands warning).  At least one
+# of decimal/exponent is still required (M-23 bare-fragment protection).
+_THOUSANDS_FRAG_RE = re.compile(r"^\d{3}(?:(?:\.\d+)(?:[eE][+-]?\d+)?|[eE][+-]?\d+)$")
 
 # Intermediate group of a thousands-separated number as it appears after
 # comma-splitting a comma-delimited data row: EXACTLY 3 bare digits (e.g.
@@ -571,7 +577,7 @@ def _is_valid_thousands_leading_group(token: str) -> bool:
 
 
 def _recombine_thousands_separators(
-    values: list[str], expected: int
+    values: list[str], expected: int, *, allow_short: bool = False
 ) -> tuple[list[str], list[tuple[str, str]]] | None:
     """Recombine comma-split thousands-separator fragments in a data row.
 
@@ -647,6 +653,16 @@ def _recombine_thousands_separators(
     Args:
         values:   Tokens from a comma-delimited data row.
         expected: Number of columns declared by the header.
+        allow_short: When True, a short row (``len(values) < expected``)
+            is still scanned for an UNAMBIGUOUS thousands run (1-2 digit
+            leading group + decimal/exponent fragment, the E-24
+            "unambiguous" shape).  The merged row is shorter than
+            declared and the caller's ragged-row machinery NaN-fills the
+            missing columns with the V-08/short-row warning firing loudly
+            (M-34).  A 3-digit leading group in a short row stays under
+            the DEV-02 exact-fit gate (genuine columns, never merged).
+            Default False keeps the documented "short rows are left to
+            the short-row null-fill path" contract.
 
     Returns:
         Tuple of ``(recombined_token_list, [(original_fragment, merged_value),
@@ -654,12 +670,44 @@ def _recombine_thousands_separators(
         none does (row already matches the expected count, or contains no
         run that passes the gates above).
     """
-    if len(values) < expected:
+    if len(values) < expected and not allow_short:
         return None
     out: list[str] = []
     pairs: list[tuple[str, str]] = []
     i = 0
     n = len(values)
+    # M-33: Pre-scan the row for every mergeable thousands run and compute
+    # the FULL-ROW post-recombination token count.  The DEV-02 exact-fit
+    # gate must compare against this count, not the per-run snapshot
+    # (len(out) + 1 + (n - j)): with two single-comma-group thousands
+    # values ("1,234.5,2,345.6" in a 2-column file) each run's snapshot
+    # assumes the OTHER run stays split, so both fail ``post_count !=
+    # expected`` individually even though the full row recombines to
+    # exactly ``expected`` tokens — silent column shift, zero thousands
+    # warning (M-33).  When the full row exactly satisfies the declared
+    # count, every run merges (the gate uses this count as PRIMARY).
+    # F-02: when the full-row count does NOT equal ``expected``, the gate
+    # falls back to the per-run snapshot so runs that fit alone still
+    # merge (see the gate site).  Single-run rows are unaffected (the
+    # full-row count equals the per-run snapshot for one run).  Linear:
+    # every token is consumed by at most one leading-group scan.
+    _full_post_count = n
+    _scan = 0
+    while _scan < n:
+        _token = values[_scan]
+        if not _is_valid_thousands_leading_group(_token):
+            _scan += 1
+            continue
+        _j = _scan + 1
+        while _j < n and _THOUSANDS_GROUP_BARE_RE.match(values[_j]):
+            _j += 1
+        if _j < n and _THOUSANDS_FRAG_RE.match(values[_j]):
+            # This run would merge: it contributes 1 token instead of
+            # (_j + 1 - _scan) tokens.
+            _full_post_count -= _j - _scan
+            _scan = _j + 1
+        else:
+            _scan = _j
     while i < n:
         token = values[i]
         if not _is_valid_thousands_leading_group(token):
@@ -694,7 +742,25 @@ def _recombine_thousands_separators(
             i = j
             continue
         run_len = j - i
-        post_count = len(out) + 1 + (n - j)
+        # M-33: the gate compares the FULL-ROW post-merge count (all runs
+        # merged), not the per-run snapshot — see the pre-scan above.
+        # F-02 (hybrid): the full-row gate stays PRIMARY — it fixes the
+        # M-33 target (two single-group thousands in a headered row, where
+        # each per-run snapshot assumes the OTHER run stays split, so both
+        # fail the exact-fit gate individually even though the full row
+        # recombines to exactly ``expected``).  But when the FULL-ROW
+        # post-merge count does NOT equal ``expected``, fall back to the
+        # OLD per-run snapshot evaluation (``len(out) + 1 + (n - j)``) so
+        # a run that satisfies ``expected`` on its own still merges — the
+        # all-or-nothing full-row gate otherwise rejects EVERY run (incl.
+        # runs that would fit alone) and regresses two multi-run shapes:
+        # headerless first rows with 2+ single-group thousands, and
+        # surplus rows mixing an unambiguous run with a genuine 3-digit
+        # pair.
+        if _full_post_count == expected:
+            post_count = _full_post_count
+        else:
+            post_count = len(out) + 1 + (n - j)
         _body = token[1:] if token[:1] in "+-" else token
         if (
             (len(values) > expected or len(_body) >= 3)
@@ -712,7 +778,13 @@ def _recombine_thousands_separators(
             # 3-digit group (the genuine-ragged-columns shape); an
             # equal-count row with a 1-2 digit leading group merges and
             # the caller NaN-fills the shorter row instead of silently
-            # column-shifting.
+            # column-shifting.  M-33: for multi-run rows the gate uses the
+            # full-row post-merge count, so two single-group thousands
+            # values recombine exactly when the full row satisfies
+            # ``expected``.  F-02: when the full-row count does NOT equal
+            # ``expected`` the post_count used here is the per-run
+            # snapshot (see above), restoring the pre-M-33 behavior for
+            # runs that fit ``expected`` on their own.
             out.extend(values[i:j])
             i = j
             continue
@@ -1587,7 +1659,23 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
         ]
         mostly_float = len(float_tokens) >= 2 and len(float_tokens) >= len(first_tokens) - 1
         if mostly_float:
-            _non_float_tokens = [t for t in first_tokens if not _is_float_token_comma_decimal(t)]
+            # M-31: the exclusion must mirror the positive comprehension
+            # above — a THOUSANDS-style token ("1,234", "5,678") is numeric
+            # data (DEV-05 recognized it as such in float_tokens), so it
+            # must NOT be treated as a non-float token.  Previously the
+            # positive comprehension was widened with _is_thousands_number
+            # but this exclusion was not, so a whitespace first row mixing
+            # thousands and a sentinel ("1,234 na 5,678") counted the
+            # thousands tokens as non-float, failed the sentinel check, and
+            # misdetected as simple format — the first data row was
+            # consumed as fabricated column names.  The comma/semicolon
+            # twins handle this shape correctly; this widens the whitespace
+            # twin identically.
+            _non_float_tokens = [
+                t
+                for t in first_tokens
+                if not _is_float_token_comma_decimal(t) and not _is_thousands_number(t)
+            ]
             _is_sentinel = all(t.lower().strip() in _DEV_SENTINELS for t in _non_float_tokens)
             if _is_sentinel:
                 return ("headerless", 0)
@@ -2732,27 +2820,55 @@ def read_dev_file_as_object(
             if names:
                 _expected_cols = len(names)
             else:
+                # H-03: The M-52 ``-1`` derivation (treat the headerless
+                # first row as having one surplus token) must NOT apply
+                # when the first row is a genuine multi-column shape.  A
+                # 3-digit leading group ("100" in "100,250.5") is
+                # ambiguous with genuine columns — the E-24 docstring
+                # explicitly classifies that shape as "genuine ragged
+                # columns, not thousands" — so with
+                # ``expected = len(values) - 1`` the DEV-02 exact-fit gate
+                # (``post_count == expected``) passes trivially and
+                # "100,250.5" silently merges into one column [100250.5]
+                # while the same data WITH a header parses correctly.
+                # Mirror the F-07 4+-digit guard: a 3-digit (or 4+)
+                # leading group makes the row ambiguous with genuine
+                # columns, so derive the FULL token count and let the
+                # exact-fit gate genuinely decide.  Only an unambiguous
+                # 1-2 digit leading group keeps the ``-1`` derivation.
                 _expected_cols = len(values) - 1
-                if not _is_valid_thousands_leading_group(values[0]):
+                _leading_body = values[0][1:] if values[0][:1] in "+-" else values[0]
+                if not _is_valid_thousands_leading_group(values[0]) or len(_leading_body) >= 3:
                     _expected_cols = len(values)
-            if len(values) >= _expected_cols:
-                _recombined = _recombine_thousands_separators(values, _expected_cols)
-                if _recombined is not None:
-                    _merged_vals, _recombine_pairs = _recombined
-                    # DEV-03: warn for EVERY recombined value (the old
-                    # single-pair return warned only for the first; a second
-                    # thousands value was destroyed silently).
-                    for _original_frag, _merged_value in _recombine_pairs:
-                        warnings.warn(
-                            f"Data value '{_original_frag}' contains a "
-                            f"thousands separator, which is not natively "
-                            f"supported in comma-delimited DEV files; "
-                            f"recombined to '{_merged_value}' for column "
-                            f"mapping. Review the data line if this row has "
-                            f"genuine extra columns.",
-                            stacklevel=2,
-                        )
-                    values = _merged_vals
+            # M-34: allow recombination on SHORT rows too.  A short row
+            # carrying an unambiguous thousands run ("1,234.5" in a 3-col
+            # file) previously skipped recombination entirely (the
+            # len >= expected call-site gate AND the function's entry
+            # guard), so the thousands value column-shifted (MD=1.0,
+            # TVD=234.5) and fired a spurious TVD-monotonicity warning.
+            # The function's allow_short path merges only unambiguous
+            # thousands runs (1-2 digit leading groups); 3-digit leading
+            # groups in short rows stay under the DEV-02 exact-fit gate
+            # (genuine columns).
+            _recombined = _recombine_thousands_separators(
+                values, _expected_cols, allow_short=True
+            )
+            if _recombined is not None:
+                _merged_vals, _recombine_pairs = _recombined
+                # DEV-03: warn for EVERY recombined value (the old
+                # single-pair return warned only for the first; a second
+                # thousands value was destroyed silently).
+                for _original_frag, _merged_value in _recombine_pairs:
+                    warnings.warn(
+                        f"Data value '{_original_frag}' contains a "
+                        f"thousands separator, which is not natively "
+                        f"supported in comma-delimited DEV files; "
+                        f"recombined to '{_merged_value}' for column "
+                        f"mapping. Review the data line if this row has "
+                        f"genuine extra columns.",
+                        stacklevel=2,
+                    )
+                values = _merged_vals
 
         if format_type == "headerless":
             if content_seen <= skip_content_lines:

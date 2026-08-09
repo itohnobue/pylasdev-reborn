@@ -1501,6 +1501,10 @@ def _read_wrapped(
     # skipped so an optional units row directly after it can also be
     # skipped (first data line only — same position gate as _read_normal).
     _mnemonic_header_skipped = False
+    # M-07: I2-02 mirror on the wrapped twin.  Track embedded-delimiter
+    # occurrences for the end-of-section summary (first occurrence logs
+    # full context; subsequent occurrences are counted silently).
+    embedded_delim_count: int | None = None
 
     for stripped in _iter_ascii_data_lines(lines, mode_suffix=" (wrapped mode)"):
         # Split using DLM-aware split (shared utility).
@@ -1562,6 +1566,55 @@ def _read_wrapped(
         # parity hygiene against future refactors that relax the gate.
         if current_line == 0 and _mnemonic_header_skipped:
             _mnemonic_header_skipped = False
+
+        # M-07: I2-02 mirror on the wrapped twin.  _read_normal warns when
+        # DLM=COMMA + embedded comma in a {S} string value produces an
+        # extra token (data_reader.py:1100-1126); the wrapped path had no
+        # equivalent — the extra token silently shifted columns and only
+        # the misleading N-I-08 fired at EOF (verified: wrapped
+        # DEPT/NAME{S}/GR with NAME value 'WELL, INC,50.0' → DEPT=
+        # [1000.0,50.0], NAME=['WELL','1001.0'], GR lost).
+        #
+        # The wrapped signal differs from _read_normal's extra-column
+        # trigger: in wrapped mode a single line may legitimately carry
+        # MORE than curve_count values (flowing layout packs multiple
+        # depth steps per line).  The reliable signal is a step-boundary
+        # overshoot: how many values does the current line add beyond
+        # what completes the partially-buffered step?  A clean flowing
+        # line adds exactly whole steps (a multiple of curve_count) — no
+        # warning.  An embedded delimiter adds exactly ONE spurious token,
+        # so the overshoot is a non-multiple of curve_count (e.g. the
+        # depth-first continuation 'WELL, INC,50.0' carries curve_count
+        # values where curve_count-1 are expected → overshoot of 1).
+        _step_remainder = (len(pending) - read_idx) % curve_count
+        # Values needed to complete the current partially-buffered step
+        # (== curve_count for a fresh step with an empty buffer).
+        _needed = curve_count - _step_remainder
+        _overshoot = len(values) - _needed
+        if (
+            delimiter != " "
+            and _string_curve_indices
+            and len(values) > _needed
+            and _overshoot > 0
+            and _overshoot % curve_count != 0
+        ):
+            if embedded_delim_count is None:
+                warnings.warn(
+                    f"Wrapped data line has {len(values)} values but the "
+                    f"current depth step needs {_needed} more value(s) for "
+                    f"{curve_count} curves declared with DLM={delimiter!r}. "
+                    f"A string curve value may contain the delimiter "
+                    f"character, truncating the string and shifting the "
+                    f"following columns (genuine values may be lost). "
+                    f"Consider quoting string values or using a delimiter "
+                    f"not present in the data. "
+                    f"(Further occurrences will be counted.)",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                embedded_delim_count = 1
+            else:
+                embedded_delim_count += 1
 
         pending.extend(values)
         while len(pending) - read_idx >= curve_count:
@@ -1709,6 +1762,21 @@ def _read_wrapped(
 
     # F-PXR-03: Warn when non-trivial conversion failures occurred.
     _log_conversion_failures(_fc, null_value)
+
+    # M-07: F-I2-XPD-03-style summary of embedded-delimiter occurrences
+    # (I2-02 mirror on the wrapped twin — same contract as _read_normal's
+    # summary at :1281-1289, so automated tools can enumerate affected
+    # rows).
+    if embedded_delim_count is not None and embedded_delim_count > 1:
+        warnings.warn(
+            f"Wrapped mode: {embedded_delim_count} data line(s) carried more "
+            f"values than the {curve_count} curves declared with "
+            f"DLM={delimiter!r}. String curve values may contain the "
+            f"delimiter character; those strings were truncated and "
+            f"following columns' genuine values may have been lost.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     # Convert pre-allocated columns to final (trimmed) numpy arrays
     for i in _float_indices:

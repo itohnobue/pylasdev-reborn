@@ -82,14 +82,18 @@ class TestExceptionHierarchy:
     def test_las_version_error_docstring(self) -> None:
         """Test that LASVersionError has its documented purpose."""
         doc = LASVersionError.__doc__ or ""
-        assert "strict version policy" in doc or issubclass(LASVersionError, PylasdevError)
+        assert "strict version policy" in doc, (
+            f"LASVersionError docstring should mention the strict version "
+            f"policy purpose, got: {doc!r}"
+        )
 
 
 class TestLASDataError:
     """M64: Tests for LASDataError — the only untested public exception class.
 
-    LASDataError is imported in 8 locations and raised at 4 call sites
-    (models.py:1060, 1210 — LASFile.from_dict and DevFile.from_dict).
+    LASDataError is imported in 8 locations and raised at many validation
+    call sites in LASFile.from_dict (e.g. models.py:6956) and DevFile.from_dict
+    (e.g. models.py:8219).
     Previously had zero test coverage (grep confirmed).
     """
 
@@ -126,10 +130,8 @@ class TestLASDataError:
     def test_raises_on_invalid_from_dict(self) -> None:
         """LASFile.from_dict with invalid data raises LASDataError.
 
-        Exercise the raise at models.py:1060 — ValueError wrapping
-        for invalid from_dict input. Inconsistent log array lengths
-        trigger ValueError at models.py:1012-1015 which is caught
-        and re-raised as LASDataError.
+        Exercise the raise at models.py:6956 — inconsistent log array
+        lengths in from_dict input are caught and re-raised as LASDataError.
         """
         from pylasdev.models import LASFile
 
@@ -146,8 +148,9 @@ class TestLASDataError:
     def test_raises_on_null_column_data(self) -> None:
         """DevFile.from_dict with None column data raises LASDataError.
 
-        Exercise DevFile.from_dict at models.py:1166-1167 — the None
-        guard raises ValueError which is caught and re-raised as LASDataError.
+        Exercise DevFile.from_dict — the None column guard raises
+        ValueError at models.py:8108 which is caught and re-raised as
+        LASDataError (models.py:8219).
         """
         from pylasdev.models import DevFile
 

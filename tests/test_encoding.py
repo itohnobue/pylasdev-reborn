@@ -23,13 +23,7 @@ class TestDetectEncoding:
         test_file.write_text("H\u00e9llo UTF-8 \u2603", encoding="utf-8")
         enc = detect_encoding(test_file)
         assert enc == "utf-8"
-
-    def test_detect_returns_string(self, tmp_path: Path) -> None:
-        """Test that detect_encoding returns a string."""
-        test_file = tmp_path / "test.las"
-        test_file.write_text("Simple ASCII text\n", encoding="utf-8")
-        result = detect_encoding(test_file)
-        assert isinstance(result, str)
+        assert isinstance(enc, str)
 
     # --- TEST-14: HAS_CHARDET=False path ---
     def test_detect_without_chardet(self, tmp_path: Path) -> None:
@@ -46,13 +40,6 @@ class TestDetectEncoding:
 
 class TestReadWithEncoding:
     """Tests for read_with_encoding."""
-
-    def test_read_utf8(self, tmp_path: Path) -> None:
-        """Test reading UTF-8 file."""
-        test_file = tmp_path / "test.las"
-        test_file.write_text("Hello UTF-8", encoding="utf-8")
-        _enc, content = read_with_encoding(test_file)
-        assert content == "Hello UTF-8"
 
     def test_read_with_explicit_encoding(self, tmp_path: Path) -> None:
         """Test reading with explicit encoding override."""
@@ -125,11 +112,15 @@ class TestReadWithEncoding:
         assert text in content
 
     def test_fallback_chain_exists(self) -> None:
-        """Test that fallback encodings are defined."""
-        assert len(FALLBACK_ENCODINGS) >= 4
-        assert "utf-8" in FALLBACK_ENCODINGS
-        assert "cp1251" in FALLBACK_ENCODINGS
-        assert "cp866" in FALLBACK_ENCODINGS
+        """Test that fallback encodings are defined in load-bearing order.
+
+        The exact chain order pins F-ITER2-D4b-M09: cp1251 must precede
+        cp866 so the E-06 near-tie (encoding.py:973-976) resolves to the
+        best Cyrillic candidate.  A swap that still satisfies a
+        membership-only assertion would change which encoding wins the
+        near-tie — the order IS the contract.
+        """
+        assert FALLBACK_ENCODINGS == ["utf-8", "cp1251", "cp866", "cp1252", "latin-1"]
 
     def test_read_real_las_file(self, test_data_dir: Path) -> None:
         """Test reading real LAS files from test_data."""
@@ -159,11 +150,11 @@ class TestReadWithEncoding:
         with pytest.raises(LASEncodingError, match="Failed to decode"):
             read_with_encoding(test_file, encoding="ascii")
 
-    # --- T5: LASEncodingError unreachable path (encoding.py:110) ---
+    # --- T5: LASEncodingError unreachable path (encoding.py:914) ---
     def test_fallback_chain_empty_raises_encoding_error(self, tmp_path: Path) -> None:
         """Test LASEncodingError when fallback chain is exhausted.
 
-        Exercises encoding.py:110-112 — the LASEncodingError raise at the end
+        Exercises encoding.py:914 — the LASEncodingError raise at the end
         of read_with_encoding when all fallback encodings fail.
         This path is normally unreachable because latin-1 can decode any byte,
         but it guards against the case where FALLBACK_ENCODINGS is modified.
@@ -354,38 +345,44 @@ class TestProductionCheckEncodingFix:
     """Regression test for F-217 fix in encoding.py."""
 
     def test_cyrillic_after_large_ascii_header(self, tmp_path: Path) -> None:
-        """F-217: Cyrillic content after >10KB ASCII preamble is detected.
+        """F-217: Cyrillic content beyond the 10K sample window is detected.
 
-        Before the fix, the 10K sample window missed Cyrillic beyond the
-        ASCII preamble. Now the window is 64K, capturing the Cyrillic
-        portion. We test by creating a file with >15KB ASCII header
-        (typical LAS headers are 5-15KB) followed by Cyrillic content
-        and verifying cp1251 detection.
-        """
-        # Build a file with ~15KB ASCII preamble + Cyrillic content
-        # A single LAS comment line is ~80 chars; 200 lines ≈ 16KB
-        ascii_preamble = "# " + ("X" * 77) + "\n"
-        large_preamble = ascii_preamble * 200  # ~15.6 KB
-
-        # Cyrillic content in Russian (cp1251 encoded)
-        # "Привет из России" — common Russian text
-        russian_text = (
-            "\u041f\u0440\u0438\u0432\u0435\u0442 \u0438\u0437 \u0420\u043e\u0441\u0441\u0438\u0438"
+        Before the fix, the 10K sample window (_MIN_VALIDATION_CHARS) missed
+        Cyrillic beyond the ASCII preamble, so a >10K-preamble cp866 file was
+        misdecoded as cp1252 (Western tiebreak).  Now the window is 64K.
+        The fixture uses the discriminating shape: a ~12K ASCII preamble
+        followed by the cp866 no-set-byte word ТЕСТ (0x92 0x85 0x93 0x92 —
+        no cp1251-Cyrillic set byte, so only the widened window can see it).
+        Verified discriminating: 64K window -> cp866, 10K window -> cp1252.
+        """  # noqa: RUF002
+        preamble = ("# " + "X" * 77 + "\n") * 150  # ~11.7 KB ASCII preamble
+        raw = (
+            preamble.encode("ascii")
+            + "\u0422\u0415\u0421\u0422".encode("cp866")  # ТЕСТ  # noqa: RUF003
+            + b" FIELD 1000.0\n"
         )
-        russian_part = "~VERSION INFORMATION\n" + russian_text + "\n"
-
-        content = large_preamble + russian_part
+        assert len(raw) > 10_000  # Cyrillic lies beyond the pre-fix 10K window
         test_file = tmp_path / "cyrillic_after_preamble.las"
-        test_file.write_text(content, encoding="utf-8")
+        test_file.write_bytes(raw)
 
-        # Should detect and read the file correctly without crashing
-        from pylasdev.encoding import read_with_encoding
+        # Force chardet to fail (utf-8 fallback) so the quality-based chain
+        # makes the decision — same seam the other F-*/ENC-* tests use.
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                from pylasdev.encoding import read_with_encoding
 
-        enc, text = read_with_encoding(test_file)
-        assert isinstance(enc, str)
-        assert len(text) > 0
-        # The Russian text characters should be present in the decoded content
-        assert "VERSION" in text
+                enc, text = read_with_encoding(test_file)
+        assert enc == "cp866", (
+            f"F-217: cp866 Cyrillic beyond 10K preamble misdecoded as {enc!r}"
+        )
+        assert "\u0422\u0415\u0421\u0422" in text
 
 
 class TestE06NumeroSignCyrillic:
@@ -574,9 +571,21 @@ class TestENC02SmartPunctuationWestern:
         assert "R\u00e9servoir" in content
 
     def test_mocked_chardet_cp1252_answer_honored(self, tmp_path: Path) -> None:
-        """Even a mocked (perfect) chardet cp1252 answer is honored — the
-        ratio sort must not override a high-confidence detection."""
-        text = 'Puits "Jean-Joseph" \u2014 R\u00e9servoir \u00e0 l\u2019ouest: profondeur 2450,5 m'
+        """ENC-02(a) is decisive: a high-confidence chardet cp1252 answer
+        is honored even when the ENC-02(b) Western rescue is blocked.
+
+        The fixture is numeric LAS data (a DEPT row) carrying one em-dash
+        (0x97).  Under cp866 the 0x97 byte decodes to the Cyrillic letter
+        'Ч' (alnum), so the cp866 ratio edges out cp1252 and the ratio
+        sort alone selects cp866.  The ENC-02(b) rescue cannot fire — the
+        Western decode carries only 4 ASCII letters, below the 8-letter
+        floor — so honoring the mocked 0.99-confidence cp1252 answer is
+        solely the ENC-02(a) detected-encoding priority's decision.  This
+        test must fail if that priority block (encoding.py:951-962) is
+        removed or gated off (confidence <= 0.7): the file would then
+        decode as cp866 mojibake.
+        """
+        text = 'DEPT 0,00 \u2014 100,00, 200,00, 300,00, 400,00, 500,00, 600,00, 700,00, 800,00, 900,00'
         test_file = tmp_path / "enc02_chardet_cp1252.las"
         test_file.write_bytes(text.encode("cp1252"))
         with mock.patch(
@@ -590,7 +599,7 @@ class TestENC02SmartPunctuationWestern:
             ):
                 enc, content = read_with_encoding(test_file)
         assert enc == "cp1252", f"ENC-02: mocked chardet cp1252 answer overridden to {enc!r}"
-        assert "R\u00e9servoir" in content
+        assert "\u2014" in content
 
     def test_utf8_cyrillic_still_utf8(self, tmp_path: Path) -> None:
         """Guard: UTF-8 Cyrillic must still decode as UTF-8 (no regression
@@ -932,67 +941,6 @@ class TestENCM1ProseUazStaysCp866:
         assert enc == "cp866", f"ENC-M1: cp866 ГАЗ/МАЗ+prose misdecoded as {enc!r} (mojibake)"  # noqa: RUF001
         assert "\u0413\u0410\u0417-66" in content
         assert "\u041c\u0410\u0417-4370" in content
-
-    def test_f09_euro_prose_still_cp1252(self, tmp_path: Path) -> None:
-        """ENC-M1 guard: the F-09 Western rescue must still fire for
-        genuine cp1252 Euro prose (the discriminator must not over-block
-        — its cp866 misread 'А' is isolated, not a word-like run)."""  # noqa: RUF002
-        text = "Well: 1234 \u20ac 5678 prix 50\u20ac total 123\u20ac"
-        test_file = tmp_path / "encm1_guard_euro.las"
-        test_file.write_bytes(text.encode("cp1252"))
-        with mock.patch(
-            "pylasdev.encoding._detect_encoding_from_bytes",
-            return_value="utf-8",
-        ):
-            with mock.patch(
-                "pylasdev.encoding._detect_confidence_from_bytes",
-                return_value=0.0,
-                create=True,
-            ):
-                enc, content = read_with_encoding(test_file)
-        assert enc == "cp1252", f"ENC-M1 guard: F-09 Euro prose misdecoded as {enc!r}"
-        assert "\u20ac" in content
-
-    def test_f09_sibling_cluster_still_cp1252(self, tmp_path: Path) -> None:
-        """ENC-M1 guard: the F-09 sibling-punct cluster must still rescue
-        to cp1252 even though its cp866 misread ('quotedЕЖЗЙЛЫФ') contains
-        a 7-letter Cyrillic run — the run is EMBEDDED in the ASCII word
-        'quoted', so the word-like discriminator correctly does not block."""  # noqa: RUF002
-        text = "He said \u201a\u201cquoted\u2026\u2020\u2021\u2030\u2039\u203a\u201d done"
-        test_file = tmp_path / "encm1_guard_sibling.las"
-        test_file.write_bytes(text.encode("cp1252"))
-        with mock.patch(
-            "pylasdev.encoding._detect_encoding_from_bytes",
-            return_value="utf-8",
-        ):
-            with mock.patch(
-                "pylasdev.encoding._detect_confidence_from_bytes",
-                return_value=0.0,
-                create=True,
-            ):
-                enc, content = read_with_encoding(test_file)
-        assert enc == "cp1252", f"ENC-M1 guard: F-09 sibling cluster misdecoded as {enc!r}"
-        assert "\u201cquoted" in content
-
-    def test_m4_digit_uaz469_still_cp866(self, tmp_path: Path) -> None:
-        """ENC-M1 guard: the M4 digit-heavy class must stay cp866 (both
-        gates and the new discriminator agree — the file has a standalone
-        'УАЗ' run, and its Western decode has <8 ASCII letters)."""  # noqa: RUF002
-        raw = b"WELL " + "\u0423\u0410\u0417-469".encode("cp866") + b" 1000.0 2000.0 3000.0 4000.0"
-        test_file = tmp_path / "encm1_guard_m4_digit.las"
-        test_file.write_bytes(raw)
-        with mock.patch(
-            "pylasdev.encoding._detect_encoding_from_bytes",
-            return_value="utf-8",
-        ):
-            with mock.patch(
-                "pylasdev.encoding._detect_confidence_from_bytes",
-                return_value=0.0,
-                create=True,
-            ):
-                enc, content = read_with_encoding(test_file)
-        assert enc == "cp866", f"ENC-M1 guard: M4 digit УАЗ-469 misdecoded as {enc!r}"  # noqa: RUF001
-        assert "\u0423\u0410\u0417-469" in content
 
     def test_cp866_uaz469_glued_before_stays_cp866(self, tmp_path: Path) -> None:
         """ENC-M1 guard: the glued-before subclass — a genuine cp866 word
@@ -1844,8 +1792,12 @@ class TestE02Cp866InvisibleBeyond64K:
 
 class TestM07StrictEvidenceCarve:
     """M-07: >64K Western cp1252 files with accented runs / Western
-    letters must NOT flip to cp1251 via the E-02 whole-file evidence —
-    and the genuine cp866 invisible-class target must STILL flip."""
+    letters must NOT flip to cp1251 via the E-02 whole-file evidence.
+
+    The genuine cp866 invisible-class positive control for this class is
+    pinned by E-02's test_cp866_invisible_words_beyond_64k_detected
+    (1769) — identical fixture, strictly stronger assertions (adds the
+    ПРИВЕТ content assert); the M-07 carve must not break that target."""
 
     def test_western_s_letter_run_stays_cp1252(self, tmp_path: Path) -> None:
         """M-07 live repro: 'the ŠŠŠ field' (cp1252 — 0x8A×3, alnum under
@@ -1920,36 +1872,6 @@ class TestM07StrictEvidenceCarve:
             f"M-07: cp1252 'áéí'@EOF misdecoded as {enc!r} (mojibake)"
         )
         assert "\u00e1\u00e9\u00ed" in content
-
-    def test_cp866_invisible_beyond_64k_still_flips(self, tmp_path: Path) -> None:
-        """M-07 positive control (E-02 direction): the genuine cp866
-        invisible-class target still flips — a >64K ASCII preamble followed
-        by cp866 words (СКВАЖИНА/ПРИВЕТ/ПЛАСТ carry strict 0x80-0x9F  # noqa: RUF002
-        evidence bytes 0x8D/0x8F that survived the carve) decodes cp866."""
-        russian = (
-            "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410 \u041f\u0420\u0418\u0412\u0415\u0422 "
-            "\u0422\u0415\u0421\u0422 \u0423\u0410\u0417 \u041f\u041b\u0410\u0421\u0422 "
-            "\u0413\u0410\u0417 \u041c\u0410\u0417 "
-        )
-        preamble = ("# " + "X" * 77 + "\n") * 900
-        raw = preamble.encode("ascii") + (russian * 30).encode("cp866") + b"\n"
-        assert len(raw) > 65_536
-        test_file = tmp_path / "m07_cp866_target.las"
-        test_file.write_bytes(raw)
-        with mock.patch(
-            "pylasdev.encoding._detect_encoding_from_bytes",
-            return_value="utf-8",
-        ):
-            with mock.patch(
-                "pylasdev.encoding._detect_confidence_from_bytes",
-                return_value=0.0,
-                create=True,
-            ):
-                enc, content = read_with_encoding(test_file)
-        assert enc == "cp866", (
-            f"M-07: cp866 invisible-class target misdecoded as {enc!r} (mojibake)"
-        )
-        assert "\u0421\u041a\u0412\u0410\u0416\u0418\u041d\u0410" in content
 
 
 # ──────────────────────────────────────────────────────────────
@@ -2479,6 +2401,109 @@ class TestM20WesternRescueBlockers:
             f"M-20b: cp1252 cluster+~CURVE misdecoded as {enc!r} (mojibake)"
         )
         assert "\u2026\u2020\u2021" in content
+
+
+# ──────────────────────────────────────────────────────────────
+# Stage 12 fix regression pins — M-08 (window-slice boundary) and
+# M-10 (true-EOF symbol cluster).  Each FAILS on pre-fix code and
+# PASSES on post-fix.  Adversarial evidence: tmp/s11-adv-m2-report.md.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestM08WindowSliceBoundary:
+    """M-08 (CONFIRMED MEDIUM): _window_has_numero_prefix treated the
+    window-SLICE start as a data/line start (`prev < 0` → True) — a
+    Western cp1252 "¹1" exactly 8 bytes before a 3-byte accent run
+    confirmed Cyrillic and the whole file decoded cp1251 mojibake.  The
+    caller now passes at_data_start=(window_start == 0), so a mid-file
+    slice boundary is not a line start."""
+
+    @staticmethod
+    def _read(tmp_path: Path, raw: bytes) -> tuple[str, str]:
+        test_file = tmp_path / "m08_slice.las"
+        test_file.write_bytes(raw)
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                return read_with_encoding(test_file)
+
+    def test_gap8_slice_start_stays_cp1252(self, tmp_path: Path) -> None:
+        """The exact M-08 repro: 0xB9 exactly 8 bytes before the accent
+        run — pre-fix whole-file cp1251 mojibake."""
+        raw = b"X\xb9 1 ABC \xd1\xe1\xf1ez Field 1000.0 DEPT 100.5"
+        enc, content = self._read(tmp_path, raw)
+        assert enc == "cp1252", f"M-08 gap-8 misdecoded as {enc!r} (mojibake)"
+        assert not any(0x0400 <= ord(c) <= 0x04FF for c in content), (
+            "Cyrillic code points fabricated into a Western file"
+        )
+
+    def test_realistic_header_stays_cp1252(self, tmp_path: Path) -> None:
+        """A realistic LAS header with the gap-8 geometry must stay
+        Western (no Cyrillic code points)."""
+        text = "WELL. Nota\u00b91 ABC \u00d1\u00e1\u00f1ez Field 1000.0"
+        enc, content = self._read(tmp_path, text.encode("cp1252"))
+        assert enc == "cp1252", f"M-08 header misdecoded as {enc!r}"
+        assert not any(0x0400 <= ord(c) <= 0x04FF for c in content), (
+            "Cyrillic code points fabricated into a Western file"
+        )
+
+    def test_numero_at_true_data_start_still_cp1251(self, tmp_path: Path) -> None:
+        """Control: the №-before-word shape at the TRUE data start still
+        confirms cp1251 (the E-26 positive shape is preserved)."""
+        text = "\u2116 1 \u0421\u041a\u0412"
+        enc, _content = self._read(tmp_path, text.encode("cp1251"))
+        assert enc == "cp1251", f"M-08 positive shape misdecoded as {enc!r}"
+
+
+class TestM10TrueEofSymbolCluster:
+    """M-10 (CONFIRMED MEDIUM): a Western typographic-symbol cluster
+    (…†‡ = 0x85 0x86 0x87) at the TRUE EOF of a <=64K file was judged
+    genuine Cyrillic by _is_genuine_word_run's unconditional EOF
+    `return True` → blocked the ENC-02(b) Western rescue → cp866
+    mojibake.  The EOF branch now has a byte-content gate: all-carved
+    Western-symbol runs return False so the rescue fires."""
+
+    @staticmethod
+    def _read(tmp_path: Path, text: str) -> str:
+        test_file = tmp_path / "m10_eof.las"
+        test_file.write_bytes(text.encode("cp1252"))
+        assert test_file.stat().st_size <= 65_536, "fixture must be <=64K"
+        with mock.patch(
+            "pylasdev.encoding._detect_encoding_from_bytes",
+            return_value="utf-8",
+        ):
+            with mock.patch(
+                "pylasdev.encoding._detect_confidence_from_bytes",
+                return_value=0.0,
+                create=True,
+            ):
+                enc, _content = read_with_encoding(test_file)
+        return enc
+
+    def test_cluster_at_true_eof_stays_cp1252(self, tmp_path: Path) -> None:
+        """The exact M-10 repro: …†‡ at EOF → cp1252 (pre-fix cp866
+        mojibake 'ЕЖЗ')."""
+        text = "~V 1.2\n~W Well Name: North Field ABC\n~C DEPT 1234.5\n~P Note: field description \u2026\u2020\u2021"
+        enc = self._read(tmp_path, text)
+        assert enc == "cp1252", f"M-10 EOF cluster misdecoded as {enc!r} (mojibake)"
+
+    def test_dash_cluster_at_eof_stays_cp1252(self, tmp_path: Path) -> None:
+        """The dash-cluster variant at EOF → cp1252."""
+        enc = self._read(tmp_path, "~P Note: text \u2013\u2014\u2026")
+        assert enc == "cp1252", f"M-10 dash cluster misdecoded as {enc!r}"
+
+    def test_prose_after_cluster_control(self, tmp_path: Path) -> None:
+        """Control: prose after the cluster already decoded cp1252 (the
+        pinned ENC-1 shape is unchanged)."""
+        text = "~V 1.2\n~W Well Name: North Field ABC\n~C DEPT 1234.5\n~P Note: field description \u2026\u2020\u2021 and more text here"
+        enc = self._read(tmp_path, text)
+        assert enc == "cp1252", f"M-10 control misdecoded as {enc!r}"
 
 
 # ──────────────────────────────────────────────────────────────

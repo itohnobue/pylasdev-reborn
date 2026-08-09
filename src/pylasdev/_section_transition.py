@@ -28,6 +28,42 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _ascii_section_display_name(section_name: str | None) -> str:
+    """Shared M-22 naming rule for standard ~A/~ASCII data sections.
+
+    A standard ASCII data section header without an explicit name — a
+    bare ``~A``/``~ASCII``, or ``~ASCII | <pipe>`` where the pipe is a
+    curve/definition association rather than a name — is left unnamed so
+    the LAS 3.0 DataSection machinery auto-names it ``Section_N``
+    (``_las30_data.py:861``).  An explicit name (e.g. ``~A FirstSection``)
+    is preserved exactly — EXCEPT an explicit name that itself IS a bare
+    keyword (``A``/``ASCII``, case-sensitive): ``~A A``/``~A ASCII`` is
+    treated as a bare keyword and auto-named ``Section_N``, matching the
+    deferred path's ``_DATA_SECTION_WORDS`` blanking (parser.py:3257).
+    All other explicit names are preserved exactly.
+
+    PARS-C-PROD (M-22 violation): the direct path previously fell back
+    to ``section_word`` for bare ``~A``/``~ASCII`` headers, producing two
+    DataSections both named ``'A'``/``'ASCII'`` — a spurious "duplicate
+    data section name" on ``validate(complete=True)`` — while the
+    deferred pre-~V path (parser.py:3250-3257) auto-named them
+    ``Section_0``/``Section_1``.  Both paths must produce the SAME names
+    for the same file shape (M-22 order-invariance contract).  The
+    deferred path's broader bare-keyword blanking covers this family
+    (``_DATA_SECTION_WORDS`` membership); this helper is the direct
+    path's implementation of the same rule for the standard family.
+    """
+    if not section_name:
+        return ""
+    stripped = section_name.strip()
+    # A name that IS a bare keyword ("~A ASCII") is not a user-provided
+    # name — the deferred path blanks it too (case-sensitive membership
+    # in _DATA_SECTION_WORDS), so keep the two paths in lockstep.
+    if stripped in {"A", "ASCII"}:
+        return ""
+    return stripped
+
+
 @dataclass(frozen=True)
 class _CapturedState:
     """Snapshot of parser state at the point a new section header is detected.
@@ -242,6 +278,11 @@ class _SectionTransitionHandler:
         """
         p = self._parser
 
+        # M-25: lazy import of the parser's keyword tables (same pattern as
+        # MAX_SECTION_SEQUENCE below — _section_transition is imported by
+        # parser at module load, so a module-level import would be circular).
+        from .parser import _DATA_SECTION_WORDS, _is_indexed_data_section
+
         # F1: Track per-section curve boundaries for LAS 3.0.
         # When entering ~C (including _Definition sections), mark the
         # current curve list position for per-section curve scoping.
@@ -259,8 +300,43 @@ class _SectionTransitionHandler:
             section_word.endswith("_PARAMETER") or section_word.endswith("_PARAMETERS")
         ):
             p._state.current_section_name = section_word
+        elif section_type == "A" and section_word in {"A", "ASCII"}:
+            # PARS-C-PROD / M-22: a standard ~A/~ASCII data section
+            # header without an explicit name (bare "~A"/"~ASCII", or
+            # "~ASCII | <pipe>") is left unnamed so the LAS 3.0 machinery
+            # auto-names it Section_N — identical to the deferred pre-~V
+            # path (parser.py:3250-3257).  Falling back to section_word
+            # produced duplicate 'A'/'ASCII' names for two bare ~A
+            # sections (spurious validate duplicate-name failure).  The
+            # shared rule lives in _ascii_section_display_name.
+            p._state.current_section_name = _ascii_section_display_name(section_name)
         else:
-            p._state.current_section_name = section_name.strip() if section_name else section_word
+            _candidate = section_name.strip() if section_name else section_word
+            # M-25 (PARS-C-PROD adjacent): non-A/ASCII bare keywords
+            # (~CORE, ~LOG, ~TOPS_DATA, ~CORE[1], ...) previously fell
+            # back to the keyword name on the DIRECT path, so two bare
+            # ~CORE sections were both named 'CORE' — a spurious
+            # "duplicate data section name" validate(complete=True)
+            # failure — while the deferred pre-~V path (parser.py:3250-
+            # 3257) blanked the whole _DATA_SECTION_WORDS family to
+            # Section_N.  Blank to Section_N ONLY when the keyword name
+            # would DUPLICATE an existing data section; single-occurrence
+            # keyword names stay (pinned: DRILLING / CORE[1] /
+            # PERFORATIONS / PERFORATIONS_DATA in test_reader.py, R7F-04
+            # in test_parser.py).  Do NOT blanket-blank — that breaks the
+            # pinned single-occurrence names.
+            if (
+                section_type == "A"
+                and _candidate
+                and (
+                    _candidate in _DATA_SECTION_WORDS
+                    or _is_indexed_data_section(_candidate)
+                )
+                and any(ds.name == _candidate for ds in p.las_file.data_sections)
+            ):
+                p._state.current_section_name = ""
+            else:
+                p._state.current_section_name = _candidate
 
         # F-34: Track section sequence for cross-section validation.
         # Section label uses section_word (e.g. "CURVE", "VERSION")
