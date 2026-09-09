@@ -41,5 +41,8 @@ AGENTS.md
 session.md
 opencode.json
 
+# CodeGraph local code index (generated per machine; methodology: docs/codegraph-methodology.md)
+.codegraph/
+
 # Local plan files (not part of the repo)
 plans/
