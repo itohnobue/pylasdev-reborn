@@ -1,5 +1,5 @@
 # Knowledge Base
-Last updated: 2026-10-04T20:19:58.625054
+Last updated: 2026-10-24T03:55:32.907753
 
 ## [got-20260630231738-c9b671]
 Category: gotcha
@@ -1262,10 +1262,12 @@ EVERY path (pat-20260806084817-cce2a1).
 
 ## [got-20260803092217-289178]
 Category: gotcha
-Tags: models, validation, gate, data-loss, curves_order, regression, write-read
-Changed: 2026-08-03T09:22:17.522696
+Tags: models, validation, gate, data-loss, curves_order, regression, write-read, guard-widening
+Changed: 2026-10-24T03:55:32.907741
 
 Guard-widening must not re-open the defect it was widened to avoid: when a validation gate is RELAXED to accept a legitimate state (M14: F-19 gate widened from 'curves_order non-empty' to allow empty top-level curves + populated curves_order + data_sections), the relaxation can re-open the ORIGINAL silent-data-loss defect the gate was built to block (MOD-M1: the widened state constructs+validates silently, then write emits only no-definition warnings and re-read loses ALL data). Fix: when widening a guard, trace the ORIGINAL defect class end-to-end (construct -> validate(complete=True) -> write -> re-read) on the newly-accepted state; the widened gate must verify data_sections[].section_curves ACTUALLY cover curves_order, not just that both are non-empty. Checklist: for every gate relaxation, re-run the original finding's full repro chain on the relaxed state; a state that constructs+validates silently but loses data on write->read is a gate hole, not a feature; coverage verification beats emptiness checks.
+
+Second direction - what ELSE the relaxed predicate admits: a widening written as a NEGATIVE test ('the winner is not one of my known values') admits the entire unclassified remainder, which is unbounded. In pylasdev-reborn the de-gated encoding rescue admitted every codec the module cannot classify and replaced chardet's CORRECT winner (KOI8-R, ISO-8859-5, windows-1255, TIS-620, MacCyrillic) with cp1251 on the public read path, with zero diagnostics. Write the widening as a POSITIVE precondition on the new state's own evidence (e.g. a script run in the winning decode), list the classes it newly admits, and test one member of each.
 
 ## [pat-20260803092241-235682]
 Category: pattern
@@ -1427,10 +1429,12 @@ F-13, M-32/F-06 - 7+ CONFIRMED.
 
 ## [pat-20260809134744-17c419]
 Category: pattern
-Tags: models, fix-residual, wholesale, mutation, entry-points, views, data-loss
-Changed: 2026-08-09T13:47:44.228890
+Tags: models, fix-residual, wholesale, mutation, entry-points, views, data-loss, consolidation
+Changed: 2026-10-24T03:55:32.810669
 
 Fix residuals — when fixing wholesale/mutation paths, verify ALL entry points AND all views in the same pass. A fix applied to one entry point (construction, wholesale assignment, mutation, pickle, deepcopy) or one view (top-level LASFile.logs vs per-section data) leaves the defect live at the twins. This run's own fixes left residuals (M-13..M-18, all CONFIRMED): F-152 reconcile heals only section curves_order/data/string_data, not top-level LASFile.logs (M-13); F-75 deepcopy skips ALREADY-guarded dicts → aliasing (M-14); F-105 duplicate check construction-only, no validate() re-check (M-15); MOD-B-PROD wholesale branch wraps _GuardedList but never deepcopies DataSection objects (M-16); DataSection.validate lacks the data∩string_data overlap check LASFile.validate has (M-17); __setattr__ mnemonic branches re-validate str/pattern/length but not bracket-vs-index (M-18). Meta-lesson: the fix-residual class is the #1 regression source — when fixing a wholesale/mutation path, mechanically enumerate construction/wholesale/mutation/pickle/deepcopy entry points AND top-level-vs-section views, and re-verify the ORIGINAL repro through every entry point and view. Checklist: after any fix, grep all sibling entry points (from_dict/wholesale/__setattr__/validate/pickle) for the same pattern; verify both views (top-level logs vs data_sections) expose the same heal/reconcile; construction-only checks need a validate()-time twin; a sibling method that HAS the check (LASFile.validate) while its twin (DataSection.validate) lacks it is the signature.
+
+Consolidation corollary - a per-site count is the escalation trigger, not a per-function refix count: 32 CONFIRMED findings in one module (models.py) in one check, 18 of them guard/state/exception class, is ONE un-centralized invariant, not 32 bugs; adding one guard per finding reproduces the class at the next site. Consolidate into ONE shared predicate per field class (or delegate to validate()) and route every entry point through it, instead of patching site by site.
 
 ## [got-20260809134750-8bb145]
 Category: gotcha
@@ -1445,4 +1449,32 @@ Tags: reader, parser, units-row, predicate, units-form, token-pattern, data-loss
 Changed: 2026-08-09T13:47:56.014812
 
 Shared units-row predicates need UNITS-FORM token patterns, not position heuristics: a predicate that classifies any letters-only row after a mnemonic header as a units row drops genuine letters-only first DATA rows when no units row exists. M-06 (MEDIUM): is_units_header_row (_data_section_reader.py:604-629) classified 'ACME SAND' (a real data row) as units on ALL 4 paths (data_reader.py:1064-1075, :1544-1556; parser.py:4523-4536, :3308-3321) — the row survives when a units row intervenes (one-shot gate closes), so the drop is order/adjacency-dependent. Fix: narrow the predicate to units-form token evidence (every token a plain 1-4 char letter abbreviation AND at least one very short <=2-letter token — the canonical M/FT/MS/MV/IN/CM/MM/US units), NOT position/looks-like-letters; the shared predicate is consumed by every reader/parser path, so refine it ONCE and verify all 4 paths + the pre-scan agree (shared-predicate contract). Checklist: letters-only first data row with no units row must be preserved on all paths; a real units row 'M GAPI' must still be skipped; a predicate refinement must land on every consumer in the same pass; docstring protection claims must be verified against the actual narrow-match logic.
+
+## [pat-20261024035530-6d50fd]
+Category: pattern
+Tags: python, fix-introduced, regression, internal-callers, roundtrip, pylasdev
+Changed: 2026-10-24T03:55:30.141938
+
+Fix-introduced regressions: enumerate the library's OWN internal callers of the changed path, not just the external trigger. A guard, parameter or assignment semantic changed for an external input is also executed by internal machinery whose contract differs — the writer's own output feeding the reader, a writer's finally-restore, a parser's internal reassignment, a shared splitter consumed by a detector. Each such caller is a consumer of the old semantics, and the fix silently changes what it produces. Evidence: in one post-fix pass 8 of 14 MEDIUM findings were FIX-INTRODUCED. A reader-side CSV quote path accepted quotes the writer never emits (raw delimiter.join) and stripped genuine quote-leading values on the library's own roundtrip; copy-on-assignment added to LASFile.__setattr__ was reached by the three version writers' finally restores and by the parser's dedup, replacing CurveDefinition objects and severing the documented las.curves[i] is section.section_curves[j] identity, so a post-parse mutation stopped reaching the file with validate()==[]; an expected= recombination parameter added to the shared row splitter collapsed rows to one token, and the wrap detector that shares that splitter then misrouted a 2-curve WRAP=NO file; a de-gated encoding rescue overrode chardet's CORRECT foreign-codec winner (KOI8-R, ISO-8859-5, windows-1255, TIS-620, MacCyrillic) with cp1251, silently. Checklist: (a) before writing a fix, grep every caller of the symbol you change and state each caller's expectation of the old behaviour; (b) for a reader change, roundtrip the library's own writer output — hand-built fixtures cannot show what the writer emits; (c) an internal path that must preserve identity (restore, dedup, sync) needs a non-copying install (list.clear + list.extend + object.__setattr__) distinct from the external defensive-copy contract; (d) for a shared helper, thread a flag instead of changing what the helper returns to all its consumers; (e) A/B the internal callers' inputs against HEAD (pat-20260806084853-48f126 covers the external inputs). Related but distinct: pat-20260720071838-171ab7 (sibling copies of the same code), pat-20260809134744-17c419 (entry points and views of the original defect).
+
+## [pat-20261024035530-951383]
+Category: pattern
+Tags: python, fix-coordination, diagnostics, contradictory-fixes, conformance, pylasdev
+Changed: 2026-10-24T03:55:30.237932
+
+Cross-finding fix contradictions: two independently correct fixes can contradict, and no per-finding verification can see it — each fix passes its own repro while the pair rejects a state the other declared conforming. Before closing a fix batch, cross every state any fix declares conforming against every diagnostic or guard any other fix added or tightened in the same batch. Evidence: a models fix removed the validate() report for the spec-conforming variable-step encoding (declared STEP 0 with a non-uniform index) while a writer diagnostic written in the same batch re-asserted that rule on the write path — every conforming variable-step file then warned on every write, and -W error turned a clean read->write into a raise. In the same pass, a guard that accepts a pre-declared column order for incremental population coexisted with (a) a narrowed equal-length check that accepted an inconsistent container and (b) an orphan verdict that treated every not-yet-populated sibling as an error, so the deferral the guard existed for became dead code and the first insert stored the column then raised. Checklist: build a two-way table at the end of the fix stage — rows = states some fix declares conforming, columns = diagnostics/guards some fix added or tightened; decide every cell deliberately; write each declared-conforming state through the writer and re-read it; for every deferral a fix preserves, grep its consumer and prove a reachable redemption path (a deferral whose consumer rejects the deferred state is dead code).
+
+## [got-20261024035530-16c7b3]
+Category: gotcha
+Tags: python, documentation-truth, comments, docstrings, fix-batch, pylasdev
+Changed: 2026-10-24T03:55:30.334012
+
+Documentation truth in the same edit: a behavior change must correct every comment/docstring its own diff falsifies, in the same edit. A comment is a contract statement; a falsified one misleads the next reader and licenses the next wrong fix. The fix batch itself is the highest-yield source, because the falsified line sits inside the function being changed: in one post-fix pass documentation truth was the largest LOW class (11 of 24 LOWs) and every instance sat on a line the same batch had changed. Instances: a docstring whose premise was true but conclusion false ("the writer emits raw delimiter.join, so plain splitting keeps the writer's own roundtrips byte-identical" — false once a quote makes the plain split not be taken); a comment claiming two family tuples "mirror dev_reader's" when they had not been extended; a test class header still advertising the wall-clock guard its body had just replaced with a structural proxy. Checklist: after each edit, read the function's docstring/comment block and test every claim about the changed line for both premise and conclusion; a claim about a sibling module must name the real lines, not a stale citation; when a mechanism is replaced, the text describing the old mechanism goes with it. Prevention is review-level rather than lint-level: require each fix to state which comment/docstring lines its diff falsifies, or state none.
+
+## [pat-20261024035530-9c1514]
+Category: pattern
+Tags: testing, determinism, oracle, performance, regression-pins, pylasdev
+Changed: 2026-10-24T03:55:30.430570
+
+Test oracles must be deterministic, and a stale pin is re-baselined by contract. (a) A wall-clock assertion measures the machine, not the code: it fails under coverage or a loaded host and says nothing about the defect class. Replace it with a proxy that still discriminates: a work counter emitted by the production path (rebuild count, values processed), a structural property of the compiled artifact (an unbounded repetition inside a start-anchored group is what makes per-start work unbounded — assert its absence plus exact parse content), or an allocation bound (tracemalloc peak of one rejecting call). Each proxy must fail on the pre-fix shape and pass post-fix — measure both. Evidence: a per-flush re-slice proxy asserted values_processed and rebuilds<=1 where the pre-fix slice yields ~45,000 rebuilds; the H-04 regex proxy is false for the old pattern and true for the shipped one; the F-22 resource proxy measured 1,654 bytes post-fix against 800,000 bytes pre-fix. A suite with zero clock reads (grep perf_counter/time.time over tests -> 0) can be pinned as a meta-test, so the class cannot return. (b) Re-baseline a stale pin by CONTRACT, not by convenience: change the expectation to the post-fix contract the authorising finding re-derived, keep the regression the test guards, add the fixture data the new rule requires rather than weakening the assertion, and retarget a deleted diagnostic to the conforming state while keeping the discrimination through a surviving check. A re-baseline that only updates an expected value, or drops the assertion, deletes the protection. Checklist: grep tests for perf_counter/time.time/monotonic/elapsed; name the authorising finding for every re-baselined node; run each re-baselined and new pin against the pre-fix tree and require failure there.
 
