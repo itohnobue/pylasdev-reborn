@@ -8,8 +8,11 @@ Covers:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from pylasdev import read_las_file, read_las_file_as_object, write_las_file
 from pylasdev.exceptions import LASParseError
 from pylasdev.parser import LASParser
 
@@ -248,3 +251,76 @@ class TestMAXTOTAL_ELEMENTS:
         parser = LASParser()
         with pytest.raises(LASParseError, match=r"Cumulative cross-section allocation"):
             parser.parse(content)
+
+
+class TestF185IndexedParameterSection:
+    """F-185 / M6 regression pin: the ``[n]`` index suffix on a typed
+    parameter section must not defeat the ``_PARAMETER`` dispatch.
+
+    ``_section_transition.enter_new_section`` (``_section_transition.py:299-315``)
+    tested the RAW section word, so a spec-legal ``~Log_Parameter[2]`` failed
+    ``endswith("_PARAMETER")``; with an annotation the raw word was then
+    replaced by the annotation text, ``_parse_parameter_entry`` had no
+    ``_PARAMETER`` left to strip, ``section_type`` became ``None`` and the
+    writer re-emitted ``~PARAMETER INFORMATION``.  The same bytes with ``~V``
+    last parsed correctly, so the model was version-order dependent
+    (ADV-2 matrix: V-first ``[None]`` / V-late ``['LOG']``).
+
+    Pre-fix this test fails on the ``v-first`` row (``section_type`` None and
+    a ``~PARAMETER INFORMATION`` header); post-fix both orders agree on
+    ``'LOG'`` and the writer re-emits ``~LOG_Parameter``.
+    """
+
+    _HEAD = (
+        "~VERSION INFORMATION\n"
+        " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+        " WRAP.   NO  : ONE LINE PER DEPTH STEP\n"
+        " DLM .   COMMA : DELIMITING CHARACTER BETWEEN DATA COLUMNS\n"
+        "~WELL INFORMATION\n"
+        " STRT .M   100.0  : First Index Value\n"
+        " STOP .M   102.0  : Last Index Value\n"
+        " STEP .M   1.0  : STEP\n"
+        " NULL .    -999.25  : NULL VALUE\n"
+    )
+    _PARAM_ANNOTATED = (
+        "~Log_Parameter[2]  Parameter Information\n BHT.DEGC   35.5 : Bottom Hole Temperature\n"
+    )
+    _PARAM_BARE = "~Log_Parameter[2]\n BHT.DEGC   35.5 : Bottom Hole Temperature\n"
+    _CURVES = "~CURVE INFORMATION\n DEPT .M  : DEPTH  {F}\n GR   .API  : GAMMA RAY  {F}\n"
+    _DATA = "~Log_Data | CURVE\n100.0,10.0\n101.0,20.0\n102.0,30.0\n"
+
+    @pytest.mark.parametrize("annotated", [True, False], ids=["annotated", "bare"])
+    @pytest.mark.parametrize("order", ["v-first", "v-late"])
+    def test_indexed_parameter_section_types_as_log(
+        self, annotated: bool, order: str, tmp_path: Path
+    ) -> None:
+        """Both ~V orders must produce section_type 'LOG' and a ~LOG_Parameter header."""
+        param_block = self._PARAM_ANNOTATED if annotated else self._PARAM_BARE
+        if order == "v-first":
+            content = self._HEAD + param_block + self._CURVES + self._DATA
+        else:
+            content = param_block + self._HEAD + self._CURVES + self._DATA
+        src = tmp_path / f"param_{order}_{'ann' if annotated else 'bare'}.las"
+        src.write_text(content, encoding="ascii")
+
+        las = read_las_file_as_object(src)
+        param_section_types = [entry.section_type for entry in las.parameters]
+        assert param_section_types == ["LOG"], (
+            f"{order}/{annotated}: indexed ~Log_Parameter must type as LOG, got "
+            f"{param_section_types}"
+        )
+
+        details = read_las_file(src).get("parameter_details", [])
+        assert [(d.get("mnemonic"), d.get("section_type")) for d in details] == [("BHT", "LOG")]
+
+        out = tmp_path / f"param_{order}_{'ann' if annotated else 'bare'}_out.las"
+        write_las_file(out, las)
+        headers = [
+            line
+            for line in out.read_text().splitlines()
+            if line.lower().startswith("~log_parameter")
+        ]
+        assert headers, "the writer must re-emit ~LOG_Parameter for a LOG-typed parameter section"
+        assert "~PARAMETER INFORMATION" not in out.read_text(), (
+            "the annotation text must not be re-emitted as a section header"
+        )

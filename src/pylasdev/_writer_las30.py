@@ -18,6 +18,7 @@ from ._writer_base import (
     _format_parameter_line,
     _lookup_data_array,
     _mnem_key,
+    _restore_live_container,
     _sanitize_las_value,
     _section_type_to_prefix,
     _WriterBase,
@@ -54,6 +55,36 @@ def _curve_identity(curve: CurveDefinition, emitted_name: str | None = None) -> 
     )
 
 
+def _is_str_placed(
+    curve: CurveDefinition,
+    emitted: str,
+    string_mnemonics: frozenset[str] | None,
+) -> bool:
+    """True when ``curve`` is placed in ``string_mnemonics`` under EITHER of
+    its names.
+
+    F-058 (M-29 vs M-35 divergence): ``_format_curve_line`` decides the
+    ``{S}`` marker from the EMITTED name **or** ``curve.mnemonic`` — M-35
+    had to add the storage key because a mnem_base-renamed curve keeps its
+    data under the storage mnemonic while emitting the vendor name.  The
+    Definition signature and both pipe-marker tuples tested the emitted
+    name ONLY, so a renamed curve placed string in one section and numeric
+    in another signed as *numeric* in both, the two sections collapsed onto
+    ONE shared ``~Log_Definition``, and the section whose placement
+    disagreed with the shared marker was re-read as the wrong type (the
+    numeric column re-read as strings, or the string values destroyed to
+    the null sentinel) with zero writer warnings.
+
+    One predicate for the signature, the pipe decision and the emitter, so
+    the three cannot drift again.
+    """
+    if string_mnemonics is None:
+        return False
+    return (
+        _mnem_key(emitted) in string_mnemonics or _mnem_key(curve.mnemonic) in string_mnemonics
+    )
+
+
 def _definition_signature(
     curve: CurveDefinition,
     emitted_name: str | None = None,
@@ -76,8 +107,10 @@ def _definition_signature(
     section's string keys — the second section's values were re-read as
     the wrong type (nulls, and in the iter-3 variant a LASParseError
     made the written file SELF-UNREADABLE with 0 write warnings).
-    String-ness is compared via the EMITTED name (``_mnem_key``),
-    matching the ``{S}``-marker decision in ``_format_curve_line``.
+    String-ness is compared via the EMITTED name OR the curve's storage
+    mnemonic (``_is_str_placed``), matching the ``{S}``-marker decision in
+    ``_format_curve_line``.  F-058: the emitted name alone was not enough —
+    see ``_is_str_placed``.
 
     W-10: ``emitted_name`` overrides the M-59 reconstruction (see
     ``_curve_identity``).
@@ -91,7 +124,7 @@ def _definition_signature(
         curve.api_code or "",
         curve.array_info.index if curve.array_info is not None else None,
         curve.array_info.time_offset if curve.array_info is not None else None,
-        string_mnemonics is not None and _mnem_key(_emitted) in string_mnemonics,
+        string_mnemonics is not None and _is_str_placed(curve, _emitted, string_mnemonics),
     )
 
 
@@ -245,11 +278,18 @@ class _Las30Writer(_WriterBase):
         )
         lines.append(f" WRAP.   {_sanitize_las_value(actual_wrap)}  : {wrap_desc}")
 
-        if self._las_file.version.dlm and self._las_file.version.dlm.upper() != "SPACE":
-            dlm_desc = "DELIMITING CHARACTER BETWEEN DATA COLUMNS"
-            lines.append(
-                f" DLM .                        {_sanitize_las_value(self._las_file.version.dlm)} : {dlm_desc}"
-            )
+        # F-059: DLM is MANDATORY in LAS 3.0 (R-03 F-12: "VERS, WRAP and DLM
+        # must be the first Parameter Data lines of the section", and the
+        # standard's own certification check requires DLM present).  The
+        # pre-fix code omitted it whenever the delimiter was SPACE — the
+        # library's default — so every space-delimited file it wrote had a
+        # two-line ~V and was non-conforming.  The value must be one of the
+        # three words ("Never use the actual ASCII characters"), so an empty
+        # dlm (a LAS 2.0-era model value) is emitted as the SPACE word rather
+        # than as a blank field: one code path for all three delimiters.
+        dlm_value = self._las_file.version.dlm or "SPACE"
+        dlm_desc = "DELIMITING CHARACTER BETWEEN DATA COLUMNS"
+        lines.append(f" DLM .                        {_sanitize_las_value(dlm_value)} : {dlm_desc}")
         lines.append("")
         return lines
 
@@ -268,6 +308,21 @@ class _Las30Writer(_WriterBase):
             # ='IK' falls back to its own mnemonic so the distinct column
             # survives in ~C).
             _emission_overrides: dict[int, str] = {}
+            # F-060: a curve OBJECT can appear in more than one section's
+            # section_curves (the parser shares one CurveDefinition object
+            # across every section that pipes the same Definition —
+            # _las30_data.py stores a slice of las_file.curves).  The name
+            # dedup below cannot see that: the object's emitted name is
+            # already taken, but its OWN mnemonic may still be free, so the
+            # W-10 fallback appended the same object a SECOND time and
+            # stored the fallback id-keyed — and the id-keyed override then
+            # retroactively renamed the FIRST occurrence too.  Result: a
+            # duplicated ~C line, the vendor name gone from ~C, and 2
+            # curves re-read as 3.  Track emitted object identities so each
+            # curve is declared once; distinct objects that merely collide
+            # on the emitted name still take the fallback (they have
+            # different ids).
+            _emitted_ids: set[int] = set()
             # W-01: Dedup during the FIRST extension loop.  Previously the
             # primary accumulation path (extend of each section's curves)
             # had NO dedup — `emitted_mnems` was computed AFTER the extend
@@ -283,6 +338,12 @@ class _Las30Writer(_WriterBase):
                 if (ds.section_type or "LOG_DATA").upper() == "LOG_DATA":
                     if ds.section_curves:
                         for curve in ds.section_curves:
+                            if id(curve) in _emitted_ids:
+                                # F-060: this OBJECT is already declared in
+                                # ~C (the same definition shared by another
+                                # section) — re-declaring it here is what
+                                # produced the duplicate line.
+                                continue
                             _emitted = _emitted_mnemonic(curve)
                             _override: str | None = None
                             # N2b-2: emitted_mnems stores UPPER-CASED keys —
@@ -382,6 +443,7 @@ class _Las30Writer(_WriterBase):
                                     continue
                             emitted_mnems.add(_mnem_key(_override or _emitted))
                             curves_to_emit.append(curve)
+                            _emitted_ids.add(id(curve))
                             if _override is not None:
                                 _emission_overrides[id(curve)] = _override
             curves_by_mnem: dict[str, CurveDefinition] = {}
@@ -419,8 +481,17 @@ class _Las30Writer(_WriterBase):
                         _emitted = _emitted_mnemonic(curve_def) if curve_def is not None else mnem
                         if _mnem_key(_emitted) not in emitted_mnems:
                             if curve_def is not None:
+                                # F-060 twin: the same curve OBJECT may
+                                # already be declared under a
+                                # collision-fallback name (its emitted name
+                                # is then absent from emitted_mnems but the
+                                # object is not) — re-appending it would
+                                # duplicate the ~C line.
+                                if id(curve_def) in _emitted_ids:
+                                    continue
                                 emitted_mnems.add(_mnem_key(_emitted))
                                 curves_to_emit.append(curve_def)
+                                _emitted_ids.add(id(curve_def))
                             else:
                                 # N-I-15: the section curve is absent from
                                 # top-level curves and cannot be emitted —
@@ -466,9 +537,11 @@ class _Las30Writer(_WriterBase):
                             if (
                                 curve_def is not None
                                 and _mnem_key(curve_def.mnemonic) not in emitted_mnems
+                                and id(curve_def) not in _emitted_ids
                             ):
                                 emitted_mnems.add(_mnem_key(curve_def.mnemonic))
                                 curves_to_emit.append(curve_def)
+                                _emitted_ids.add(id(curve_def))
                                 _emission_overrides[id(curve_def)] = curve_def.mnemonic
 
             # W-01: When ALL data sections are non-LOG_DATA and carry their
@@ -481,7 +554,17 @@ class _Las30Writer(_WriterBase):
                 for ds in self._las_file.data_sections
             )
             if not curves_to_emit and not curves_in_definitions:
-                curves_to_emit = list(self._las_file.curves)
+                # F-060 twin: this fallback takes the model's curves list
+                # wholesale — the same guard keeps a curve OBJECT that the
+                # model holds twice (a _GuardedList validates element types
+                # only, not identity) from being declared twice with an
+                # id-keyed fallback name.
+                curves_to_emit = []
+                for _c in self._las_file.curves:
+                    if id(_c) in _emitted_ids:
+                        continue
+                    _emitted_ids.add(id(_c))
+                    curves_to_emit.append(_c)
             # F-28: when curves_in_definitions (all sections non-LOG_DATA
             # with section_curves, e.g. CORE-only files), the empty
             # curves_to_emit is EXPECTED — the section curves live in the
@@ -536,6 +619,11 @@ class _Las30Writer(_WriterBase):
                     _emitted = _emitted_mnemonic(curve)
                     if _mnem_key(_emitted) in emitted_mnems:
                         continue
+                    # F-060 twin: the mnemonic test above misses a curve
+                    # that is already declared under a collision-fallback
+                    # name — the object identity is the authoritative test.
+                    if id(curve) in _emitted_ids:
+                        continue
                     # I2-22 (PF-21): case-insensitive comparison — _section_mnems
                     # holds upper-cased keys, so compare the emitted/mnemonic
                     # uppercased to match a lowercase curves_order reference.
@@ -553,6 +641,7 @@ class _Las30Writer(_WriterBase):
                     # metadata survives; warn that it has no data.
                     emitted_mnems.add(_mnem_key(_emitted))
                     curves_to_emit.append(curve)
+                    _emitted_ids.add(id(curve))
                     import warnings
 
                     warnings.warn(
@@ -738,10 +827,15 @@ class _Las30Writer(_WriterBase):
                 # Fallback to legacy ~A for LAS 3.0 without data_sections.
                 lines.extend(self._write_ascii_legacy(delimiter, check_line_limit))
         finally:
-            self._las_file.logs = _saved_logs
-            self._las_file.string_data = _saved_string_data
-            self._las_file.curves_order = _saved_curves_order
-            self._las_file.curves = _saved_curves
+            # M12/L24: restore IN PLACE (see _restore_live_container).  Never
+            # ``self._las_file.<container> = ...``: that branch deep-copies
+            # ``curves`` (severing section_curves identity) and re-runs the
+            # container validators, so a restore could raise while the
+            # write's own LASWriteError is in flight.
+            _restore_live_container(self._las_file, "logs", _saved_logs)
+            _restore_live_container(self._las_file, "string_data", _saved_string_data)
+            _restore_live_container(self._las_file, "curves_order", _saved_curves_order)
+            _restore_live_container(self._las_file, "curves", _saved_curves)
             self._las_file.version.dlm = _saved_dlm
 
         return lines
@@ -941,6 +1035,9 @@ class _Las30Writer(_WriterBase):
                 )
 
         emitted_defs: dict[str, dict[tuple[Any, ...], str]] = {}
+        # F-064-B: emitted data-section TITLES, counted so a repeat can carry
+        # the spec's [n] array index (see the header emission below).
+        _emitted_titles: dict[str, int] = {}
         for section in self._las_file.data_sections:
             sec_type = (section.section_type or "LOG_DATA").upper()
             section_prefix = _section_type_to_prefix(sec_type)
@@ -1201,11 +1298,14 @@ class _Las30Writer(_WriterBase):
                 )
                 _main_str_set = self._all_string_mnemonics()
                 _sec_marker = tuple(
-                    _mnem_key(_emitted_by_id[id(c)]) in _sec_str_set for c in _sec_curves
+                    _is_str_placed(c, _emitted_by_id[id(c)], _sec_str_set) for c in _sec_curves
                 )
                 _main_marker = tuple(
-                    _mnem_key(self._main_emitted_names.get(id(c), _emitted_mnemonic(c)))
-                    in _main_str_set
+                    _is_str_placed(
+                        c,
+                        self._main_emitted_names.get(id(c), _emitted_mnemonic(c)),
+                        _main_str_set,
+                    )
                     for c in self._main_curves
                 )
                 if _sec_identity != _main_identity or _sec_marker != _main_marker:
@@ -1251,10 +1351,21 @@ class _Las30Writer(_WriterBase):
                     sig_map = emitted_defs[def_prefix]
                     if sig not in sig_map:
                         emit_idx = len(sig_map) + 1
+                        # F-064/N-002: LAS 3.0 suffixes a REPEATING section
+                        # title with the array-index brackets, [], containing
+                        # a sequential number (R-03 F-3), and the only
+                        # sanctioned repeats are ~Log_Parameter/~Log_Definition/
+                        # ~Log_Data.  The pre-fix `~Log_Definition_2` satisfies
+                        # neither the reserved title list nor the bracket rule,
+                        # so a conforming reader cannot classify the second
+                        # block at all.  The first occurrence stays bare and
+                        # the repeats are indexed [2], [3], ... (the pragmatic
+                        # reading of the rule; the reader accepts both, and the
+                        # numbering is unchanged — only the delimiter form is).
                         def_section_name = (
                             f"{def_prefix}_Definition"
                             if emit_idx == 1
-                            else f"{def_prefix}_Definition_{emit_idx}"
+                            else f"{def_prefix}_Definition[{emit_idx}]"
                         )
                         sig_map[sig] = def_section_name
                         lines.append(f"~{def_section_name}")
@@ -1276,15 +1387,34 @@ class _Las30Writer(_WriterBase):
                     pipe_def_name = sig_map[sig]
 
             # Data section header with pipe notation.
+            # F-064-B (the N-002 twin at the DATA-section site): a repeated
+            # data-section title must carry the SAME [n] array index the
+            # Definition fix emits — a LAS 3.0 file may repeat a section title
+            # only in the bracketed form, and the pre-fix writer emitted two
+            # identical bare `~A` headers for two unnamed sections.  Only the
+            # repeat is indexed (first occurrence stays bare, matching the
+            # Definition naming), and the index goes in the NAME slot: a bare
+            # indexed section word (`~A[2]`) is not dispatched as a data
+            # section at all — the whole body lands in `other` and the values
+            # are lost — while `~A [2]` and `~A LOG1[2]` both round-trip.
+            _section_title = f"{section_prefix}{section_name}"
+            _title_count = _emitted_titles.get(_section_title, 0) + 1
+            _emitted_titles[_section_title] = _title_count
+            if _title_count > 1:
+                _section_title = (
+                    f"{section_prefix}{section_name}[{_title_count}]"
+                    if section_name
+                    else f"{section_prefix} [{_title_count}]"
+                )
             if sec_type == "LOG_DATA":
                 if pipe_def_name:
-                    lines.append(f"~{section_prefix}{section_name} | {pipe_def_name}")
+                    lines.append(f"~{_section_title} | {pipe_def_name}")
                 else:
-                    lines.append(f"~{section_prefix}{section_name} | CURVE")
+                    lines.append(f"~{_section_title} | CURVE")
             elif pipe_def_name:
-                lines.append(f"~{section_prefix}{section_name} | {pipe_def_name}")
+                lines.append(f"~{_section_title} | {pipe_def_name}")
             else:
-                lines.append(f"~{section_prefix}{section_name}")
+                lines.append(f"~{_section_title}")
             # W-11/W-12/I2-13: emit data rows aligned to the SAME
             # resolved+deduped curve set the pipe target declares — the
             # live curves_order entries in live order.

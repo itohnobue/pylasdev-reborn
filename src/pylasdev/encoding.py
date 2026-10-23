@@ -9,8 +9,11 @@ Geoscience files commonly use:
 
 from __future__ import annotations
 
+import codecs
 import logging
 import re
+import unicodedata
+import warnings
 from pathlib import Path
 
 from .exceptions import LASEncodingError
@@ -45,6 +48,19 @@ DEFAULT_MAX_FILE_SIZE = 524_288_000  # 500 MB
 # mojibake rather than Cyrillic mojibake).  For truly ambiguous files,
 # chardet detection (if available) runs first.
 FALLBACK_ENCODINGS = ["utf-8", "cp1251", "cp866", "cp1252", "latin-1"]
+
+# F-113: the codec-name aliases of the fallback members, keyed by the
+# canonical name ``codecs.lookup()`` resolves a label to.  Encoding detection
+# (chardet) reports labels in ITS namespace — 'ISO-8859-1', 'IBM866',
+# 'windows-1251' — while the class sets below (_CYRILLIC_ENCS / _WESTERN)
+# compare names by identity.  An alias of a fallback member therefore matched
+# neither class, installed its own decode on a ratio tie, and left every
+# guard written to reverse a wrong honour class-gated off.  Resolving through
+# this map puts the detected name in this module's namespace before it is used
+# for classification, so the guards see the codec they are guarding.
+_ENCODING_CANONICAL_NAMES: dict[str, str] = {
+    codecs.lookup(name).name: name for name in FALLBACK_ENCODINGS
+}
 
 # F-ITER2-D4b-M09: Minimum proportion of word characters (\w) required for
 # a decoded content to pass the mojibake detection heuristic.  Both cp866
@@ -121,6 +137,15 @@ _STRONG_RUN_MIN = 3
 # discriminator reads the Cyrillic evidence from the candidate that IS
 # correct — the winning non-Western decode — instead of from cp1251.
 _WORD_LIKE_CYRILLIC_RUN_MIN = 3
+# M2 (FIX pass 2): minimum run of non-Latin-script letters that makes a decode
+# a reading in ANOTHER script rather than a Latin-script rendering of the same
+# bytes.  Used by _reads_in_non_latin_script, the positive script precondition
+# the E-06 near-tie guard needs before it may displace a foreign label: the
+# byte-class detector (_has_confirmed_cyrillic_run) is true for every
+# single-byte script sharing the 0xC0-0xFF range, so it alone cannot say that a
+# foreign winner is wrong.  3 = the shortest Cyrillic/Hebrew/Thai word
+# (СКВ, באר, ...), the same "word" floor as _WORD_LIKE_CYRILLIC_RUN_MIN.  # noqa: RUF003
+_NON_LATIN_SCRIPT_RUN_MIN = 3
 # F-02 (ENC-1 regression, FIX pass 4): bytes that decode to a Cyrillic
 # letter (U+0400-U+04FF) under cp1251.  Within the ambiguous 0x80-0x9F
 # range — the ONLY range rule (2) of _is_genuine_word_run examines, because
@@ -353,6 +378,25 @@ _CYRILLIC_RUN_GE_RE, _CYRILLIC_RUN_3_RE, _STRONG_CYRILLIC_RUN_RE = _build_cyrill
 # pure-ASCII and Western-only files on the cheap path.
 _CYRILLIC_WORD_PRE_RE = re.compile("[\u0400-\u04FF]{3}")
 
+# F-115: C-speed run finder for _has_word_like_cyrillic_run.  The scan used a
+# per-character Python `while i < n` walk over the WHOLE decode (one iteration
+# per character), so a 162 MB decode cost ~45 ms/MB per candidate and could
+# not early-exit on a non-genuine run (the walk continues to EOF).  finditer
+# yields only the maximal Cyrillic runs, so the per-run logic below is entered
+# at most once per run and the rest of the decode costs a C-level scan.
+_CYRILLIC_WORD_RE = re.compile("[\u0400-\u04FF]+")
+
+# F-114: anchor for the informative ratio window used by the Cyrillic-vs-Cyrillic
+# near-tie discriminator — the first byte that is not ASCII.  C-speed scan.
+_FIRST_NON_ASCII_BYTE_RE = re.compile(b"[\x80-\xff]")
+
+# M2 (FIX pass 2): C-speed pre-gate for _reads_in_non_latin_script.  A decode
+# with no character beyond U+00FF (pure ASCII or Latin-1) cannot carry a
+# non-Latin-script letter run, so the per-character script scan is only entered
+# when this regex matches — which keeps every Western winner (cp1252/latin-1,
+# whose decodes never leave U+00FF) on the cheap path.
+_NON_LATIN_PRE_RE = re.compile("[^\x00-\xff]")
+
 
 def _window_has_numero_prefix(window: bytes, at_data_start: bool = False) -> bool:
     """Return True if *window* contains a 0xB9 byte that is a Cyrillic "№".
@@ -537,34 +581,33 @@ def _has_word_like_cyrillic_run(
     marks a genuine word; the Western smart-punctuation clusters use bytes
     that are not Cyrillic under cp1251 and stay prose punctuation.
 
+    F-115: the scan is driven by ``_CYRILLIC_WORD_RE`` (C speed) instead of a
+    per-character Python walk, so the cost is proportional to the number of
+    Cyrillic runs, not to the number of characters in the decode.
+
     When *raw* is None (multi-byte decode, e.g. utf-8), every Cyrillic run
     is genuine and the original standalone-token rule applies: the run is
     word-like when it is NOT embedded between ASCII letters.
     """  # noqa: RUF002
-    i = 0
     n = len(decoded)
-    while i < n:
-        if 0x0400 <= ord(decoded[i]) <= 0x04FF:
-            j = i + 1
-            while j < n and 0x0400 <= ord(decoded[j]) <= 0x04FF:
-                j += 1
-            if j - i >= _WORD_LIKE_CYRILLIC_RUN_MIN:
-                if raw is not None:
-                    if _is_genuine_word_run(
-                        decoded, raw, i, j, sample_truncated, allow_rule1=allow_rule1
-                    ):
-                        return True
-                else:
-                    before = decoded[i - 1] if i > 0 else ""
-                    after = decoded[j] if j < n else ""
-                    if not (
-                        (before and before.isascii() and before.isalpha())
-                        or (after and after.isascii() and after.isalpha())
-                    ):
-                        return True
-            i = j
+    for match in _CYRILLIC_WORD_RE.finditer(decoded):
+        i = match.start()
+        j = match.end()
+        if j - i < _WORD_LIKE_CYRILLIC_RUN_MIN:
+            continue
+        if raw is not None:
+            if _is_genuine_word_run(
+                decoded, raw, i, j, sample_truncated, allow_rule1=allow_rule1
+            ):
+                return True
         else:
-            i += 1
+            before = decoded[i - 1] if i > 0 else ""
+            after = decoded[j] if j < n else ""
+            if not (
+                (before and before.isascii() and before.isalpha())
+                or (after and after.isascii() and after.isalpha())
+            ):
+                return True
     return False
 
 
@@ -849,6 +892,35 @@ def detect_encoding(file_path: Path) -> str:
     return "utf-8"
 
 
+def _canonical_encoding_name(label: str) -> str:
+    """Return *label* expressed in this module's own encoding namespace.
+
+    F-113: ``chardet`` names codecs in its own namespace — ``'ISO-8859-1'``
+    (= latin-1), ``'IBM866'`` (= cp866), ``'windows-1251'`` (= cp1251) — and
+    the class sets in :func:`_decode_best_quality` compare names by identity.
+    An alias of a fallback member matched neither class, so the detected name
+    installed its own decode on a ratio tie and every reversal guard
+    (:data:`_CYRILLIC_ENCS` / :data:`_WESTERN`-gated) was unreachable.
+
+    ``codecs.lookup()`` resolves an alias to its codec's canonical name; when
+    that canonical name belongs to one of :data:`FALLBACK_ENCODINGS` the
+    fallback member is returned.  A genuinely foreign codec (``MacRoman``,
+    ``KOI8-R``) has no fallback member and is passed through unchanged; the
+    E-06 near-tie guard (no longer Western-gated) then decides between it and cp1251,
+    and the decision is content-based, not label-based: the guard keeps the
+    foreign winner when its own decode reads as text in another script (the
+    correct ``KOI8-R`` / ``windows-1255`` / ``TIS-620`` case) and displaces it —
+    with a counted ``UserWarning`` naming both labels — only when that decode
+    is a Latin-script rendering of Cyrillic bytes (a wrong foreign label such
+    as ``MacRoman`` over cp1251 content).
+    """
+    try:
+        canonical = codecs.lookup(label).name
+    except LookupError:
+        return label
+    return _ENCODING_CANONICAL_NAMES.get(canonical, label)
+
+
 def _detect_encoding_from_bytes(raw_data: bytes) -> str:
     """Detect encoding from pre-read bytes using chardet.
 
@@ -865,7 +937,11 @@ def _detect_encoding_from_bytes(raw_data: bytes) -> str:
     if HAS_CHARDET:
         result = chardet.detect(raw_data[:50_000])
         if result["confidence"] and result["confidence"] > 0.7:
-            return result["encoding"] or "utf-8"
+            # F-113: canonicalise the label before it leaves this boundary —
+            # every consumer (_decode_best_quality's class taxonomy, the
+            # `.encoding` attribute of the models, roundtrip serialisation)
+            # reads this module's names.
+            return _canonical_encoding_name(result["encoding"] or "utf-8")
 
     return "utf-8"
 
@@ -882,6 +958,133 @@ def _detect_confidence_from_bytes(raw_data: bytes) -> float:
         result = chardet.detect(raw_data[:50_000])
         return result["confidence"] or 0.0
     return 0.0
+
+
+def _multibyte_byte_share(sample: str) -> float:
+    """Return the share of *sample*'s source bytes that belong to multi-byte
+    sequences (0.0 for a pure-ASCII sample).
+
+    F-116: used as the bound on the character-count advantage a single-byte
+    decode of the same bytes can extract from those sequences.  A UTF-8
+    multi-byte character contributes one character (zero alnum when it is
+    typographic punctuation) while the single-byte decode of the same bytes
+    contributes one character PER BYTE, nearly all of them alnum under
+    cp866/cp1251 — so the counted-alnum ratio is structurally unfair to
+    multi-byte UTF-8 by up to one character per multi-byte source byte.
+    """
+    if sample.isascii():
+        return 0.0
+    total_source_bytes = len(sample.encode("utf-8"))
+    ascii_chars = len(sample.encode("ascii", "ignore"))
+    return (total_source_bytes - ascii_chars) / max(total_source_bytes, 1)
+
+
+def _non_ascii_window_ratio(enc: str, raw: bytes, start: int) -> float:
+    """Return the alnum ratio of *enc*'s decode of the first non-ASCII region.
+
+    F-114: the 64K ratio window is blind when a file's Cyrillic content lies
+    beyond a large ASCII preamble — cp1251 and cp866 decode the ASCII prefix
+    identically, so they tie EXACTLY and the fallback order decides.  Measuring
+    on a bounded window ANCHORED at the first non-ASCII byte brings the
+    informative bytes into the sample at the same bounded cost (at most
+    ``_MIN_VALIDATION_CHARS`` bytes per candidate).  Both encodings compared
+    here are single-byte, so the slice cannot split a character and no decode
+    error is possible.
+
+    The metric is the module's own: alnum + ``_`` per decoded character.  In
+    the correct decode those bytes are letters; in the misread a large part of
+    them are punctuation/symbol characters of the other codec's 0x80-0x9F
+    table, which lowers the ratio.
+    """
+    decoded = raw[start : start + _MIN_VALIDATION_CHARS].decode(enc)
+    return sum(1 for c in decoded if c.isalnum() or c == "_") / max(len(decoded), 1)
+
+
+def _full_decode_has_word_like_cyrillic(enc: str, raw: bytes) -> bool:
+    """Return True when *raw* decoded with *enc* carries whole-file
+    word-like Cyrillic evidence.
+
+    F-114/E-02 shared entry point: decodes the FULL byte string with *enc*
+    (the 64K ratio sample would truncate the very evidence these checks look
+    for), short-circuits on the C-speed ``_CYRILLIC_WORD_PRE_RE`` pre-gate so
+    decodes without a 3+ Cyrillic code-point run cost no Python-level scan,
+    and judges the run with ``allow_rule1=False`` — the E-02 whole-file
+    evidence class, where bytes >= 0xA0 (cp866 lowercase / Western symbols /
+    accented Latin) and 0xC0-0xFF accents are ambiguous and only the
+    0x80-0x9F uppercase class may count (see :func:`_is_genuine_word_run`).
+
+    Returns False when *enc* cannot decode *raw*.
+    """
+    try:
+        decoded = raw.decode(enc)
+    except UnicodeDecodeError:
+        return False
+    return bool(_CYRILLIC_WORD_PRE_RE.search(decoded)) and _has_word_like_cyrillic_run(
+        decoded, raw, allow_rule1=False
+    )
+
+
+def _is_latin_script_letter(char: str) -> bool:
+    """Return True when *char* is a letter of the Latin script.
+
+    ``unicodedata.name`` is the standard-library script probe: every Latin
+    letter's name starts with ``LATIN `` (e.g. ``LATIN CAPITAL LETTER O WITH
+    GRAVE``), while Cyrillic/Hebrew/Greek/Thai letters name their own script.
+    An unnamed code point cannot be a letter (the caller only passes
+    ``str.isalpha()`` characters), so the empty default is unreachable in
+    practice.
+    """
+    return unicodedata.name(char, "").startswith("LATIN ")
+
+
+def _reads_in_non_latin_script(decoded: str) -> bool:
+    """Return True when *decoded* reads as text in a non-Latin script.
+
+    M2 (FIX pass 2): the E-06 near-tie guard displaced ANY winner that was not
+    one of this module's two Cyrillic candidates, on byte-class evidence alone
+    (``_has_confirmed_cyrillic_run`` is a raw-byte detector whose 0xC0-0xFF
+    range is shared by every single-byte script).  A CORRECT foreign-codec
+    winner was therefore replaced by cp1251 — windows-1255 (Hebrew), TIS-620
+    (Thai), KOI8-R and ISO-8859-5 all decoded as cp1251 mojibake, silently.
+    The guard needs a positive script precondition before it may displace a
+    foreign label: the winner's own decode must NOT be a reading in another
+    script.
+
+    The test is script identity, not a byte class: a run of
+    ``_NON_LATIN_SCRIPT_RUN_MIN`` or more consecutive letters whose Unicode
+    names are not Latin marks the decode as text in another script.  It is
+    codec-agnostic (Cyrillic, Hebrew, Greek, Thai, CJK, ...), so no
+    hand-enumerated range table can drift out of date, and it never looks at
+    the raw bytes.
+
+    Decision direction:
+    - The winner's decode reads in another script (KOI8-R 'скважина',  # noqa: RUF003
+      windows-1255 'באר', TIS-620 'หลุม'): the winner IS a genuine
+      foreign-script reading of the bytes, so E-06 must not displace it.
+    - The winner's decode is a Latin/Latin-1 rendering of the bytes (a wrong
+      foreign label such as MacRoman over cp1251 bytes: accented Latin letters
+      plus typographic symbols, no Cyrillic):
+      the label names a codec that reads Cyrillic content as Latin, so it is
+      the wrong codec and E-06 may displace it (the caller warns).
+    - Two CYRILLIC-codec readings of the same bytes (KOI8-R vs cp1251) stay
+      indistinguishable at this layer — both give plausible Cyrillic words and
+      no byte or letter-frequency rule separates them (the module's documented
+      irreducible-class convention).  This precondition therefore keeps the
+      ratio winner for that pair, exactly as HEAD did, instead of adding a new
+      byte rule to the fix-regress cycle; the residual is recorded in the
+      E-06 comment.
+    """
+    if decoded.isascii() or not _NON_LATIN_PRE_RE.search(decoded):
+        return False
+    run = 0
+    for char in decoded:
+        if ord(char) < 0x100 or not char.isalpha() or _is_latin_script_letter(char):
+            run = 0
+            continue
+        run += 1
+        if run >= _NON_LATIN_SCRIPT_RUN_MIN:
+            return True
+    return False
 
 
 def _decode_best_quality(
@@ -1001,11 +1204,39 @@ def _decode_best_quality(
     # E-06: Near-tie Cyrillic preference.  The ratio-primary sort above is
     # load-bearing (a preference-primary sort regresses UTF-8 Cyrillic), so
     # we do not reorder candidates.  Instead, when the content is judged
-    # Cyrillic and the winning Western candidate (cp1252/latin-1) beats the
-    # best Cyrillic candidate by only the near-tie margin created by the
-    # "№" (0xB9) per-char advantage, prefer the Cyrillic candidate.  This
-    # leaves every other selection decision untouched.
-    if _is_cyrillic and best_enc in _WESTERN:
+    # Cyrillic and the winning candidate is neither a Cyrillic candidate nor
+    # a clean UTF-8 decode, prefer the best Cyrillic candidate when it is
+    # within the near-tie margin created by the "№" (0xB9) per-char
+    # advantage.  This leaves every other selection decision untouched.
+    # F-113: the gate used to read `best_enc in _WESTERN`, which made the
+    # guard unreachable for a FOREIGN detected label ('MacRoman', 'KOI8-R' —
+    # codecs canonicalisation cannot map them onto a fallback member): the
+    # content is Cyrillic, the winner is neither Cyrillic nor Western, and
+    # the file decoded as mojibake with no guard able to reverse it.  The
+    # semantic the guard needs is "the winner is not a Cyrillic candidate",
+    # with utf-8 excluded explicitly: a clean UTF-8 decode is a legitimate
+    # winner (test_utf8_cyrillic_still_detected_after_fix pins it) and
+    # widening to "not a Cyrillic candidate" alone would flip it to cp1251.
+    # M2 (FIX pass 2): the de-gate above admitted EVERY foreign label on
+    # `_is_cyrillic` alone, but that detector is a raw-BYTE class test whose
+    # 0xC0-0xFF range is shared by every single-byte script (Hebrew, Thai,
+    # Greek, KOI8-R, ISO-8859-5, MacCyrillic ...).  A CORRECT foreign-codec
+    # winner was therefore displaced to cp1251 — a silent end-to-end
+    # regression vs HEAD.  The guard now requires a positive script
+    # precondition on the winner's OWN decode: a foreign label may be
+    # displaced only when that decode is not a reading in another script
+    # (_reads_in_non_latin_script).  Two Cyrillic-codec readings of the same
+    # bytes (KOI8-R vs cp1251) remain indistinguishable at this layer and keep
+    # the ratio winner, exactly as HEAD did — the module's documented
+    # irreducible-class convention, not a new byte rule.  A displaced foreign
+    # label is never silent: the warning below names both labels.
+    _foreign_winner = best_enc not in FALLBACK_ENCODINGS
+    if (
+        _is_cyrillic
+        and best_enc not in _CYRILLIC_ENCS
+        and best_enc != "utf-8"
+        and not (_foreign_winner and _reads_in_non_latin_script(_best_sample))
+    ):
         _best_cyrillic: tuple[str, str, float] | None = None
         for _cand in candidates:
             if _cand[0] in _CYRILLIC_ENCS:
@@ -1024,9 +1255,60 @@ def _decode_best_quality(
             _ratio_window = raw_bytes[:_MIN_VALIDATION_CHARS]
             _numero_artifact = _ratio_window.count(0xB9) / max(len(_ratio_window), 1)
             if best_ratio - _cyr_ratio - _numero_artifact <= _NEAR_TIE_CYRILLIC_MARGIN * best_ratio:
+                if _foreign_winner:
+                    warnings.warn(
+                        f"Encoding detection overrode the detected label {best_enc!r} with "
+                        f"{_cyr_enc!r} for {file_path.name}: the bytes are judged Cyrillic "
+                        f"but the {best_enc!r} decode is not a reading in another "
+                        f"(non-Latin) script, so the label names the wrong codec. The file "
+                        f"is decoded as {_cyr_enc!r}; pass encoding={best_enc!r} explicitly "
+                        f"if it is the correct codec.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
                 best_enc = _cyr_enc
                 _best_sample = _cyr_sample
                 best_ratio = _cyr_ratio
+
+    # F-114: Cyrillic-vs-Cyrillic near-tie discriminator.  cp1251 and cp866
+    # both decode any byte sequence into the same number of characters, so a
+    # file whose Cyrillic content lies beyond the 64K ratio window (a large
+    # ASCII preamble — the E-07 layout) ties them EXACTLY on the ratio and the
+    # stable sort falls back to FALLBACK_ENCODINGS order, which puts cp1251
+    # first (F-ITER2-D4b-M09).  A genuine cp866 file therefore decoded as
+    # cp1251 mojibake (its Cyrillic reads as punctuation and symbol
+    # characters), silently, with chardet forced to utf-8 as the tests do.
+    # The tie is an artifact of WHERE the ratio was measured, not of the
+    # bytes: the ASCII-only preamble is identical under both codecs.  Re-
+    # measuring the same metric on a bounded window anchored at the first
+    # non-ASCII byte puts the informative bytes in the sample; in the correct
+    # decode they are letters, in the misread a large part of them are the
+    # other codec's 0x80-0x9F punctuation.  The alternative must win by a
+    # material margin (`_NEAR_TIE_CYRILLIC_MARGIN`) — a byte-ambiguous pair
+    # (cp866 lowercase vs cp1251 lowercase, the documented irreducible class)
+    # scores the same under both and keeps the current winner.
+    if _is_cyrillic and best_enc in _CYRILLIC_ENCS:
+        _alt_cyrillic: tuple[str, str, float] | None = None
+        for _cand in candidates:
+            if _cand[0] in _CYRILLIC_ENCS and _cand[0] != best_enc:
+                _alt_cyrillic = _cand
+                break
+        if (
+            _alt_cyrillic is not None
+            and best_ratio - _alt_cyrillic[2] <= _NEAR_TIE_CYRILLIC_MARGIN * best_ratio
+        ):
+            _anchor = _FIRST_NON_ASCII_BYTE_RE.search(raw_bytes)
+            if _anchor is not None:
+                _best_window_ratio = _non_ascii_window_ratio(
+                    best_enc, raw_bytes, _anchor.start()
+                )
+                _alt_window_ratio = _non_ascii_window_ratio(
+                    _alt_cyrillic[0], raw_bytes, _anchor.start()
+                )
+                if _alt_window_ratio - _best_window_ratio > _NEAR_TIE_CYRILLIC_MARGIN:
+                    best_enc = _alt_cyrillic[0]
+                    _best_sample = _alt_cyrillic[1]
+                    best_ratio = _alt_cyrillic[2]
 
     # ENC-02 (b): Western near-tie rescue — the symmetric completion of
     # E-06.  When the content is judged NON-Cyrillic and the winning
@@ -1143,14 +1425,7 @@ def _decode_best_quality(
         for _cyr_cand in candidates:
             if _cyr_cand[0] not in _CYRILLIC_ENCS:
                 continue
-            _cyr_full: str
-            try:
-                _cyr_full = raw_bytes.decode(_cyr_cand[0])
-            except UnicodeDecodeError:
-                continue
-            if _CYRILLIC_WORD_PRE_RE.search(_cyr_full) and _has_word_like_cyrillic_run(
-                _cyr_full, raw_bytes, allow_rule1=False
-            ):
+            if _full_decode_has_word_like_cyrillic(_cyr_cand[0], raw_bytes):
                 best_enc = _cyr_cand[0]
                 _best_sample = _cyr_cand[1]
                 best_ratio = _cyr_cand[2]
@@ -1161,19 +1436,37 @@ def _decode_best_quality(
     best_content = raw_bytes.decode(best_enc).lstrip("\ufeff")
 
     # UTF-8 preference: when UTF-8 decodes successfully and its word-char
-    # ratio is close to the best candidate's (within 2%), prefer UTF-8.
-    # This prevents single-byte encodings (e.g. cp1251) from "winning" by
-    # a tiny margin on valid UTF-8 files — every byte maps to a printable
-    # character in those encodings, so their word-char ratios can be
-    # marginally higher even when the content is actually UTF-8 Cyrillic.
-    # The 2% threshold is conservative: real encoding mismatches produce
-    # much larger ratio gaps (typically >10%), so this won't override a
-    # genuinely better match.
+    # ratio is close to the best candidate's, prefer UTF-8.  This prevents
+    # single-byte encodings (e.g. cp1251) from "winning" by a tiny margin on
+    # valid UTF-8 files — every byte maps to a printable character in those
+    # encodings, so their word-char ratios can be marginally higher even when
+    # the content is actually UTF-8 Cyrillic.
+    # F-116 (HIGH): the counted-alnum ratio is structurally unfair to
+    # multi-byte UTF-8 — a 3-byte typographic punctuation character counts one
+    # character and zero alnum, while the single-byte decode of the same three
+    # bytes counts three alnum characters — so a clean UTF-8 header whose
+    # prose carries em dashes/quotes loses the ratio race to cp866 at ~1% mark
+    # density.  The result was the library's own default-writer output read
+    # back as cp866 mojibake with zero warnings.  The old fixed 0.02 margin
+    # was exceeded by that bias at ~3 marks in a 450-byte header, and no fixed
+    # margin can hold because the bias grows with the multi-byte density.
+    # When the UTF-8 sample contains at least one multi-byte sequence (any
+    # non-ASCII character implies one), a displacing single-byte candidate
+    # must therefore beat UTF-8 by the material margin
+    # (_DETECTED_ENCODING_MARGIN) PLUS the bounded structural bias
+    # (_multibyte_byte_share).  A pure-ASCII sample keeps the historical 0.02
+    # margin: there the two decodes are character-identical, no bias exists,
+    # and the documented all-ASCII tie trade is untouched.
     if best_enc != "utf-8":
         for enc_candidate in candidates:
             if enc_candidate[0] == "utf-8":
                 utf8_ratio = enc_candidate[2]
-                if best_ratio - utf8_ratio < 0.02:
+                _utf8_margin = 0.02
+                if not enc_candidate[1].isascii():
+                    _utf8_margin = _DETECTED_ENCODING_MARGIN + _multibyte_byte_share(
+                        enc_candidate[1]
+                    )
+                if best_ratio - utf8_ratio < _utf8_margin:
                     best_enc = enc_candidate[0]
                     best_content = raw_bytes.decode(best_enc).lstrip("\ufeff")
                     best_ratio = utf8_ratio
@@ -1255,7 +1548,34 @@ def read_with_encoding(
     if raw_bytes.startswith(b"\xef\xbb\xbf"):
         raw_bytes = raw_bytes[3:]
 
-    # Strip UTF-16/32 BOM prefixes and decode immediately — these BOMs
+    # F-118: the explicit override is honoured BEFORE the UTF-16/32 BOM
+    # branch.  The BOM branch used to return first, so `encoding=` was
+    # silently ignored for UTF-16/32 BOM files while it was honoured for
+    # UTF-8 BOM files — contradicting the documented contract ("Explicit
+    # encoding override. If None, auto-detected", reader.py:56/:118,
+    # dev_reader.py:2214/:2267) and making the README recovery recipe
+    # (`except LASEncodingError: ... encoding="latin-1"`) unusable for exactly
+    # the files that raise: a BOM-prefixed non-UTF-16 payload (a
+    # false-positive BOM) raised under utf-16-le with no way to override.
+    # Applying the override to the bytes as-is also keeps an explicit
+    # 'utf-16'/'utf-32' override endianness-correct: the generic codecs need
+    # the BOM to pick the endianness (stripping it here would decode BE files
+    # on LE hosts to garbage).
+    if encoding is not None:
+        try:
+            content = raw_bytes.decode(encoding)
+        except (UnicodeDecodeError, LookupError) as e:
+            # F-94: Invalid encoding names (e.g. "nonexistent-enc")
+            # raise LookupError from Python's codecs machinery, which
+            # previously bypassed the pylasdev exception hierarchy.
+            # Wrap in LASEncodingError for consistent error reporting.
+            raise LASEncodingError(
+                f"Failed to decode {file_path} with encoding '{encoding}': {e}"
+            ) from e
+        content = content.lstrip("\ufeff")
+        return encoding, content
+
+    # Detect UTF-16/32 BOM prefixes and decode immediately — these BOMs
     # definitively identify the encoding.  Without this, UTF-16/32 files
     # decode as garbage through single-byte fallbacks when chardet is
     # unavailable.  Checking 4-byte prefixes first avoids false matches
@@ -1285,20 +1605,6 @@ def read_with_encoding(
             raise LASEncodingError(
                 f"Failed to decode {file_path} with encoding '{_bom_enc}': {e}"
             ) from e
-
-    if encoding is not None:
-        try:
-            content = raw_bytes.decode(encoding)
-        except (UnicodeDecodeError, LookupError) as e:
-            # F-94: Invalid encoding names (e.g. "nonexistent-enc")
-            # raise LookupError from Python's codecs machinery, which
-            # previously bypassed the pylasdev exception hierarchy.
-            # Wrap in LASEncodingError for consistent error reporting.
-            raise LASEncodingError(
-                f"Failed to decode {file_path} with encoding '{encoding}': {e}"
-            ) from e
-        content = content.lstrip("\ufeff")
-        return encoding, content
 
     # Try auto-detection from the already-read bytes
     detected = _detect_encoding_from_bytes(raw_bytes[:50_000])

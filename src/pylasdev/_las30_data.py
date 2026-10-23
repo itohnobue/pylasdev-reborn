@@ -11,6 +11,7 @@ All state that was previously on ``self`` is passed through an
 
 from __future__ import annotations
 
+import csv
 import re
 import warnings
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from .data_reader import (
     _get_null_value,
     _parse_float_with_d_notation,
     _resolve_max_tokens_per_line,
+    _suffixed_curve_name,
     _to_finite_float,
     _to_integer_value,
 )
@@ -88,7 +90,11 @@ def _deduplicate_curves(
     its own copy; the algorithmic core is identical across all three.
 
     When curve mnemonics collide (duplicates within the same section),
-    suffixes ``_2``, ``_3``, etc. are appended.  ``original_mnemonic``
+    suffixes ``_2``, ``_3``, etc. are appended to the mnemonic STEM —
+    ``NMR[1]`` becomes ``NMR_2[1]``, never ``NMR[1]_2``, which the
+    ``CurveDefinition`` mnemonic grammar rejects (F-075/F-077; the LAS
+    1.2/2.0 twin builds its names with the same
+    ``data_reader._suffixed_curve_name``).  ``original_mnemonic``
     is preserved on the renamed copy so writers can reconstruct the
     original name.
 
@@ -113,10 +119,10 @@ def _deduplicate_curves(
         if name in seen:
             seen[name] += 1
             suffix = seen[name]
-            new_name = f"{name}_{suffix}"
+            new_name = _suffixed_curve_name(name, suffix)
             while new_name in output_names:
                 suffix += 1
-                new_name = f"{name}_{suffix}"
+                new_name = _suffixed_curve_name(name, suffix)
             seen[name] = suffix
             section_curves[i] = CurveDefinition(
                 mnemonic=new_name,
@@ -137,10 +143,10 @@ def _deduplicate_curves(
                 ctx.las_file.curves_order[global_idx] = new_name
         elif name in output_names:
             suffix = 2
-            new_name = f"{name}_{suffix}"
+            new_name = _suffixed_curve_name(name, suffix)
             while new_name in output_names:
                 suffix += 1
-                new_name = f"{name}_{suffix}"
+                new_name = _suffixed_curve_name(name, suffix)
             seen[name] = suffix
             section_curves[i] = CurveDefinition(
                 mnemonic=new_name,
@@ -191,6 +197,13 @@ _NULL_LOGS_OWNER_ATTR = "_pylasdev_logs_owner"
 # malformed/crafted — reject like the other MAX_* guards.
 _MAX_FILL_CELLS = _data_reader.MAX_TOTAL_ELEMENTS // 12
 _MAX_STRING_VALUES = _data_reader.MAX_TOTAL_ELEMENTS // 12
+
+# F-129 (reader half): how many data rows the ``{D}``-format channel
+# fingerprint looks at.  A Fortran-D numeric column proves itself numeric on
+# its FIRST value; a date column never does.  The bound keeps the probe O(1)
+# per section regardless of the file size (it is a classification hint, not a
+# full validation pass).
+_D_FORMAT_PROBE_ROWS = 50
 
 
 def _reconcile_null_sentinels(las_file: LASFile) -> None:
@@ -297,6 +310,7 @@ def _detect_actual_wrap_las30(
         True when the data is genuinely wrapped.
     """
     window: list[int] = []
+    _degraded: list[bool] = []  # M10: per-line recombination-degraded flags
     for line in data_lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -305,10 +319,24 @@ def _detect_actual_wrap_las30(
         # pattern inside process_ascii_data: _data_section_reader imports
         # data_reader at module level, so a top-level import here would
         # create a cycle through data_reader.
-        from ._data_section_reader import _split_data_line
+        from ._data_section_reader import _split_data_line_traced
 
-        values = _split_data_line(stripped, delimiter)
+        # F-074: pass ``expected=n_curves`` so the wrap gate sees the SAME
+        # column layout the fill loop sees (thousands-grouped COMMA rows are
+        # 2N raw tokens but N columns).  Without it a valid WRAP=NO file
+        # whose first-row values are comma-grouped counts 2N tokens, the R-1
+        # flowing rule fires (2N is a multiple of N and > N) and the LAS 3.0
+        # reader rejects the file as a wrapped layout.  warn=False: this is a
+        # speculative 4-line window scan — the fill loop re-splits the same
+        # lines and emits the recombination diagnostic there.
+        # M10: the traced splitter also reports whether recombination merged
+        # fragments on this row, so a shrunken (degraded) count is not read
+        # as a depth line by the shared detector.
+        values, _recombined = _split_data_line_traced(
+            stripped, delimiter, expected=n_curves, warn=False
+        )
         window.append(len(values))
+        _degraded.append(_recombined)
         if len(window) >= 4:
             break
 
@@ -322,6 +350,7 @@ def _detect_actual_wrap_las30(
         n_curves,
         declared_wrap,
         empty_window_default=False,
+        recombination_degraded=_degraded,
     )
 
 
@@ -346,7 +375,26 @@ def _detect_actual_wrap_las30(
 # synthesis regex must accept the same form or time_offset is silently
 # lost and the marker stays in the description (doubled '{A:0 }  {A}'
 # artifact on write).
-_SPEC_FORM_ARRAY_RE = re.compile(r"\{A:(?P<offset>[-\d.]*)\s{0,64}\}")
+# F-007: the CWLS 3.0 NORMATIVE array-element grammar is
+# ``{A[<format>];<spacing><unit>}`` — ``{A;0ms}``, ``{AF;0ms}``,
+# ``{AF10.4;5ms}`` (Release 3.00 pp.11/27).  The COLON form ``{A:<offset>}``
+# exists only in the CWLS-distributed example file, and it is what
+# pylasdev's own writer emits (_writer_base.py:466-499), so BOTH forms
+# must be accepted.  Accepted set (unit U3, shared with the parser's
+# _FORMAT_SPEC_RE):
+#   {A[:<offset>]}                     colon form, offset [-\d.]*
+#   {A;<spacing>[unit]}                normative form, spacing [-\d.]+,
+#                                      unit optional letters
+#   {AF<digits>[.<digits>]<sep>...}    same two forms with an F format body
+# Trailing whitespace before '}' is tolerated (F-11).
+# Plain markers ({A}, {A } with no colon/semicolon) and non-numeric
+# semicolon groups ({A;X}, a string-format suffix group) intentionally do
+# NOT match: they carry no spacing and are not array elements.
+_SPEC_FORM_ARRAY_RE = re.compile(
+    r"\{A(?:F\d*(?:\.\d+)?)?"
+    r"(?::(?P<offset>[-\d.]*)|;(?P<spacing>[-\d.]+)[A-Za-z]*)"
+    r"\s{0,64}\}"
+)
 
 
 def _spec_form_group_data_is_numeric(
@@ -385,6 +433,25 @@ def _spec_form_group_data_is_numeric(
 
     Returns:
         True only when the group is unambiguously numeric.
+
+    .. note::
+
+       F-008: :func:`_build_spec_form_array_info` no longer calls this
+       function per group — doing so re-scanned every data line once per
+       group (G x R x C token work).  The reader computes the same
+       per-column evidence in ONE pass and asks ``_group_is_numeric``.
+       This function is kept as the reference predicate (direct callers
+       and the pinned tests import it).  It is NOT a semantic oracle for
+       that single-pass derivation: the pass splits each line with
+       ``expected=len(section_curves)``, so it sees the columns the fill
+       loop will actually parse, while this predicate sees the raw
+       fragments (a thousands-grouped COMMA row reads as
+       ``['1', '234.5']`` here and as ``['1234.5']`` there).  An EMPTY
+       ``data_lines`` list answers False here but True in the single pass,
+       which has no line to contradict it — unreachable in production,
+       because :func:`process_ascii_data` returns before
+       ``_build_spec_form_array_info`` when the section has no data lines.
+       Token-level empty/short-row/NaN handling IS identical.
     """
     if not data_lines or delimiter is None:
         return False
@@ -482,6 +549,67 @@ def _build_spec_form_array_info(
 
     result = list(section_curves)
 
+    # F-008: compute the numeric evidence ONCE per section as a per-column
+    # flag, instead of once per group over every data line.  The old shape
+    # called _spec_form_group_data_is_numeric() inside the group loop, and
+    # each call re-split EVERY data line while reading only that group's
+    # columns — G x R x C token work against the fill loop's R x C, i.e. an
+    # amplification of G on a public read API (measured 71 s vs 3.3 s on an
+    # 8.1 MB file that passes every MAX_* guard).
+    #
+    # Only candidate columns are watched (2+ member groups, and
+    # single-element groups carrying an {A:N}/{A;N} marker), so the pass
+    # costs R x |watched| <= R x C — the fill loop's own order.
+    #
+    # The PREDICATE is unchanged (this is a cost fix, not a semantics fix):
+    #   - empty/missing tokens are null-compatible, not string evidence;
+    #   - NaN/Inf tokens are numeric evidence (float() accepts them, and the
+    #     fill loop null-fills them) — M-06;
+    #   - any genuine parse failure makes that COLUMN string evidence.
+    # A marker-bearing duplicate group holding string data still must NOT be
+    # synthesized (tests/test_coverage_gaps.py:431 pins it).
+    #
+    # The split now passes ``expected=len(section_curves)`` so the probe sees
+    # the SAME column layout the fill loop sees (thousands recombination
+    # included, warning suppressed — the fill loop re-splits the same lines
+    # and emits the diagnostic there).
+    _numeric_ok: list[bool] | None = None
+    _candidate_groups = [
+        _indices
+        for _base, _indices in groups
+        if len(_indices) >= 2 or _SPEC_FORM_ARRAY_RE.search(result[_indices[0]].description or "")
+    ]
+    _watched_cols = sorted({_col for _indices in _candidate_groups for _col in _indices})
+    if data_lines is not None and delimiter is not None and _watched_cols:
+        _numeric_ok = [True] * len(section_curves)
+        _expected_cols = len(section_curves)
+        for _line in data_lines:
+            _stripped = _line.strip()
+            if not _stripped or _stripped.startswith("#"):
+                continue
+            if not any(_numeric_ok[_col] for _col in _watched_cols):
+                break  # every candidate group already proven string
+            _values = _split_data_line(_stripped, delimiter, expected=_expected_cols, warn=False)
+            for _col in _watched_cols:
+                if not _numeric_ok[_col]:
+                    continue
+                if _col >= len(_values):
+                    # Short row — the cell is null-filled downstream (null for
+                    # numeric curves), which is not string evidence.
+                    continue
+                _token = _values[_col]
+                if not _token:
+                    # Empty token — null-compatible, not string evidence.
+                    continue
+                try:
+                    _parse_float_with_d_notation(_token)
+                except (ValueError, OverflowError):
+                    _numeric_ok[_col] = False
+
+    def _group_is_numeric(indices: list[int]) -> bool:
+        """Group numeric verdict from the single-pass per-column evidence."""
+        return _numeric_ok is not None and all(_numeric_ok[_col] for _col in indices)
+
     def _synthesize_members(indices: list[int]) -> None:
         """Rewrite the group members at *indices* as array elements.
 
@@ -496,11 +624,17 @@ def _build_spec_form_array_info(
             offset: float | None = None
             description = curve.description or ""
             match = _SPEC_FORM_ARRAY_RE.search(description)
-            if match and match.group("offset"):
-                try:
-                    offset = float(match.group("offset"))
-                except ValueError:
-                    offset = None
+            if match:
+                # F-007: the colon form carries the offset, the normative
+                # semicolon form carries the spacing — same quantity
+                # (ArrayElementInfo.time_offset).  Exactly one group can be
+                # populated for a given match.
+                _offset_text = match.group("offset") or match.group("spacing")
+                if _offset_text:
+                    try:
+                        offset = float(_offset_text)
+                    except ValueError:
+                        offset = None
             # L30-01: When the {A:N} marker survived in the description
             # (the parser-side coordination change preserves it for LAS 3.0
             # A-format spec-form curves), strip it here so the WRITER
@@ -544,7 +678,7 @@ def _build_spec_form_array_info(
             member = result[indices[0]]
             if not _SPEC_FORM_ARRAY_RE.search(member.description or ""):
                 continue
-            if not _spec_form_group_data_is_numeric(data_lines, delimiter, indices):
+            if not _group_is_numeric(indices):
                 continue
             _synthesize_members(indices)
             continue
@@ -553,7 +687,7 @@ def _build_spec_form_array_info(
         # stripped by parser); numeric data confirms the array channel,
         # non-numeric data means duplicate STRING curves whose values must
         # be preserved (pre-fix behavior).
-        if not _spec_form_group_data_is_numeric(data_lines, delimiter, indices):
+        if not _group_is_numeric(indices):
             continue
         # M-16: offset-bearing '{A:N}' markers ARE observable (L30-01
         # preserves them) — their presence confirms the spec-form channel
@@ -578,6 +712,173 @@ def _build_spec_form_array_info(
             )
         _synthesize_members(indices)
     return result
+
+
+def _split_quoted_data_line(
+    stripped: str, delimiter: str, max_tokens: int
+) -> list[str] | None:
+    """Split a LAS 3.0 data line that carries CWLS double-quoted items (F-011).
+
+    CWLS 3.0 (data records): an item that CONTAINS the delimiting character
+    "must be entirely surrounded by a single pair of quotes".  The plain
+    delimiter split cannot see that, so ``100,"WELL, A",50`` truncated the
+    string at the comma, took ``A`` as the next column and discarded the
+    rest as extra columns — every following column shifted.
+
+    Quoting is spec'd for every delimiter (comma, tab and space), so this
+    helper is delimiter-agnostic.  ``skipinitialspace`` is enabled only for
+    the space delimiter, where a single space separates items; for
+    comma/tab it stays off so token-edge whitespace is preserved exactly as
+    the plain split preserves it (IT3-F1).
+
+    Returns None when the line is not safely quotable — unbalanced quotes
+    (an odd count, i.e. a stray quote character inside a value) or a csv
+    parse failure.  The caller then falls back to the plain delimiter
+    split, i.e. the pre-fix behaviour, so a quote character in an unquoted
+    row cannot change how that row is read.
+    """
+    if '"' not in stripped or stripped.count('"') % 2:
+        return None
+    try:
+        values = next(
+            csv.reader([stripped], delimiter=delimiter, skipinitialspace=delimiter == " ")
+        )
+    except (csv.Error, StopIteration):
+        return None
+    if not values:
+        return None
+    if len(values) > max_tokens:
+        # Bounded allocation, mirroring _split_data_line's maxsplit: overflow
+        # folds into the last token instead of growing the row unboundedly.
+        values = [*values[: max_tokens - 1], delimiter.join(values[max_tokens - 1 :])]
+    while values and values[-1] == "":
+        values.pop()
+    return values
+
+
+def _split_plain_las30_row(
+    line: str,
+    delimiter: str,
+    max_tokens: int,
+    num_curves: int,
+    warn: bool = True,
+) -> list[str]:
+    """Plain (non-CSV) split policy for ONE LAS 3.0 data row.
+
+    SPACE keeps ``str.split``; every other delimiter routes through the
+    shared DLM-aware splitter so thousands-grouped fragments recombine
+    ("1,234.5" → "1234.5") with a loud warning instead of shifting every
+    later column (M-05/M-30).  *warn* is forwarded to that splitter.
+    """
+    if delimiter == " ":
+        return line.split(maxsplit=max_tokens)
+    return _split_data_line(line.strip(), delimiter, expected=num_curves, warn=warn)
+
+
+def _split_las30_row(
+    line: str,
+    delimiter: str,
+    max_tokens: int,
+    num_curves: int,
+    has_string_curve: bool,
+) -> list[str]:
+    """Split ONE LAS 3.0 data row into its items (the loop's split policy).
+
+    ONE place for the row-splitting rules, shared by the read loop and the
+    ``{D}``-format data probe (F-129): drifting twins of this logic are the
+    repo's dominant defect class, so the probe must not carry its own copy.
+
+    F-011: a line carrying a spec-conforming double-quoted item is split by
+    ``csv`` only when ALL of these hold — the section declares a string
+    curve (a numeric-only section has no item that may legally contain the
+    delimiter), the line contains a quote, and the plain split of that line
+    OVER-COUNTS the declared columns, i.e. quoting is genuinely needed to
+    keep the row intact (``100,"WELL, A",50`` is 4 plain tokens for 3
+    curves).  Otherwise the plain split is kept: the writer emits raw
+    ``delimiter.join()`` with no CSV quoting, so parsing every even-quote
+    row through ``csv`` silently stripped quote characters the library
+    itself wrote (M1: ``"WELL"`` → ``WELL``, ``""`` → empty).  Stated
+    trade: an external item quoted WITHOUT an embedded delimiter keeps its
+    quote characters (the pre-F-011 reading) instead of having them
+    stripped — the safe direction for the writer's own roundtrip.
+    """
+    if has_string_curve and '"' in line:
+        # Counting probe only — recombination diagnostics are emitted by the
+        # real split below, never twice.
+        _plain_values = _split_plain_las30_row(line, delimiter, max_tokens, num_curves, warn=False)
+        if len(_plain_values) > num_curves:
+            _quoted_values = _split_quoted_data_line(line.strip(), delimiter, max_tokens)
+            if _quoted_values is not None:
+                return _quoted_values
+    return _split_plain_las30_row(line, delimiter, max_tokens, num_curves)
+
+
+def _detect_d_format_date_columns(
+    lines: list[str],
+    section_curves: list[CurveDefinition],
+    delimiter: str,
+    max_tokens: int,
+) -> dict[int, str]:
+    """Return ``{column index: first offending value}`` for ``{D}`` date columns.
+
+    F-129 (reader half).  ``D`` is ambiguous in LAS 3.0: the CWLS 3.0
+    "Data Formats" chapter defines no ``D`` code (dates are letter patterns
+    such as ``{DD/MM/YYYY}``), the standard's OWN appendix uses ``{D}`` for a
+    DATE channel ("C_DT … {D}", R-03 F-7), and the Fortran
+    double-precision reading (``1.234D+05``) is legitimate for a numeric
+    channel.  The models/parser grammar therefore keeps ``D`` in the
+    accepted set, and the token alone cannot decide the channel type.
+
+    The DATA decides it: a Fortran-D column's values parse as numbers, a
+    date column's do not.  This bounded probe (up to
+    ``_D_FORMAT_PROBE_ROWS`` data rows) reports a column as a date column
+    when it produced at least one non-empty value and NOT ONE value parsed
+    as a number.  A column with no usable evidence stays numeric, i.e. the
+    pre-fix behaviour.
+
+    Returns an empty mapping when the section declares no ``{D}`` curve.
+    """
+    candidates = [
+        i for i, c in enumerate(section_curves) if (c.data_format or "").upper() == "D"
+    ]
+    if not candidates:
+        return {}
+    # Lazy import (same reason as process_ascii_data): parser.py imports this
+    # module, so the patterns are fetched at call time to avoid the cycle.
+    from .parser import COMMENT_PATTERN, EMPTY_PATTERN
+
+    pending: set[int] = set(candidates)
+    numeric: set[int] = set()
+    evidence: dict[int, str] = {}
+    scanned = 0
+    for line in lines:
+        if scanned >= _D_FORMAT_PROBE_ROWS:
+            break
+        if COMMENT_PATTERN.match(line) or EMPTY_PATTERN.match(line):
+            continue
+        scanned += 1
+        # Quotes are honoured whenever present: a quoted item is a single
+        # column even for the probe (F-011 split policy, shared helper).
+        values = _split_las30_row(
+            line, delimiter, max_tokens, len(section_curves), '"' in line
+        )
+        for idx in list(pending):
+            if idx >= len(values):
+                continue
+            token = values[idx].strip()
+            if not token:
+                continue
+            try:
+                _parse_float_with_d_notation(token)
+            except (ValueError, OverflowError):
+                evidence.setdefault(idx, token)
+            else:
+                numeric.add(idx)
+                pending.discard(idx)
+        pending -= numeric
+        if not pending:
+            break
+    return {idx: sample for idx, sample in evidence.items() if idx not in numeric}
 
 
 def process_ascii_data(ctx: AsciiDataContext) -> None:
@@ -818,6 +1119,47 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
         for i, c in enumerate(section_curves)
     }
 
+    # F-129 (reader half): a `{D}` channel declared as a DATE column.
+    # CWLS LAS 3.0 defines no `D` data-format code (its "Data Formats"
+    # chapter lists F/I/S/E plus the date/time letter patterns and the DMS
+    # symbol form), yet the standard's own appendix writes `{D}` for a DATE
+    # channel ("C_DT … {D}", R-03 F-7), and the models layer keeps `D` in
+    # `_VALID_DATA_FORMATS` because the Fortran double-precision reading is
+    # legitimate.  The token alone therefore cannot classify the channel; the
+    # DATA can — a Fortran-D column parses as a number ("1.234D+05"), a date
+    # column does not.  Without this the whole date column failed float()
+    # and became the null sentinel (probed: `C_DT = [-999.25, -999.25]`).
+    # The routed column carries `data_format="S"`, the representation the
+    # models/parser grammar uses for every non-numeric date channel
+    # (`_normalize_curve_data_format`), which also keeps
+    # `_check_df_vs_placement` / `LASFile.__post_init__` consistent.
+    _d_date_columns = _detect_d_format_date_columns(
+        ctx.ascii_data_lines, section_curves, delimiter, _max_tokens
+    )
+    for _i, _sample in sorted(_d_date_columns.items()):
+        string_curves[_i] = True
+        _curve = section_curves[_i]
+        _curve.data_format = "S"
+        # Propagate to the GLOBAL curve definition (the F2-07 writeback below
+        # copies mnemonic/description/array_info, not data_format; for a
+        # dedup-renamed curve the section entry is a COPY, so the global
+        # definition would otherwise keep `D` and the format-vs-placement
+        # check would reject the string column on to_dict → from_dict).
+        _gidx = ctx.section_curve_start_idx + _i
+        if _gidx < len(ctx.las_file.curves):
+            ctx.las_file.curves[_gidx].data_format = "S"
+        warnings.warn(
+            f"Data section '{ctx.current_section_name or 'ASCII'}': curve "
+            f"'{_curve.mnemonic}' declares the undefined '{{D}}' format and its "
+            f"values are not numbers (first: {_sample!r}) — reading the column "
+            f"as STRING data.  CWLS LAS 3.0 defines no 'D' code (dates are "
+            f"letter patterns such as {{DD/MM/YYYY}}) while the standard's own "
+            f"appendix uses '{{D}}' for a date channel; a Fortran "
+            f"double-precision column would parse as a number.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     # L-03: Detect {I} integer-format curves.  Stored as int64 (when the
     # null sentinel is integral) and parsed via int() so values above 2^53
     # are not silently rounded by float().
@@ -1036,6 +1378,11 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
     # distinguish an embedded delimiter from a column separator.  Mirrors the
     # LAS 1.2/2.0 twin (I2-02) fix so both paths emit the same loud warning.
     embedded_delim_count = 0  # I2-02 twin: delimiter-in-string truncation
+    # F-012/F-013: Row-count accumulator for a BLANK first (index) item.
+    # CWLS 3.0: when the first channel of a column-data line is the indexed
+    # channel, that first item cannot be blank or null.  A blank item was
+    # read as the null value with zero diagnostics.
+    blank_index_count = 0
     _fc = [0]  # F-002: Mutable counter for float conversion diagnostics
     # F-39, F-40, I2-F-03: Desanitize reversal warning dedup flags.
     _desan_warned_ws = False  # whitespace→underscore (F-39)
@@ -1074,6 +1421,11 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
             )
         _string_value_count += 1
 
+    # F-011: quoting is only meaningful when the section declares a string
+    # curve — a numeric-only section has no item that may legally contain the
+    # delimiter — so hoist the test out of the per-line loop.
+    _has_string_curve = any(string_curves.get(i, False) for i in range(num_curves))
+
     for line in ctx.ascii_data_lines:
         # Skip comment lines and blank/whitespace-only lines.
         # F-32: EMPTY_PATTERN was defined at module level but never
@@ -1088,28 +1440,12 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
         # first token and column shift.  SPACE mode is unaffected
         # (str.split(None) strips implicitly).  Consistent with
         # data_reader.py which strips before all delimiter splits.
-        # F2-015: Use csv.reader for TAB/COMMA delimiters so values
-        # containing the delimiter inside double-quotes are NOT
-        # incorrectly split (e.g., "Run 1, Tool A" stays as one token
-        # with COMMA delimiter).  csv.QUOTE_MINIMAL handles CSV-style
-        # quoting: fields are quoted only when they contain the
-        # delimiter, quotechar, or line terminator.
-        if delimiter == " ":
-            values = line.split(maxsplit=_max_tokens)
-        else:
-            # M-05/M-30 parity (LAS 3.0): route the non-space split through
-            # the shared DLM-aware splitter so the comma branch ALSO
-            # recombines thousands-separated fragments ("1,234.5" →
-            # "1234.5") with a loud warning instead of silently
-            # mis-assigning every subsequent column (mirrors
-            # data_reader.py:1021/1484 — the LAS 1.2/2.0 paths already use
-            # _split_data_line).  F-I2-M01: strip the line first — leading
-            # whitespace would produce an empty first token and column
-            # shift; the shared splitter expects a stripped line.  F2-015:
-            # csv.reader quoting is deliberately not used (the writer emits
-            # raw delimiter.join()); str.split keeps the writer's own
-            # roundtrips byte-identical.
-            values = _split_data_line(line.strip(), delimiter, expected=num_curves)
+        # F2-015/F-011/M-05: the split policy itself (quoting, thousands
+        # recombination, delimiter branches) lives in _split_las30_row, shared
+        # with the {D}-format data probe (F-129) so the two cannot drift.
+        values = _split_las30_row(
+            line, delimiter, _max_tokens, num_curves, _has_string_curve
+        )
 
         # Warn about extra columns being silently discarded
         if len(values) > num_curves:
@@ -1120,12 +1456,12 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
             # values are lost as "extra columns" (verified: `100.0,WELL A,
             # B,10.0` with DEPT/WELLS{S}/GR → WELLS truncated to 'WELL A',
             # GR receives ' B' → conversion failure → -999.25, genuine 10.0
-            # discarded).  csv.reader quote-awareness is deliberately NOT
-            # used (F2-015: the writer emits raw delimiter.join() with no
-            # CSV quotes, so adding quote parsing would break the writer's
-            # own roundtrips) — the correct response for external files is
-            # a LOUD warning naming the delimiter-in-string mechanism, not
-            # a silent shift.  Mirrors the LAS 1.2/2.0 I2-02 fix.
+            # discarded).  F-011 handles the SPEC-CONFORMING case (the item
+            # is quoted); this warning is the remaining case — an unquoted
+            # value holding the delimiter — where the split genuinely cannot
+            # tell an embedded delimiter from a column separator, so the
+            # correct response is a LOUD warning naming the mechanism rather
+            # than a silent shift.  Mirrors the LAS 1.2/2.0 I2-02 fix.
             if delimiter != " " and any(string_curves.get(i, False) for i in range(num_curves)):
                 if embedded_delim_count == 0:
                     warnings.warn(
@@ -1172,6 +1508,20 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
                 if track_fill:
                     _check_fill_cell_cap()
                     fill_cells.append((idx, _pad_idx))
+
+        # F-012/F-013: CWLS 3.0 index-channel rule — when the first channel
+        # of a column-data line is the indexed channel, that first data item
+        # cannot be blank or null.  A blank first token was converted to the
+        # null value by _to_finite_float("") without incrementing the failure
+        # counter and without any diagnostic, so a corrupt/truncated row
+        # silently produced a null index.  Counted per section and warned
+        # once below.
+        # Scope: only a NUMERIC first channel.  A {S} first curve may hold a
+        # legitimately empty string (existing pinned behaviour), and the
+        # library's own writer emits the NULL sentinel — not a blank — for a
+        # padded index cell, so the sentinel form is not counted here.
+        if not string_curves.get(0, False) and not values[0].strip():
+            blank_index_count += 1
 
         for i in range(num_curves):
             # IT3-F1: Do NOT strip per-token whitespace.  The LAS 1.2/2.0
@@ -1333,6 +1683,20 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
             stacklevel=2,
         )
 
+    # F-012/F-013: Report the CWLS 3.0 index-channel violation once per
+    # section (the per-row detail is the count itself; the fill already
+    # stored the null value, so there is nothing to reconcile here).
+    if blank_index_count > 0:
+        warnings.warn(
+            f"Data section '{ctx.current_section_name or 'ASCII'}': "
+            f"{blank_index_count} row(s) had a blank first (index) value.  "
+            f"LAS 3.0 requires the first item of an indexed column-data line "
+            f"to be a value; the blank item was read as the null value "
+            f"({null_value}).  The file may be truncated or corrupt.",
+            UserWarning,
+            stacklevel=2,
+        )
+
     # F-002: Emit diagnostic warning when float conversions fail in
     # the LAS 3.0 data path — data processing is correct (values fall
     # back to null_value), but users should know about unparseable data.
@@ -1359,13 +1723,30 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
     # section populates the view (matching the single-population
     # semantics of the previous order-based gate).
     is_log_data = ctx.current_data_section_type == "LOG_DATA"
-    if is_log_data and not ctx.las_file.logs:
+    # F-014: ONE ownership decision for BOTH top-level views.  The two
+    # independent emptiness gates (``not logs`` here, ``not string_data``
+    # below) let a numeric-only first LOG_DATA section populate ``logs``
+    # while a LATER section populated ``string_data``: the two views then
+    # described different sections with different row counts, so the
+    # library's own write→read output failed validate() and
+    # ``LASFile.from_dict(las.to_dict())`` raised LASDataError.
+    # The latch is the owner marker already used by
+    # _reconcile_null_sentinels, so "the first LOG_DATA section owns both
+    # views" needs no new state: it fires on that section whether or not it
+    # carries string curves, and both copies below read the same section.
+    # This subsumes the former ``not logs`` / ``not string_data`` clauses —
+    # nothing else populates these views on the LAS 3.0 read path.
+    _views_owned = any(
+        getattr(_section, _NULL_LOGS_OWNER_ATTR, False) for _section in ctx.las_file.data_sections
+    )
+    _owns_views = is_log_data and not _views_owned
+    if _owns_views:
         for curve in section_curves:
             if curve.mnemonic in data_section.data:
                 ctx.las_file.logs[curve.mnemonic] = data_section.data[curve.mnemonic].copy()
         # M-04: Record which section's arrays were copied into the
         # top-level logs view so _reconcile_null_sentinels only writes
-        # fill cells back into the SAME section's logs arrays (the gate
+        # fill cells back into the SAME section's logs arrays (the latch
         # above ensures this is the first LOG_DATA section).
         setattr(data_section, _NULL_LOGS_OWNER_ATTR, True)
 
@@ -1381,7 +1762,8 @@ def process_ascii_data(ctx: AsciiDataContext) -> None:
     # previous gate inside the loop stopped after the FIRST string curve
     # (``not ctx.las_file.string_data`` becomes False once any key exists),
     # silently dropping every later string curve from the top-level view.
-    if is_log_data and not ctx.las_file.string_data:
+    # F-014: keyed on the SAME ``_owns_views`` decision as the numeric copy.
+    if _owns_views:
         for i, curve in enumerate(section_curves):
             if i in string_data_lists:
                 # F2-014: Defensive copy — prevents shared-reference

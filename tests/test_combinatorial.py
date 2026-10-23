@@ -35,10 +35,17 @@ def _make_version_dict(vers: str, wrap: str, dlm: str) -> dict[str, str]:
 def _make_well_dict(vers: str, numeric_only: bool = True) -> dict[str, str]:
     """Build a well section dict appropriate for the given LAS version.
 
-    M-11: LAS 1.2/2.0 mandate the lascheck 10-field set for ~W:
-    STRT, STOP, STEP, NULL, COMP, WELL, FLD, LOC, SRVC, DATE.
-    UWI is optional (present but not required).  LAS 3.0 uses the
-    same minimum set.
+    The shipped rule is ``_version_spec.mandatory_well_field_groups``
+    (_version_spec.py:84-139): LAS 2.0 requires TWELVE slots —
+    STRT, STOP, STEP, NULL, COMP, WELL, FLD, LOC,
+    ``PROV|CNTY|STAT|CTRY``, SRVC, DATE, ``UWI|API`` — while LAS 1.2 and
+    LAS 3.0 require only the four numeric depth-control fields.
+
+    The earlier note here ("UWI is optional ... present but not required")
+    was the M-11 flat-tuple reading and is FALSE for LAS 2.0 under the
+    shipped group rule: a 2.0 file carrying neither UWI nor API draws the
+    ``UWI or API`` slot warning.  The extra fields below therefore include
+    one PROV-family spelling and a UWI value.
     """
     well: dict[str, str] = {
         "STRT": "100.0",
@@ -53,8 +60,10 @@ def _make_well_dict(vers: str, numeric_only: bool = True) -> dict[str, str]:
                 "WELL": "TEST-WELL-01",
                 "FLD": "TEST FIELD",
                 "LOC": "12-34-56-78W5",
+                "PROV": "TEST PROVINCE",
                 "SRVC": "TEST SRVC",
                 "DATE": "01/01/2020",
+                "UWI": "12-34-56-78W5-00",
             }
         )
     return well
@@ -1025,8 +1034,17 @@ class TestCombinatorialRoundtrip:
             f"VERS changed: {orig_vers} -> {rt_vers} in {spec['id']}"
         )
 
-        # WRAP assertion: only check if the writer didn't override
-        if not expect_wrap_override:
+        # WRAP assertion: the writer emits the unwrapped form and rewrites the
+        # header, so a case that declares WRAP=YES must come back as NO
+        # (HARDEN — the register's F-06 row: the old `if not
+        # expect_wrap_override` branch asserted NOTHING for those cases, so
+        # the nominal wrap dimension was unpinned).
+        if expect_wrap_override:
+            assert str(roundtrip["version"].get("WRAP", "")).upper() == "NO", (
+                f"declared WRAP=YES must round-trip as the unwrapped NO form "
+                f"in {spec['id']}, got {roundtrip['version'].get('WRAP')!r}"
+            )
+        else:
             orig_wrap = str(original["version"].get("WRAP", "")).upper()
             rt_wrap = str(roundtrip["version"].get("WRAP", "")).upper()
             assert rt_wrap == orig_wrap, f"WRAP changed: {orig_wrap} -> {rt_wrap} in {spec['id']}"
@@ -1241,7 +1259,12 @@ def test_curve_drop_detected_in_single_section_roundtrip(tmp_path: Path) -> None
 
 
 def test_las30_multi_section_from_dict_roundtrip(tmp_path: Path) -> None:
-    """Test LAS 3.0 multi-section from_dict roundtrip."""
+    """Test LAS 3.0 multi-section from_dict roundtrip.
+
+    HARDEN (test-register row): the old body asserted section count and
+    section_type only — the Core section's data values were never compared,
+    so a writer that emitted empty section bodies stayed green.
+    """
     data = _build_las30_multi_section_dict()
 
     # from_dict
@@ -1263,6 +1286,21 @@ def test_las30_multi_section_from_dict_roundtrip(tmp_path: Path) -> None:
     sections = parsed["data_sections"]
     assert sections[0]["section_type"] == "LOG_DATA"
     assert sections[1]["section_type"] == "CORE_DATA"
+
+    # Core values preserved (the assertion the HARDEN adds).
+    core = sections[1]
+    np.testing.assert_allclose(
+        core["data"]["CORET"],
+        np.array([550.0, 551.0, 552.0]),
+        rtol=1e-5,
+        err_msg="CORET data not preserved through multi-section roundtrip",
+    )
+    np.testing.assert_allclose(
+        core["data"]["COREB"],
+        np.array([555.0, 556.0, 557.0]),
+        rtol=1e-5,
+        err_msg="COREB data not preserved through multi-section roundtrip",
+    )
 
 
 def test_las30_core_curves_from_dict_roundtrip(tmp_path: Path) -> None:
@@ -1310,7 +1348,16 @@ def test_las30_core_curves_from_dict_roundtrip(tmp_path: Path) -> None:
 
 
 def test_las30_per_section_params_from_dict_roundtrip(tmp_path: Path) -> None:
-    """Test LAS 3.0 per-section parameters from_dict roundtrip."""
+    """Test LAS 3.0 per-section parameters from_dict roundtrip.
+
+    HARDEN (test-register row): the parameter VALUES were unasserted (count
+    plus section_type only), so a writer that emitted the section header
+    with empty values stayed green.  The MERGE proposal against
+    ``test_roundtrip.py:202`` is DECLINED: this test constructs the model
+    directly (LASFile + ParameterEntry + write) while the roundtrip twin
+    goes through ``read_las_file``; they are the two ends of the same
+    contract, not duplicates.
+    """
     from pylasdev.models import (
         CurveDefinition,
         DataSection,
@@ -1367,18 +1414,28 @@ def test_las30_per_section_params_from_dict_roundtrip(tmp_path: Path) -> None:
     # Roundtrip
     data = read_las_file(temp_file)
     param_details = data.get("parameter_details", [])
-    assert len(param_details) >= 2
+    assert len(param_details) == 2
 
     matr_params = [p for p in param_details if p.get("mnemonic") == "MATR"]
     assert len(matr_params) == 1
     assert matr_params[0].get("section_type") == "CORE"
+    assert matr_params[0].get("value") == "SAND"
+    assert matr_params[0].get("description") == "Neutron Matrix"
 
     bht_params = [p for p in param_details if p.get("mnemonic") == "BHT"]
     assert len(bht_params) == 1
+    assert bht_params[0].get("value") == "35.5"
+    assert bht_params[0].get("unit") == "DEGC"
+    assert bht_params[0].get("description") == "Bottom Hole Temperature"
 
 
 def test_las20_from_dict_explicit_curves(tmp_path: Path) -> None:
-    """Test LAS 2.0 from_dict -> write -> read -> compare with explicit curve definitions."""
+    """Test LAS 2.0 from_dict -> write -> read -> compare with explicit curve definitions.
+
+    HARDEN (test-register row): the fixture's well fields (COMP/WELL) were
+    carried through from_dict but never asserted, so a writer that dropped
+    the non-numeric well entries stayed green.
+    """
     data = {
         "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
         "well": {
@@ -1424,3 +1481,174 @@ def test_las20_from_dict_explicit_curves(tmp_path: Path) -> None:
             parsed["logs"][curve],
             rtol=1e-5,
         )
+    # Well values survive the write/read (COMP/WELL are the non-numeric
+    # entries; a dropped non-numeric well line is the regression this pins).
+    assert parsed["well"]["COMP"] == "Test Company"
+    assert parsed["well"]["WELL"] == "Test Well #1"
+    assert parsed["well"]["STEP"] == "-0.125"
+
+
+# =============================================================================
+# G-A (test-register ADD-GAP): a genuinely WRAPPED member of the version x DLM
+# matrix.  Every other parse-path case in TEST_MATRIX emits one line per depth
+# row, so _read_wrapped was never entered from this file (register row G-A,
+# probe 4).  Depth on its own line plus a continuation line carrying the
+# remaining curves exercises the wrapped accumulator AND the declared
+# delimiter inside it.
+# =============================================================================
+
+
+@pytest.mark.parametrize("dlm", ["SPACE", "COMMA", "TAB"])
+def test_las20_wrapped_continuation_roundtrip(dlm: str, tmp_path: Path) -> None:
+    """G-A: WRAP=YES LAS 2.0 parse -> write -> read in the version x DLM matrix.
+
+    The source declares WRAP=YES with the depth on its own line and the
+    remaining curves on the following line, so the wrapped accumulator must
+    pair each depth with the continuation values.  The writer emits
+    WRAP=NO/unwrapped (documented writer behaviour), so the re-read must
+    reproduce the SAME arrays from the unwrapped form — which also pins
+    reader/writer symmetry across the wrap modes.
+    """
+    sep = _delimiter_char(dlm)
+    dlm_line = "" if dlm == "SPACE" else f" DLM .  {dlm} : DELIMITING CHARACTER\n"
+    rows = [
+        ("100.0", "10.0", "2550.0"),
+        ("101.0", "20.0", "2551.0"),
+        ("102.0", "30.0", "2552.0"),
+    ]
+    wrapped_rows = "".join(
+        f"{dept}\n{sep.join((gr, rhob))}\n" for dept, gr, rhob in rows
+    )
+    content = (
+        "~VERSION INFORMATION\n"
+        " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+        " WRAP.   YES  : MULTIPLE LINES PER DEPTH STEP\n"
+        f"{dlm_line}"
+        "~WELL INFORMATION\n"
+        " STRT.M   100.0  : START DEPTH\n"
+        " STOP.M   102.0  : STOP DEPTH\n"
+        " STEP.M   1.0  : STEP\n"
+        " NULL.    -999.25  : NULL VALUE\n"
+        " COMP.   WRAP CO  : COMPANY\n"
+        " WELL.   WRAP-01  : WELL\n"
+        " FLD.    WRAP FLD : FIELD\n"
+        " LOC.    12-34-56-78W5 : LOCATION\n"
+        " PROV.   WRAP PROV : PROVINCE\n"
+        " SRVC.   WRAP SRVC : SERVICE\n"
+        " DATE.   01/01/2020 : DATE\n"
+        " UWI.    12-34-56-78W5-00 : UWI\n"
+        "~CURVE INFORMATION\n"
+        " DEPT.M  : DEPTH\n"
+        " GR.API  : GAMMA RAY\n"
+        " RHOB.K/M3  : BULK DENSITY\n"
+        "~A DEPT GR RHOB\n"
+        f"{wrapped_rows}"
+    )
+    src = tmp_path / f"wrapped_{dlm.lower()}.las"
+    src.write_text(content, encoding="ascii")
+
+    parsed = read_las_file(src)
+    assert parsed["curves_order"] == ["DEPT", "GR", "RHOB"]
+    np.testing.assert_allclose(parsed["logs"]["DEPT"], [100.0, 101.0, 102.0])
+    np.testing.assert_allclose(parsed["logs"]["GR"], [10.0, 20.0, 30.0])
+    np.testing.assert_allclose(parsed["logs"]["RHOB"], [2550.0, 2551.0, 2552.0])
+
+    out = tmp_path / f"wrapped_{dlm.lower()}_rt.las"
+    write_las_file(out, parsed)
+    reread = read_las_file(out)
+    assert reread["curves_order"] == ["DEPT", "GR", "RHOB"]
+    for curve, expected in (
+        ("DEPT", [100.0, 101.0, 102.0]),
+        ("GR", [10.0, 20.0, 30.0]),
+        ("RHOB", [2550.0, 2551.0, 2552.0]),
+    ):
+        np.testing.assert_allclose(
+            reread["logs"][curve],
+            expected,
+            err_msg=f"{curve} lost through the wrapped-parse roundtrip (DLM={dlm})",
+        )
+
+
+# =============================================================================
+# F-05 / F-06 (test-register HARDEN rows for the string-column matrix cases):
+# the LAS 2.0/1.2 path has no string type, so a non-numeric column is nulled —
+# which means the matrix cases that carry a text column compare NULL against
+# NULL and prove nothing about it.  This test states what the behaviour IS,
+# in both directions, so a change that silently drops the diagnostic (or
+# silently starts preserving text) fails.
+# =============================================================================
+
+
+def test_las20_non_numeric_column_is_null_filled_with_a_counted_warning(tmp_path: Path) -> None:
+    """LAS 2.0 text column: every value nulls out AND one warning counts the loss.
+
+    The null fill alone is a documented LAS 2.0 limitation (no string type);
+    the counted warning is what makes it non-silent.  Both halves are pinned:
+    pre-fix behaviour that dropped the warning would lose the diagnostic, and
+    a silent partial parse would leave a column whose values look like data.
+    """
+    import warnings
+
+    content = (
+        "~VERSION INFORMATION\n"
+        " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+        " WRAP.   NO  : ONE LINE PER DEPTH STEP\n"
+        " DLM .   COMMA : DELIMITING CHARACTER\n"
+        "~WELL INFORMATION\n"
+        " STRT.M   100.0 : START DEPTH\n"
+        " STOP.M   102.0 : STOP DEPTH\n"
+        " STEP.M   1.0 : STEP\n"
+        " NULL.    -999.25 : NULL VALUE\n"
+        "~CURVE INFORMATION\n"
+        " DEPT.M  : DEPTH\n"
+        " LITH.   : LITHOLOGY\n"
+        "~A DEPT LITH\n"
+        "100.0,SAND\n"
+        "101.0,SHALE\n"
+        "102.0,LIME\n"
+    )
+    src = tmp_path / "las20_text_column.las"
+    src.write_text(content, encoding="ascii")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        parsed = read_las_file(src)
+
+    assert parsed["curves_order"] == ["DEPT", "LITH"]
+    assert parsed["logs"]["LITH"].tolist() == [-999.25, -999.25, -999.25]
+    conversion = [str(w.message) for w in caught if "could not be converted to finite float" in str(w.message)]
+    assert len(conversion) == 1, f"expected one counted conversion warning, got {conversion}"
+    assert "3 value(s)" in conversion[0], conversion[0]
+
+
+def test_las30_string_curve_keeps_its_values_in_string_data(tmp_path: Path) -> None:
+    """LAS 3.0 {S} curve: the text values survive in string_data, not logs.
+
+    The counterpart of the LAS 2.0 null-fill above — a 3.0 model that lost the
+    {S} classification would null the column exactly like the 2.0 path.
+    """
+    content = (
+        "~VERSION INFORMATION\n"
+        " VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0\n"
+        " WRAP.   NO  : ONE LINE PER DEPTH STEP\n"
+        " DLM .   COMMA : DELIMITING CHARACTER BETWEEN DATA COLUMNS\n"
+        "~Well Information\n"
+        " STRT .M   100.0  : First Index Value\n"
+        " STOP .M   102.0  : Last Index Value\n"
+        " STEP .M   1.0  : STEP\n"
+        " NULL .    -999.25  : NULL VALUE\n"
+        "~CURVE INFORMATION\n"
+        " DEPT .M  : DEPTH  {F}\n"
+        " LITH .  : LITHOLOGY  {S}\n"
+        "~A DEPT LITH\n"
+        "100.0,SAND\n"
+        "101.0,SHALE\n"
+        "102.0,LIME\n"
+    )
+    src = tmp_path / "las30_string_column.las"
+    src.write_text(content, encoding="ascii")
+
+    parsed = read_las_file(src)
+    assert parsed["curves_order"] == ["DEPT", "LITH"]
+    assert parsed["string_data"]["LITH"].tolist() == ["SAND", "SHALE", "LIME"]
+    assert "LITH" not in parsed["logs"], "a {S} curve must not appear as a numeric log"

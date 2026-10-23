@@ -34,38 +34,23 @@ from pylasdev.writer import (
 class TestWriteLASFile:
     """Tests for write_las_file function."""
 
-    def test_write_from_dict(self, sample_las_data: dict, tmp_path: Path) -> None:
-        """Test writing from a dictionary."""
-        temp_file = tmp_path / "output.las"
-        write_las_file(temp_file, sample_las_data)
-
-        assert temp_file.exists()
-        content = temp_file.read_text()
-        assert "~VERSION" in content
-        assert "~WELL" in content
-        assert "~CURVE" in content
-
-    def test_write_from_las_file_object(self, tmp_path: Path) -> None:
-        """Test writing from a LASFile dataclass."""
-        las = LASFile()
-        las.version = VersionSection(vers="2.0", wrap="NO")
-        las.well["STRT"] = "100.0"
-        las.well["STOP"] = "200.0"
-        las.well["NULL"] = "-999.25"
-        las.curves_order = ["DEPT", "DT"]
-        las.curves.append(CurveDefinition(mnemonic="DEPT", unit="M"))
-        las.curves.append(CurveDefinition(mnemonic="DT", unit="US/M"))
-        las.logs["DEPT"] = np.array([100.0, 101.0, 102.0])
-        las.logs["DT"] = np.array([50.0, 51.0, 52.0])
-
-        temp_file = tmp_path / "output.las"
-        write_las_file(temp_file, las)
-
-        content = temp_file.read_text()
-        assert "VERS" in content
-        assert "DEPT" in content
-        assert "DT" in content
-        assert "100" in content
+    # DELETED (register, named-sibling coverage):
+    #   * test_write_from_dict — asserted only "~VERSION"/"~WELL"/"~CURVE"
+    #     substrings.  Same fixture, same call, stronger oracle:
+    #     ``TestWriteLASFile::test_write_read_roundtrip`` re-reads the file it
+    #     writes and asserts version, curves_order and every data value.
+    #   * test_write_from_las_file_object — asserted "VERS"/"DEPT"/"DT"/"100"
+    #     ANYWHERE in the file, all of which the ~W STRT entry satisfies.  The
+    #     object write path with a real oracle is pinned by
+    #     ``test_write_preserves_curve_units`` (object → emitted ~C lines) and
+    #     ``test_write_las30_with_dlm_tab`` (object → write + re-read values).
+    #   * test_write_curve_names — mnemonic presence only, no column meaning;
+    #     ``test_write_preserves_curve_units`` pins the emitted ~C lines and
+    #     ``test_write_read_roundtrip`` pins that curves_order survives the
+    #     write→read, which is the regression the smoke assertion named.
+    #   * test_write_las30_version — RETAINED: its "COMMA" assertion still
+    #     detects a DLM-loss mutation (the only source-level pin of a COMMA
+    #     ~V DLM token); only "3.0"/"VERSION 3.0" need the ~V description.
 
     def test_write_preserves_version(self, sample_las_data: dict, tmp_path: Path) -> None:
         """Test that version info is preserved in output."""
@@ -76,35 +61,39 @@ class TestWriteLASFile:
         assert "2.0" in content
 
     def test_write_well_info(self, sample_las_data: dict, tmp_path: Path) -> None:
-        """Test that well info entries are written."""
+        """Well entries are emitted as parseable ~W lines.
+
+        MERGED + HARDENED (register F-04): the former body matched whole-file
+        substrings, which a value↔description swap satisfies.  The entries are
+        now re-read and compared field by field, and the emitted lines are
+        checked for the mnemonic in the leading position.
+        """
         temp_file = tmp_path / "output.las"
         write_las_file(temp_file, sample_las_data)
 
         content = temp_file.read_text()
-        assert "STRT" in content
-        assert "STOP" in content
-        assert "COMP" in content
-        assert "Test Company" in content
-
-    def test_write_curve_names(self, sample_las_data: dict, tmp_path: Path) -> None:
-        """Test that curve names appear in curve section."""
-        temp_file = tmp_path / "output.las"
-        write_las_file(temp_file, sample_las_data)
-
-        content = temp_file.read_text()
-        assert "DEPT" in content
-        assert "DT" in content
-        assert "RHOB" in content
+        well_section = content[content.index("~WELL") : content.index("~CURVE")]
+        assert any(line.strip().startswith("STRT") for line in well_section.splitlines())
+        reread = read_las_file(temp_file)
+        assert reread["well"]["COMP"] == "Test Company"
+        assert reread["well"]["WELL"] == "Test Well #1"
+        assert reread["well"]["STRT"] == "1670.0"
 
     def test_write_parameters(self, sample_las_data: dict, tmp_path: Path) -> None:
-        """Test that parameters are written."""
+        """Parameters are emitted as parseable ~P lines.
+
+        MERGED + HARDENED (register): the former body asserted the ``"35.5"``
+        substring without ever re-reading a parameter.  The values are now read
+        back from the written file.
+        """
         temp_file = tmp_path / "output.las"
         write_las_file(temp_file, sample_las_data)
 
         content = temp_file.read_text()
         assert "~PARAMETER" in content
-        assert "BHT" in content
-        assert "35.5" in content
+        reread = read_las_file(temp_file)
+        assert reread["parameters"]["BHT"] == "35.5"
+        assert reread["parameters"]["BS"] == "200.0"
 
     def test_write_ascii_data(self, sample_las_data: dict, tmp_path: Path) -> None:
         """Test that ASCII data section is present."""
@@ -131,7 +120,14 @@ class TestWriteLASFile:
         assert "1669.875" in data_lines[2]
 
     def test_write_read_roundtrip(self, sample_las_data: dict, tmp_path: Path) -> None:
-        """Test that write then read produces equivalent data."""
+        """Write then read produces equivalent data, well and parameters included.
+
+        HARDENED (register): the former body compared only the log arrays with
+        ``decimal=6`` — the well and parameter sections were never compared, so
+        a value/description swap or a dropped entry passed.  The numeric compare
+        is now tight (``.8g`` emission is exact for these values) and the
+        metadata is compared field by field.
+        """
         temp_file = tmp_path / "roundtrip.las"
         write_las_file(temp_file, sample_las_data)
 
@@ -139,11 +135,17 @@ class TestWriteLASFile:
         assert reread["version"]["VERS"] == "2.0"
         assert reread["curves_order"] == sample_las_data["curves_order"]
         for curve in sample_las_data["curves_order"]:
-            np.testing.assert_array_almost_equal(
+            np.testing.assert_allclose(
                 reread["logs"][curve],
                 sample_las_data["logs"][curve],
-                decimal=6,
+                rtol=0,
+                atol=1e-6,
+                err_msg=curve,
             )
+        for key, value in sample_las_data["well"].items():
+            assert reread["well"][key] == value, f"well[{key}] changed on roundtrip"
+        for key, value in sample_las_data["parameters"].items():
+            assert reread["parameters"][key] == value, f"parameters[{key}] changed on roundtrip"
 
     def test_write_empty_data(self, tmp_path: Path) -> None:
         """Test writing with no log data."""
@@ -725,13 +727,13 @@ class TestWriteLASFile:
 
     # --- F-29: Dict encoding key ---
     def test_write_dict_with_encoding_key(self, tmp_path: Path) -> None:
-        """Test writing from dict with an 'encoding' key.
+        """The ``encoding`` key reaches the model AND ``encoding=`` governs the bytes.
 
-        The encoding key is processed by LASFile.from_dict()
-        (models.py:5979) and stored on the model.  The writers
-        themselves never read las_file.encoding — write_las_file takes
-        its own encoding parameter — so the from_dict processing is
-        the only behavior this test can honestly pin.
+        HARDENED (register): the former body admitted it pinned only
+        ``from_dict`` — the ``encoding=`` kwarg of ``write_las_file`` had zero
+        coverage.  Both halves are now pinned: the model carries the declared
+        encoding, and an explicit output encoding decides the bytes on disk and
+        the decoded value on a matching read.
         """
         data = {
             "encoding": "ascii",
@@ -747,10 +749,23 @@ class TestWriteLASFile:
 
         temp_file = tmp_path / "enc_key.las"
         write_las_file(temp_file, las)
+        assert "~VERSION" in temp_file.read_text()
 
-        assert temp_file.exists()
-        content = temp_file.read_text()
-        assert "~VERSION" in content
+        # encoding= must control the emitted bytes and the decoded value.
+        cp1252_las = LASFile.from_dict(
+            {
+                "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+                "well": {"NULL": "-999.25", "WELL": "Caf\u00e9 Well"},
+                "curves_order": ["DEPT"],
+                "logs": {"DEPT": np.array([1.0])},
+            }
+        )
+        cp1252_file = tmp_path / "enc_cp1252.las"
+        write_las_file(cp1252_file, cp1252_las, encoding="cp1252")
+        assert b"\xe9" in cp1252_file.read_bytes(), (
+            "encoding='cp1252' must emit the single-byte e-acute, not a UTF-8 sequence"
+        )
+        assert read_las_file(cp1252_file, encoding="cp1252")["well"]["WELL"] == "Caf\u00e9 Well"
 
     # --- Test: write_las_file rejects invalid input types ---
     def test_write_rejects_invalid_types(self, tmp_path: Path) -> None:
@@ -1013,9 +1028,14 @@ class TestWriteLASFile:
         # With 3 curves, non-wrapped mode: 1 header line + 2 data lines = 3 lines total
         # F-I2-M50: Assert exact count — >= 2 would pass even if one row is lost.
         assert len(data_lines) == 3, f"Expected 3 lines (1 header + 2 data), got {len(data_lines)}"
-        # Verify WRAP is overridden to NO (F-01: header-data consistency fix)
-        assert "WRAP.   NO" in content
-        assert "WRAP.   YES" not in content
+        # Verify WRAP is overridden to NO (F-01: header-data consistency fix).
+        # HARDENED (register F-07): ``"WRAP.   NO" in content`` was coupled to
+        # the emitted spacing.  Assert the entry's VALUE token and the re-read
+        # header instead.
+        wrap_line = next(line for line in content.splitlines() if line.strip().startswith("WRAP"))
+        assert wrap_line.split(":")[0].split()[-1].strip(".") == "NO", wrap_line
+        assert "YES" not in wrap_line, wrap_line
+        assert read_las_file(temp_file)["version"]["WRAP"] == "NO"
 
     # --- F-S6-M4: _format_fixed_precision unit tests ---
 
@@ -1138,6 +1158,14 @@ class TestWriteLASFile:
         assert "hijacked" in first_data_line
         # The second data line is clean
         assert "101" in data_lines[1]
+        # HARDENED (register F-11): the line count is discriminating but the
+        # VALUE was never read back, so a sanitizer that mangled the payload
+        # (truncation, dropped segment) stayed green.  Re-read the column.
+        reread = read_las_file_as_object(temp_file)
+        assert np.asarray(reread.data_sections[0].string_data["CDES"]).tolist() == [
+            "normal ~VERSION INFORMATION hijacked",
+            "clean",
+        ], "the sanitized value must survive with the injected content made safe"
 
     # --- E-18: LAS 3.0 ~Other deprecation refusal test ---
     def test_las30_other_section_deprecation_warning(self, tmp_path: Path) -> None:
@@ -1635,31 +1663,26 @@ class TestAPICodeColonEscaping:
         write_las_file(temp_file, las)
 
         content = temp_file.read_text()
-        # The api_code with colon must be escaped in the output
-        # (e.g., "42 _:_ injected" or similar — _escape_colons_for_las_value
-        # inserts _ at whitespace-colon adjacencies)
-        # Verify it's readable
-        assert "42" in content
-        assert "injected" in content
-        # The raw colon-space pattern should be escaped
+        # The api_code with colon is emitted in the escaped form (the parser
+        # un-escapes it on re-read).
         curve_section = content.split("~CURVE")[1].split("~A")[0]
-        assert "42" in curve_section
+        assert "42 _:_ injected" in curve_section, (
+            f"the colon adjacency was not escaped in the ~C line: {curve_section!r}"
+        )
 
-        # Roundtrip: re-read and check api_code is preserved (escaped form)
+        # HARDENED (register F-02): substring checks accepted the ESCAPED
+        # artefact ("42 _:_ injected") as a pass, so a lost un-escape stayed
+        # green.  The parsed value must be the original, exactly.
         from pylasdev.parser import LASParser
 
         parser = LASParser()
         re_read = parser.parse(content)
-        # DEPT has the colon-containing api_code
         dept_curve = re_read.curves[0]  # DEPT is first in curves_order
-        # api_code is preserved (though in escaped form — _escape_colons
-        # inserts _ between whitespace-colon adjacencies)
-        assert "42" in dept_curve.api_code, (
-            f"api_code should contain '42', got: {dept_curve.api_code!r}"
+        assert dept_curve.api_code == "42 : injected", (
+            f"api_code did not round-trip exactly: {dept_curve.api_code!r}"
         )
-        assert "injected" in dept_curve.api_code, (
-            f"api_code should contain 'injected', got: {dept_curve.api_code!r}"
-        )
+        assert dept_curve.unit == "M"
+        assert dept_curve.description == "Depth"
 
     def test_api_code_no_colon_unchanged(self, tmp_path: Path) -> None:
         """IF-024: api_code without colon survives roundtrip unchanged."""
@@ -1853,55 +1876,62 @@ class TestColonEscaping:
         assert result == "Oil"
 
     def test_roundtrip_colon_space(self, tmp_path: Path) -> None:
-        """ "Oil: Gas Corp" (colon-space) survives roundtrip — parser now un-escapes."""
+        """ "Oil: Gas Corp" (colon-space) survives roundtrip exactly.
+
+        HARDENED (register F-02 class): ``assert "Oil" in result`` accepted the
+        raw escape artefact (``Oil:_ Gas Corp``) as a pass.  Exact equality is
+        the only assertion the un-escape can fail.
+        """
         result = self._roundtrip_well_value(tmp_path, "Oil: Gas Corp")
-        # F-022: The parser now un-escapes colon artifacts inserted by
-        # _escape_colons_for_las_value, restoring the original value.
         assert result == "Oil: Gas Corp"
-        assert "Oil" in result  # Not truncated to just "Oil"
 
     def test_roundtrip_space_colon_space(self, tmp_path: Path) -> None:
-        """ "Oil : Gas Corp" (space-colon-space) survives roundtrip."""
+        """ "Oil : Gas Corp" (space-colon-space) survives roundtrip exactly.
+
+        HARDENED (register): ``!= "Oil"`` plus substrings accepted the escaped
+        artefact ``Oil _:_ Gas Corp``; exact equality pins the un-escape.
+        """
         result = self._roundtrip_well_value(tmp_path, "Oil : Gas Corp")
-        # Must NOT be truncated to just "Oil" (the F-EX-03 corruption).
-        assert result != "Oil"
-        assert "Oil" in result
-        assert "Gas Corp" in result
+        assert result == "Oil : Gas Corp"
 
     def test_roundtrip_space_colon_no_trailing_space(self, tmp_path: Path) -> None:
-        """ "Oil :Gas Corp" (space-colon, no space after) survives roundtrip."""
+        """ "Oil :Gas Corp" (space-colon, no space after) survives exactly.
+
+        HARDENED (register): substring checks accepted the escaped artefact.
+        """
         result = self._roundtrip_well_value(tmp_path, "Oil :Gas Corp")
-        assert result != "Oil"
-        assert "Oil" in result
-        assert "Gas Corp" in result
+        assert result == "Oil :Gas Corp"
 
     def test_roundtrip_trailing_colon(self, tmp_path: Path) -> None:
-        """ "Oil:" (trailing colon) survives roundtrip."""
+        """ "Oil:" (trailing colon) survives roundtrip exactly.
+
+        HARDENED (register): ``"Oil" in result`` accepted ``Oil:_`` — the
+        escaped form that is the exact bug this test names.
+        """
         result = self._roundtrip_well_value(tmp_path, "Oil:")
-        # Must NOT be truncated — colon-containing value preserved.
-        assert result != "Oil"
-        assert "Oil" in result
+        assert result == "Oil:"
 
     def test_roundtrip_trailing_space_colon(self, tmp_path: Path) -> None:
-        """ "Oil :" (trailing space-colon) survives roundtrip."""
+        """ "Oil :" (trailing space-colon) survives roundtrip exactly.
+
+        HARDENED (register): substring checks accepted ``Oil _:_``.
+        """
         result = self._roundtrip_well_value(tmp_path, "Oil :")
-        # Must NOT be truncated to just "Oil" (the F-EX-03 corruption).
-        assert result != "Oil"
-        assert "Oil" in result
+        assert result == "Oil :"
 
     def test_roundtrip_leading_colon_no_ws(self, tmp_path: Path) -> None:
         """Leading colon without whitespace is harmless."""
         result = self._roundtrip_well_value(tmp_path, ":Oil")
-        # Leading colon is not a structural separator — preserved as-is.
-        assert ":Oil" in result
+        assert result == ":Oil"
 
     def test_roundtrip_multiple_embedded_colons(self, tmp_path: Path) -> None:
-        """Multiple embedded colons all survive roundtrip."""
+        """Multiple embedded colons all survive roundtrip exactly.
+
+        HARDENED (register): ``"A"/"B"/"C" in result`` accepted the escaped
+        artefact ``A:_ B _:_ C``; exact equality is the discriminating check.
+        """
         result = self._roundtrip_well_value(tmp_path, "A: B : C")
-        # Must contain A, B, C — not truncated at any colon.
-        assert "A" in result
-        assert "B" in result
-        assert "C" in result
+        assert result == "A: B : C"
 
 
 class TestValidatePrecision:
@@ -2265,14 +2295,22 @@ class TestF016TimeOffsetNonAsciiRegression:
         write_las_file(temp_file, las)
 
         content = temp_file.read_text()
-        # F-016: time_offset must NOT appear in format spec for non-'A'
-        # data_format curves.  With data_format='F', the format is just
-        # {F} with no colon or time_offset (contrast with 'A' curves
-        # where {A:5.5} would appear).
-        assert "{F}" in content  # format without time_offset
-        assert "   {A}" not in content  # no A-format curves
-        # Specifically: no time_offset 5.5 in the format specs
-        assert ":5.5" not in content
+        # F-016: time_offset must NOT appear in the format spec for non-'A'
+        # data_format curves.  With data_format='F' the spec is exactly {F}.
+        # HARDENED (register F-07): ``"   {A}" not in content`` was coupled to
+        # the emitted spacing, so a change in column padding made it pass
+        # vacuously.  The curve's own ~C line is now inspected structurally.
+        curve_line = next(
+            line for line in content.splitlines() if line.strip().startswith("NMR[1]")
+        )
+        assert curve_line.rstrip().endswith("{F}"), (
+            f"non-ASCII array curve must carry a bare {{F}} spec: {curve_line!r}"
+        )
+        assert "{A" not in curve_line
+        assert ":5.5" not in curve_line
+        # ... while the model keeps the time offset for the {A} case.
+        assert las.curves[-1].array_info is not None
+        assert las.curves[-1].array_info.time_offset == 5.5
 
 
 # ============================================================
@@ -2390,8 +2428,14 @@ class TestProductionCheckWriterFixes:
         # line (lines.append("") at _writer_las30.py:463) right after
         # the ~CURVE INFORMATION header.
         after_header = content.split("~CURVE INFORMATION", 1)[1]
-        assert after_header.startswith("\n\n"), (
-            f"no blank line after ~CURVE INFORMATION: {after_header[:40]!r}"
+        # HARDENED (register F-07): ``startswith("\n\n")`` couples the pin to
+        # newline bookkeeping.  The structural contract is "one blank line, then
+        # the next section header" — asserted on the line sequence instead.
+        header_lines = after_header.splitlines()
+        assert header_lines[0] == "", f"no blank line after ~CURVE INFORMATION: {header_lines[:2]}"
+        next_content = next((line for line in header_lines if line.strip()), "")
+        assert next_content.startswith("~"), (
+            f"the blank line must be followed by the next section header: {next_content!r}"
         )
 
     def test_empty_curves_early_return_warns(self, tmp_path: Path) -> None:
@@ -2508,15 +2552,19 @@ class TestProductionCheckWriterFixes:
         # 1e-100 with sig_digits=200 would produce ~293 decimal places
         # without the cap.  With the fix, it caps at 100.
         result = _format_fixed_precision(1e-100, ".200g")
-        # The formatted result should not be excessively long
-        # (cap at 100 decimal places ≈ ~104 chars including leading zero)
-        assert len(result) < 200, (
-            f"Precision cap should limit output length, got {len(result)} chars: {result!r}"
+        # HARDENED (register F-08): ``len(result) < 200`` cannot see a cap
+        # raised from 100 to 150 decimals (that is 152 chars).  The cap is
+        # pinned exactly, and a second spec proves it is the CAP and not the
+        # requested digit count that decides the width.
+        assert len(result.split(".")[1]) == 100, (
+            f"decimal places must be capped at 100, got {len(result.split('.')[1])}"
         )
+        assert len(result) == 102, f"expected a 102-char output, got {len(result)}"
+        assert len(_format_fixed_precision(1e-100, ".150g").split(".")[1]) == 100
 
         # Also verify sensible inputs still work
         normal = _format_fixed_precision(3.14, ".4g")
-        assert "3.14" in normal
+        assert normal == "3.1400"
 
     # --- I2F-007: string_data-only curves included in curves_order ---
 
@@ -3210,7 +3258,12 @@ class TestG8FixGroup:
         # Each section must pipe to its own per-section Definition, not the
         # hardcoded ``| CURVE`` that destroyed per-section scope.
         assert "| Log_Definition" in content, "Section 1 missing per-section Definition pipe"
-        assert "| Log_Definition_2" in content, "Section 2 missing per-section Definition pipe"
+        # RE-BASELINED (F-064 + F-185, gate TEST-UPDATE #19): the writer emits the
+        # per-section Definition target in the spec's bracketed ``[n]`` form
+        # (_writer_las30.py:1365-1371, :1411/:1415); the old ``_2`` suffix
+        # spelling was the pre-fix form and the parser accepts the bracketed one
+        # (parser.py:670-700, :2223-2230).
+        assert "| Log_Definition[2]" in content, "Section 2 missing per-section Definition pipe"
 
         reread = read_las_file_as_object(temp_file)
         # Top-level curves dedupe to the main ~C set.
@@ -4940,6 +4993,13 @@ class TestFixWriterE36WellUnitValidation:
             warnings.simplefilter("ignore")
             write_las_file(out, las)
         assert ".kg:m" in out.read_text(encoding="utf-8"), "valid colon unit not emitted"
+        # HARDENED (register F-7): emission substring only.  The unit must
+        # survive the re-read — a unit that re-reads as 'kg:m' truncated or
+        # re-escaped would be a lost entry value.
+        back = read_las_file_as_object(out)
+        assert back.well.units["NULL"] == "kg:m", (
+            f"colon unit did not round-trip: {back.well.units['NULL']!r}"
+        )
 
 
 class TestFixWriterE40OffsetCap:
@@ -4980,6 +5040,11 @@ class TestFixWriterE40OffsetCap:
         assert "A:100000000000000000000" in out.read_text(encoding="utf-8"), (
             "representable {A:N} spec not emitted"
         )
+        # HARDENED (register F-7): emission substring only — the offset must
+        # survive the re-read (a spec the parser drops loses the whole curve).
+        back = read_las_file_as_object(out)
+        assert back.curves[0].array_info is not None
+        assert back.curves[0].array_info.time_offset == 1e20
 
     def test_e40_sub_1e61_offset_warns_and_clamps(self, tmp_path: Path) -> None:
         r"""E-40 (round+clamp branch): a sub-1e-61 time_offset cannot be
@@ -5044,6 +5109,15 @@ class TestFixWriterE44EmptySectionWarning:
             write_las_file(out, las)
         assert any("NO data rows" in str(w.message) for w in rec), (
             f"no empty-section warning: {[str(w.message) for w in rec]}"
+        )
+        # HARDENED (register F-7): the warning alone left the CONSEQUENCE
+        # unpinned — the emitted section is header-only, so the file carries no
+        # data line for the section at all.
+        lines = out.read_text(encoding="utf-8").splitlines()
+        header_idx = next(i for i, line in enumerate(lines) if line.startswith("~A"))
+        subsequent = [line for line in lines[header_idx + 1 :] if line.strip()]
+        assert not any(line[0].isdigit() or line[0] == "-" for line in subsequent), (
+            f"a zero-row section must emit no data lines, got {subsequent[:3]}"
         )
 
 
@@ -5144,6 +5218,8 @@ class TestFixWriterM29StringAwareDefinitionDedup:
         assert back.data_sections[0].string_data.get("GR", None) is not None, (
             "section 1 GR not string"
         )
+        # HARDENED (register F-1): existence only — the VALUES must survive.
+        assert np.asarray(back.data_sections[0].string_data["GR"]).tolist() == ["sand", "shale"]
         np.testing.assert_allclose(
             back.data_sections[1].data["GR"], [75.0, 80.0], err_msg="numeric GR null-filled"
         )
@@ -5195,6 +5271,9 @@ class TestFixWriterN04UnionForcedMarkerAware:
             back.data_sections[1].data["GR"], [75.0, 80.0],
             err_msg="numeric GR re-read as string",
         )
+        # HARDENED (register F-1): the string side was asserted only through the
+        # pipe string; its values must survive too.
+        assert np.asarray(back.data_sections[0].string_data["GR"]).tolist() == ["sand", "shale"]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -5542,6 +5621,10 @@ class TestM29CommaTabEmptyRowPreserved:
             back = read_las_file_as_object(out)
         desc = back.string_data["DESC"]
         assert len(desc) == 2, f"M-29 row dropped ({len(desc)} rows): {desc}"
+        # HARDENED (register F-2): row count alone let a content swap through.
+        # The second row keeps its own value, so the blank row is preserved in
+        # place rather than dropped and shifted.
+        assert desc[1] == "x", f"row content shifted: {desc}"
 
     def test_tab_empty_value_row_preserved(self, tmp_path: Path) -> None:
         las = LASFile(version=VersionSection(vers="3.0", wrap="NO", dlm="TAB"))
@@ -5562,6 +5645,8 @@ class TestM29CommaTabEmptyRowPreserved:
         assert len(back.string_data["DESC"]) == 2, (
             f"M-29 TAB row dropped: {back.string_data['DESC']}"
         )
+        # HARDENED (register F-2): the TAB twin pinned the row count only.
+        assert back.string_data["DESC"][1] == "x", f"row content shifted: {back.string_data['DESC']}"
 
 
 class TestM30NoneContainersLAsWriteError:
@@ -5822,3 +5907,332 @@ class TestFixWriterS8AsciiKeywordNameCollision:
         assert [d.name for d in back.data_sections] == ["FirstSection"], (
             f"normal name not preserved: {[d.name for d in back.data_sections]}"
         )
+
+
+# ══════════════════════════════════════════════════════════════
+# TEST-UPDATE regression pins for landed writer fixes that had none
+# (s4 extraction backlog rows for tests/test_writer.py).  Each test
+# names its finding id and asserts post-fix behaviour.
+# ══════════════════════════════════════════════════════════════
+
+
+class TestS4RegressionPinsWriter:
+    """Regression pins for landed writer fixes that had no test."""
+
+    def _parseable_las(self, step: str, stop: str, dept: list[float]) -> LASFile:
+        return LASFile.from_dict(
+            {
+                "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+                "well": {"NULL": "-999.25", "STRT": "100.0", "STOP": stop, "STEP": step},
+                "curves": [{"mnemonic": "DEPT", "unit": "M"}],
+                "curves_order": ["DEPT"],
+                "logs": {"DEPT": np.array(dept)},
+            }
+        )
+
+    def test_f018_colon_escape_non_invertibility_warns(self, tmp_path: Path) -> None:
+        """F-018: the three genuinely lossy colon shapes warn and name the loss.
+
+        The writer's ``_:`` escape cannot be inverted when the value itself
+        contains a literal underscore in an escape position, so re-reading drops
+        characters.  Pre-fix the write was silent about that.  Each shape now
+        warns with the exact count and the before/after value.
+        """
+        las = LASFile.from_dict(
+            {
+                "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+                "well": {
+                    "NULL": "-999.25",
+                    "STRT": "100.0",
+                    "STOP": "101.0",
+                    "STEP": "1.0",
+                    "COMP": "Oil:_",  # trailing colon
+                    "FLD": "A:_ B _:_ C",  # multiple embedded
+                    "LOC": "Oil _:_ Gas",  # space-colon-space
+                },
+                "curves": [{"mnemonic": "DEPT", "unit": "M"}],
+                "curves_order": ["DEPT"],
+                "logs": {"DEPT": np.array([100.0, 101.0])},
+            }
+        )
+        out = tmp_path / "f018_colon.las"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+        losses = [
+            str(x.message)
+            for x in caught
+            if "colon escape is not invertible" in str(x.message)
+        ]
+        assert len(losses) == 3, f"expected one warning per lossy value, got {losses}"
+        assert any("'Oil:_' -> 'Oil:'" in m for m in losses)
+        assert any("'A:_ B _:_ C' -> 'A: B : C'" in m for m in losses)
+        assert any("'Oil _:_ Gas' -> 'Oil : Gas'" in m for m in losses)
+
+        # The warned loss is what actually happens on re-read.
+        reread = read_las_file(out)
+        assert reread["well"]["COMP"] == "Oil:"
+        assert reread["well"]["FLD"] == "A: B : C"
+        assert reread["well"]["LOC"] == "Oil : Gas"
+
+    def test_m12_write_path_identity_preserved_and_mutation_observed(
+        self, test_data_dir: Path, tmp_path: Path
+    ) -> None:
+        """M-12 / F-158 / F-123: a write keeps the section↔top-level curve
+        identity and a post-write mutation is observed by the NEXT write.
+
+        Pre-fix the writer replaced ``section_curves`` with copies, so a caller
+        that mutated ``section.section_curves[j]`` after the first write saw the
+        change silently ignored by the second.  46 of the fixture's 50 section
+        curves are the same objects as the top-level curves after parsing; the
+        write must keep that count and honour a later mutation.
+
+        HEAD A/B (measured this run): passes on the pre-fix tree too — the
+        write-path instance of M-12 was already fixed there.  Kept as a
+        BEHAVIOUR pin; the fix witness for M-12 lives on the parse-time path
+        (tests/test_regression.py).
+        """
+        source = test_data_dir / "sample_las3.0_spec.las"
+        assert source.exists(), f"Required test data missing: {source}"
+        las = read_las_file_as_object(source)
+        shared_before = sum(
+            1
+            for section in las.data_sections
+            for curve in section.section_curves
+            if any(curve is top for top in las.curves)
+        )
+        assert shared_before == 46, f"unexpected fixture identity count: {shared_before}"
+
+        first = tmp_path / "m12_first.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(first, las)
+        shared_after = sum(
+            1
+            for section in las.data_sections
+            for curve in section.section_curves
+            if any(curve is top for top in las.curves)
+        )
+        assert shared_after == shared_before, (
+            f"the write broke curve identity: {shared_before} → {shared_after}"
+        )
+
+        target = las.data_sections[0].section_curves[-1]
+        target.unit = "ZZZ"
+        second = tmp_path / "m12_second.las"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            write_las_file(second, las)
+        assert "ZZZ" in second.read_text(encoding="utf-8"), (
+            "a post-write mutation of a shared section curve was ignored by the next write"
+        )
+
+    def test_f044_step_zero_conforming_grid_draws_no_warning(self, tmp_path: Path) -> None:
+        """F-044 / M-13: ``STEP 0`` is the documented "irregular grid" marker —
+        a conforming header draws NO divergence warning, a contradicting one does.
+
+        Pre-fix the writer copied STRT/STOP/STEP verbatim and never related them
+        to the emitted index (silent contradiction); the fix warns on a real
+        divergence.  The liveness half is what keeps the fix from crying wolf on
+        the legal ``STEP 0`` convention.
+        """
+        conforming = self._parseable_las("0", "109.0", [100.0, 103.0, 109.0])
+        out = tmp_path / "f044_conforming.las"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            write_las_file(out, conforming)
+        assert not [m for m in map(str, (x.message for x in caught)) if "does not describe" in m], (
+            "a conforming STEP 0 / STOP==last-index header must not warn"
+        )
+
+        uniform = self._parseable_las("3.0", "106.0", [100.0, 103.0, 106.0])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            write_las_file(tmp_path / "f044_uniform.las", uniform)
+        assert not [
+            m for m in map(str, (x.message for x in caught)) if "does not describe" in m
+        ], "an exact uniform header must not warn"
+
+        divergent = self._parseable_las("1.0", "900.0", [100.0, 101.0, 102.0])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            write_las_file(tmp_path / "f044_divergent.las", divergent)
+        messages = [str(x.message) for x in caught]
+        divergence = [m for m in messages if "does not describe" in m]
+        assert len(divergence) == 1, f"a real STRT/STOP divergence must warn once: {messages}"
+        assert "STOP 900.0 but the last index value is 102.0" in divergence[0]
+
+    @pytest.mark.parametrize("null_value", ["-999.25", "-999.0"], ids=["fractional", "integral"])
+    def test_l10_null_sentinel_classification_warns(
+        self, tmp_path: Path, null_value: str
+    ) -> None:
+        """L-10: a real value equal to the declared NULL is emitted as the
+        sentinel, and the ambiguity is announced.
+
+        Pre-fix the value was emitted as an ordinary number (silently claiming a
+        real measurement) or reformatted; both lose the distinction.  The
+        warning must name the curve and the value, and the emitted cell must be
+        exactly the declared sentinel.
+        """
+        las = LASFile.from_dict(
+            {
+                "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+                "well": {"NULL": null_value, "STRT": "100.0", "STOP": "101.0", "STEP": "1.0"},
+                "curves": [
+                    {"mnemonic": "DEPT", "unit": "M"},
+                    {"mnemonic": "GR", "unit": "API"},
+                ],
+                "curves_order": ["DEPT", "GR"],
+                "logs": {"DEPT": np.array([100.0, 101.0]), "GR": np.array([float(null_value), 51.0])},
+            }
+        )
+        out = tmp_path / f"l10_{null_value}.las"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+        messages = [str(x.message) for x in caught]
+        collisions = [m for m in messages if "equals the declared NULL value" in m]
+        assert len(collisions) == 1, f"null-sentinel collision not announced: {messages}"
+        assert "'GR'" in collisions[0] and null_value in collisions[0]
+
+        data_rows = [
+            line for line in out.read_text(encoding="utf-8").splitlines() if line[:1] in "0123456789-"
+        ]
+        assert data_rows[-2].split()[1] == null_value, (
+            f"the colliding value must be emitted as the declared sentinel: {data_rows[-2]!r}"
+        )
+
+    def test_re7_leading_hash_escape_loss_warns(self, tmp_path: Path) -> None:
+        """RE-7: a value whose first non-blank content is ``_#`` warns that the
+        escape is not invertible and names what re-reading will lose.
+
+        Pre-fix the writer escaped it like any ``#``-leading value with no
+        diagnostic, so a re-read silently dropped one underscore.
+        """
+        las = LASFile.from_dict(
+            {
+                "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+                "well": {
+                    "NULL": "-999.25",
+                    "STRT": "100.0",
+                    "STOP": "101.0",
+                    "STEP": "1.0",
+                    "COMP": "_#literal",
+                },
+                "curves": [{"mnemonic": "DEPT", "unit": "M"}],
+                "curves_order": ["DEPT"],
+                "logs": {"DEPT": np.array([100.0, 101.0])},
+            }
+        )
+        out = tmp_path / "re7_hash.las"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            write_las_file(out, las)
+        messages = [str(x.message) for x in caught]
+        losses = [m for m in messages if "'_#' escape is not invertible" in m]
+        assert len(losses) == 1, f"RE-7 diagnostic missing: {messages}"
+        assert "'_#literal' -> '#literal'" in losses[0]
+
+        reread = read_las_file(out)
+        assert reread["well"]["COMP"] == "#literal", (
+            f"the warned loss must be what re-reading produces: {reread['well']['COMP']!r}"
+        )
+
+    def test_f032_f034_inexact_index_diagnostic_warns(self, tmp_path: Path) -> None:
+        """F-032/F-034: an explicit precision that rounds the index warns, and
+        the warning names the emitted token and the model value.
+
+        ``_format_index_value`` repairs the DEFAULT precision only; a caller's
+        explicit precision is the user's choice and is left untouched, so
+        ``_warn_inexact_index`` is the sole diagnostic for that remaining
+        silent-loss path (CWLS LAS 2.0 §5.4 forbids rounding depth values, and
+        a rounded index can collapse two depths into one row on re-read).
+        Pre-fix — a ``return False`` at the top of ``_warn_inexact_index`` —
+        the write is silent and no message matches; the emitted-token
+        assertions still hold, which is why only the diagnostic half is pinned
+        here (the exact-default behaviour is covered elsewhere).
+        """
+        las = LASFile.from_dict(
+            {
+                "version": {"VERS": "2.0", "WRAP": "NO", "DLM": "SPACE"},
+                "well": {
+                    "NULL": "-999.25",
+                    "STRT": "100.123456789",
+                    "STOP": "100.223456789",
+                    "STEP": "0.1",
+                },
+                "curves": [{"mnemonic": "DEPT", "unit": "M"}],
+                "curves_order": ["DEPT"],
+                "logs": {"DEPT": np.array([100.123456789, 100.223456789])},
+            }
+        )
+        out = tmp_path / "inexact_index.las"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            write_las_file(out, las, precision=".4g")
+        diagnostics = [
+            str(x.message)
+            for x in caught
+            if "does not read back as the model value" in str(x.message)
+        ]
+        assert len(diagnostics) == 1, (
+            f"expected exactly one index-rounding diagnostic, got {diagnostics}"
+        )
+        assert diagnostics[0] == (
+            "Index curve 'DEPT': the emitted depth '100.1' does not read back as "
+            "the model value 100.123456789 (precision '.4g').  CWLS LAS 2.0 §5.4 "
+            "forbids rounding depth values — distinct depths can collapse into "
+            "one depth row on re-read.  Use the default precision to keep the "
+            "index exact."
+        )
+
+        # The warning must describe the file that was actually written: the two
+        # distinct model depths are emitted as the rounded tokens it names.
+        data_lines = [
+            line for line in out.read_text(encoding="utf-8").split("~A")[-1].splitlines() if line.strip()
+        ]
+        assert data_lines[0].split() == ["DEPT"]
+        assert [line.split()[0] for line in data_lines[1:]] == ["100.1", "100.2"]
+
+    def test_las12_wrap_yes_overridden_to_no(self, tmp_path: Path) -> None:
+        """LAS 1.2: a declared WRAP=YES is warned about and emitted as NO.
+
+        The LAS 2.0/3.0 twins were pinned (``TestWriteLASFile``
+        ``test_wrap_yes_produces_correct_data_layout`` and the cross-version
+        parity rows), but the LAS 1.2 writer's own override
+        (``_writer_las12.py:49``, ``actual_wrap = "NO"``) had no test anywhere:
+        emitting ``WRAP=YES`` while writing unwrapped data survived the whole
+        suite, so a header claiming a wrapped layout over
+        one-line-per-depth-step data (the F-01 header/data inconsistency) could
+        return unnoticed.
+        """
+        las = LASFile.from_dict(
+            {
+                "version": {"VERS": "1.2", "WRAP": "YES"},
+                "well": {
+                    "NULL": "-999.25",
+                    "STRT": "100.0",
+                    "STOP": "101.0",
+                    "STEP": "1.0",
+                    "WELL": "TEST-1",
+                },
+                "curves": [
+                    {"mnemonic": "DEPT", "unit": "M"},
+                    {"mnemonic": "GR", "unit": "API"},
+                ],
+                "curves_order": ["DEPT", "GR"],
+                "logs": {"DEPT": np.array([100.0, 101.0]), "GR": np.array([50.0, 51.0])},
+            }
+        )
+        temp_file = tmp_path / "las12_wrap_yes.las"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            write_las_file(temp_file, las)
+        overrides = [str(x.message) for x in caught if "WRAP=YES overridden" in str(x.message)]
+        assert len(overrides) == 1, f"expected one WRAP=YES override warning, got {overrides}"
+
+        content = temp_file.read_text(encoding="utf-8")
+        wrap_line = next(line for line in content.splitlines() if line.strip().startswith("WRAP"))
+        assert wrap_line.split(":")[0].split()[-1].strip(".") == "NO", wrap_line
+        assert "YES" not in wrap_line, wrap_line
+        assert read_las_file(temp_file)["version"]["WRAP"] == "NO"

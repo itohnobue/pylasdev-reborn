@@ -6,6 +6,7 @@ import logging
 import tempfile
 import threading
 import warnings
+from importlib import import_module
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -16,6 +17,7 @@ from pylasdev import CurveDefinition, DataSection, read_las_file
 from pylasdev.exceptions import LASParseError
 from pylasdev.models import LASFile, _GuardedList
 from pylasdev.parser import (
+    DATA_LINE_PATTERN,
     LASParser,
     _is_indexed_data_section,
     _validate_data_section_column_counts,
@@ -26,27 +28,11 @@ from pylasdev.reader import read_las_file_as_object
 class TestLASParser:
     """Tests for the regex-based LAS parser."""
 
-    def test_parse_version_section(self) -> None:
-        """Test parsing ~V section."""
-        content = """~VERSION INFORMATION
- VERS.   2.0  : CWLS LOG ASCII STANDARD
- WRAP.   NO   : ONE LINE PER DEPTH STEP
-"""
-        parser = LASParser()
-        las = parser.parse(content)
-        assert las.version.vers == "2.0"
-        assert las.version.wrap == "NO"
-
-    def test_parse_version_120(self) -> None:
-        """Test parsing LAS 1.2 version."""
-        content = """~Version Information
- VERS.                1.20:   CWLS log ASCII Standard -VERSION 1.20
- WRAP.                 YES:   Multiple lines per depth step
-"""
-        parser = LASParser()
-        las = parser.parse(content)
-        assert las.version.vers == "1.20"
-        assert las.version.wrap == "YES"
+    # register DELETE: `test_parse_version_section` and `test_parse_version_120`
+    # were exact duplicates of the 2.0 and 1.20 parametrizations of
+    # `test_version_detection_parametrized` below (same fixture text, same
+    # `vers`/`wrap` assertions, plus `is_las30`).  Both agents agreed on the
+    # deletion; the parametrized cases keep both inputs.
 
     def test_parse_well_section(self) -> None:
         """Test parsing ~W section."""
@@ -185,6 +171,11 @@ Line two of free text.
         Uses public API (read_las_file) instead of asserting on private
         _data_line_count. The correct pre-scan count produces correct
         data array lengths on read.
+
+        HARDEN (F-8/F-324): the length assertions alone could not see a
+        pre-scan that miscounts in the same direction as the reader, so the
+        parser's own estimate is asserted and the exact column CONTENT is
+        pinned.  The trailing blank line must not be counted as data.
         """
         content = """~VERSION INFORMATION
  VERS.   2.0  :
@@ -196,12 +187,20 @@ Line two of free text.
 100.0  50.0
 100.1  51.0
 100.2  52.0
+
 """
         test_file = tmp_path / "pre_scan_data.las"
         test_file.write_text(content, encoding="utf-8")
         data = read_las_file(test_file)
-        assert len(data["logs"]["DEPT"]) == 3
-        assert len(data["logs"]["DT"]) == 3
+        assert list(data["logs"]["DEPT"]) == [100.0, 100.1, 100.2]
+        assert list(data["logs"]["DT"]) == [50.0, 51.0, 52.0]
+        parser = LASParser()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            parser.parse(content)
+        assert parser.data_line_count == 3, (
+            f"pre-scan estimate must be 3 data lines; got {parser.data_line_count}"
+        )
 
     def test_las30_version_detected(self) -> None:
         """Test that LAS 3.0 version is detected correctly."""
@@ -271,7 +270,16 @@ Line two of free text.
         assert las.curves[2].data_format == "S"
 
     def test_las30_array_notation(self) -> None:
-        """Test parsing LAS 3.0 array notation NMR[1], NMR[2]."""
+        """Test parsing LAS 3.0 array notation NMR[1], NMR[2].
+
+        HARDEN (F-2/F-326): the colon extension form was the only form
+        pinned.  The normative ``;``-spacing form ({A;0ms}, {AF10.4;5ms}) is
+        added: per F-180 the parser accepts the token (no "Invalid data
+        format" clearing) and deliberately KEEPS it in the description,
+        because the spacing is consumed later by
+        ``_las30_data._SPEC_FORM_ARRAY_RE`` — stripping it here would delete
+        the only copy of the spacing.
+        """
         content = """~VERSION INFORMATION
  VERS.   3.0  :
  WRAP.   NO   :
@@ -280,10 +288,14 @@ Line two of free text.
  DEPT.M       : DEPTH  {F}
  NMR[1].ms    : NMR Echo Array {A:0}
  NMR[2].ms    : NMR Echo Array {A:5}
+ NMR[3].ms    : NMR Echo Array {A;0ms}
+ NMR[4].ms    : NMR Echo Array {AF10.4;5ms}
 """
         parser = LASParser()
-        las = parser.parse(content)
-        assert len(las.curves) == 3
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            las = parser.parse(content)
+        assert len(las.curves) == 5
         nmr1 = las.curves[1]
         assert nmr1.array_info is not None
         assert nmr1.array_info.base_name == "NMR"
@@ -293,6 +305,18 @@ Line two of free text.
         assert nmr2.array_info is not None
         assert nmr2.array_info.index == 2
         assert nmr2.array_info.time_offset == 5.0
+        # F-180: the normative spacing forms are valid data formats — the
+        # pre-fix grammar cleared {AF10.4;5ms} to "" and warned.
+        invalid = [
+            str(w.message) for w in recorded if "Invalid data format" in str(w.message)
+        ]
+        assert invalid == [], invalid
+        for curve, description in (
+            (las.curves[3], "NMR Echo Array {A;0ms}"),
+            (las.curves[4], "NMR Echo Array {AF10.4;5ms}"),
+        ):
+            assert curve.data_format == "A", curve.mnemonic
+            assert curve.description == description, curve.mnemonic
 
     def test_empty_content(self) -> None:
         """Test parsing empty content."""
@@ -384,7 +408,14 @@ Line two of free text.
 
     # --- TEST-16: Comment skip / space delimiter / string-curve fallback in ASCII data ---
     def test_las30_ascii_comment_skip(self) -> None:
-        """Test that comments in LAS 3.0 ASCII data are skipped."""
+        """Test that comments in LAS 3.0 ASCII data are skipped.
+
+        DISPUTED-DELETE resolved conservatively (KEEP + HARDEN): the proposal
+        called this a strict subset of the later two-row comment test, but
+        this is the only pin whose FIRST data-section line is a comment, so it
+        is kept.  HARDEN: the row count alone could not see a shifted or
+        null-filled column, so the values are asserted too.
+        """
         content = """~VERSION INFORMATION
  VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
  WRAP.   NO   :
@@ -400,7 +431,8 @@ Line two of free text.
         las = parser.parse(content)
         assert len(las.data_sections) == 1
         # Should only have 1 data row, comment skipped
-        assert len(las.data_sections[0].data["DEPT"]) == 1
+        assert las.data_sections[0].data["DEPT"].tolist() == [100.0]
+        assert las.data_sections[0].data["DT"].tolist() == [50.0]
 
     def test_las30_space_delimiter(self) -> None:
         """Test LAS 3.0 with SPACE delimiter (default split behavior)."""
@@ -1197,7 +1229,12 @@ class TestUnknownSectionWarning:
     """F-031: Unknown section handler warning test."""
 
     def test_unknown_section_emits_warning(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Test that a ~X section (unknown type) emits a warning via logger."""
+        """Test that a ~X section (unknown type) emits a warning via logger.
+
+        HARDEN (register, G-07): the warning alone is satisfied even when the
+        section's BODY is dropped, so the body routing is asserted too — an
+        unknown section's lines must reach ``las.other``.
+        """
         content = """~VERSION INFORMATION
  VERS.   2.0  : CWLS LOG ASCII STANDARD
  WRAP.   NO   : ONE LINE PER DEPTH STEP
@@ -1206,22 +1243,11 @@ class TestUnknownSectionWarning:
 """
         with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
             parser = LASParser()
-            parser.parse(content)
+            las = parser.parse(content)
 
         assert "Unknown section type" in caplog.text
         assert "~X" in caplog.text
-
-    def test_unknown_section_with_warnings_module(self) -> None:
-        """Test unknown section via pytest caplog (more portable)."""
-        content = """~VERSION INFORMATION
- VERS.   2.0  : CWLS LOG ASCII STANDARD
- WRAP.   NO   : ONE LINE PER DEPTH STEP
-~X CUSTOM
- Some data in custom section.
-"""
-        parser = LASParser()
-        las = parser.parse(content)
-        # Should parse without error — unknown sections are logged, not fatal
+        assert "Some data in custom section." in las.other, las.other
         assert las.version.vers == "2.0"
 
 
@@ -1318,6 +1344,13 @@ class TestConcurrentParserAccess:
         # consistent.  Asserted here, in the main thread, so the check is
         # live — inside the worker's ``except Exception: pass`` it could
         # never fail (an AssertionError is swallowed as an Exception).
+        # HARDEN (F-8): ``all()`` over an EMPTY list is vacuously True, so a
+        # burst in which every parse raised would pass this check without
+        # testing anything.  Require at least one completion first.
+        assert completed, (
+            "no concurrent parse completed — the consistency check below "
+            "would be vacuous"
+        )
         assert all(r == 2 for r in completed), (
             f"Inconsistent completed parses: {completed}"
         )
@@ -1518,16 +1551,45 @@ class TestLAS30AsciiDataBranches:
             mandatory_warnings = [
                 x for x in w if "LAS 2.0 file missing mandatory well field" in str(x.message)
             ]
-            # M-11: LAS 2.0 requires the lascheck 10-field set
-            # (STRT, STOP, STEP, NULL, COMP, WELL, FLD, LOC, SRVC, DATE).
-            # This file has STRT, STOP only → 8 warnings.
-            assert len(mandatory_warnings) == 8
+            # F-330 / F-024: LAS 2.0 requires the CWLS twelve-SLOT set
+            # (STRT, STOP, STEP, NULL, COMP, WELL, FLD, LOC,
+            # PROV|CNTY|STAT|CTRY, SRVC, DATE, UWI|API).  The flat lascheck
+            # 10-field tuple this test used to count could not express the
+            # two alternative-spelling slots, so it pinned 8 warnings for a
+            # STRT+STOP file.  The slot rule (F-024) makes it 10, and the
+            # pin is the exact missing-SLOT SET so a change to the field set
+            # fails here instead of silently passing a count.
             warning_texts = [str(x.message) for x in mandatory_warnings]
-            assert any("STEP" in t for t in warning_texts)
-            assert any("NULL" in t for t in warning_texts)
+            missing_labels = {
+                t.split("mandatory well field: ", 1)[1] for t in warning_texts
+            }
+            assert missing_labels == {
+                "STEP",
+                "NULL",
+                "COMP",
+                "WELL",
+                "FLD",
+                "LOC",
+                "PROV or CNTY or STAT or CTRY",
+                "SRVC",
+                "DATE",
+                "UWI or API",
+            }, sorted(missing_labels)
+            # One warning per missing slot — a duplicated emission (the
+            # pre-F-024 double-report shape) must fail, not be absorbed by
+            # the set comparison above.
+            assert len(warning_texts) == len(missing_labels), warning_texts
 
     def test_las20_all_mandatory_fields_no_warning(self) -> None:
-        """LAS 2.0 files with all mandatory fields should not warn."""
+        """LAS 2.0 files with all mandatory fields should not warn.
+
+        F-024: the CWLS twelve-slot set includes the ``PROV|CNTY|STAT|CTRY``
+        and ``UWI|API`` alternative-spelling slots.  This fixture used to stop
+        at the flat lascheck 10-field tuple, so it silently omitted the
+        province slot and now draws the missing-slot warning; the ``PROV``
+        entry below completes the twelve slots, which is what the test's
+        no-warning premise requires.
+        """
         content = """~VERSION INFORMATION
  VERS.   2.0  : CWLS LOG ASCII STANDARD
  WRAP.   NO   :
@@ -1540,6 +1602,7 @@ class TestLAS30AsciiDataBranches:
  WELL.   WELL_A  :
  FLD.    NORTH  :
  LOC .   LOC_A  :
+ PROV.   STATE_A  :
  SRVC.   SRVC_A  :
  DATE.   01/01/2020  :
  UWI .   UWI_A  :
@@ -1638,6 +1701,10 @@ class TestLAS30AsciiDataBranches:
 
         Uses public API to verify that only 2 data points (from ~A section)
         are read, not 4 (the ~Core lines are excluded by pre-scan).
+
+        HARDEN (G-05/F-324): the reader-side lengths are produced by the READ
+        path, so an inflated pre-scan estimate is invisible here; the parser's
+        own estimate is asserted too (2, not 4).
         """
         content = """~VERSION INFORMATION
  VERS.   2.0  :
@@ -1655,8 +1722,15 @@ class TestLAS30AsciiDataBranches:
         test_file = tmp_path / "pre_scan_non_ascii.las"
         test_file.write_text(content, encoding="utf-8")
         data = read_las_file(test_file)
-        assert len(data["logs"]["DEPT"]) == 2
-        assert len(data["logs"]["DT"]) == 2
+        assert list(data["logs"]["DEPT"]) == [100.0, 100.1]
+        assert list(data["logs"]["DT"]) == [50.0, 51.0]
+        parser = LASParser()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            parser.parse(content)
+        assert parser.data_line_count == 2, (
+            f"pre-scan must count only the ~A lines; got {parser.data_line_count}"
+        )
 
     def test_parse_las30_creates_expected_data_sections(self) -> None:
         """For LAS 3.0, the parser creates data_sections for each section
@@ -2059,24 +2133,36 @@ class TestVERSValidation:
 
         LAS 1.20 is a real format; the value is preserved so the reader
         can emit its own 'not officially supported' warning.
-        """
-        import warnings
 
+        HARDEN (register): ``len(...) >= 1`` plus a substring could not see a
+        duplicated warning or a wrong message, and the test never checked that
+        the preserved value is actually INTERPRETED — 1.20 must take the
+        LAS 1.2 branch (4-field well rule), not fall back to 2.0.
+        """
         content = """~VERSION INFORMATION
  VERS . 1.20 : CWLS LOG ASCII STANDARD -VERSION 1.20
  WRAP.   NO   : ONE LINE PER DEPTH STEP
+~WELL INFORMATION
+ STRT.M    : 1670.0
+ STOP.M    : 1680.0
+ STEP.M    : 0.1
+ NULL.     : -999.25
 """
         parser = LASParser()
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             las = parser.parse(content)
-            vers_warnings = [x for x in w if "Non-standard VERS value" in str(x.message)]
-            assert len(vers_warnings) >= 1, (
-                f"Expected warning for non-standard VERS 1.20, got: {[str(x.message) for x in w]}"
-            )
-            assert "1.20" in str(vers_warnings[0].message)
-            # Value must be preserved as-is for reader's own validation
-            assert las.version.vers == "1.20"
+        vers_warnings = [str(x.message) for x in w if "Non-standard VERS value" in str(x.message)]
+        assert vers_warnings == [
+            "Non-standard VERS value '1.20'. Expected 1.2, 2.0, or 3.0. "
+            "Preserving as-is for backward compatibility."
+        ], vers_warnings
+        # Value must be preserved as-is for reader's own validation
+        assert las.version.vers == "1.20"
+        # ... and the preserved value must drive the LAS 1.2 rule: a file with
+        # the four numeric fields draws no mandatory-field warning.
+        mandatory = [str(x.message) for x in w if "missing mandatory well field" in str(x.message)]
+        assert mandatory == [], mandatory
 
     def test_vers_standard_no_warning(self) -> None:
         """F-005: Standard VERS value '2.0' produces no warning."""
@@ -2257,62 +2343,98 @@ class TestSplitlinesCharsSanitization:
         "\u2029",  # PARAGRAPH SEPARATOR
     )
 
-    def test_all_splitline_chars_sanitized_in_version_value(self) -> None:
-        """Inject each splitline character into a VERS value and verify
-        they don't cause fake section breaks. The characters are replaced
-        with spaces before splitlines(), so VERS remains on one line.
-        """
-        for ch in self._SPLITLINES_CHARS:
-            content = (
-                f"~VERSION INFORMATION\n"
-                f" VERS.\x20\x20 2.0{ch}  : CWLS LOG ASCII STANDARD\n"
-                f" WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
-            )
-            parser = LASParser()
-            las = parser.parse(content)
-            # The VERS line should still be parsed despite injected char
-            assert las.version.vers.startswith("2.0")
+    def test_all_splitline_chars_sanitized_in_version_value(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Inject each splitline character into a VERS line and verify it does
+        not cause a fake section break.
 
-    def test_all_splitline_chars_sanitized_in_curve_section(self) -> None:
-        """Inject each splitline character between curve lines and verify
-        curves are still parsed correctly.
+        HARDEN (register: proven vacuous, G-06): in the original shape the
+        character sat at LINE TAIL, where ``splitlines()`` reproduces the
+        sanitized structure even with the regex disabled — all three tests
+        passed under a no-op sanitizer.  The character now sits MID-LINE
+        (inside the VERS description), where an unsanitized split emits a
+        stray fragment; the discriminator is that the parser logs no
+        "Non-matching ~V line" for any of the eight characters and the VERS
+        value stays exact.  The chars are finding-named (F-ITER2-T1-M02), so
+        the pin is kept and hardened, never deleted.
         """
         for ch in self._SPLITLINES_CHARS:
+            caplog.clear()
             content = (
-                f"~VERSION INFORMATION\n"
-                f" VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
-                f" WRAP.   NO   :\n"
-                f"~CURVE INFORMATION\n"
-                f" DEPT.M   :  Depth{ch}\n"
-                f" DT.US/M  :  Sonic\n"
+                "~VERSION INFORMATION\n"
+                f" VERS.   2.0  : CWL{ch}S LOG ASCII STANDARD\n"
+                " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
             )
             parser = LASParser()
-            las = parser.parse(content)
-            assert len(las.curves) == 2
+            with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+                las = parser.parse(content)
+            assert las.version.vers == "2.0", (repr(ch), las.version.vers)
+            assert las.version.wrap == "NO", (repr(ch), las.version.wrap)
+            # A fake line break leaves the post-char fragment behind as a
+            # stray ~V line, which the parser reports.
+            assert "Non-matching ~V line" not in caplog.text, (repr(ch), caplog.text)
+
+    def test_all_splitline_chars_sanitized_in_curve_section(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Inject each splitline character into a ~C line and verify no fake
+        curve line is produced.
+
+        HARDEN (register: proven vacuous, G-06): the character sits inside the
+        curve DESCRIPTION, where an unsanitized split truncates the
+        description to "De" and leaves "pth" behind as a non-matching ~C line.
+        The sanitized path substitutes a space, so the exact description is
+        "De pth" and no stray line is logged.
+        """
+        for ch in self._SPLITLINES_CHARS:
+            caplog.clear()
+            content = (
+                "~VERSION INFORMATION\n"
+                " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+                " WRAP.   NO   :\n"
+                "~CURVE INFORMATION\n"
+                f" DEPT.M   :  De{ch}pth\n"
+                " DT.US/M  :  Sonic\n"
+            )
+            parser = LASParser()
+            with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+                las = parser.parse(content)
+            assert len(las.curves) == 2, (repr(ch), len(las.curves))
             assert las.curves[0].mnemonic == "DEPT"
             assert las.curves[1].mnemonic == "DT"
+            assert las.curves[0].description == "De pth", (repr(ch), las.curves[0].description)
+            assert las.curves[1].description == "Sonic"
+            assert "Non-matching ~C line" not in caplog.text, (repr(ch), caplog.text)
 
-    def test_all_splitline_chars_sanitized_no_missing_curves(self) -> None:
-        """Inject all 8 characters between curve lines; parse should
-        succeed with all curves detected, not split into fake lines.
+    def test_all_splitline_chars_sanitized_no_missing_curves(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Inject all 8 characters into one curve line; parse should succeed
+        with all curves detected, not split into fake lines.
+
+        HARDEN (register: proven vacuous, G-06): with every character inside
+        the description, the sanitized path yields exactly eight substituted
+        spaces ("De        pth"); an unsanitized split truncates the
+        description and logs a stray non-matching ~C line.
         """
-        # Build content with every splitline char between the two curve lines
         all_chars = "".join(self._SPLITLINES_CHARS)
         content = (
             "~VERSION INFORMATION\n"
             " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
             " WRAP.   NO   :\n"
             "~CURVE INFORMATION\n"
-            f" DEPT.M   :  Depth{all_chars}\n"
-            f" DT.US/M  :  Sonic\n"
+            f" DEPT.M   :  De{all_chars}pth\n"
+            " DT.US/M  :  Sonic\n"
         )
         parser = LASParser()
-        las = parser.parse(content)
-        # Both curves should be detected — the control chars were
-        # replaced with spaces, not treated as line breaks
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            las = parser.parse(content)
         assert len(las.curves) == 2
         assert las.curves[0].mnemonic == "DEPT"
         assert las.curves[1].mnemonic == "DT"
+        assert las.curves[0].description == "De" + " " * 8 + "pth", las.curves[0].description
+        assert "Non-matching ~C line" not in caplog.text, caplog.text
 
     def test_mid_line_splitline_char_no_column_shift(self) -> None:
         """HARDEN PARS-M1: a MID-LINE splitline char must not fake a
@@ -2369,17 +2491,20 @@ class TestValueOnlyPattern:
         """VERSION line without a colon: VALUE_ONLY_PATTERN captures
         the entire remainder as the value group, which includes the
         description text since there is no colon to separate them.
+
+        MERGE (register, both agents agreed): this input is the 2.0 case of
+        ``test_colon_free_vers_parses_true_version`` below, which asserts the
+        value with EQUALITY (``startswith`` here accepted "2.0 garbage") and
+        also pins the absence of a VERS warning.  Kept as a pointer so the
+        register's MERGE decision is traceable in place.
         """
         content = (
             "~VERSION INFORMATION\n"
             " VERS.   2.0  CWLS LOG ASCII STANDARD\n"
             " WRAP.   NO   : ONE LINE PER DEPTH STEP\n"
         )
-        parser = LASParser()
-        las = parser.parse(content)
-        # Without colon, the entire rest of the line is the value
-        # (VALUE_ONLY_PATTERN captures everything after unit dot)
-        assert las.version.vers.startswith("2.0")
+        las = LASParser().parse(content)
+        assert las.version.vers == "2.0", las.version.vers
 
     @pytest.mark.parametrize("vers", ["1.2", "2.0", "3.0"])
     def test_colon_free_vers_parses_true_version(self, vers: str) -> None:
@@ -2489,7 +2614,13 @@ class TestValueOnlyPattern:
         assert las.well.descriptions["WELL"] == "Test Well Name"
 
     def test_well_descriptions_roundtrip_las20(self) -> None:
-        """F-07: LAS 2.0+ well descriptions survive roundtrip through writer."""
+        """F-07: LAS 2.0+ well descriptions survive roundtrip through writer.
+
+        HARDEN (MQ-1): the roundtrip alone is a write→read oracle — the writer
+        could emit the wrong layout and the same reader would still agree.  The
+        EMITTED text is asserted, so a writer-side description/format change
+        fails here instead of being masked by reader symmetry.
+        """
         from pylasdev import write_las_file
 
         content = (
@@ -2513,7 +2644,12 @@ class TestValueOnlyPattern:
             write_las_file(tf.name, las)
             out_path = Path(tf.name)
 
-        re_read = parser.parse(out_path.read_text())
+        emitted = out_path.read_text()
+        assert " Oil Company Name" in emitted, emitted
+        assert "COMP." in emitted, emitted
+        assert "OILCO" in emitted, emitted
+
+        re_read = parser.parse(emitted)
         assert re_read.well.descriptions["COMP"] == "Oil Company Name"
         out_path.unlink()
 
@@ -2823,7 +2959,15 @@ class TestMaxGuardLimits:
     # ── MAX_DATA_LINES (parser.py:1927) ──────────────────────────
 
     def test_max_data_lines_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """MAX_DATA_LINES guard raises LASParseError when data lines exceed limit."""
+        """MAX_DATA_LINES guard raises LASParseError when data lines exceed limit.
+
+        HARDEN (F-7): the loose ``match=r"ASCII data line count.*exceeds"``
+        is satisfied by either the parser's accumulation guard or
+        ``_las30_data``'s per-section guard.  The message is pinned exactly
+        (bearing both counts), which names the firing guard and fails if the
+        guard stops reporting the overflowing count — the observable that
+        tells a user WHY the file was rejected.
+        """
         monkeypatch.setattr("pylasdev.data_reader.MAX_DATA_LINES", 1)
         content = """~VERSION INFORMATION
  VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
@@ -2838,7 +2982,13 @@ class TestMaxGuardLimits:
 101.0
 """
         parser = LASParser()
-        with pytest.raises(LASParseError, match=r"ASCII data line count.*exceeds"):
+        with pytest.raises(
+            LASParseError,
+            match=(
+                r"ASCII data line count \(2\) exceeds maximum allowed \(1\)\. "
+                r"The file may be malformed or corrupt\."
+            ),
+        ):
             parser.parse(content)
 
     def test_max_data_lines_at_limit_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3172,6 +3322,12 @@ class TestIndexedSectionOrdering:
         )
         # PARS-05: the buffered data is attached once the definition parses.
         assert len(las.data_sections) == 1
+        # HARDEN (G-14): the message alone is satisfied while the buffered
+        # rows are dropped — assert the attached CONTENT and the resolved
+        # curve columns.
+        section = las.data_sections[0]
+        assert section.data["RHOZ"].tolist() == [2.5], section.data
+        assert section.data["PHIZ"].tolist() == [0.15], section.data
         assert not any("Data has been discarded" in str(w.message) for w in rec), (
             f"Unexpected discard warning for supported shape: {[str(w.message) for w in rec]}"
         )
@@ -3431,7 +3587,12 @@ class TestValidateCrossSectionConsistency:
         self,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Data section appearing before its definition emits ordering warning."""
+        """Data section appearing before its definition emits ordering warning.
+
+        HARDEN (G-14): ``"before" in caplog.text`` accepted any unrelated
+        warning containing the word.  The ordering diagnostic is pinned by its
+        exact shape (section name + the "should precede" wording).
+        """
         content = """~VERSION INFORMATION
  VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
  WRAP.   NO   :
@@ -3447,8 +3608,11 @@ class TestValidateCrossSectionConsistency:
         parser = LASParser()
         with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
             parser.parse(content)
-            warning_text = caplog.text
-            assert "before" in warning_text, f"Expected ordering warning; got: {warning_text}"
+        warning_text = caplog.text
+        assert "~CORE_DATA before ~CORE_DEFINITION" in warning_text, (
+            f"Expected ordering warning naming both sections; got: {warning_text}"
+        )
+        assert "are buffered and attached" in warning_text, warning_text
 
     # --- (4) Definition→Data gap ---
 
@@ -3744,6 +3908,15 @@ class TestValidateCrossSectionConsistency:
 """
         parser = LASParser()
         las = parser.parse(content)
+
+        # HARDEN (F-8): the validator agreeing with the state proves the two
+        # implementations match, not that the state is clean.  Assert the
+        # post-condition itself: the final flush consumed the buffer and
+        # advanced the section index once per data section.
+        assert parser._state.ascii_data_lines == [], parser._state.ascii_data_lines
+        assert parser._state.current_data_section_idx == 2, (
+            parser._state.current_data_section_idx
+        )
 
         # Validate parser state — must not contain "dangling data" issue
         state_issues = parser._state.validate(las)
@@ -4081,7 +4254,13 @@ class TestP01WellFormatLasioInversion:
     def test_cwls_and_lasio_modes_equivalent(self) -> None:
         """P-01: cwls and lasio modes produce identical extraction for
         spec-layout files (the parameter is API-compatible; both parse
-        the CWLS label-left/value-right layout the same way)."""
+        the CWLS label-left/value-right layout the same way).
+
+        HARDEN (F2): comparing the two modes to EACH OTHER is
+        non-discriminating — a shared wrong extraction satisfies it.  The
+        literal expected values are asserted first; the equivalence check is
+        then only the API-compatibility half of the claim.
+        """
         content = (
             "~VERSION INFORMATION\n"
             " VERS.   1.2  : CWLS LOG ASCII STANDARD\n"
@@ -4095,7 +4274,14 @@ class TestP01WellFormatLasioInversion:
         )
         las_cwls = LASParser(well_format="cwls").parse(content)
         las_lasio = LASParser(well_format="lasio").parse(content)
-        assert las_cwls.well["COMP"] == las_lasio.well["COMP"] == "Test Oil Company Ltd."
+        for label, las in (("cwls", las_cwls), ("lasio", las_lasio)):
+            assert las.well["COMP"] == "Test Oil Company Ltd.", (label, las.well["COMP"])
+            assert las.well.descriptions["COMP"] == "COMPANY", (
+                label,
+                las.well.descriptions["COMP"],
+            )
+            assert las.well["STRT"] == "1000.5", (label, las.well["STRT"])
+        assert las_cwls.well["COMP"] == las_lasio.well["COMP"]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -4785,67 +4971,390 @@ class TestM13TopLevelLogsHeal:
 # ──────────────────────────────────────────────────────────────
 
 
+class _CallCounter:
+    """Delegating call counter: records every call and forwards to the target.
+
+    Used to instrument the parser's line-matching entry points (the compiled
+    patterns and the manual scan) so routing is asserted without a clock.
+    """
+
+    def __init__(self, target: Any) -> None:
+        self._target = target
+        self.calls: list[str] = []
+
+    def __call__(self, *args: Any) -> Any:
+        self.calls.append(args[-1] if args else "")
+        return self._target(*args)
+
+    def match(self, string: str) -> Any:
+        self.calls.append(string)
+        return self._target.match(string)
+
+
+def _edge_repeat(seq: Any, *, from_end: bool) -> tuple[str, bool] | None:
+    """The unbounded repeat the engine reaches first/last on a path.
+
+    Returns ``(kind, wildcard)`` — ``kind`` is ``'greedy'`` or ``'lazy'`` and
+    ``wildcard`` says the repeat's body can match ANY character — or ``None``
+    when that edge of the path offers no unbounded CHOICE: a possessive
+    (``\\s++``) or atomic (``(?>...)``) repeat is atomic, a bounded repeat
+    (``{0,64}``/``?``) is capped, a literal ends the path, and reading from the
+    END an anchor (``$``) ends it (nothing past the anchor can be re-scanned).
+    ``ASSERT``/``ASSERT_NOT`` are zero-width and skipped.
+
+    Groups and branches are descended, so the repeat that ENDS a group is
+    still visible to the element after the group and the repeat that STARTS a
+    group/branch is visible to the element before it.  That boundary is where
+    the partial pre-fix revert lives: restoring only the separator's greedy
+    ``\\s+`` (``(\\s+:...)``) leaves the repeated run at the START of a branch,
+    with the lazy ``(?P<value>.*?)`` immediately before the group.
+    """
+    _c = import_module("re._constants")
+
+    items = list(seq)
+    if from_end:
+        items.reverse()
+    for op, av in items:
+        if op is _c.AT:
+            if from_end:
+                return None
+            continue
+        if op is _c.POSSESSIVE_REPEAT or op is _c.ATOMIC_GROUP:
+            return None
+        if op in (_c.MAX_REPEAT, _c.MIN_REPEAT):
+            if av[1] < _c.MAXREPEAT:
+                return None
+            return (
+                "greedy" if op is _c.MAX_REPEAT else "lazy",
+                any(sub_op is _c.ANY for sub_op, _ in av[-1]),
+            )
+        if op is _c.SUBPATTERN:
+            return _edge_repeat(av[-1], from_end=from_end)
+        if op is _c.BRANCH:
+            edges = [_edge_repeat(branch, from_end=from_end) for branch in av[1]]
+            for kind in ("greedy", "lazy"):
+                matches = [edge for edge in edges if edge is not None and edge[0] == kind]
+                if matches:
+                    return kind, any(edge[1] for edge in matches)
+            return None
+        if op in (_c.ASSERT, _c.ASSERT_NOT):
+            continue
+        return None
+    return None
+
+
+def _contains_unbounded_repeat(seq: Any) -> bool:
+    """True when *seq* itself offers an unbounded greedy/lazy repeat anywhere.
+
+    A possessive/atomic wrapper is a BARRIER: it commits to one match, so the
+    enclosing repeat has a single way to consume it (``(a++)+`` and
+    ``(?>a+)+`` are not exponential).  Anything catastrophic INSIDE such a
+    wrapper is still found — the caller walks into its body as its own
+    sequence — so the barrier only stops the outer repeat from counting an
+    inner choice it can never re-split.  Bounded wrappers are descended: a
+    repeat inside them is still re-split per outer iteration.
+    """
+    _c = import_module("re._constants")
+
+    for op, av in seq:
+        if op is _c.POSSESSIVE_REPEAT or op is _c.ATOMIC_GROUP:
+            continue
+        if op in (_c.MAX_REPEAT, _c.MIN_REPEAT) and av[1] >= _c.MAXREPEAT:
+            return True
+        for body in _child_sequences(op, av):
+            if _contains_unbounded_repeat(body):
+                return True
+    return False
+
+
+def _child_sequences(op: Any, av: Any) -> list[Any]:
+    """The sub-pattern sequences nested under one parse-tree item."""
+    _c = import_module("re._constants")
+
+    if op in (_c.MAX_REPEAT, _c.MIN_REPEAT, _c.POSSESSIVE_REPEAT, _c.SUBPATTERN):
+        return [av[-1]]
+    if op is _c.ATOMIC_GROUP:
+        # ``(?>...)`` stores the SubPattern directly (no bounds prefix).
+        return [av]
+    if op in (_c.ASSERT, _c.ASSERT_NOT):
+        return [av[1]]
+    if op is _c.BRANCH:
+        return list(av[1])
+    return []
+
+
+def _ambiguous_repeat_adjacencies(pattern_source: str) -> list[str]:
+    """Structural backtracking hazards in *pattern_source*.
+
+    PARS-11's defect class: a non-greedy wildcard (``.*?``) followed by a
+    greedy unbounded repeat makes the engine try every split point, so the
+    trailing whitespace run is re-scanned once per candidate position — the
+    pre-fix pattern resolved to O(n³) on a 2000-char no-colon line (3.86 s).
+    A possessive (``\\s++``) or atomic (``(?>\\s+)``) quantifier removes the
+    choice and with it the re-scan; so does a non-greedy follower.  A second
+    hazard is the exponential family: an unbounded repeat whose body holds
+    another unbounded repeat (``(a+)+``, ``(.*)*``) — every split of the run
+    is retried per outer iteration.
+
+    The walk uses CPython's parse tree, not the pattern TEXT, so any
+    equivalent spelling of the guarantee passes and only a return to the
+    mixed-greediness adjacency (or a nested unbounded repeat) fails.  Adjacency
+    is checked across group/branch boundaries, so a partial revert that keeps
+    the possessive separator but restores one greedy ``\\s+`` at a branch start
+    is still caught.  Returns one message per offending structure (empty list
+    = no ambiguity found).
+    """
+    _c = import_module("re._constants")
+    _parse = import_module("re._parser")
+
+    problems: list[str] = []
+
+    def walk(seq: Any, path: str) -> None:
+        items = list(seq)
+        for index in range(len(items) - 1):
+            left = _edge_repeat(items[index : index + 1], from_end=True)
+            right = _edge_repeat(items[index + 1 : index + 2], from_end=False)
+            if left is None or right is None:
+                continue
+            if left[0] != right[0] or left[1]:
+                problems.append(
+                    f"{path}[{index}->{index + 1}]: {left[0]} unbounded repeat "
+                    f"followed by a {right[0]} unbounded repeat (engine re-scans)"
+                )
+        for index, (op, av) in enumerate(items):
+            if (
+                op in (_c.MAX_REPEAT, _c.MIN_REPEAT)
+                and av[1] >= _c.MAXREPEAT
+                and _contains_unbounded_repeat(av[-1])
+            ):
+                problems.append(
+                    f"{path}[{index}]: unbounded repeat nested inside another "
+                    f"unbounded repeat (exponential backtracking)"
+                )
+            for sub_index, body in enumerate(_child_sequences(op, av)):
+                walk(body, f"{path}[{index}].sub{sub_index}")
+
+    walk(_parse.parse(pattern_source), "pattern")
+    return problems
+
+
+def _count_line_matching_routes(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Instrument _match_data_line's two routes and return their counters.
+
+    Returns ``{"data_pattern": _CallCounter, "value_only_pattern":
+    _CallCounter, "manual_scan": list[str]}``.  The routed-lines lists are
+    what the assertions compare, so a routing regression (the length gate
+    removed, or the patterns consulted for a long line) fails here without a
+    clock.
+    """
+    from pylasdev import parser as parser_module
+
+    counters: dict[str, Any] = {}
+    for label, attribute in (
+        ("data_pattern", "DATA_LINE_PATTERN"),
+        ("value_only_pattern", "VALUE_ONLY_PATTERN"),
+    ):
+        counting = _CallCounter(getattr(parser_module, attribute))
+        monkeypatch.setattr(parser_module, attribute, counting)
+        counters[label] = counting
+
+    manual_calls: list[str] = []
+    original_manual = LASParser._match_data_line_manual
+
+    def counting_manual(self: LASParser, line: str) -> Any:
+        manual_calls.append(line)
+        return original_manual(self, line)
+
+    monkeypatch.setattr(LASParser, "_match_data_line_manual", counting_manual)
+    counters["manual_scan"] = manual_calls
+    return counters
+
+
 class TestS8PARS11NoCatastrophicBacktracking:
     """PARS-11 (HIGH): DATA_LINE_PATTERN was O(n³) on no-colon
-    whitespace-run lines at the 2000-char gate boundary (3.86s pre-fix).
-    Possessive quantifiers make it linear; the gate no longer has a
-    cliff at 2000/2001 chars."""
+    whitespace-run lines at the 2000-char gate boundary (3.86 s pre-fix).
+    Possessive quantifiers make it linear and the length gate routes lines
+    longer than 2000 chars to the manual scan.
 
-    def _assert_fast(self, line: str, budget_ms: float = 500.0) -> Any:
-        import time as _time
+    Determinism rework (register rows for this class): the original pins
+    asserted wall-clock budgets (``elapsed < 500 ms`` / ``< 2000 ms``), which
+    flake under ``--cov`` because coverage multiplies interpreter work by an
+    amount unrelated to the defect.  Each timing assertion is replaced by two
+    deterministic proxies that fail on the pre-fix code:
 
-        start = _time.perf_counter()
-        result = LASParser()._match_data_line(line)
-        elapsed_ms = (_time.perf_counter() - start) * 1000.0
-        assert elapsed_ms < budget_ms, (
-            f"DATA_LINE_PATTERN took {elapsed_ms:.1f} ms on "
-            f"{len(line)}-char line (regression: O(n³) backtracking)"
+    * ``_ambiguous_repeat_adjacencies`` — the mixed-greediness adjacency in the
+      compiled pattern is what made the engine re-scan; the shipped pattern
+      must have none, and the pre-fix spelling must be detected — including the
+      PARTIAL revert (only the separator's possessive removed) and the nested
+      unbounded-repeat family (``(a+)+``) — asserted in
+      ``test_detector_rejects_the_pre_fix_spelling`` and
+      ``test_detector_flags_nested_repeats_and_respects_atomic_forms`` so the
+      proxy cannot go vacuous.
+    * route call counters — the length gate must send <=2000-char lines to the
+      regex and >2000-char lines to the manual scan; within the regex path the
+      data pattern runs first and the ``VALUE_ONLY_PATTERN`` fallback runs
+      exactly once when it rejects the line.
+    """
+
+    def test_detector_rejects_the_pre_fix_spelling(self) -> None:
+        """The structural proxy must be a real witness, not a tautology.
+
+        Reconstructing the pre-fix spelling (greedy whitespace quantifiers)
+        must produce at least one reported adjacency; the shipped pattern must
+        produce none.  The PARTIAL revert matters most: a later edit that
+        restores only the separator's first ``\\s+`` (leaving ``\\s*+``
+        possessive) recreates the same quadratic shape, and the detector must
+        see it across the group boundary — the repeat now starts a BRANCH and
+        the lazy ``(?P<value>.*?)`` sits in the element before it.
+        """
+        shipped = DATA_LINE_PATTERN.pattern
+        pre_fix = shipped.replace(r"\s++", r"\s+").replace(r"\s*+", r"\s*")
+        assert pre_fix != shipped
+        assert _ambiguous_repeat_adjacencies(pre_fix), (
+            "detector cannot see the pre-fix greedy spelling — the linearity "
+            "pin would be vacuous"
         )
-        return result
+        partial_revert = shipped.replace(r"(\s++:\s*+|", r"(\s+:\s*+|", 1)
+        assert partial_revert != shipped
+        assert _ambiguous_repeat_adjacencies(partial_revert), (
+            "detector misses the PARTIAL revert (only the separator's first "
+            "\\s++ restored) — a realistic re-introduction of the quadratic "
+            "shape would ship green"
+        )
+        assert _ambiguous_repeat_adjacencies(shipped) == []
 
-    def test_pathological_2000_char_line_is_fast(self) -> None:
-        """Adversarial no-colon whitespace-run line at the regex gate
-        boundary must complete in well under the pre-fix 3.86s.
+    def test_detector_flags_nested_repeats_and_respects_atomic_forms(self) -> None:
+        """Witness the detector's own scope, so its verdict is auditable.
+
+        Nested unbounded repeats are the exponential family (``(a+)+``,
+        ``(.*)*``) — every split of the run is retried per outer iteration —
+        and must be flagged even though no two repeats are adjacent in the
+        tree.  Possessive (``a++``) and atomic (``(?>a+)``) repetitions remove
+        the backtracking choice, so they must NOT be flagged; without that
+        half a detector that flagged every nested repeat would also flag the
+        shipped PARS-11 fix (which uses ``\\s++``)."""
+        assert _ambiguous_repeat_adjacencies(r"^(a+)+$"), "nested greedy repeat not seen"
+        assert _ambiguous_repeat_adjacencies(r"^(a*)*$"), "nested greedy star not seen"
+        assert _ambiguous_repeat_adjacencies(r"^(?:a+)*$"), "nested group repeat not seen"
+        assert _ambiguous_repeat_adjacencies(r"^(a++)+$") == [], (
+            "a possessive inner repeat cannot backtrack — false positive"
+        )
+        assert _ambiguous_repeat_adjacencies(r"^(?>a+)+$") == [], (
+            "an atomic inner group cannot backtrack — false positive"
+        )
+        assert _ambiguous_repeat_adjacencies(r"^(?:ab)+$") == [], (
+            "bounded alternation of literals is not ambiguous — false positive"
+        )
+
+    def test_pathological_2000_char_line_uses_regex_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The worst regex case (a TOTAL line of exactly 2000 chars) must go
+        to the regex path exactly once and must not re-scan.
 
         The _SAFE_REGEX_LINE_LENGTH gate bypasses the regex for lines
-        STRICTLY LONGER than 2000 chars, so the worst regex case is a
-        TOTAL line of exactly 2000 chars ('AB.CD' + 1995 spaces)."""
+        STRICTLY LONGER than 2000 chars, so 'AB.CD' + 1995 spaces is the
+        largest input the regex ever sees.
+
+        HARDEN (register test-parser-b): the ``VALUE_ONLY_PATTERN`` fallback
+        route is instrumented too and was never asserted.  The colon-less
+        pathological line is exactly the fallback's input (the data pattern
+        requires a separator colon), so the counter now pins that the fallback
+        is consulted ONCE for the line — a regression that made the fallback
+        run per candidate position, or that dropped it, fails here.
+        """
         line = "AB.CD" + " " * 1995
         assert len(line) == 2000
-        self._assert_fast(line)
+        counters = _count_line_matching_routes(monkeypatch)
+        LASParser()._match_data_line(line)
+        assert counters["data_pattern"].calls == [line]
+        assert counters["value_only_pattern"].calls == [line]
+        assert counters["manual_scan"] == []
+        # Correctness half: a VALID 2000-char header line still parses to the
+        # exact groups — possessive quantifiers must not change the captures
+        # at the boundary.
+        head = "DEPT.M 1000.0 : "
+        padded = head + "x" * (2000 - len(head))
+        match = LASParser()._match_data_line(padded)
+        assert match is not None, "valid 2000-char header line must still parse"
+        assert match.groupdict() == {
+            "mnemonic": "DEPT",
+            "unit": "M",
+            "value": "1000.0",
+            "description": "x" * (2000 - len(head)),
+        }
 
-    def test_pathological_2001_char_line_is_fast(self) -> None:
-        """One char past the boundary (manual-scan path) must also be fast."""
+    def test_pathological_2001_char_line_uses_manual_scan(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One char past the boundary must bypass the regex entirely."""
         line = "AB.CD" + " " * 1996
         assert len(line) == 2001
-        self._assert_fast(line)
+        counters = _count_line_matching_routes(monkeypatch)
+        assert LASParser()._match_data_line(line) is None
+        assert counters["manual_scan"] == [line]
+        assert counters["data_pattern"].calls == []
+        # Correctness half: the manual scan parses a valid long line exactly.
+        head = "DEPT.M 1000.0 : "
+        padded = head + "x" * (2001 - len(head))
+        match = LASParser()._match_data_line(padded)
+        assert match is not None, "valid 2001-char header line must still parse"
+        assert match.groupdict() == {
+            "mnemonic": "DEPT",
+            "unit": "M",
+            "value": "1000.0",
+            "description": "x" * (2001 - len(head)),
+        }
 
-    def test_large_pathological_line_is_fast(self) -> None:
-        """10K-char no-colon line through the manual scan."""
-        self._assert_fast("AB.CD" + " " * 10_000)
+    def test_large_pathological_line_uses_manual_scan(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """10K-char no-colon line goes through the manual scan, not the regex."""
+        line = "AB.CD" + " " * 10_000
+        counters = _count_line_matching_routes(monkeypatch)
+        assert LASParser()._match_data_line(line) is None
+        assert counters["manual_scan"] == [line]
+        assert counters["data_pattern"].calls == []
 
-    def test_end_to_end_parse_with_pathological_curve_line(self) -> None:
-        """The gate must not produce a cliff at 2000/2001 chars when a
-        pathological line appears in a real file (public API)."""
-        import time as _time
+    def test_end_to_end_parse_with_pathological_curve_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gate boundary holds through the public API.
 
-        for n in (2000, 2001):
+        A pathological curve line at exactly 2000 chars goes to the regex and
+        one char further to the manual scan, and the file still parses.
+        """
+        for length, expected_manual in ((2000, False), (2001, True)):
+            counters = _count_line_matching_routes(monkeypatch)
+            pathological = " AB.CD" + " " * (length - 6)
+            assert len(pathological) == length
             content = (
                 "~VERSION INFORMATION\n"
                 " VERS.   3.0  : CWLS\n"
                 " WRAP.   NO   :\n"
-                "~CURVE INFORMATION\n"
-                " AB.CD" + " " * (n - 5) + "\n"
+                "~CURVE INFORMATION\n" + pathological + "\n"
             )
-            start = _time.perf_counter()
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                LASParser().parse(content)
-            elapsed_ms = (_time.perf_counter() - start) * 1000.0
-            assert elapsed_ms < 2000.0, (
-                f"parse() took {elapsed_ms:.1f} ms with {n}-char pathological "
-                f"line (pre-fix: 3.86s cliff at 2000)"
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                las = LASParser().parse(content)
+            assert (pathological in counters["manual_scan"]) is expected_manual, (
+                length,
+                counters["manual_scan"],
             )
+            assert (pathological in counters["data_pattern"].calls) is not expected_manual, (
+                length,
+                len(counters["data_pattern"].calls),
+            )
+            # Correctness half: the malformed line never produces more than
+            # one curve, and any curve it does produce is the declared one.
+            # The exact outcome is NOT pinned because the two routes disagree
+            # at the boundary (2000-char line → curve AB via the regex
+            # fallback; 2001 → line rejected by the manual scan) — reported as
+            # a LOW production observation rather than frozen into a pin.
+            assert len(las.curves) <= 1, (length, [c.mnemonic for c in las.curves])
+            for curve in las.curves:
+                assert curve.mnemonic == "AB", (length, curve.mnemonic)
+
 
     def test_semantics_preserved_on_realistic_shapes(self) -> None:
         """Possessive quantifiers must not change parsing semantics."""
@@ -5065,7 +5574,12 @@ class TestS8I205WideDataRow:
     data rows that data_reader would accept (advertised MAX_CURVES=100K
     unreachable).  MAX_LINE_LENGTH now covers MAX_CURVES * 24."""
 
-    def test_wide_data_row_within_advertised_limits_parses(self) -> None:
+    def test_wide_data_row_within_advertised_limits_parses(self, tmp_path: Path) -> None:
+        """HARDEN (F10): asserting only the version proves nothing about the
+        row — a LAS 2.0 direct parse never processes it, so the test was
+        pinning MAX_LINE_LENGTH alone.  The READ path is asserted here: the
+        wide row must be read and its value must land in the column.
+        """
         row = " ".join(["-999.25"] * 9_500)  # ~76KB row — > old 50KB cap
         assert len(row) > 50_000
         content = (
@@ -5082,6 +5596,14 @@ class TestS8I205WideDataRow:
             warnings.simplefilter("ignore")
             las = LASParser().parse(content)
         assert las.version.vers == "2.0"
+        path = tmp_path / "wide_row.las"
+        path.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(path)
+        assert len(data["logs"]["DEPT"]) == 1, data["logs"]["DEPT"]
+        # The row's only declared curve carries the null sentinel value.
+        assert float(data["logs"]["DEPT"][0]) == -999.25, data["logs"]["DEPT"][0]
 
     def test_still_rejects_absurd_single_line(self) -> None:
         """The DoS guard must still reject absurd single lines."""
@@ -5111,7 +5633,12 @@ class TestS8I206SecondABlockWarning:
     warnings API) fired with a direction-misstating message.  Now a
     warnings-API warning fires stating the LATER block is dropped."""
 
-    def test_two_a_blocks_warning_captured(self) -> None:
+    def test_two_a_blocks_warning_captured(self, tmp_path: Path) -> None:
+        """HARDEN (F8): the warning alone is satisfied while the first block's
+        rows are discarded (mutation-confirmed: clearing the first block on
+        the second ~A keeps the warning-only assertion green).  The READ path
+        is asserted: the first block's rows survive the drop.
+        """
         content = (
             "~VERSION INFORMATION\n"
             " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
@@ -5141,6 +5668,13 @@ class TestS8I206SecondABlockWarning:
             f"expected one warnings-API 'later ~A dropped' warning, got {dropped}"
         )
         assert "DROPPED" in dropped[0]
+        path = tmp_path / "two_a_blocks.las"
+        path.write_text(content, encoding="utf-8")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = read_las_file(path)
+        assert list(data["logs"]["DEPT"]) == [100.0, 101.0], data["logs"]["DEPT"]
+        assert list(data["logs"]["DT"]) == [50.0, 51.0], data["logs"]["DT"]
 
     def test_single_a_block_no_warning(self) -> None:
         content = (
@@ -5221,8 +5755,18 @@ class TestS8I207Las12MandatoryFields:
             for x in w
             if "LAS 2.0 file missing mandatory well field" in str(x.message)
         ]
-        assert len(mandatory) == 1, mandatory
-        assert "DATE" in mandatory[0]
+        # F-024/F-342: three slots are missing here — DATE, the
+        # PROV|CNTY|STAT|CTRY family and UWI|API.  The old pin asserted a
+        # bare count of 1 plus the substring "DATE", which passed only while
+        # the flat lascheck tuple could not see the two alternative-spelling
+        # slots.  Pin the exact label set instead.
+        missing_labels = {t.split("mandatory well field: ", 1)[1] for t in mandatory}
+        assert missing_labels == {
+            "DATE",
+            "PROV or CNTY or STAT or CTRY",
+            "UWI or API",
+        }, sorted(missing_labels)
+        assert len(mandatory) == len(missing_labels), mandatory
 
 
 class TestS8I208MixedPrePostVDataPreserved:
@@ -5852,9 +6396,19 @@ class TestS8PXM03VERSNormalization:
         assert self._parse_vers("2.0.1") == "2.0"
 
     def test_known_vers_preserved(self) -> None:
+        """HARDEN (F5): the `1.20` spelling (a real LAS 1.2 spelling the
+        library accepts) is added, and each case asserts the preserved value
+        drives the LAS 1.2 / 2.0 / 3.0 rule it belongs to.
+        """
         assert self._parse_vers("1.2") == "1.2"
+        assert self._parse_vers("1.20") == "1.20"
         assert self._parse_vers("2.0") == "2.0"
         assert self._parse_vers("3.0") == "3.0"
+        from pylasdev._version_spec import _LASVersionSpec
+
+        assert _LASVersionSpec("1.20").is_las12
+        assert _LASVersionSpec("2.0").is_las20
+        assert _LASVersionSpec("3.0").is_las30
 
 
 class TestS8W08OtherSectionDesanitize:
@@ -6180,7 +6734,9 @@ class TestS6F30DirectParseDeduplicatesLegacyCurves:
         " FLD.     Field : FIELD\n"
         " LOC.     Location : LOCATION\n"
         " SRVC.    Service : SERVICE\n"
+        " PROV.    State : PROVINCE\n"
         " DATE.    2026-01-01 : DATE\n"
+        " UWI.     1234567890 : UNIQUE WELL ID\n"
         "~CURVE INFORMATION\n"
         " DEPT.M   :  Depth\n"
         " IK.MS/M  :  Laterolog 1\n"
@@ -7232,11 +7788,20 @@ class TestPARSCProdBareAsciiSectionAutoNaming:
 
     def test_two_bare_a_direct_path_section_n_names_clean_validate(self) -> None:
         """Two bare ~A after ~V (direct path) auto-name Section_0/Section_1
-        and validate clean WITHOUT the simplefilter mask."""
+        and validate clean WITHOUT the simplefilter mask.
+
+        HARDEN (F6): the names and the validation result are also satisfied
+        by a parse that mis-assigns the rows between the two sections, so the
+        per-section CONTENT is asserted.
+        """
         las = LASParser().parse(self._V_FIRST)  # no simplefilter mask
         assert [ds.name for ds in las.data_sections] == ["Section_0", "Section_1"], (
             f"direct-path bare ~A names: {[ds.name for ds in las.data_sections]}"
         )
+        assert las.data_sections[0].data["DEPT"].tolist() == [1000.0, 2000.0]
+        assert las.data_sections[0].data["GR"].tolist() == [50.0, 55.0]
+        assert las.data_sections[1].data["DEPT"].tolist() == [3000.0, 4000.0]
+        assert las.data_sections[1].data["GR"].tolist() == [60.0, 65.0]
         assert las.validate(complete=True) == [], (
             f"expected clean validate(complete=True), got: {las.validate(complete=True)}"
         )
@@ -7690,6 +8255,10 @@ class TestM22DedupSynthesisHeaderMatchSet:
         assert list(las.logs["DEPT"]) == [1000.0, 2000.0], (
             f"DEPT phantom row: {list(las.logs['DEPT'])}"
         )
+        # HARDEN (M-22): DEPT alone cannot see a mis-assignment between the
+        # two synthesized array columns; assert them too.
+        assert list(las.logs["NMR[1]"]) == [5.0, 9.0], list(las.logs["NMR[1]"])
+        assert list(las.logs["NMR[2]"]) == [6.0, 10.0], list(las.logs["NMR[2]"])
 
     def test_deduped_2_header_on_duplicate_curves(self) -> None:
         """`DEPT GR GR_2` header on a duplicate-~C section — GR_2 is the
@@ -7715,6 +8284,10 @@ class TestM22DedupSynthesisHeaderMatchSet:
         assert list(las.logs["DEPT"]) == [1000.0, 2000.0], (
             f"DEPT phantom row: {list(las.logs['DEPT'])}"
         )
+        # HARDEN (M-22): the post-dedup GR_2 column must hold the SECOND
+        # curve's values — a swapped assignment kept DEPT clean.
+        assert list(las.logs["GR"]) == [50.0, 55.0], list(las.logs["GR"])
+        assert list(las.logs["GR_2"]) == [60.0, 65.0], list(las.logs["GR_2"])
 
 
 # ──────────────────────────────────────────────────────────────
@@ -7785,3 +8358,342 @@ class TestM23AllArraySectionHeaderSkipped:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 LASParser().parse(content)
+
+
+# ──────────────────────────────────────────────────────────────
+# s5 TEST-UPDATE — regression pins for landed fixes that had none
+# (s4-synth "consolidated TEST-UPDATE + regression-pin backlog",
+#  tests/test_parser.py group: F-330/F-342/F-371, M5, N-2, F-185,
+#  F-019, F-326).  Each pin names its finding id and fails on the
+#  pre-fix behaviour described in that finding's adversarial verdict.
+# ──────────────────────────────────────────────────────────────
+
+
+_FULL_WELL_20 = (
+    " STRT.M  1670.0  :\n"
+    " STOP.M  1680.0  :\n"
+    " STEP.M  0.1     :\n"
+    " NULL.   -999.25 :\n"
+    " COMP.   ACME    :\n"
+    " WELL.   WELL_A  :\n"
+    " FLD.    NORTH   :\n"
+    " LOC.    LOC_A   :\n"
+    " PROV.   STATE_A :\n"
+    " SRVC.   SRVC_A  :\n"
+    " DATE.   01/01/2020 :\n"
+    " UWI.    UWI_A   :\n"
+)
+
+# slot label -> the CWLS line that satisfies it (LAS 2.0 twelve-slot rule)
+_SLOT_LINES = {
+    "STRT": " STRT.M  1670.0  :\n",
+    "STOP": " STOP.M  1680.0  :\n",
+    "STEP": " STEP.M  0.1     :\n",
+    "NULL": " NULL.   -999.25 :\n",
+    "COMP": " COMP.   ACME    :\n",
+    "WELL": " WELL.   WELL_A  :\n",
+    "FLD": "  FLD.    NORTH   :\n",
+    "LOC": " LOC.    LOC_A   :\n",
+    "PROV or CNTY or STAT or CTRY": " PROV.   STATE_A :\n",
+    "SRVC": " SRVC.   SRVC_A  :\n",
+    "DATE": " DATE.   01/01/2020 :\n",
+    "UWI or API": " UWI.    UWI_A   :\n",
+}
+
+
+def _las20_missing_labels(well_lines: str) -> list[str]:
+    """Parse a LAS 2.0 file with the given well lines; return missing-slot labels."""
+    content = (
+        "~VERSION INFORMATION\n"
+        " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
+        " WRAP.   NO   :\n"
+        "~WELL INFORMATION\n"
+        f"{well_lines}"
+        "~CURVE INFORMATION\n"
+        " DEPT.M   : DEPTH\n"
+        "~A\n"
+        " 100.0\n"
+    )
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        LASParser().parse(content)
+    return sorted(
+        str(w.message).split("mandatory well field: ", 1)[1]
+        for w in recorded
+        if "LAS 2.0 file missing mandatory well field" in str(w.message)
+    )
+
+
+class TestF342WellFieldSlotMatrix:
+    """F-330 / F-342 / F-371 / N-2: the LAS 2.0 mandatory well set is the CWLS
+    TWELVE-slot rule, including the two alternative-spelling slots
+    (``PROV|CNTY|STAT|CTRY`` and ``UWI|API``).
+
+    Pre-fix the rule was the flat lascheck ten-name tuple: the PROV family was
+    enforced NOWHERE (a file with none of PROV/CNTY/STAT/CTRY drew no
+    diagnostic) and ``UWI`` was optional, so no slot matrix existed to fail.
+    Each case below iterates the slot set, so a regression to the flat tuple
+    fails on the PROV and UWI|API rows.
+    """
+
+    def test_complete_well_draws_no_missing_warning(self) -> None:
+        """All twelve slots satisfied → no missing-field warning (N-2)."""
+        assert _las20_missing_labels(_FULL_WELL_20) == []
+
+    @pytest.mark.parametrize("slot", sorted(_SLOT_LINES))
+    def test_each_slot_is_required(self, slot: str) -> None:
+        """Dropping exactly one slot reports exactly that slot (F-342)."""
+        well_lines = "".join(
+            line for label, line in _SLOT_LINES.items() if label != slot
+        )
+        assert _las20_missing_labels(well_lines) == [slot]
+
+    @pytest.mark.parametrize("alternative", ["PROV", "CNTY", "STAT", "CTRY"])
+    def test_province_family_alternatives_satisfy_the_slot(self, alternative: str) -> None:
+        """Any PROV-family spelling satisfies the slot on its own (F-024/F-330)."""
+        well_lines = "".join(
+            line
+            for label, line in _SLOT_LINES.items()
+            if label != "PROV or CNTY or STAT or CTRY"
+        )
+        well_lines += f" {alternative}.   ALT :\n"
+        assert _las20_missing_labels(well_lines) == []
+
+    @pytest.mark.parametrize("alternative", ["UWI", "API"])
+    def test_identifier_alternatives_satisfy_the_slot(self, alternative: str) -> None:
+        """UWI or API alone satisfies the ``UWI|API`` slot (N-2)."""
+        well_lines = "".join(
+            line for label, line in _SLOT_LINES.items() if label != "UWI or API"
+        )
+        well_lines += f" {alternative}.   ID :\n"
+        assert _las20_missing_labels(well_lines) == []
+
+    def test_neither_identifier_spelling_warns(self) -> None:
+        """With neither UWI nor API the slot is missing and named (N-2).
+
+        The message must name the ALTERNATIVE ("UWI or API"), which is the
+        content the pre-fix rule never produced.
+        """
+        well_lines = "".join(
+            line for label, line in _SLOT_LINES.items() if label != "UWI or API"
+        )
+        assert _las20_missing_labels(well_lines) == ["UWI or API"]
+
+
+class TestM5CurveFormatPosition:
+    """M5: a date/time data-format token is a LAS 3.0 channel format only in
+    the TRAILING position.
+
+    Pre-fix the extractor used the last matching token anywhere in the
+    description, so a mid-description date token made a numeric column a
+    string channel (and a mid-description ``{A:5}`` fabricated a 5 ms offset).
+    F-216 fixed the position rule for {S}/{A}/{F}; M5 pins that the date/time
+    and Deg/Min/Sec fallbacks obey it too.
+    """
+
+    def _curve(self, vers: str, curve_line: str) -> Any:
+        content = (
+            "~VERSION INFORMATION\n"
+            f" VERS.   {vers}  : CWLS\n"
+            " WRAP.   NO   :\n"
+            "~CURVE INFORMATION\n"
+            f"{curve_line}\n"
+            " DEPT.M   : DEPTH {F}\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        return las.curves[0]
+
+    def test_las30_trailing_date_token_is_string_format(self) -> None:
+        """3.0 + trailing {DD/MM/YYYY} → data_format 'S' (string channel)."""
+        curve = self._curve("3.0", " DATE.   : LOG DATE {DD/MM/YYYY}")
+        assert curve.data_format == "S", curve.data_format
+        # The template stays in the description so write→read is stable.
+        assert curve.description == "LOG DATE {DD/MM/YYYY}", curve.description
+
+    def test_las30_trailing_time_token_is_string_format(self) -> None:
+        """3.0 + trailing {hh:mm:ss} → 'S'."""
+        curve = self._curve("3.0", " TIME.   : TIME {hh:mm:ss}")
+        assert curve.data_format == "S", curve.data_format
+
+    def test_las30_mid_description_date_token_stays_numeric(self) -> None:
+        """A MID-description date token is user text: numeric channel."""
+        curve = self._curve("3.0", " DATE.   : LOG {DD/MM/YYYY} DATE")
+        assert curve.data_format == "", curve.data_format
+        assert curve.description == "LOG {DD/MM/YYYY} DATE", curve.description
+
+    @pytest.mark.parametrize("vers", ["1.2", "2.0"])
+    def test_non_las30_date_token_anywhere_stays_numeric(self, vers: str) -> None:
+        """On 1.2/2.0 the date token is plain description text (M-35 rule)."""
+        curve = self._curve(vers, " DATE.   : LOG DATE {DD/MM/YYYY}")
+        assert curve.data_format == "", curve.data_format
+        assert curve.description == "LOG DATE {DD/MM/YYYY}", curve.description
+
+
+class TestF326BraceGrammarWidthForms:
+    """F-326 (and F-322's width half): the standard's width forms are data
+    formats, not description text.
+
+    Release 3.00 "Data Formats" defines a total-length width on F/I/S/E
+    ({Fx.y}, {Ix}, {Sx}) and the ``A`` flag followed by a regular format
+    ({AS}, {AF10.4}).  Pre-fix ``_FORMAT_SPEC_RE`` accepted only the bare
+    letters (PARS-01's narrowing), so a conforming {S20}/{AF10.4} curve had
+    its data_format CLEARED with an "Invalid data format" warning and every
+    value replaced by the null sentinel.
+    """
+
+    @pytest.mark.parametrize(
+        "spec,expected",
+        [("{S20}", "S"), ("{I5}", "I"), ("{F10.3}", "F"), ("{AS}", "A"), ("{AS32}", "A")],
+    )
+    def test_width_forms_are_accepted(self, spec: str, expected: str) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS\n"
+            " WRAP.   NO   :\n"
+            " DLM.   COMMA :\n"
+            "~CURVE INFORMATION\n"
+            f" CDES.       : CORE DESC {spec}\n"
+            "~ASCII\n"
+            ' \"SAND\"\n'
+        )
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            las = LASParser().parse(content)
+        curve = las.curves[0]
+        assert curve.data_format == expected, (spec, curve.data_format)
+        invalid = [
+            str(w.message) for w in recorded if "Invalid data format" in str(w.message)
+        ]
+        assert invalid == [], (spec, invalid)
+
+    def test_word_like_tokens_are_still_rejected(self) -> None:
+        """The PARS-01 block direction stays closed (no over-acceptance)."""
+        for spec in ("{API}", "{SAND}", "{DENSITY}"):
+            content = (
+                "~VERSION INFORMATION\n"
+                " VERS.   3.0  : CWLS\n"
+                " WRAP.   NO   :\n"
+                "~CURVE INFORMATION\n"
+                f" GR.API      : Gamma {spec}\n"
+            )
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                las = LASParser().parse(content)
+            curve = las.curves[0]
+            assert curve.data_format == "", (spec, curve.data_format)
+            # The token is user text, so it must survive in the description.
+            assert spec in curve.description, (spec, curve.description)
+
+
+class TestF185IndexedDefinitionAndParameterSections:
+    """F-185: the spec's ``[n]`` bracket form is legal for every section type,
+    not just ``*_DATA``.
+
+    Pre-fix the bracket-index whitelist covered only ``*_DATA``; a
+    ``~Log_Parameter[2]`` / ``~Log_Definition[2]`` header fell into the
+    "unknown section type" branch (its body routed to ``other``) instead of
+    opening the corresponding typed section.
+    """
+
+    @pytest.mark.parametrize(
+        "header",
+        ["~Log_Parameter[2]   Parameter Information", "~Log_Definition[2]  Definition"],
+    )
+    def test_indexed_header_is_not_an_unknown_section(
+        self, header: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS\n"
+            " WRAP.   NO   :\n"
+            " DLM.   COMMA :\n"
+            "~WELL INFORMATION\n"
+            " STRT.M 100.0 :\n STOP.M 200.0 :\n STEP.M 1.0 :\n NULL. -999.25 :\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M : DEPTH {F}\n"
+            f"{header}\n"
+            " NMR[1].ms : ECHO {A:0}\n"
+            "~ASCII\n"
+            "1.0,2.0\n"
+        )
+        with caplog.at_level(logging.WARNING, logger="pylasdev.parser"):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                las = LASParser().parse(content)
+        assert "Unknown section type" not in caplog.text, caplog.text
+        assert header not in las.other, las.other
+
+    def test_parameter_index_header_opens_a_parameter_section(self) -> None:
+        """The [n] index names the order; the section TYPE still resolves."""
+        content = (
+            "~VERSION INFORMATION\n"
+            " VERS.   3.0  : CWLS\n"
+            " WRAP.   NO   :\n"
+            " DLM.   COMMA :\n"
+            "~WELL INFORMATION\n"
+            " STRT.M 100.0 :\n STOP.M 200.0 :\n STEP.M 1.0 :\n NULL. -999.25 :\n"
+            "~CURVE INFORMATION\n"
+            " DEPT.M : DEPTH {F}\n"
+            "~Log_Parameter[2]   Parameter Information\n"
+            " PARAM1.MNEM : VALUE : DESCRIPTION\n"
+            "~ASCII\n"
+            "1.0\n"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(content)
+        parameters = las.parameters
+        assert any(p.mnemonic == "PARAM1" for p in parameters), [
+            p.mnemonic for p in parameters
+        ]
+
+
+class TestF019DesanitizeGateCoversEveryFamily:
+    """F-019: ``_DESANITIZE_ENABLED = False`` must leave an EXTERNAL file's
+    escaping untouched for every escape family, not just ``_#``/``_~``.
+
+    Pre-fix the colon, pipe and brace un-escapes ran unconditionally at the
+    same call sites, so the documented ``desanitize=False`` remedy for
+    external files still rewrote their content.  The pre-fix code produced
+    the SAME description for both flag states, so this pin fails on it.
+    """
+
+    _CONTENT = (
+        "~VERSION INFORMATION\n"
+        " VERS.   2.0  :\n"
+        " WRAP.   NO   :\n"
+        "~WELL INFORMATION\n"
+        " STRT.M   1670.0 :\n"
+        " STOP.M   1680.0 :\n"
+        " STEP.M   1.0 :\n"
+        " NULL.   -999.25 :\n"
+        "~CURVE INFORMATION\n"
+        " DEPT.M   : Depth\n"
+        " GR.GAPI  : Gamma \\| ray \\{S\\}\n"
+        "~A\n"
+        "100.0  45.0\n"
+    )
+
+    def test_disabled_preserves_external_escapes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Every family stays verbatim when sanitisation is off."""
+        monkeypatch.setattr("pylasdev.parser._DESANITIZE_ENABLED", False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(self._CONTENT)
+        assert las.curves[1].description == "Gamma \\| ray \\{S\\}", (
+            las.curves[1].description
+        )
+
+    def test_enabled_default_restores_writer_escapes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The default still reverses the writer's brace escape."""
+        monkeypatch.setattr("pylasdev.parser._DESANITIZE_ENABLED", True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            las = LASParser().parse(self._CONTENT)
+        assert las.curves[1].description == "Gamma \\| ray {S}", (
+            las.curves[1].description
+        )

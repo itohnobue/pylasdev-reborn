@@ -77,8 +77,18 @@ class TestScalarsEqualGuards:
         assert _scalars_equal(np.nan, np.nan) is True
 
     def test_type_error_fallback_false(self) -> None:
-        # object() comparison raises TypeError -> caught -> False
-        assert _scalars_equal(object(), object()) is False
+        """HARDEN (test-register row): make the comparison actually raise.
+
+        ``object() == object()`` returns False without raising, so the old
+        fixture exited at the ``bool(a == b)`` return and never entered the
+        ``except (TypeError, ValueError)`` fallback it names (compare.py:41-48).
+        """
+
+        class _RaisesOnCompare:
+            def __eq__(self, other: object) -> bool:
+                raise TypeError("incomparable operand")
+
+        assert _scalars_equal(_RaisesOnCompare(), _RaisesOnCompare()) is False
 
 
 class TestHasNanGuards:
@@ -130,9 +140,40 @@ class TestCompareListsEdgeCases:
     """_compare_lists fallback branches (non-numeric lists)."""
 
     def test_length_mismatch_via_per_element_path(self) -> None:
-        # list with a dict element -> _list_to_numeric_array returns None ->
-        # _has_nan(dict) False -> l1 != l2 shortcut False -> per-element path
-        assert _compare_lists([{"a": 1}], [{"a": 1}, {"b": 2}], "x", 1e-7, 0.0) is False
+        # HARDEN (test-register row): the old fixture (two equal-length lists
+        # of dicts) never reached the per-element path — `l1 != l2` decided it
+        # through the direct-inequality shortcut.  A dict value holding a
+        # multi-element ndarray makes `l1 != l2` raise ValueError (ambiguous
+        # truth value), which is what routes into the per-element loop
+        # (compare.py:614-677; the loop is at :672-677); the differing nested
+        # array then makes the per-element comparison return False.
+        assert (
+            _compare_lists(
+                [{"a": np.array([1.0, 2.0])}], [{"a": np.array([1.0, 3.0])}], "x", 1e-7, 0.0
+            )
+            is False
+        )
+        # Control: the same path must return True when the nested arrays
+        # agree, otherwise the assertion above would pass on a path that
+        # always returns False.
+        assert (
+            _compare_lists(
+                [{"a": np.array([1.0, 2.0])}], [{"a": np.array([1.0, 2.0])}], "x", 1e-7, 0.0
+            )
+            is True
+        )
+        # Length mismatch is still reported by the per-element path's length
+        # guard rather than by the shortcut.
+        assert (
+            _compare_lists(
+                [{"a": np.array([1.0, 2.0])}],
+                [{"a": np.array([1.0, 2.0])}, {"b": np.array([3.0])}],
+                "x",
+                1e-7,
+                0.0,
+            )
+            is False
+        )
 
     def test_type_mismatch_non_list_first(self) -> None:
         # l1 is a dict (not a list) whose value contains NaN -> _has_nan
@@ -309,22 +350,29 @@ class TestDeduplicateCurvesEdges:
     """_deduplicate_curves collision and writeback edge cases."""
 
     def test_second_collision_while_loop_used(self) -> None:
-        # X, X_2, X_2 collision -> X_3 (both while loops exercised)
+        """HARDEN (test-register row): the while body must actually run.
+
+        The previous fixture ([X, X, X]) only ever generates X_2 and X_3,
+        neither of which is already in ``output_names``, so both
+        "while new_name in output_names" bodies were dead.  A literal X_2
+        curve ahead of the duplicates makes the first generated suffix
+        collide, so the loop advances to X_3.
+        """
         las = LASFile()
         las.curves = [
-            CurveDefinition(mnemonic="X"),
+            CurveDefinition(mnemonic="X_2"),
             CurveDefinition(mnemonic="X"),
             CurveDefinition(mnemonic="X"),
         ]
-        las.curves_order = ["X", "X", "X"]
+        las.curves_order = ["X_2", "X", "X"]
         ctx = _ctx(las)
         sc = [
-            CurveDefinition(mnemonic="X"),
+            CurveDefinition(mnemonic="X_2"),
             CurveDefinition(mnemonic="X"),
             CurveDefinition(mnemonic="X"),
         ]
         order = _deduplicate_curves(ctx, sc, is_first_section=True)
-        assert order == ["X", "X_2", "X_3"]
+        assert order == ["X_2", "X", "X_3"]
 
     def test_first_section_global_writeback(self) -> None:
         las = LASFile()
@@ -341,7 +389,20 @@ class TestDeduplicateCurvesEdges:
         assert las.curves_order == ["A", "A_2"]
 
     def test_second_collision_branch(self) -> None:
-        # name in output_names but not in seen -> suffix=2 path
+        """HARDEN (test-register row): reach the ``name in output_names`` arm.
+
+        [B, B, B, B] always takes the ``name in seen`` arm — the name was
+        seen as an INPUT.  The branch the register names is the other one:
+        a name that was never an input but already exists as a GENERATED
+        output name.  [X, X, X_2] produces X_2 for the duplicate and then
+        meets a literal X_2, which can only be resolved by the
+        ``elif name in output_names`` arm (compare the ``seen`` dict branch
+        above it).  [X_2_2, X, X, X_2] additionally makes the arm's own
+        ``while new_name in output_names`` body iterate: the first candidate
+        ``X_2_2`` is already taken, so the suffix advances to 3.  Without
+        that advancement the second X_2 collision emits a DUPLICATE ``X_2_2``
+        column — the exact defect the function exists to prevent.
+        """
         las = LASFile()
         las.curves = [
             CurveDefinition(mnemonic="B"),
@@ -359,6 +420,44 @@ class TestDeduplicateCurvesEdges:
         ]
         order = _deduplicate_curves(ctx, sc, is_first_section=True)
         assert order == ["B", "B_2", "B_3", "B_4"]
+
+        las2 = LASFile()
+        las2.curves = [
+            CurveDefinition(mnemonic="X"),
+            CurveDefinition(mnemonic="X"),
+            CurveDefinition(mnemonic="X_2"),
+        ]
+        las2.curves_order = ["X", "X", "X_2"]
+        ctx2 = _ctx(las2)
+        sc2 = [
+            CurveDefinition(mnemonic="X"),
+            CurveDefinition(mnemonic="X"),
+            CurveDefinition(mnemonic="X_2"),
+        ]
+        order2 = _deduplicate_curves(ctx2, sc2, is_first_section=True)
+        assert order2 == ["X", "X_2", "X_2_2"]
+
+        # The arm's while body must iterate: the generated name X_2_2 is
+        # already an output name, so the collision resolves to X_2_3.  With
+        # the body dead the result is ["X_2_2", "X", "X_2", "X_2_2"] — two
+        # columns with the same name.
+        las3 = LASFile()
+        las3.curves = [
+            CurveDefinition(mnemonic="X_2_2"),
+            CurveDefinition(mnemonic="X"),
+            CurveDefinition(mnemonic="X"),
+            CurveDefinition(mnemonic="X_2"),
+        ]
+        las3.curves_order = ["X_2_2", "X", "X", "X_2"]
+        ctx3 = _ctx(las3)
+        sc3 = [
+            CurveDefinition(mnemonic="X_2_2"),
+            CurveDefinition(mnemonic="X"),
+            CurveDefinition(mnemonic="X"),
+            CurveDefinition(mnemonic="X_2"),
+        ]
+        order3 = _deduplicate_curves(ctx3, sc3, is_first_section=True)
+        assert order3 == ["X_2_2", "X", "X_2", "X_2_3"]
 
 
 class TestDetectActualWrapLas30Edges:
@@ -593,9 +692,18 @@ class TestReadWithEncodingGuards:
         with pytest.raises(LASEncodingError):
             read_with_encoding(tmp_path)
 
-    def test_negative_max_file_size_raises(self) -> None:
+    def test_negative_max_file_size_raises(self, tmp_path: Path) -> None:
+        """HARDEN (test-register row): do not depend on the process CWD.
+
+        ``Path("README.md")`` resolved against the working directory, so the
+        test passed only when pytest was launched from the repo root (and
+        would otherwise fail at the ``is_file()`` guard with LASEncodingError
+        before reaching the max_file_size check under test).
+        """
+        target = tmp_path / "any.las"
+        target.write_text("~V", encoding="utf-8")
         with pytest.raises(ValueError, match="max_file_size"):
-            read_with_encoding(Path("README.md"), max_file_size=-1)
+            read_with_encoding(target, max_file_size=-1)
 
     def test_utf32_le_bom(self, tmp_path: Path) -> None:
         p = tmp_path / "u32le.las"

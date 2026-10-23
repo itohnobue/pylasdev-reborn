@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 
+from ._sanitize import normalize_nbsp_family
 from .data_reader import _to_finite_float
 from .encoding import read_with_encoding
 from .exceptions import DEVReadError
@@ -71,19 +72,70 @@ _DEV_NUMERIC_SENTINELS: frozenset[float] = frozenset(
     }
 )
 
-# Characters that Python's splitlines() treats as line breaks beyond \n and \r.
-# When present in file content, they cause splitlines() to produce fake section
-# headers and corrupt parsed data.  Matches the full character class used by
-# reader.py:29 and parser.py:102 — covers all 33 C0 control chars (including
-# \x00 (NUL), \x7F (DEL)) plus NEL (\x85) and Unicode line/paragraph separators.
-# F-001: Also include the 13 Unicode whitespace characters that the writer's
-# _CONTROL_CHARS_RE strips (\u00A0, \u2000-\u200A, \u202F, \u205F, \u3000)
-# so the write→read roundtrip is symmetric.
-_SPLITLINES_CHARS_RE = re.compile(
-    r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85"
-    r"\u2028\u2029"
+# Characters that must become a SPACE before splitlines(): every character
+# Python's splitlines() treats as a line break beyond \n and \r (\x0B, \x0C,
+# \x1C-\x1E, NEL \x85, Unicode line/paragraph separators) — so a phantom line
+# break cannot forge a section/row boundary — plus the Unicode whitespace
+# characters the writer's _CONTROL_CHARS_RE strips (U+2000-U+200A other than
+# U+2009, U+205F, U+3000).  A space (rather than a deletion) is correct for
+# both groups: they CAN separate tokens, so deleting them would concatenate
+# 'ABC\xa0DEF' into 'ABCDEF' (F-05).
+# LD-08: the non-breaking space family (NBSP U+00A0, THIN SPACE U+2009,
+# NARROW NBSP U+202F) is normalized FIRST by the shared
+# _sanitize.normalize_nbsp_family — its three-digit thousands grouping shape
+# is deleted, every other occurrence becomes a space — so the same bytes
+# normalize identically through the LAS reader, the parser and this reader.
+# The family members stay listed here as a fallback.
+_DEV_SPACE_CHARS_RE = re.compile(
+    r"[\x0B\x0C\x1C-\x1E\x85\u2028\u2029"
     r"\u00A0\u2000-\u200A\u202F\u205F\u3000]"
 )
+
+# F-083: C0 control characters (and DEL) that splitlines() does NOT treat as
+# line breaks, and that the DEV/LAS writer DELETES rather than substitutes
+# (_sanitize.py:39-42 applies _CONTROL_CHARS_RE with .sub("", value)).
+# Substituting a space for them here invented a column delimiter in a
+# space-delimited DEV file: '1\x002' parsed as the columns 1 and 2, shifting
+# every later value on the row while the genuine value was discarded as an
+# "extra column".  They are DELETED (one counted warning per file), so the
+# reader and the writer agree on the class.  \t (\x09) and the true line
+# separators are deliberately absent — the tab is a legitimate delimiter.
+_DEV_DELETE_CHARS_RE = re.compile(r"[\x00-\x08\x0E-\x1B\x1F\x7F]")
+
+# F-098: a bare separator line emitted by third-party DEV exporters
+# ("=====", "-----", "*****") is neither a comment nor blank, so the
+# non-content predicate (blank or '#'-prefixed) treated it as CONTENT: a
+# wide Petrel trace failed with a delimiter mismatch, a narrow one
+# fabricated a "=====" column whose values were discarded, and a separator
+# placed after the header produced a phantom all-NaN station.  The
+# predicate was copied at every line scan (content collection, delimiter
+# cross-validation sampling, Pass 1 counting, Pass 2 parsing); one helper
+# keeps all four copies in agreement.  A single '-' is a legitimate
+# missing-data sentinel (_DEV_SENTINELS) and a data row or a real header
+# cannot match the pattern, which requires 3+ repetition of one separator
+# character and nothing else on the line.
+_DEV_SEPARATOR_RE = re.compile(r"^[=\-_*~]{3,}$")
+
+# F-097/F-270: Excel writes a "sep=;" / "sep=," directive as the first
+# line of a CSV export to declare the field separator.  It is exporter
+# metadata — not a header and not data.  Without a handler the line became
+# the sole column name and every record collapsed to NaN (headerless
+# files), and the declared separator itself was never applied.
+_DEV_SEP_DIRECTIVE_RE = re.compile(r"^sep=(.)$", re.IGNORECASE)
+
+# F-262: separator tokens that appear BETWEEN the *-prefixed column names
+# of a *COLUMNS keyword header ("*COLUMNS *MD | *INC | *AZM", or the
+# comma-attached "*COLUMNS *MD, *INC, *AZM").  They are field separators,
+# never column names.
+_DEV_COLUMNS_SEPARATOR_RE = re.compile(r"^[|,;]+$")
+
+# LD-08: the NBSP-family rule (thousands padding deleted, everything else one
+# space) lives in _sanitize.normalize_nbsp_family — ONE implementation shared
+# with the writer, the parser and the LAS reader.  This module used to carry
+# its own narrower copy (_DEV_THOUSANDS_SPACE_RE); it was removed when the
+# three sites were consolidated, because a second copy is exactly how the
+# sites drifted apart (reader.py's copy deleted between ANY two digits and
+# fused "1.0\xa02.0" into "1.02.0").
 
 logger = logging.getLogger(__name__)
 
@@ -98,10 +150,20 @@ _DEV_ALIASES: dict[str, str] = {
     "MDRKB": "MD",
     "DEPTH": "MD",  # Petrel / common industry alias
     "DPT": "MD",  # Petrel depth
+    # F-084: documented DEV vocabulary that was missing from the alias table —
+    # a "MDMSL"/"DEPT" depth column raised a false "MD column not found" and
+    # skipped every MD validation (monotonicity, negatives, NaN density).
+    # DEPT is Petrel's depth column, semantically identical to the already
+    # aliased DEPTH/DPT, and this table is also what DevFile.validate()
+    # resolves through (models.py:7953-7955) — so the model-side checks cover
+    # these names too.
+    "DEPT": "MD",  # Petrel depth (4-letter form)
+    "MDMSL": "MD",  # measured depth below mean sea level
     # True vertical depth variants
     "TVDKB": "TVD",
     "TVDSS": "TVD",
     "TVDBML": "TVD",
+    "TVDMSL": "TVD",  # F-084: TVD below mean sea level
     # Inclination variants
     "INCL": "INC",
     "DEVI": "INC",  # Petrel deviation
@@ -143,6 +205,22 @@ _DEV_ALIASES: dict[str, str] = {
     "DY": "DY",  # Petrel Y offset (grid-north, distinct from Y)
 }
 
+# M8: the rows above whose LEFT-hand spelling carries a depth datum /
+# reference that the KB-relative canonical column does NOT record.  Renaming
+# one of these is a semantic loss, not a spelling normalisation: the model
+# keeps only the canonical key, so the distinction between the two spellings
+# is gone and nothing said so (the pre-existing N-006 class, extended here by
+# F-084's DEPT/MDMSL/TVDMSL rows).  `_report_datum_alias_rewrites` warns for
+# every name in this set that a read actually rewrites.
+# Scope boundary (deliberate): MDKB / MDRKB / DEPTH / DPT / TVDKB are NOT in
+# the set.  They are the long-standing KB-referenced spellings whose canonical
+# keys are the pinned, documented output of `read_dev_file`; warning on them
+# would fire on every Petrel export and dilute the diagnostic.  The set is the
+# one the verified repair names.
+_DATUM_DISTINCT_DEV_ALIASES: frozenset[str] = frozenset(
+    {"MDSS", "TVDSS", "TVDBML", "MDMSL", "TVDMSL", "DEPT"}
+)
+
 
 def _normalize_dev_column(name: str) -> str:
     """Normalize a DEV column name through the alias mapping.
@@ -160,11 +238,67 @@ def _normalize_dev_column(name: str) -> str:
     return _DEV_ALIASES.get(name.strip().upper(), name.strip().upper())
 
 
+def _report_datum_alias_rewrites(
+    rewrites: list[tuple[str, str]], *, _warn_stacklevel: int = 4
+) -> None:
+    """Warn once per datum-distinct DEV alias that a read rewrote (M8).
+
+    Args:
+        rewrites: ``(original_upper_name, canonical_name)`` pairs that were
+            actually rewritten, in file order.
+        _warn_stacklevel: ``warnings.warn`` stacklevel.  The default points at
+            the caller of a public entry point (warn -> this function -> the
+            entry point's body -> its caller).
+    """
+    _count = len(rewrites)
+    for _orig, _canon in rewrites:
+        warnings.warn(
+            f"DEV column '{_orig}' was rewritten to the canonical column "
+            f"'{_canon}'.  The original name is not preserved, so the "
+            f"datum/reference distinction carried by '{_orig}' is not "
+            f"recorded in the model's column names ({_count} column(s) in "
+            f"this file were rewritten this way).  Pass "
+            f"normalize_aliases=False to keep the original column name.",
+            stacklevel=_warn_stacklevel,
+        )
+
+
+def _normalize_dev_columns(names: list[str], *, _warn_stacklevel: int = 4) -> list[str]:
+    """Normalize a header's column names, reporting datum-distinct rewrites.
+
+    M8: ``_normalize_dev_column`` alone maps every alias silently, so a file
+    declaring ``TVDMSL`` came back with a ``TVD`` column and no diagnostic —
+    the datum that distinguishes the two names was dropped between the file
+    and the model.  This wrapper is the ONE place a header is normalized, so
+    every entry point that normalizes a list reports the same way.
+
+    Args:
+        names: Raw column names from the header, in file order.
+        _warn_stacklevel: ``warnings.warn`` stacklevel; see
+            ``_report_datum_alias_rewrites``.
+
+    Returns:
+        The canonical names, positionally matching ``names``.
+    """
+    _normalized: list[str] = []
+    _rewrites: list[tuple[str, str]] = []
+    for _name in names:
+        _raw_upper = _name.strip().upper()
+        _canonical = _normalize_dev_column(_name)
+        if _canonical != _raw_upper and _raw_upper in _DATUM_DISTINCT_DEV_ALIASES:
+            _rewrites.append((_raw_upper, _canonical))
+        _normalized.append(_canonical)
+    if _rewrites:
+        _report_datum_alias_rewrites(_rewrites, _warn_stacklevel=_warn_stacklevel)
+    return _normalized
+
+
 def _deduplicate_string_list(
     items: list[str],
     *,
     name_label: str = "name",
     _stacklevel: int = 2,
+    originals: list[str] | None = None,
 ) -> list[str]:
     """Deduplicate a list of strings with cross-base collision detection.
 
@@ -178,6 +312,14 @@ def _deduplicate_string_list(
         name_label:  Human-readable label used in warning messages
                      (e.g. ``"DEV column name"``).
         _stacklevel: Stacklevel for ``warnings.warn``.
+        originals:   Optional positional list of the PRE-normalization names
+                     ``items`` was built from (same length, same order).  M8:
+                     when two DIFFERENT originals normalize onto one canonical
+                     name (TVDKB + TVDMSL -> TVD) the collision is an alias
+                     collapse, not a repeated column — the warning then names
+                     both spellings instead of claiming the file repeats a
+                     column name.  A genuinely repeated original keeps the
+                     repeated-name wording.
 
     Returns:
         Deduplicated list of strings with ``_N`` suffixes on collisions.
@@ -185,13 +327,45 @@ def _deduplicate_string_list(
     seen: dict[str, int] = {}
     result: list[str] = []
     output_names: set[str] = set()
+    # M8: first original spelling seen for each normalized name — the alias
+    # collapse test compares against it.
+    first_original: dict[str, str] = {}
     # Track all natural input names so generated _N suffixes don't
     # collide with a name that appears later in the input list.
     # Without this, e.g. input ["MD","TVD","MD","TVD","TVD_2"]
     # produces "TVD_2" for the first duplicate, then misnames the
     # natural "TVD_2" as "TVD_2_2" with a false "duplicate" warning.
     natural_names: frozenset[str] = frozenset(items)
-    for name in items:
+
+    def _collision_message(_name: str, _new_name: str, _index: int) -> str:
+        if originals is not None:
+            _orig = originals[_index]
+            _previous_original = first_original.get(_name)
+            if _previous_original is not None and _orig != _previous_original:
+                _not_repeated = (
+                    f"These are not repeated {name_label}s: they are two "
+                    f"distinct spellings an alias maps onto '{_name}', so "
+                    f"the distinction between them is not recorded in the "
+                    f"column names."
+                )
+                if _previous_original == _name:
+                    return (
+                        f"{name_label} '{_orig}' is an alias of the "
+                        f"canonical name '{_name}' and was renamed to "
+                        f"'{_new_name}'.  {_not_repeated}"
+                    )
+                return (
+                    f"{name_label} '{_orig}' and '{_previous_original}' are "
+                    f"distinct spellings that both normalize to '{_name}'; "
+                    f"'{_orig}' was renamed to '{_new_name}'.  {_not_repeated}"
+                )
+        return (
+            f"Duplicate {name_label} '{_name}' renamed to "
+            f"'{_new_name}'. Data may come from a file with "
+            f"repeated {name_label}s."
+        )
+
+    for _index, name in enumerate(items):
         if name in seen:
             seen[name] += 1
             suffix = seen[name]
@@ -204,9 +378,7 @@ def _deduplicate_string_list(
                 new_name = f"{name}_{suffix}"
             seen[name] = suffix
             warnings.warn(
-                f"Duplicate {name_label} '{name}' renamed to "
-                f"'{new_name}'. Data may come from a file with "
-                f"repeated {name_label}s.",
+                _collision_message(name, new_name, _index),
                 stacklevel=_stacklevel,
             )
             result.append(new_name)
@@ -220,21 +392,23 @@ def _deduplicate_string_list(
                     new_name = f"{name}_{suffix}"
                 seen[name] = suffix
                 warnings.warn(
-                    f"Duplicate {name_label} '{name}' renamed to "
-                    f"'{new_name}'. Data may come from a file with "
-                    f"repeated {name_label}s.",
+                    _collision_message(name, new_name, _index),
                     stacklevel=_stacklevel,
                 )
                 result.append(new_name)
                 output_names.add(new_name)
             else:
                 seen[name] = 1
+                if originals is not None:
+                    first_original.setdefault(name, originals[_index])
                 result.append(name)
                 output_names.add(name)
     return result
 
 
-def _deduplicate_dev_columns(names: list[str]) -> list[str]:
+def _deduplicate_dev_columns(
+    names: list[str], *, originals: list[str] | None = None
+) -> list[str]:
     """Deduplicate DEV column names with cross-base collision detection.
 
     Thin wrapper around ``_deduplicate_string_list`` with DEV-specific
@@ -243,12 +417,17 @@ def _deduplicate_dev_columns(names: list[str]) -> list[str]:
 
     Args:
         names: Raw column names from the header line.
+        originals: M8: the pre-normalization spellings, positionally matching
+            ``names``, so a two-alias collision reports an alias collapse
+            rather than a repeated column name.
 
     Returns:
         Deduplicated column names.  A warning is emitted for each
         duplicate.
     """
-    return _deduplicate_string_list(names, name_label="DEV column name", _stacklevel=3)
+    return _deduplicate_string_list(
+        names, name_label="DEV column name", _stacklevel=3, originals=originals
+    )
 
 
 def _is_float_token(token: str) -> bool:
@@ -296,6 +475,10 @@ def _is_float_token_comma_decimal(token: str) -> bool:
     :func:`_dev_to_finite_float`'s gating).  Locale decimals in practice use
     1-2 fractional digits (``"1,00"``/``"1,50"``).
 
+    F-085: the normalization is shared with the converter
+    (:func:`_normalize_locale_token`), so the dot-thousands + comma-decimal
+    form (``"1.234,5"``) is recognized here exactly as it is converted there.
+
     Args:
         token: Raw data token (already whitespace-stripped).
 
@@ -304,7 +487,7 @@ def _is_float_token_comma_decimal(token: str) -> bool:
     """
     if _THOUSANDS_GROUP_RE.match(token) is not None:
         return False
-    return _is_float_token(_convert_comma_decimal(token))
+    return _is_float_token(_normalize_locale_token(token))
 
 
 # --- Locale-style number handling (V-07 / V-08) ---
@@ -314,6 +497,17 @@ def _is_float_token_comma_decimal(token: str) -> bool:
 # Directional Drilling export variants that are semicolon-delimited but
 # use a comma for the decimal point.
 _COMMA_DECIMAL_RE = re.compile(r"^([+-]?\d+),(\d+)$")
+
+# F-085: dot-thousands + comma-decimal locale token ("1.234,5", "-12.345,67").
+# The European export form uses "." to group thousands and "," as the decimal
+# separator.  It matched NONE of the three existing grammars — _COMMA_DECIMAL_RE
+# rejects the dot, _THOUSANDS_GROUP_RE requires ',' groups of three with no dot,
+# _THOUSANDS_NUMBER_RE requires ',' separators — so such a file was silently
+# corrupted: NaN values in a headered file (generic "could not be converted"
+# counter only), and a fabricated header + first-station loss in a headerless
+# one.  Unambiguous by construction: a plain decimal number cannot contain both
+# '.' and ','.  A bare "1.234" is deliberately NOT matched (it is a US decimal).
+_DOT_THOUSANDS_COMMA_DECIMAL_RE = re.compile(r"^([+-]?)(\d{1,3}(?:\.\d{3})+),(\d+)$")
 
 # Thousands-separator token: digits with a comma followed by EXACTLY three
 # digits (e.g. "1,234", "-12,345").  In space/tab/semicolon-delimited files
@@ -419,6 +613,50 @@ def _convert_comma_decimal(value: str) -> str:
     if m is None:
         return value
     return f"{m.group(1)}.{m.group(2)}"
+
+
+def _convert_dot_thousands_comma_decimal(value: str) -> str | None:
+    """Convert a dot-thousands + comma-decimal locale token to plain notation.
+
+    F-085: ``"1.234,5"`` → ``"1234.5"``, ``"-12.345,67"`` → ``"-12345.67"``.
+    The form is unambiguous (no plain number carries both separators), so it is
+    converted rather than rejected.  Returns ``None`` when the token is not of
+    that form, distinguishing "not this grammar" from "converted".
+
+    Args:
+        value: Raw data token from a data line.
+
+    Returns:
+        The plain-decimal form when the token matches
+        :data:`_DOT_THOUSANDS_COMMA_DECIMAL_RE`, otherwise ``None``.
+    """
+    m = _DOT_THOUSANDS_COMMA_DECIMAL_RE.match(value)
+    if m is None:
+        return None
+    return f"{m.group(1)}{m.group(2).replace('.', '')}.{m.group(3)}"
+
+
+def _normalize_locale_token(value: str) -> str:
+    """Single shared locale normalization for DETECTION and CONVERSION.
+
+    F-085 / F-06: the detection predicates and the value converter must apply
+    the SAME number grammar or a token is recognized as numeric data by one
+    side and dropped to NaN by the other (the F-06 drift).  Both call sites go
+    through this helper:
+      * :func:`_convert_dot_thousands_comma_decimal` ("1.234,5" → "1234.5"),
+      * :func:`_convert_comma_decimal` ("1,00" → "1.00").
+
+    Args:
+        value: Raw data token.
+
+    Returns:
+        The normalized token, or the input unchanged when no locale form
+        applies.
+    """
+    _dot_thousands = _convert_dot_thousands_comma_decimal(value)
+    if _dot_thousands is not None:
+        return _dot_thousands
+    return _convert_comma_decimal(value)
 
 
 def _dev_to_finite_float(
@@ -534,7 +772,10 @@ def _dev_to_finite_float(
         if not _comma_as_thousands:
             value_str = value_str.replace(",", "")
     else:
-        value_str = _convert_comma_decimal(value_str)
+        # F-085: shared locale normalization (dot-thousands + comma-decimal
+        # "1.234,5" AND the V-07 comma-decimal "1,00") — the same helper the
+        # detection predicates use, so detection and conversion cannot drift.
+        value_str = _normalize_locale_token(value_str)
     result = _to_finite_float(
         value_str,
         null_value,
@@ -849,8 +1090,42 @@ def _parse_columns_tokens(tokens: list[str]) -> list[str]:
     every remaining token, and filters out trailing empty names that
     result (e.g. from a trailing ``*``).  Middle empty cells (V-18) are
     rejected by :func:`_filter_header_names`.
+
+    F-262: the keyword layout documents a field SEPARATOR between the
+    ``*``-prefixed names — ``*COLUMNS *MD | *INC | *AZM`` and the
+    comma-attached ``*COLUMNS *MD, *INC, *AZM``.  Leaving the separator
+    attached to a token fabricated column names ``'MD,'`` / ``'|'``: the
+    junk names absorbed the data's separator tokens, a false "duplicate
+    column" warning fired, and a name like ``'MD,'`` no longer matched the
+    MD column family, so every MD validation was skipped.  Bare separator
+    tokens are dropped and an attached trailing separator is stripped.
+
+    The keyword is stripped from whichever token carries it: when the
+    header is split BY the separator, the keyword stays attached to the
+    first name (``'*COLUMNS *MD'``), so the check cannot assume
+    ``tokens[0]`` is the bare keyword.
+
+    Args:
+        tokens: Split header tokens (the header line already split by the
+            detected delimiter).
+
+    Returns:
+        Column names with the keyword, ``*`` decoration and separators
+        removed.
     """
-    return _filter_header_names([t.lstrip("*") for t in tokens[1:]])
+    names: list[str] = []
+    for _idx, _token in enumerate(tokens):
+        name = _token.strip().lstrip("*").strip()
+        if _idx == 0 and name.upper().startswith("COLUMNS"):
+            name = name[len("COLUMNS") :].strip().lstrip("*").strip()
+            if not name:
+                # The bare "*COLUMNS" keyword token carries no column name.
+                continue
+        if _DEV_COLUMNS_SEPARATOR_RE.match(name):
+            # A bare separator token separates names; it is never a name.
+            continue
+        names.append(name.strip("|,;").strip())
+    return _filter_header_names(names)
 
 
 # --- Delimited-line splitting with quoting support (F2-015) ---
@@ -958,7 +1233,9 @@ def _is_headerless_data_token(token: str) -> bool:
         return True
     if _is_thousands_number(token):
         return True
-    return _COMMA_DECIMAL_RE.match(token) is not None
+    # F-085: locale forms (comma-decimal "1,00" and dot-thousands
+    # comma-decimal "1.234,5") via the shared normalizer.
+    return _is_float_token(_normalize_locale_token(token))
 
 
 def _pick_headerless_delimiter(hdr: str, max_tokens: int) -> str:
@@ -1018,6 +1295,28 @@ def _looks_like_dev_header(tokens: list[str]) -> bool:
     return bool(tokens) and all(t.isalpha() and len(t) <= 6 for t in tokens)
 
 
+def _is_dev_noncontent_line(stripped: str) -> bool:
+    """Whether a stripped DEV line carries no content (F-098).
+
+    A DEV file's non-content lines are blank lines, ``#`` comments, and —
+    for exports written by third-party tools — bare separator rules such
+    as ``"====="`` / ``"-----"``.  All four line scans in
+    :func:`read_dev_file_as_object` (content collection for format
+    detection, delimiter cross-validation sampling, Pass 1 counting, Pass
+    2 parsing) must agree on this predicate: a separator counted as
+    content either becomes the column-name line, becomes a phantom
+    all-NaN station, or shifts ``skip_content_lines`` relative to the
+    parse passes.
+
+    Args:
+        stripped: The line with leading/trailing whitespace removed.
+
+    Returns:
+        True for blank, comment, and separator-rule lines.
+    """
+    return not stripped or stripped.startswith("#") or _DEV_SEPARATOR_RE.match(stripped) is not None
+
+
 def _split_detected_delimiter(line: str, max_tokens: int) -> list[str]:
     """Split a content line by its apparent delimiter.
 
@@ -1066,6 +1365,47 @@ def _warn_dug_count_mismatch(col_count: int, header_tokens: list[str]) -> None:
         f"the header; the survey will be parsed with the header's "
         f"{len(header_tokens)} columns.",
         stacklevel=3,
+    )
+
+
+def _warn_mostly_numeric_header_decision(
+    first_line: str,
+    float_tokens: list[str],
+    non_float_tokens: list[str],
+) -> None:
+    """F-089: make the header/headerless decision observable.
+
+    When the first content line is mostly numeric (two or more float tokens and
+    at most one non-float token) and that non-float token is not a known
+    missing-data sentinel, the reader consumes the line as COLUMN NAMES and its
+    values are never parsed as data — with the only diagnostic being a later
+    "MD column not found".  The ambiguity is genuine (a non-sentinel text token
+    is indistinguishable from a column name), so the data-preserving default is
+    to keep the header interpretation; what was missing is any warning that
+    names the decision.
+
+    Emitted only at the terminal ``("simple", 1)`` return, so the DUG and
+    Petrel branches — which return earlier and DO special-case the line — can
+    never be misreported.
+
+    Args:
+        first_line:       The first content line (stripped), for the message.
+        float_tokens:     Tokens of that line that parse as numeric data.
+        non_float_tokens: Tokens of that line that do not.
+    """
+    unparseable = [
+        t for t in non_float_tokens if t.lower().strip() not in _DEV_SENTINELS
+    ]
+    if not unparseable:
+        return
+    warnings.warn(
+        f"First content line {first_line!r} is mostly numeric but was treated "
+        f"as the column-name header: token(s) {unparseable!r} are not "
+        f"recognized missing-data sentinels.  The values on that line "
+        f"({float_tokens!r}) will NOT be parsed as data.  If the line is a "
+        f"data row, correct the unknown token (a genuine sentinel such as "
+        f"'na', 'null' or '-' keeps the row as data).",
+        stacklevel=4,
     )
 
 
@@ -1318,14 +1658,14 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
         # data row ("1.0;2.0;na") failed the all-float check, fell
         # through to whitespace detection, and the first station was
         # consumed as fabricated column names ('1.0','2.0','NA').
-        _semi_float = [_is_float_token(_convert_comma_decimal(t)) for t in semi_tokens]
+        _semi_float = [_is_float_token(_normalize_locale_token(t)) for t in semi_tokens]
         _semi_mostly_float = (
             len(semi_tokens) >= 2 and sum(_semi_float) >= len(semi_tokens) - 1
         )
         _semi_is_sentinel = _semi_mostly_float and all(
             t.lower().strip() in _DEV_SENTINELS
             for t in semi_tokens
-            if not _is_float_token(_convert_comma_decimal(t))
+            if not _is_float_token(_normalize_locale_token(t))
         )
         if semi_tokens and (all(_semi_float) or _semi_is_sentinel):
             # DEV-01: count-prefix skip mirroring the comma/whitespace twins.
@@ -1604,7 +1944,14 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
     # data, so the guard cannot misfire on real headerless input.
     _second_is_text_header = False
     if len(content_entries) >= 2:
-        _second_toks = content_entries[1][1].split(maxsplit=_max_tokens)
+        # N-003: split the second line by its DETECTED delimiter, not by
+        # whitespace.  On a comma-delimited line ("5.0,6.0,7.0") the
+        # whitespace split yields ONE token that parses as no float, so the
+        # line was classified as a "genuine text column header" and the
+        # Petrel well-header branch below skipped two real data rows
+        # ("1.0,2.0,x" + two numeric rows -> 2 of 3 rows lost).  The
+        # delimiter-aware split sees three floats and the line is data.
+        _second_toks = _split_detected_delimiter(content_entries[1][1], _max_tokens)
         _second_is_text_header = (
             bool(_second_toks)
             and not any(
@@ -1715,7 +2062,9 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
         and (not _is_float_token(_hdr_tokens[0]) or _second_is_text_header)
         and any(_is_float_token(t) for t in _hdr_tokens[1:])
     ):
-        second_line_tokens = content_entries[1][1].split(maxsplit=_max_tokens)
+        # N-003: delimiter-aware second-line split (see _second_is_text_header
+        # above) — a comma-delimited numeric data line is data, not a header.
+        second_line_tokens = _split_detected_delimiter(content_entries[1][1], _max_tokens)
         # Real column header line has ALL non-numeric tokens (MD, TVD, etc.).
         if second_line_tokens and not any(_is_float_token(t) for t in second_line_tokens):
             warnings.warn(
@@ -1726,6 +2075,44 @@ def _detect_dev_format(content_entries: list[tuple[int, str]]) -> tuple[str, int
                 stacklevel=3,
             )
             return ("simple", 2)
+
+    # F-090: vendor-documented DUG layout — a free-text title line, then the
+    # column-label line, then data, with NO column-count line (R-04 C1).  Both
+    # DUG patterns require a single-integer count line, so this layout fell
+    # through to ("simple", 1): the title became the column names and the
+    # label line became an all-NaN station that shifted every array.
+    # Structural, deterministic discriminator: a first line that is NOT
+    # header-shaped and carries no numeric token, followed by a header-shaped
+    # line (short alphabetic tokens).  Returns ("simple", 2) rather than
+    # ("dug", 2): there is no DUG count line here, and the dug Pass-2 branch
+    # emits DUG-specific diagnostics (the ≥4-column specification warning,
+    # DUG-specific error text) that would mislabel the file.  The skip
+    # semantics are identical — both branches take content_entries[skip-1] as
+    # the header and skip `skip` content lines before data.
+    if (
+        len(content_entries) >= 3
+        and not _looks_like_dev_header(first_tokens)
+        and not any(
+            _is_float_token_comma_decimal(t) or _is_thousands_number(t) for t in first_tokens
+        )
+        and _looks_like_dev_header(
+            _split_detected_delimiter(content_entries[1][1], _max_tokens)
+        )
+    ):
+        return ("simple", 2)
+
+    # F-089: the first content line is about to become the column-name header.
+    # If it is mostly numeric, say so instead of losing its values silently.
+    _first_line_tokens = _split_detected_delimiter(content_entries[0][1], _max_tokens)
+    _first_line_floats = [
+        t for t in _first_line_tokens if _is_float_token_comma_decimal(t) or _is_thousands_number(t)
+    ]
+    if len(_first_line_floats) >= 2 and len(_first_line_floats) >= len(_first_line_tokens) - 1:
+        _warn_mostly_numeric_header_decision(
+            content_entries[0][1],
+            _first_line_floats,
+            [t for t in _first_line_tokens if t not in _first_line_floats],
+        )
 
     return ("simple", 1)
 
@@ -1807,8 +2194,13 @@ def _validate_dev_data(dev: DevFile, *, _stacklevel: int = 3) -> None:
     # depth columns: the first one found becomes the MD reference column
     # (also used by the TVD MD-consistency checks), additional ones are
     # validated as survivors.
-    _MD_FAMILY_BASES = ("MD", "MDKB", "MDSS", "MDRKB", "DEPTH", "DPT")
-    _MD_DEPTH_ALIASES = ("MDKB", "MDSS", "MDRKB", "DEPTH", "DPT")
+    # F-084: DEPT/MDMSL are documented depth vocabulary.  They are listed in
+    # the validation sets (not only in _DEV_ALIASES) because the alias table
+    # only applies when normalize_aliases=True — with normalize_aliases=False
+    # the raw name survives and previously triggered the false "MD column not
+    # found" warning while escaping every MD check.
+    _MD_FAMILY_BASES = ("MD", "MDKB", "MDSS", "MDRKB", "DEPTH", "DPT", "DEPT", "MDMSL")
+    _MD_DEPTH_ALIASES = ("MDKB", "MDSS", "MDRKB", "DEPTH", "DPT", "DEPT", "MDMSL")
 
     _md_col = None
     for _cn in dev.columns:
@@ -1951,7 +2343,12 @@ def _validate_dev_data(dev: DevFile, *, _stacklevel: int = 3) -> None:
     # --- 4. Check azimuth range [0, 360] ---
     # F-043: Iterate over all columns and match case-insensitively
     # so lowercase headers (e.g. "azi", "azim") are validated.
-    _azi_names_upper = {"AZI", "AZIM", "AZ", "AZM", "AZIMUTH"}
+    # F-084/F-092: AZIM_TN / AZIM_GN are the Petrel true-north and grid-north
+    # azimuth columns.  They are kept as their OWN identities (aliasing both to
+    # AZI would fabricate an AZI_2 and destroy the north-reference distinction —
+    # the same reason EW/NS stay distinct, see :data:`_DEV_ALIASES`), but they
+    # are azimuths and must be range-validated like one.
+    _azi_names_upper = {"AZI", "AZIM", "AZ", "AZM", "AZIMUTH", "AZIM_TN", "AZIM_GN"}
     for azi_name, azi_data in dev.columns.items():
         if azi_name.upper() not in _azi_names_upper:
             continue
@@ -1982,7 +2379,9 @@ def _validate_dev_data(dev: DevFile, *, _stacklevel: int = 3) -> None:
     # the _N-suffixed survivor bypasses the exact-name check above.
     # Validate those deduplication survivors.
     # F-043: Use case-insensitive startswith for column name matching.
-    _azi_names = ("AZI", "AZIM", "AZ", "AZM", "AZIMUTH")
+    # F-084/F-092: include the Petrel true-north/grid-north names so their
+    # dedup survivors (AZIM_TN_2, ...) are range-validated too.
+    _azi_names = ("AZI", "AZIM", "AZ", "AZM", "AZIMUTH", "AZIM_TN", "AZIM_GN")
     for azi_name in _azi_names:
         _azi_upper = azi_name.upper()
         for col_name in dev.column_order:
@@ -2074,7 +2473,10 @@ def _validate_dev_data(dev: DevFile, *, _stacklevel: int = 3) -> None:
     # or corrupt TVD data.  TVD is a fundamental survey column; NaN density
     # and MD-consistency checks catch delimiter mismatches and data corruption.
     # F-043: Iterate over all columns and match case-insensitively.
-    _tvd_names_upper = {"TVD", "TVDKB", "TVDSS", "TVDBML"}
+    # F-084: TVDMSL (TVD below mean sea level) is the documented Petrel/LAS
+    # spelling; without it the column got no NaN-density or MD-consistency
+    # check at all.
+    _tvd_names_upper = {"TVD", "TVDKB", "TVDSS", "TVDBML", "TVDMSL"}
     for tvd_name, tvd_data in dev.columns.items():
         if tvd_name.upper() not in _tvd_names_upper:
             continue
@@ -2092,10 +2494,14 @@ def _validate_dev_data(dev: DevFile, *, _stacklevel: int = 3) -> None:
                 stacklevel=_stacklevel,
             )
 
-        # MD-consistency: when both MD and TVD are present, TVD should not
-        # decrease where MD increases (in normal wells TVD increases with
-        # depth).  This is a soft check — TVD can stay constant in horizontal
-        # sections, but backward jumps signal data corruption.
+        # F-094: TVD is legitimately NON-monotonic — wherever inclination
+        # exceeds 90° TVD decreases while MD increases (R-04 J4, CONFIRMED on
+        # real data: 6088.0 -> 6087.58 -> 6087.83 with MD increasing through a
+        # horizontal section).  The old bare `np.diff(tvd) < 0` test therefore
+        # fired "may indicate data corruption" on valid surveys.  Tolerance-
+        # bound: report only a decrease steeper than half the MD step
+        # (|ΔTVD| > 0.5·ΔMD, i.e. |cos(inc)| > 0.5 ⇒ inclination beyond
+        # ~120°), which no near-horizontal or ordinary updip section reaches.
         if _md_col is None:
             continue
         md = dev.columns[_md_col]
@@ -2104,9 +2510,9 @@ def _validate_dev_data(dev: DevFile, *, _stacklevel: int = 3) -> None:
             continue
         md_finite = md[both_finite]
         tvd_finite = tvd[both_finite]
-        md_increasing = np.diff(md_finite) > 0
-        tvd_decreasing_where_md_increases = np.diff(tvd_finite) < 0
-        violations = np.logical_and(md_increasing, tvd_decreasing_where_md_increases)
+        _md_step = np.diff(md_finite)
+        _tvd_step = np.diff(tvd_finite)
+        violations = (_md_step > 0) & (_tvd_step < -0.5 * _md_step)
         if np.any(violations):
             n_bad = int(np.sum(violations))
             violations_idx = np.where(violations)[0]
@@ -2130,7 +2536,7 @@ def _validate_dev_data(dev: DevFile, *, _stacklevel: int = 3) -> None:
     # (e.g., TVDSS + TVDKB both normalise to TVD, producing TVD and TVD_2).
     # Validate NaN density and MD-consistency for deduplicated survivors
     # matching the pattern used for AZI/INC dedup survivors (F-025).
-    _tvd_names = ("TVD", "TVDKB", "TVDSS", "TVDBML")
+    _tvd_names = ("TVD", "TVDKB", "TVDSS", "TVDBML", "TVDMSL")
     for tvd_name in _tvd_names:
         _tvd_upper = tvd_name.upper()
         for col_name in dev.column_order:
@@ -2156,7 +2562,10 @@ def _validate_dev_data(dev: DevFile, *, _stacklevel: int = 3) -> None:
                         stacklevel=_stacklevel,
                     )
 
-                # MD-consistency: TVD should not decrease where MD increases.
+                # MD-consistency (F-094): same tolerance bound as the primary
+                # TVD block — TVD legitimately decreases where inclination
+                # exceeds 90°, so only a decrease steeper than half the MD
+                # step is reported.  Both instances must stay identical.
                 if _md_col is None:
                     continue
                 md = dev.columns[_md_col]
@@ -2165,9 +2574,9 @@ def _validate_dev_data(dev: DevFile, *, _stacklevel: int = 3) -> None:
                     continue
                 md_finite = md[both_finite]
                 tvd_finite = tvd[both_finite]
-                md_increasing = np.diff(md_finite) > 0
-                tvd_decreasing_where_md_increases = np.diff(tvd_finite) < 0
-                violations = np.logical_and(md_increasing, tvd_decreasing_where_md_increases)
+                _md_step = np.diff(md_finite)
+                _tvd_step = np.diff(tvd_finite)
+                violations = (_md_step > 0) & (_tvd_step < -0.5 * _md_step)
                 if np.any(violations):
                     n_bad = int(np.sum(violations))
                     violations_idx = np.where(violations)[0]
@@ -2195,6 +2604,50 @@ def _validate_dev_data(dev: DevFile, *, _stacklevel: int = 3) -> None:
     #       delimiter mismatch, but the MD column is the most
     #       reliable indicator — if MD is >50% NaN, the file is
     #       almost certainly misparsed.) ---
+
+
+def _allocate_dev_columns(dev: DevFile, names: list[str], data_lines: int) -> None:
+    """Allocate one NaN-filled array per parsed DEV column (F-104).
+
+    The DEV model validates column insertion (``_DevColumns.__setitem__``
+    rejects a case-variant duplicate key such as ``MD`` + ``md``) and the
+    ``column_order`` assignment (duplicate / unknown entries).  Both raise
+    model-layer exceptions — a bare ``ValueError`` at
+    ``models.py:7432`` today, ``LASDataError`` (a ``ValueError`` subclass)
+    once the model-side error type is corrected — which escaped
+    ``read_dev_file*`` with a type the reader never documents.  Every
+    reader entry point documents ``DEVReadError`` as its failure type, so
+    the reader boundary translates the model error here, in ONE place for
+    all three format branches (headerless / dug / simple).  Catching
+    ``ValueError`` covers the current bare raise and the ``LASDataError``
+    replacement without depending on which lands first; ``MemoryError``
+    keeps its existing message.
+
+    Args:
+        dev:        The DevFile being populated.
+        names:      Column names, already normalized and deduplicated.
+        data_lines: Number of data rows each column holds.
+
+    Raises:
+        DEVReadError: When the model rejects a column name or the order,
+            or when the column array cannot be allocated.
+    """
+    for name in names:
+        try:
+            dev.columns[name] = np.full(data_lines, np.nan, dtype=np.float64)
+        except MemoryError as e:
+            raise DEVReadError(
+                f"Cannot allocate {data_lines} elements for column "
+                f"'{name}' ({len(names)} columns total): out of memory"
+            ) from e
+        except ValueError as e:
+            raise DEVReadError(
+                f"Invalid DEV column {name!r} ({len(names)} columns total): {e}"
+            ) from e
+    try:
+        dev.column_order = list(names)
+    except ValueError as e:
+        raise DEVReadError(f"Invalid DEV column order {names!r}: {e}") from e
 
 
 def read_dev_file(
@@ -2335,11 +2788,61 @@ def read_dev_file_as_object(
             f"Cannot read file (size exceeded or invalid parameter): {file_path}"
         ) from e
 
-    # Sanitize control characters that Python's splitlines() treats as line
-    # breaks before splitting.  This is the same protection used by reader.py
-    # and parser.py — without it, embedded control characters can produce fake
-    # lines and corrupt data boundaries.
-    lines = _SPLITLINES_CHARS_RE.sub(" ", content).splitlines()
+    # Sanitize control characters before splitting.  This is the same
+    # protection used by reader.py and parser.py — without it, embedded
+    # control characters can produce fake lines and corrupt data boundaries.
+    # F-083: the two classes are handled differently.  A character that
+    # splitlines() really breaks on is replaced with a space (it separates
+    # tokens); a C0 control character that is NOT a line break is DELETED
+    # with one counted warning, because in a space-delimited DEV file a
+    # substituted space IS the column delimiter — it silently split a single
+    # value into two columns and shifted the rest of the row.
+    _n_deleted_controls = len(_DEV_DELETE_CHARS_RE.findall(content))
+    if _n_deleted_controls:
+        content = _DEV_DELETE_CHARS_RE.sub("", content)
+        warnings.warn(
+            f"Removed {_n_deleted_controls} control character(s) from "
+            f"{file_path} before parsing.  Control characters that are not "
+            f"line breaks are deleted (the DEV writer deletes the same "
+            f"character class); they are never turned into a column "
+            f"delimiter.  Verify the file is not corrupt.",
+            stacklevel=2,
+        )
+    # LD-08: the shared NBSP-family rule — a thousands grouping separator is
+    # deleted ("1\u00a0000.5" -> "1000.5", so the space substitution below
+    # cannot split the token) and every other occurrence becomes a space
+    # ("1.5\u00a02.5" is two values).  This is the same helper the LAS
+    # reader, the parser and the writer call, so the same bytes normalize
+    # identically through every entry point.  The counted warning is
+    # preserved here (stacklevel 3 keeps it pointing at read_dev_file's
+    # caller, where the pre-consolidation stacklevel-2 warning pointed); the
+    # LAS paths stay silent, as they were.
+    content = normalize_nbsp_family(content, warn_context=str(file_path), stacklevel=3)
+    lines = _DEV_SPACE_CHARS_RE.sub(" ", content).splitlines()
+
+    # F-097/F-270: strip an Excel list-separator directive.  Excel writes
+    # "sep=;" (or "sep=,") as the FIRST line of a CSV export to declare the
+    # field separator; it is exporter metadata, not a header and not data.
+    # Left in place it became the sole column name and every record became
+    # NaN (a headerless file), and the declared separator was never applied.
+    # Only the first CONTENT line can carry it (blank and comment lines are
+    # skipped, exactly as the content scan below skips them).
+    _sep_directive: str | None = None
+    for _line_idx, _line in enumerate(lines):
+        _stripped_line = _line.strip()
+        if not _stripped_line or _stripped_line.startswith("#"):
+            continue
+        _sep_match = _DEV_SEP_DIRECTIVE_RE.match(_stripped_line)
+        if _sep_match is not None:
+            _sep_directive = _sep_match.group(1)
+            del lines[_line_idx]
+            warnings.warn(
+                f"Stripped Excel list-separator directive {_stripped_line!r} "
+                f"from the first content line of {file_path}.  It is exporter "
+                f"metadata, not a header or a data line.",
+                stacklevel=2,
+            )
+        break
 
     # --- Gather first few content lines for format detection ---
     # Scan past comments and empty lines to collect up to 3 content-bearing
@@ -2348,7 +2851,7 @@ def read_dev_file_as_object(
     content_entries: list[tuple[int, str]] = []
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
+        if not _is_dev_noncontent_line(stripped):
             content_entries.append((i, stripped))
             if len(content_entries) >= 4:
                 break
@@ -2432,9 +2935,49 @@ def read_dev_file_as_object(
     # delimiters get validated but not silently changed.
     _delimiter_was_auto = delimiter is None
 
+    # F-097/F-270: a "sep=<c>" directive declares the field separator.
+    # Applied only when the caller supplied no delimiter, and only when the
+    # declared character actually occurs on the delimiter-bearing line: a
+    # directive that contradicts the data ("sep=;" over comma records) is
+    # stale exporter metadata, not a reason to collapse every row into one
+    # column, so auto-detection takes over with a warning.  The delimiter
+    # cross-validation below still runs on top of this, so a directive that
+    # matches the header but not the data rows is auto-corrected.
+    # _delimiter_was_auto stays True for a directive because the separator
+    # came from the FILE, not from the caller.
+    if delimiter is None and _sep_directive is not None:
+        if _sep_directive in hdr:
+            delimiter = _sep_directive
+        else:
+            warnings.warn(
+                f"The Excel list-separator directive declares "
+                f"{_sep_directive!r} but that character does not occur on "
+                f"the header line {hdr[:80]!r}; the declared separator is "
+                f"ignored and the delimiter is auto-detected from the "
+                f"content instead.",
+                stacklevel=2,
+            )
+
+    # F-262: the *COLUMNS keyword layout carries its own field separator
+    # between the *-prefixed names (documented Petrel form:
+    # "*COLUMNS *MD | *INC | *AZM", and the comma-attached
+    # "*COLUMNS *MD, *INC, *AZM").  The space/tab/comma heuristics below
+    # see those separators as extra tokens — the pipe form scores 6 space
+    # tokens against 3 pipe tokens, so space won and every data row was
+    # split into 5 values against 3 names, shifting each column.  Use the
+    # separator the header actually carries.
+    _columns_sep: str | None = None
+    if hdr.lstrip().upper().startswith("*COLUMNS"):
+        for _cand_sep in ("|", ",", ";"):
+            if _cand_sep in hdr:
+                _columns_sep = _cand_sep
+                break
+
     if delimiter is None:
         if hdr:
-            if format_type == "headerless":
+            if _columns_sep is not None:
+                delimiter = _columns_sep
+            elif format_type == "headerless":
                 # DEV-04/DEV-05: for headerless files the first line IS
                 # data, so the raw fragment-count heuristic below is the
                 # WRONG tool — a semicolon-delimited comma-decimal line
@@ -2544,7 +3087,7 @@ def read_dev_file_as_object(
         _data_lines: list[str] = []
         for _lin in lines:
             _s = _lin.strip()
-            if not _s or _s.startswith("#"):
+            if _is_dev_noncontent_line(_s):
                 continue
             _content_seen += 1
             if _content_seen > skip_content_lines:
@@ -2585,8 +3128,11 @@ def read_dev_file_as_object(
                     _later_full_rows += 1
             if _hdr_cols >= 2 and _data_cols == 1:
                 # Delimiter fails on first data line (produces only 1
-                # token).  Try the alternative delimiter.
-                _alt_delim = " " if delimiter == "," else ","
+                # token).  Try the alternative delimiter.  F-262: a "|"
+                # delimiter (the *COLUMNS keyword separator) falls back to
+                # whitespace like "," does; otherwise a pipe-decorated
+                # header over space-delimited rows could not be rescued.
+                _alt_delim = " " if delimiter in (",", "|") else ","
                 if _alt_delim == " ":
                     _data_alt_cols = len(_first_data.split(maxsplit=_max_tokens))
                 else:
@@ -2724,7 +3270,7 @@ def read_dev_file_as_object(
     data_lines = 0
     for line in lines:
         stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+        if _is_dev_noncontent_line(stripped):
             continue
         content_seen += 1
         if content_seen > skip_content_lines:
@@ -2772,7 +3318,7 @@ def read_dev_file_as_object(
 
     for line in lines:
         stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+        if _is_dev_noncontent_line(stripped):
             continue
 
         content_seen += 1
@@ -2892,15 +3438,7 @@ def read_dev_file_as_object(
                         f"maximum allowed ({MAX_TOTAL_ELEMENTS}). "
                         f"The file may be malformed or corrupt."
                     )
-                for name in names:
-                    try:
-                        dev.columns[name] = np.full(data_lines, np.nan, dtype=np.float64)
-                    except MemoryError as e:
-                        raise DEVReadError(
-                            f"Cannot allocate {data_lines} elements for column "
-                            f"'{name}' ({len(names)} columns total): out of memory"
-                        ) from e
-                dev.column_order = list(names)
+                _allocate_dev_columns(dev, names, data_lines)
                 # Store first data row (G-04 bounds guard).
                 if current_line < data_lines:
                     for k in range(len(names)):
@@ -2979,10 +3517,16 @@ def read_dev_file_as_object(
                     )
                 # Apply alias normalization before deduplication so that
                 # variants like MDKB and MD are recognized as duplicates.
+                # M8: keep the raw spellings — the normalizer reports a
+                # datum-distinct rewrite, and the dedup diagnostic needs the
+                # originals to tell an alias collapse from a repeated column.
+                _raw_names = names
                 if normalize_aliases:
-                    names = [_normalize_dev_column(n) for n in names]
+                    names = _normalize_dev_columns(names)
                 # Deduplicate column names.
-                names = _deduplicate_dev_columns(names)
+                names = _deduplicate_dev_columns(
+                    names, originals=_raw_names if normalize_aliases else None
+                )
                 # E-23: DUG files with FEWER than 4 columns were silently
                 # accepted, but the published DUG specification requires
                 # at least four columns to tie MD, TVD, X, and Y.  Warn
@@ -3012,15 +3556,7 @@ def read_dev_file_as_object(
                         f"maximum allowed ({MAX_TOTAL_ELEMENTS}). "
                         f"The file may be malformed or corrupt."
                     )
-                for name in names:
-                    try:
-                        dev.columns[name] = np.full(data_lines, np.nan, dtype=np.float64)
-                    except MemoryError as e:
-                        raise DEVReadError(
-                            f"Cannot allocate {data_lines} elements for column "
-                            f"'{name}' ({len(names)} columns total): out of memory"
-                        ) from e
-                dev.column_order = list(names)
+                _allocate_dev_columns(dev, names, data_lines)
             else:
                 # Data lines (G-04 bounds guard).
                 if current_line < data_lines:
@@ -3088,10 +3624,14 @@ def read_dev_file_as_object(
                     )
                 # Apply alias normalization before deduplication so that
                 # variants like MDKB and MD are recognized as duplicates.
+                # M8: keep the raw spellings — see the DUG branch above.
+                _raw_names = names
                 if normalize_aliases:
-                    names = [_normalize_dev_column(n) for n in names]
+                    names = _normalize_dev_columns(names)
                 # Deduplicate column names.
-                names = _deduplicate_dev_columns(names)
+                names = _deduplicate_dev_columns(
+                    names, originals=_raw_names if normalize_aliases else None
+                )
                 if len(names) >= MAX_CURVES:
                     raise DEVReadError(
                         f"Column count ({len(names)}) exceeds maximum allowed "
@@ -3105,15 +3645,7 @@ def read_dev_file_as_object(
                         f"maximum allowed ({MAX_TOTAL_ELEMENTS}). "
                         f"The file may be malformed or corrupt."
                     )
-                for name in names:
-                    try:
-                        dev.columns[name] = np.full(data_lines, np.nan, dtype=np.float64)
-                    except MemoryError as e:
-                        raise DEVReadError(
-                            f"Cannot allocate {data_lines} elements for column "
-                            f"'{name}' ({len(names)} columns total): out of memory"
-                        ) from e
-                dev.column_order = list(names)
+                _allocate_dev_columns(dev, names, data_lines)
             else:
                 # Data lines (G-04 bounds guard).
                 if current_line < data_lines:

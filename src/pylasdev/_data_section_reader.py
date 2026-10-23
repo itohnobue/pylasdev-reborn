@@ -218,7 +218,25 @@ def _iter_ascii_data_lines(
                     # ~#) fails that check and is skipped below — it never
                     # breaks data reading.
                     section_word = _get_section_word(stripped)
-                    if not _is_recognized_section_word(section_word):
+                    if _is_recognized_section_word(section_word):
+                        # F-001: a genuine LAS section header inside ~A is a
+                        # section boundary (deliberate — P-16 above), but the
+                        # rows after it are NOT read: the reader returns here.
+                        # The unrecognized-word branch below has always warned;
+                        # the recognized-word branch returned silently, so a
+                        # data row whose FIRST token starts '~'+letter (e.g. a
+                        # first-column {S} value '~C' or '~SHALE') lost the
+                        # rest of the ~A block with no warnings-API signal.
+                        # Warn on this branch too — the boundary policy stays,
+                        # the silent loss does not.
+                        warnings.warn(
+                            f"Section header '~{section_word}' found inside the ASCII "
+                            f"data section{mode_suffix}.  Data reading stops at this "
+                            f"section boundary; the remaining ~A rows are not read.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                    else:
                         warnings.warn(
                             f"Unrecognized section header '~{section_word}' found in ASCII "
                             f"data section{mode_suffix}.  Data reading stops at this "
@@ -246,6 +264,7 @@ def _split_data_line(
     stripped: str,
     delimiter: str,
     expected: int | None = None,
+    warn: bool = True,
 ) -> list[str]:
     """Split a data line into tokens using delimiter-aware logic.
 
@@ -264,15 +283,45 @@ def _split_data_line(
     with a loud warning so a comma-grouped value cannot silently shift or
     mis-assign columns (M-30, mirroring the DEV reader's
     ``_recombine_thousands_separators``).  Callers that must see raw
-    token counts (``_detect_actual_wrap``, the LAS 3.0 twin) omit it.
+    token counts omit it.
+
+    *warn* applies to the recombination warning only.  Detection callers
+    (``_detect_actual_wrap``, ``_las30_data._detect_actual_wrap_las30``)
+    pass ``expected`` so the wrap gate sees the SAME column layout the
+    fill loop sees (F-074: a thousands-grouped COMMA row is 2N raw tokens
+    but N columns), and pass ``warn=False`` — the read path re-splits the
+    same lines and will emit the recombination warning there.
 
     Also used by _detect_actual_wrap, _read_normal, and _read_wrapped.
+
+    Token list only.  A caller that must know whether recombination fired
+    for the row (the wrap detectors — M10) calls
+    :func:`_split_data_line_traced` instead.
+    """
+    return _split_data_line_traced(stripped, delimiter, expected=expected, warn=warn)[0]
+
+
+def _split_data_line_traced(
+    stripped: str,
+    delimiter: str,
+    expected: int | None = None,
+    warn: bool = True,
+) -> tuple[list[str], bool]:
+    """Split a data line and report whether recombination degraded its count.
+
+    Identical split policy to :func:`_split_data_line` (which is the
+    token-only wrapper around this function).  The second return value is
+    ``True`` when the thousands recombination actually merged fragments on
+    this row (M10) — i.e. the row's post-merge token count is smaller than
+    the raw column layout the file carries, so that count is an artifact of
+    the heuristic rather than evidence about the file's wrap layout.
     """
     if delimiter == " ":
-        return stripped.split(maxsplit=_resolve_max_tokens_per_line())
+        return stripped.split(maxsplit=_resolve_max_tokens_per_line()), False
 
     _max_tokens = _resolve_max_tokens_per_line()
     values = stripped.split(delimiter, maxsplit=_max_tokens)
+    _recombination_fired = False
 
     # Strip trailing empty strings from csv.reader output.
     # Trailing delimiters (e.g. "100.0,") produce empty fields that
@@ -289,20 +338,22 @@ def _split_data_line(
         _recombined = _recombine_las_thousands_separators(values, expected)
         if _recombined is not None:
             _merged_vals, _recombine_pairs = _recombined
-            for _original_frag, _merged_value in _recombine_pairs:
-                warnings.warn(
-                    f"Data value '{_original_frag}' contains a "
-                    f"thousands separator, which is not natively "
-                    f"supported in comma-delimited LAS data; "
-                    f"recombined to '{_merged_value}' for column "
-                    f"mapping. Review the data line if this row has "
-                    f"genuine extra columns.",
-                    UserWarning,
-                    stacklevel=3,
-                )
+            _recombination_fired = True
+            if warn:
+                for _original_frag, _merged_value in _recombine_pairs:
+                    warnings.warn(
+                        f"Data value '{_original_frag}' contains a "
+                        f"thousands separator, which is not natively "
+                        f"supported in comma-delimited LAS data; "
+                        f"recombined to '{_merged_value}' for column "
+                        f"mapping. Review the data line if this row has "
+                        f"genuine extra columns.",
+                        UserWarning,
+                        stacklevel=3,
+                    )
             values = _merged_vals
 
-    return values
+    return values, _recombination_fired
 
 
 def _detect_string_curves(las_file: LASFile) -> set[int]:
@@ -370,6 +421,7 @@ def detect_actual_wrap_from_window(
     curve_count: int,
     declared_wrap: str | None,
     empty_window_default: bool = True,
+    recombination_degraded: list[bool] | None = None,
 ) -> bool:
     """Pure decision: is the first-4-data-lines value-count *window* wrapped?
 
@@ -403,6 +455,15 @@ def detect_actual_wrap_from_window(
     - majority vote: >=2 full → False; >=3 partial → True;
     - tiebreak: declared header YES → True, else True (conservative).
 
+    M10 recombination-degraded rows: the thousands recombination
+    (``_split_data_line_traced``) can shrink a row's token count below
+    ``curve_count`` (the documented loud short-row trade), which would
+    otherwise read as a depth line.  Such a row is excluded from the
+    depth/1-value arms and from the H-02 uniform-short set — its post-merge
+    count is a tokenizer artifact, not layout evidence — and it counts as
+    full-width, because recombination only fires on a row whose RAW token
+    count was already ``>= curve_count``.
+
     Args:
         window: Value counts of up to 4 data lines (caller-collected).
         curve_count: Declared curve count for the section.
@@ -411,6 +472,10 @@ def detect_actual_wrap_from_window(
             lines found); True on the LAS 1.2/2.0 path (conservative),
             False on the LAS 3.0 path (blank-only section must not be
             rejected as WRAP=YES).
+        recombination_degraded: Optional per-row flags parallel to *window*
+            — True where the thousands recombination merged fragments on
+            that row (M10).  None (the default) or a shorter list means
+            "no row was degraded", i.e. the pre-M10 behaviour.
 
     Returns:
         True when the data is genuinely wrapped.
@@ -422,7 +487,15 @@ def detect_actual_wrap_from_window(
     if curve_count <= 1:
         return False
 
-    def _is_full(n: int) -> bool:
+    _degraded = recombination_degraded if recombination_degraded is not None else []
+
+    def _is_degraded(index: int) -> bool:
+        # M10: this row's token count was reduced by the thousands
+        # recombination, so the count is a tokenizer artifact — it must not
+        # be read as a 1-value depth line or as a uniform short row.
+        return index < len(_degraded) and bool(_degraded[index])
+
+    def _is_full(index: int) -> bool:
         # COMMA/TAB: trailing empties are stripped by _split_data_line, so
         # value counts reflect real tokens.  A data line is "full" only
         # when it carries the complete row (curve_count values) — a
@@ -430,7 +503,13 @@ def detect_actual_wrap_from_window(
         # depth-only line carries exactly 1, so both are partial (wrapped)
         # evidence.  (W2-F3: the twin's delimiter if/else was dead — both
         # branches returned n >= curve_count — collapsed to one form.)
-        return n >= curve_count
+        # M10: a recombination-degraded row is full-width evidence — the
+        # heuristic only fires on a row whose RAW token count already
+        # reached curve_count (see _recombine_las_thousands_separators),
+        # so its shrunken post-merge count must not read as partial.
+        if _is_degraded(index):
+            return True
+        return window[index] >= curve_count
 
     # F-07 (DR-01/I2-04): depth-line evidence rule.  A genuine wrapped
     # file ALWAYS has depth lines (rows with exactly 1 value).  When any
@@ -445,13 +524,19 @@ def detect_actual_wrap_from_window(
     # carries curve_count-1 values, never curve_count) — the 1-value row
     # was a ragged short row, so the >=2 arm must NOT fire ([3,1,3,1] /
     # [3,1,1,3] WRAP=NO stay non-wrapped — W-2/NEW-1).
-    depth_later = len(window) > 1 and any(n == 1 for n in window[1:])
+    depth_later = len(window) > 1 and any(
+        window[i] == 1 and not _is_degraded(i) for i in range(1, len(window))
+    )
     if depth_later:
         if declared_wrap is not None and declared_wrap.upper() == "YES":
             return True
-        if _is_full(window[0]) and sum(1 for n in window[1:] if n == 1) >= 2:
+        if (
+            _is_full(0)
+            and sum(1 for i in range(1, len(window)) if window[i] == 1 and not _is_degraded(i)) >= 2
+        ):
             if not any(
-                window[i] == 1 and _is_full(window[i + 1]) for i in range(1, len(window) - 1)
+                window[i] == 1 and not _is_degraded(i) and _is_full(i + 1)
+                for i in range(1, len(window) - 1)
             ):
                 return True
 
@@ -467,7 +552,7 @@ def detect_actual_wrap_from_window(
     # from an extra-columns nc=2 file — the extra-columns reading is
     # test-locked on both paths (test_reader.py:1736, test_parser.py:1395),
     # so nc=2 stays non-wrapped (II-6 spirit: never misroute extra-columns).
-    if _is_full(window[0]) and curve_count >= 3:
+    if _is_full(0) and curve_count >= 3:
         if window[0] % curve_count == 0 and window[0] > curve_count:
             return True
         # M-38: a WRAP=YES header with a COMPLETE first row can still be a
@@ -477,14 +562,14 @@ def detect_actual_wrap_from_window(
         # evidence), fall through to the majority vote instead of
         # short-circuiting to non-wrapped.
         if declared_wrap is not None and declared_wrap.upper() == "YES":
-            if len(window) > 1 and any(not _is_full(n) for n in window[1:]):
+            if len(window) > 1 and any(not _is_full(i) for i in range(1, len(window))):
                 pass  # fall through to the majority vote below
             else:
                 return False
         else:
             return False
 
-    full_count = sum(1 for n in window if _is_full(n))
+    full_count = sum(1 for i in range(len(window)) if _is_full(i))
     partial_count = len(window) - full_count
 
     # H-02: curve-count mismatch guard.  When ~C declares MORE curves than
@@ -497,10 +582,14 @@ def detect_actual_wrap_from_window(
     # length L (1 < L < curve_count) across the whole window, with NO
     # 1-value depth line, is a column-count mismatch — treat as
     # non-wrapped so the graceful short-row null-fill preserves the data.
+    # M10: recombination-degraded rows are not layout evidence and are
+    # excluded from the uniform set (with no evidence rows left the guard
+    # cannot fire; the vote below sees them as full-width).
+    _undegraded = [window[i] for i in range(len(window)) if not _is_degraded(i)]
     if (
         len(window) >= 2
         and full_count == 0
-        and len(set(window)) == 1
+        and len(set(_undegraded)) == 1
         and 1 < window[0] < curve_count
     ):
         return False

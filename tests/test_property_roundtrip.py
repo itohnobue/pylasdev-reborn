@@ -332,6 +332,57 @@ _SCEN_LAS30_FORMATS = """~VERSION INFORMATION
 102.0,2.85E+12,44
 """
 
+# G-B (test-register ADD-GAP): LAS 3.0 structural drift — two typed data
+# sections, a _Definition section and a pipe target — under the fuzz
+# contract.  Every other scenario here is a single-section 1.2/2.0 file (or a
+# single ~A 3.0 section), so 3.0 section typing / pipe routing was outside
+# the harness.
+_SCEN_LAS30_PIPE = """~VERSION INFORMATION
+ VERS.   3.0  : CWLS LOG ASCII STANDARD -VERSION 3.0
+ WRAP.   NO  : ONE LINE PER DEPTH STEP
+ DLM .   COMMA : DELIMITING CHARACTER BETWEEN DATA COLUMNS
+~Well Information
+ STRT .M   100.0  : First Index Value
+ STOP .M   102.0  : Last Index Value
+ STEP .M   1.0  : STEP
+ NULL .    -999.25  : NULL VALUE
+ WELL .   PIPE WELL  : WELL
+~CURVE INFORMATION
+ DEPT .M  : DEPTH  {F}
+ GR   .API  : GAMMA RAY  {F}
+~Core_Definition
+ CORET.M                                : Core Top Depth  {F}
+ COREB.M                                : Core Bottom Depth  {F}
+~Core[1] | Core_Definition
+550.0,555.0
+551.0,556.0
+~Log_Data | CURVE
+100.0,10.0
+101.0,20.0
+102.0,30.0
+"""
+
+# G-D (test-register ADD-GAP): the NULL sentinel appearing in the INDEX
+# column (column 0) — the reader/writer asymmetry trap R-05 A1/A2.  lasio
+# null-maps non-index curves only; a sentinel in the index column must keep
+# its value through parse -> write -> reparse.
+_SCEN_INDEX_NULL = """~VERSION INFORMATION
+ VERS.   2.0  : CWLS LOG ASCII STANDARD
+ WRAP.   NO  : One line per depth step
+~WELL INFORMATION
+ STRT.M   -999.25  : START DEPTH
+ STOP.M   102.0  : STOP DEPTH
+ STEP.M   1.0  : STEP
+ NULL.    -999.25  : NULL VALUE
+~CURVE INFORMATION
+ DEPT.M  : DEPTH
+ GR.API  : GAMMA RAY
+~A DEPT GR
+-999.25 10.0
+101.0 20.0
+102.0 30.0
+"""
+
 _SCENARIOS = [
     pytest.param(_SCEN_WRAP_DEPTH_OWN_LINE, id="wrap-depth-on-own-line"),
     pytest.param(_SCEN_WRAP_FLOWING, id="wrap-flowing-multiples"),
@@ -344,6 +395,8 @@ _SCENARIOS = [
     pytest.param(_SCEN_LAS12, id="las12-baseline"),
     pytest.param(_SCEN_LAS30_STRING, id="las30-string-curve"),
     pytest.param(_SCEN_LAS30_FORMATS, id="las30-exponential-integer"),
+    pytest.param(_SCEN_LAS30_PIPE, id="las30-multi-section-pipe"),
+    pytest.param(_SCEN_INDEX_NULL, id="index-column-null"),
 ]
 
 
@@ -554,3 +607,132 @@ class TestSeededRandomBatch:
         content = _build_las30(rng)
         first, second = _roundtrip(content, tmp_path, f"r30_{seed}")
         assert_structural_equal(first, second)
+
+
+# ---------------------------------------------------------------------------
+# G-C (test-register ADD-GAP): falsifiability of the structural contract.
+# A guard nobody can falsify is not a guard.  Each control below mutates ONE
+# dimension of a synthetic parsed-dict pair and requires
+# assert_structural_equal to raise — so a future edit that drops a dimension
+# from the contract fails here instead of silently weakening the harness.
+# ---------------------------------------------------------------------------
+
+
+def _contract_baseline() -> dict:
+    """A minimal parsed dict exercising every dimension the contract asserts."""
+    return {
+        "version": {"VERS": "2.0", "WRAP": "NO"},
+        "curves_order": ["DEPT", "GR"],
+        "curves": [
+            {"mnemonic": "DEPT", "unit": "M", "description": "DEPTH", "data_format": None},
+            {"mnemonic": "GR", "unit": "API", "description": "GAMMA RAY", "data_format": None},
+        ],
+        "well": {"STRT": "100.0", "NULL": "-999.25"},
+        "logs": {"DEPT": np.array([100.0, 101.0]), "GR": np.array([10.0, 20.0])},
+        "string_data": {"LITH": np.array(["SAND", "SHALE"])},
+    }
+
+
+class TestStructuralContractFalsifiability:
+    """G-C: assert_structural_equal must fail on each contract dimension."""
+
+    def test_identical_dicts_pass(self) -> None:
+        """Control: the baseline against itself must pass (no false positive)."""
+        assert_structural_equal(_contract_baseline(), _contract_baseline())
+
+    def test_curves_order_drift_fails(self) -> None:
+        first = _contract_baseline()
+        second = _contract_baseline()
+        second["curves_order"] = ["GR", "DEPT"]
+        with pytest.raises(AssertionError, match="curves_order drift"):
+            assert_structural_equal(first, second)
+
+    def test_curve_metadata_drift_fails(self) -> None:
+        first = _contract_baseline()
+        second = _contract_baseline()
+        second["curves"][1]["unit"] = "OHMM"
+        with pytest.raises(AssertionError, match="curve metadata drift"):
+            assert_structural_equal(first, second)
+
+    def test_well_drift_fails(self) -> None:
+        first = _contract_baseline()
+        second = _contract_baseline()
+        second["well"]["STRT"] = "200.0"
+        with pytest.raises(AssertionError, match="well field drift"):
+            assert_structural_equal(first, second)
+
+    def test_log_data_drift_fails(self) -> None:
+        first = _contract_baseline()
+        second = _contract_baseline()
+        second["logs"]["GR"] = np.array([10.0, 99.0])
+        with pytest.raises(AssertionError):
+            assert_structural_equal(first, second)
+
+    def test_missing_log_curve_fails(self) -> None:
+        first = _contract_baseline()
+        second = _contract_baseline()
+        second["logs"].pop("GR")
+        with pytest.raises(AssertionError):
+            assert_structural_equal(first, second)
+
+    def test_string_data_key_drift_fails(self) -> None:
+        first = _contract_baseline()
+        second = _contract_baseline()
+        second["string_data"] = {}
+        with pytest.raises(AssertionError, match="string_data key drift"):
+            assert_structural_equal(first, second)
+
+    def test_string_data_value_drift_fails(self) -> None:
+        first = _contract_baseline()
+        second = _contract_baseline()
+        second["string_data"]["LITH"] = np.array(["SAND", "LIME"])
+        with pytest.raises(AssertionError):
+            assert_structural_equal(first, second)
+
+
+# ---------------------------------------------------------------------------
+# G-B / G-D explicit expectations.  The parametrized scenario test above only
+# proves reader/writer SYMMETRY (both parses agree); these two assert the
+# VALUES independently, so a deterministic reader/writer bug shared by both
+# parses still fails.
+# ---------------------------------------------------------------------------
+
+
+class TestLas30MultiSectionPipeRoundtrip:
+    """G-B: LAS 3.0 multi-section + pipe + _Definition survives the roundtrip."""
+
+    def test_sections_pipe_and_values_survive(self, tmp_path: Path) -> None:
+        first, second = _roundtrip(_SCEN_LAS30_PIPE, tmp_path, "pipe")
+        for label, parsed in (("first parse", first), ("reparse", second)):
+            sections = parsed.get("data_sections", [])
+            assert len(sections) == 2, f"{label}: expected 2 data sections, got {len(sections)}"
+            # Sections come back in file order: ~Core[1] precedes ~Log_Data.
+            by_type = {section["section_type"]: section for section in sections}
+            assert set(by_type) == {"LOG_DATA", "CORE_DATA"}, f"{label}: {sorted(by_type)}"
+            core = by_type["CORE_DATA"]
+            np.testing.assert_allclose(
+                core["data"]["CORET"], [550.0, 551.0], err_msg=f"{label}: CORET"
+            )
+            np.testing.assert_allclose(
+                core["data"]["COREB"], [555.0, 556.0], err_msg=f"{label}: COREB"
+            )
+            np.testing.assert_allclose(
+                parsed["logs"]["DEPT"], [100.0, 101.0, 102.0], err_msg=f"{label}: DEPT"
+            )
+            np.testing.assert_allclose(
+                parsed["logs"]["GR"], [10.0, 20.0, 30.0], err_msg=f"{label}: GR"
+            )
+
+
+class TestIndexColumnNullRoundtrip:
+    """G-D: a NULL sentinel in the INDEX column keeps its value through roundtrip."""
+
+    def test_index_sentinel_survives(self, tmp_path: Path) -> None:
+        first, second = _roundtrip(_SCEN_INDEX_NULL, tmp_path, "indexnull")
+        for label, parsed in (("first parse", first), ("reparse", second)):
+            np.testing.assert_allclose(
+                parsed["logs"]["DEPT"],
+                [-999.25, 101.0, 102.0],
+                err_msg=f"{label}: the index-column NULL sentinel must not be null-filled",
+            )
+            np.testing.assert_allclose(parsed["logs"]["GR"], [10.0, 20.0, 30.0], err_msg=label)

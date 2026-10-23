@@ -11,6 +11,7 @@ output conforms to LAS specification requirements:
 from __future__ import annotations
 
 import re
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -384,16 +385,21 @@ class TestFormatCompliance:
 
     # --- F-M-25: LAS 1.2 256-char line-length compliance ---
     def test_las12_long_data_lines_do_not_crash(self, tmp_path: Path) -> None:
-        """Test LAS 1.2 output with data lines exceeding 256 characters.
+        """LAS 1.2 output with over-256-character data lines warns and survives.
 
         The LAS 1.2 spec allows a maximum of 256 characters per line in
-        unwrapped mode (each line = one depth step). This test verifies
-        that the library does not crash or silently corrupt data when
-        data lines exceed this limit.
+        unwrapped mode (each line = one depth step).  The writer does not
+        truncate (truncation would lose data) — it emits ONE counted
+        ``Data line exceeds 256-character limit`` warning per section and
+        writes the long line as-is.
 
-        NOTE: The library currently does NOT enforce the 256-char limit.
-        Long lines are written as-is and read back correctly. This test
-        documents the current behavior (no enforcement).
+        HARDEN (test-register row): the previous version discarded the
+        writer's warning and its docstring claimed the library "does NOT
+        enforce the 256-char limit", which is false — the check exists at
+        ``_writer_base.py:1140-1150``.  The warning is now asserted
+        (counted once, per the ``warned_long`` flag), so a regression that
+        dropped the diagnostic fails here, and the roundtrip assertions
+        below prove the long line is still read back intact.
         """
         # Create 30 curves — each formatted value is ~10 chars, so 30
         # columns produce lines well over 256 characters.
@@ -417,7 +423,15 @@ class TestFormatCompliance:
             "curves_order": curve_names,
         }
         temp_file = tmp_path / "las12_long_lines.las"
-        write_las_file(temp_file, data)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            write_las_file(temp_file, data)
+        long_line_warnings = [w for w in caught if "exceeds 256-character limit" in str(w.message)]
+        assert len(long_line_warnings) == 1, (
+            "exactly one data-line length warning per section is expected "
+            f"(the `warned_long` flag), got {[str(w.message) for w in caught]}"
+        )
+        assert "Data line exceeds 256-character limit" in str(long_line_warnings[0].message)
 
         content = temp_file.read_text()
         # Extract data section after ~A
@@ -493,9 +507,14 @@ class TestFormatCompliance:
         """Test that LAS 3.0 with WRAP=NO is accepted silently (no warnings).
 
         This is the correct/expected LAS 3.0 configuration per spec.
-        """
-        import warnings
 
+        HARDEN (test-register row): the old final assertion was
+        ``"~VERSION 3.0" in content or "VERSION 3.0" in content`` — the first
+        disjunct can never hold (the writer emits ``~VERSION INFORMATION``
+        plus a ``VERS.   3.0  :`` line), and the second is satisfied by the
+        description text alone.  The emitted VERS line is now matched
+        structurally, so a malformed ``VERS.  : 3.0`` header fails here.
+        """
         las = LASFile()
         las.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
         las.well["NULL"] = "-999.25"
@@ -514,4 +533,8 @@ class TestFormatCompliance:
 
         content = temp_file.read_text()
         assert "WRAP.   NO" in content
-        assert "~VERSION 3.0" in content or "VERSION 3.0" in content
+        vers_match = re.search(r"^ VERS\.\s+3\.0\s+:", content, re.MULTILINE)
+        assert vers_match is not None, (
+            "VERS value must precede the colon on its own line; the writer "
+            f"emitted:\n{content.splitlines()[:3]}"
+        )

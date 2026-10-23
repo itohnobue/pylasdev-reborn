@@ -92,19 +92,25 @@ class TestCompareLasDicts:
         assert compare_las_dicts(d1, d2) is False
 
     # --- TEST-01: val2 is dict, val1 is NOT dict (line 49 uncovered branch) ---
-    def test_val2_dict_val1_not_dict(self) -> None:
+    # MERGE (test-register row): the two former assertion blocks both returned
+    # False through the same single-side-dict branch, so they are one
+    # parametrized case with two inputs instead of two blocks.
+    @pytest.mark.parametrize(
+        ("val1", "val2"),
+        [
+            (["A", "B"], {0: "A", 1: "B"}),
+            (["A", "C"], {0: "A", 1: "B"}),
+        ],
+    )
+    def test_val2_dict_val1_not_dict(self, val1: list, val2: dict) -> None:
         """Test comparison when val2 is a dict but val1 is not (e.g., list).
 
         Exercises the branch where isinstance(val2, dict) is True but
         isinstance(val1, dict) is False at line 49 of compare.py.
         A list supports integer subscripting so the iteration works.
         """
-        d1 = {"data": ["A", "B"]}
-        d2 = {"data": {0: "A", 1: "B"}}
-        assert compare_las_dicts(d1, d2) is False
-
-        # Different values should return False
-        d1["data"] = ["A", "C"]
+        d1 = {"data": val1}
+        d2 = {"data": val2}
         assert compare_las_dicts(d1, d2) is False
 
     # --- TEST-01: nested type mismatch (line 67-74) ---
@@ -342,6 +348,27 @@ class TestCompareLasDicts:
                 1e-7,
                 True,
             ),
+            # Symmetric tolerance reference (F-T3-M05 HARDEN): every row above
+            # keeps the second operand equal or LARGER, so np.allclose's
+            # second-operand rtol*|b| already equals rtol*max(|a|,|b|) and all
+            # of them agree with _allclose_symmetric — none discriminates.
+            # The pair below puts the SMALLER operand second: |101.005 - 100.0|
+            # = 1.005 exceeds rtol*|100.0| = 1.0 (np.allclose -> False) yet is
+            # inside rtol*max = 1.01005, so both orders must agree to stay equal.
+            (
+                {"logs": {"V": np.array([101.005])}},
+                {"logs": {"V": np.array([100.0])}},
+                0.0,
+                1e-2,
+                True,
+            ),
+            (
+                {"logs": {"V": np.array([100.0])}},
+                {"logs": {"V": np.array([101.005])}},
+                0.0,
+                1e-2,
+                True,
+            ),
         ],
     )
     def test_compare_tolerance_parametrized(
@@ -576,7 +603,15 @@ class TestIntegrationCompareLasDicts:
     """
 
     def test_compare_las_file_to_dict_self(self) -> None:
-        """A LASFile compared to its own to_dict() output must match."""
+        """A LASFile compared to its own to_dict() output must match.
+
+        HARDEN (test-register DISPUTED-DELETE, resolved KEEP + HARDEN):
+        ``compare(d, d)`` alone can only fail on a crash — every value
+        mismatch compares a value with itself.  The mutation control below
+        makes the test falsifiable: flipping one data value in a COPY of the
+        same dict must flip the verdict to False, so a dispatch regression
+        that skipped ``logs`` would fail here.
+        """
         from pylasdev.models import LASFile, VersionSection
 
         las = LASFile()
@@ -591,6 +626,13 @@ class TestIntegrationCompareLasDicts:
 
         d = las.to_dict()
         assert compare_las_dicts(d, d) is True, "Self-comparison must be True"
+
+        mutated = las.to_dict()
+        mutated["logs"]["DT"] = np.array([50.0, 999.0])
+        assert compare_las_dicts(d, mutated) is False, (
+            "mutation control: a changed log value must be detected, or the "
+            "self-comparison above proves nothing"
+        )
 
     def test_compare_las_file_to_dict_identical(self) -> None:
         """Two identical LASFile objects produce matching dicts."""
@@ -636,41 +678,34 @@ class TestIntegrationCompareLasDicts:
 class TestProductionCheckCompareFix:
     """Regression test for F-005 fix in compare.py."""
 
-    def test_nan_guard_covers_all_float_dtypes(self) -> None:
+    # MERGE (test-register row): the three array-form NaN tests below all
+    # exercise the ONE float64-promoted array path
+    # (_compare_arrays -> _allclose_symmetric, NaN baseline at
+    # compare.py:186) with the same assertion; they were three functions
+    # asserting the same branch.  Merged into one parametrized test that
+    # keeps all three inputs.  The genuinely distinct pin is
+    # test_nan_guard_bare_scalar_np_floating (the np.floating scalar guard).
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            (np.array([1.0, np.float32(np.nan), 3.0]), np.array([1.0, np.float32(np.nan), 3.0])),
+            (np.array([1.0, np.float16(np.nan)]), np.array([1.0, np.float16(np.nan)])),
+            (np.array([np.float32(np.nan)]), np.array([np.float64(np.nan)])),
+        ],
+        ids=["float32-nan", "float16-nan", "mixed-dtype-nan"],
+    )
+    def test_nan_arrays_with_nan_compare_equal(self, left: np.ndarray, right: np.ndarray) -> None:
         """F-005: arrays containing NaN of mixed float dtypes compare equal.
 
-        The np.float32/np.float16 elements are promoted to float64 when the
-        array is constructed, so these fixtures exercise the ARRAY path
+        np.float32/np.float16 elements are promoted to float64 at array
+        construction, so every row exercises the ARRAY path
         (_compare_arrays -> _allclose_symmetric), where NaN matches NaN via
         the equal_nan clause (compare.py:186) — NOT the _scalars_equal
-        np.floating guard (compare.py:43), which sees 0 calls here.  The
-        genuine bare-scalar pin of the guard is
-        test_nan_guard_bare_scalar_np_floating below.
+        np.floating guard (compare.py:43).
         """
-        d1 = {"logs": {"VAL": np.array([1.0, np.float32(np.nan), 3.0])}}
-        d2 = {"logs": {"VAL": np.array([1.0, np.float32(np.nan), 3.0])}}
-        assert compare_las_dicts(d1, d2) is True, "NaN np.float32 comparison must match"
-
-    def test_nan_float16_guard(self) -> None:
-        """F-005: arrays containing np.float16 NaN compare equal.
-
-        Same float64-promotion + equal_nan array path as
-        test_nan_guard_covers_all_float_dtypes: the np.float16 element is
-        erased at array construction, so this guards NaN-in-array handling
-        (compare.py:186), not the _scalars_equal np.floating guard
-        (compare.py:43).
-        """
-        d1 = {"logs": {"VAL": np.array([1.0, np.float16(np.nan)])}}
-        d2 = {"logs": {"VAL": np.array([1.0, np.float16(np.nan)])}}
-        assert compare_las_dicts(d1, d2) is True, "NaN np.float16 comparison must match"
-
-    def test_nan_different_float_dtypes_both_nan(self) -> None:
-        """F-005: NaN values of different float dtypes still match as equal."""
-        # np.float32(nan) and np.float64(nan) should both be treated as NaN=NaN
-        d1 = {"logs": {"VAL": np.array([np.float32(np.nan)])}}
-        d2 = {"logs": {"VAL": np.array([np.float64(np.nan)])}}
-        # Both are NaN → comparison should return True (NaN==NaN via per-element path)
-        assert compare_las_dicts(d1, d2) is True
+        assert compare_las_dicts({"logs": {"VAL": left}}, {"logs": {"VAL": right}}) is True, (
+            "NaN values of mixed float dtypes must compare equal"
+        )
 
     def test_nan_guard_bare_scalar_np_floating(self) -> None:
         """F-005/F-26: bare np.floating NaN scalars hit the guard directly.
@@ -1524,3 +1559,145 @@ class TestZeroDimNumericTolerance:
         """N-11 guard (F-42): 0-d vs plain scalar keeps the scalar path."""
         assert compare_las_dicts({"x": np.array(42.0)}, {"x": 42.0}) is True
         assert compare_las_dicts({"x": np.array(42.0)}, {"x": 42.5}) is False
+
+
+class TestStructuredMaskPerFieldSemantics:
+    """F-065 regression pins: per-field structured (V-kind) mask semantics.
+
+    Pre-fix, ``_reduce_structured_mask`` OR-folded a structured mask to a
+    row-level "any field masked" projection before the mask-equality test
+    and the value comparison.  Two consequences, both measured on the
+    pre-fix algorithm (replicated in ``tmp/s5-probe-compare2.py``):
+
+    (a) a row masked in ANY field was excluded from the value comparison
+        entirely, so a difference in a field that was UNMASKED in both
+        operands compared EQUAL (fix report F-065: "99.0 vs 3.0");
+    (b) two arrays whose per-field mask PATTERNS differ but whose folded
+        projections agree compared EQUAL.
+
+    Post-fix ``compare.py:56-74`` (``_masks_equal``) compares the mask
+    field by field and ``_fill_structured_mask`` (:76-98) fills each
+    field's masked positions, so every unmasked position is compared.
+    Both pins below return True on the pre-fix algorithm and False now;
+    the two liveness controls keep the mask contract honest.
+    """
+
+    _DT = np.dtype([("a", "f8"), ("b", "f8")])
+    _MDT = np.dtype([("a", "?"), ("b", "?")])
+
+    @staticmethod
+    def _masked(
+        a_values: tuple[float, float],
+        b_values: tuple[float, float],
+        a_mask: tuple[bool, bool],
+        b_mask: tuple[bool, bool],
+    ) -> np.ma.MaskedArray:
+        data = np.zeros(2, dtype=TestStructuredMaskPerFieldSemantics._DT)
+        data["a"] = a_values
+        data["b"] = b_values
+        mask = np.zeros(2, dtype=TestStructuredMaskPerFieldSemantics._MDT)
+        mask["a"] = a_mask
+        mask["b"] = b_mask
+        return np.ma.MaskedArray(data, mask=mask)
+
+    @staticmethod
+    def _compare(left: np.ndarray, right: np.ndarray) -> bool:
+        return compare_las_dicts({"logs": {"X": left}}, {"logs": {"X": right}})
+
+    def test_unmasked_field_difference_on_masked_row_detected(self) -> None:
+        """F-065 (a): a field unmasked in BOTH operands is still compared.
+
+        Field ``a`` is masked at row 0, field ``b`` is unmasked everywhere,
+        and ``b`` differs at row 0 (3.0 vs 99.0).  Pre-fix the OR-fold
+        excluded row 0 from the value check -> True; post-fix -> False.
+        """
+        left = self._masked((9.0, 2.0), (3.0, 4.0), (True, False), (False, False))
+        right = self._masked((1.0, 2.0), (99.0, 4.0), (True, False), (False, False))
+        assert self._compare(left, right) is False, (
+            "a difference in a field unmasked in both operands must be detected"
+        )
+
+    def test_differing_per_field_mask_pattern_detected(self) -> None:
+        """F-065 (b): equal folded projections, different per-field patterns.
+
+        Both arrays fold to "row 0 masked", but row 0 is masked in field
+        ``a`` only on the left and in BOTH fields on the right.  The data is
+        identical, so only the per-field mask comparison can reject the
+        pair: pre-fix True, post-fix False.
+        """
+        left = self._masked((1.0, 2.0), (3.0, 4.0), (True, False), (False, False))
+        right = self._masked((1.0, 2.0), (3.0, 4.0), (True, False), (True, False))
+        assert self._compare(left, right) is False, (
+            "different per-field mask patterns are a structural mismatch"
+        )
+
+    def test_identical_structured_masks_and_data_equal(self) -> None:
+        """F-065 liveness: same mask pattern and data stay EQUAL."""
+        left = self._masked((1.0, 2.0), (3.0, 4.0), (True, False), (False, False))
+        right = self._masked((1.0, 2.0), (3.0, 4.0), (True, False), (False, False))
+        assert self._compare(left, right) is True
+
+    def test_masked_position_data_never_compared(self) -> None:
+        """F-065 liveness: a masked position matches a masked position only.
+
+        The masked field's underlying data differs (9.0 vs 1.0); the
+        documented mask contract says a masked position is equal by
+        construction, so the verdict stays True.
+        """
+        left = self._masked((9.0, 2.0), (3.0, 4.0), (True, False), (False, False))
+        right = self._masked((1.0, 2.0), (3.0, 4.0), (True, False), (False, False))
+        assert self._compare(left, right) is True
+
+
+class TestIncomparableDtypeVerdicts:
+    """F-068 regression pins: incomparable dtype pairs return bool, never raise.
+
+    ``np.array_equal`` raises ``TypeError`` for structured-vs-non-void and
+    for two structured dtypes with no common type, and ``ValueError`` for
+    object arrays whose elements are ndarrays.  Pre-fix the H-02
+    ``try/except`` wrapped only the mask unwrap, so those raises escaped
+    ``compare_las_dicts`` — whose documented return is a bool verdict.
+    Post-fix (``compare.py:283-299``) the comparison itself is guarded.
+    Each case below raises inside ``np.array_equal`` (verified in
+    ``tmp/s5-probe-compare.py``) and must return False without raising.
+    """
+
+    _DT = np.dtype([("a", "f8"), ("b", "f8")])
+
+    @staticmethod
+    def _compare(left: np.ndarray, right: np.ndarray) -> bool:
+        return compare_las_dicts({"logs": {"X": left}}, {"logs": {"X": right}})
+
+    def test_structured_vs_plain_returns_false(self) -> None:
+        """F-068: V-kind vs float64 -> False (np.array_equal raises TypeError)."""
+        structured = np.array([(1.0, 2.0)], dtype=self._DT)
+        plain = np.array([1.0])
+        assert self._compare(structured, plain) is False
+        assert self._compare(plain, structured) is False
+
+    def test_two_structured_dtypes_without_common_type_return_false(self) -> None:
+        """F-068: f8-field vs M8-field structured arrays -> False, no raise."""
+        numeric = np.array([(1.0,)], dtype=[("a", "f8")])
+        datetime_field = np.array([("2020-01-01",)], dtype=[("a", "M8[D]")])
+        assert self._compare(numeric, datetime_field) is False
+
+    def test_object_array_of_ndarrays_returns_false(self) -> None:
+        """F-068: object arrays holding ndarrays -> False (ambiguous truth value)."""
+        left = np.empty(2, dtype=object)
+        left[0] = np.array([1.0, 2.0])
+        left[1] = np.array([3.0, 4.0])
+        right = np.empty(2, dtype=object)
+        right[0] = np.array([1.0, 2.0])
+        right[1] = np.array([3.0, 9.0])
+        assert self._compare(left, right) is False
+
+    def test_identical_structured_arrays_equal(self) -> None:
+        """F-068 liveness: the guard must not reject same-kind pairs."""
+        structured = np.array([(1.0, 2.0)], dtype=self._DT)
+        assert self._compare(structured, structured.copy()) is True
+
+    def test_object_string_arrays_still_discriminate(self) -> None:
+        """F-068 liveness: comparable object arrays keep their True/False verdicts."""
+        left = np.array(["a", "b"], dtype=object)
+        assert self._compare(left, np.array(["a", "b"], dtype=object)) is True
+        assert self._compare(left, np.array(["a", "c"], dtype=object)) is False

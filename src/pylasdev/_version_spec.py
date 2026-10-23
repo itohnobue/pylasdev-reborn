@@ -82,6 +82,63 @@ class _LASVersionSpec:
     # Deleted: well_format_swap_value_desc (F-033: zero callers)
 
     @property
+    def mandatory_well_field_groups(self) -> tuple[tuple[str, ...], ...]:
+        """Mandatory well-section field SLOTS, as alternative-spelling groups.
+
+        A slot is satisfied when ANY of its members is present in the well
+        section.  This is the authoritative CWLS rule (LAS 2.0 "Well
+        Information" requires twelve entries, two of which the standard
+        accepts under alternative mnemonics):
+
+        STRT, STOP, STEP, NULL, COMP, WELL, FLD, LOC,
+        ``PROV|CNTY|STAT|CTRY``, SRVC, DATE, ``UWI|API``.
+
+        F-024: the previous model was a flat tuple (``mandatory_well_fields``)
+        that could express neither alternative, so the ``PROV`` family was
+        enforced nowhere and a LAS 2.0 file with no province/county/state/
+        country field drew no diagnostic at all.  ``UWI`` must NOT become a
+        flat requirement — M-11 documents it as optional-when-present, and
+        the non-2.0 rule below keeps the four numeric fields, so a common
+        LAS 1.2 file with no UWI does not warn.  For LAS 2.0 the ``UWI|API``
+        group is a SLOT: a file carrying either spelling satisfies it with no
+        warning, and a file carrying NEITHER warns like the rest of the CWLS
+        set — the M-11 no-UWI-warn decision is superseded for LAS 2.0 by this
+        group.  (M11: the LAS 1.2 M-11 test is not a witness for this group —
+        it exercises the 1.2 rule only, so what it pins is the 1.2 branch
+        below, not the 2.0 slot.)
+
+        LAS 1.2 and LAS 3.0 keep the four numeric depth-control fields
+        (I2-07: the 2.0-era lascheck set is not a 1.2 requirement; the 3.0
+        Well section inherits the same four).
+
+        The flat :attr:`mandatory_well_fields` property is the legacy view.
+        It cannot express the CWLS alternative spellings, and after D4b no
+        in-tree consumer reads it — ``models.py`` and ``parser.py`` consume
+        THIS property — so validation must use this one.
+        """
+        if self.is_las20:
+            return (
+                ("STRT",),
+                ("STOP",),
+                ("STEP",),
+                ("NULL",),
+                ("COMP",),
+                ("WELL",),
+                ("FLD",),
+                ("LOC",),
+                ("PROV", "CNTY", "STAT", "CTRY"),
+                ("SRVC",),
+                ("DATE",),
+                ("UWI", "API"),
+            )
+        return (
+            ("STRT",),
+            ("STOP",),
+            ("STEP",),
+            ("NULL",),
+        )
+
+    @property
     def mandatory_well_fields(self) -> tuple[str, ...]:
         """Mandatory well-section field mnemonics for the current version.
 
@@ -102,7 +159,16 @@ class _LASVersionSpec:
         present) — previously LAS 1.2 wrongly required it, producing a
         false-positive "missing: UWI" warning on common files that carry no
         UWI.  COMP/FLD/DATE were previously omitted, producing false
-        negatives for LAS 2.0.
+        negatives for LAS 2.0.  This note describes the FLAT tuple only; the
+        shipped LAS 2.0 rule is the group-aware one above, where ``UWI`` or
+        ``API`` IS required.
+
+        F-024: this FLAT view is retained for compatibility only.  After D4b
+        every in-tree consumer (``models.py``, ``parser.py``) reads
+        :attr:`mandatory_well_field_groups`, so no library code uses this
+        tuple, and it cannot express the CWLS alternative spellings
+        (``UWI|API``, ``PROV|CNTY|STAT|CTRY``).  Validation must consume
+        :attr:`mandatory_well_field_groups`.
         """
         if self.is_las12:
             return ("STRT", "STOP", "STEP", "NULL")

@@ -61,14 +61,23 @@ class TestExceptionHierarchy:
     """Verify the full exception hierarchy is correct."""
 
     def test_all_exceptions_are_importable(self) -> None:
-        """Test that all exception classes are importable."""
-        assert PylasdevError is not None
-        assert LASReadError is not None
-        assert LASWriteError is not None
-        assert LASParseError is not None
-        assert LASVersionError is not None
-        assert LASEncodingError is not None
-        assert DEVReadError is not None
+        """Every public exception is re-exported from the package root.
+
+        HARDEN (test-register DISPUTED-DELETE, resolved KEEP + HARDEN): the
+        old body was seven ``assert X is not None`` statements over names
+        imported at module level, which cannot fail.  The contract worth
+        pinning is the re-export: ``from pylasdev import <Name>`` must give
+        the same class object as ``pylasdev.exceptions``.
+        """
+        import pylasdev
+
+        assert pylasdev.PylasdevError is PylasdevError
+        assert pylasdev.LASReadError is LASReadError
+        assert pylasdev.LASWriteError is LASWriteError
+        assert pylasdev.LASParseError is LASParseError
+        assert pylasdev.LASVersionError is LASVersionError
+        assert pylasdev.LASEncodingError is LASEncodingError
+        assert pylasdev.DEVReadError is DEVReadError
 
     def test_all_inherit_from_pylasdev_error(self) -> None:
         """Test that all custom exceptions inherit from PylasdevError."""
@@ -117,14 +126,13 @@ class TestLASDataError:
         """LASDataError is also a subclass of ValueError (dual inheritance)."""
         assert issubclass(LASDataError, ValueError)
 
-    def test_caught_as_pylasdev_error(self) -> None:
-        """LASDataError can be caught as PylasdevError."""
-        with pytest.raises(PylasdevError):
-            raise LASDataError("test")
-
-    def test_caught_as_value_error(self) -> None:
-        """LASDataError can be caught as ValueError (backward compat)."""
-        with pytest.raises(ValueError):
+    # MERGE (test-register row, pin_conflict resolved conservatively): the two
+    # former tests raised the same exception and only varied the CAUGHT base
+    # class, so they are one parametrized test that keeps both bases.
+    @pytest.mark.parametrize("base", [PylasdevError, ValueError], ids=["pylasdev", "value"])
+    def test_caught_as_base_classes(self, base: type[Exception]) -> None:
+        """LASDataError is catchable as PylasdevError and as ValueError (backward compat)."""
+        with pytest.raises(base):
             raise LASDataError("test")
 
     def test_raises_on_invalid_from_dict(self) -> None:

@@ -99,6 +99,7 @@ from ._data_section_reader import (  # noqa: E402
     _iter_ascii_data_lines,
     _log_conversion_failures,
     _split_data_line,
+    _split_data_line_traced,
     _split_header_row,
     detect_actual_wrap_from_window,
     is_mnemonic_header_row,
@@ -559,6 +560,7 @@ def _detect_actual_wrap(
     """
     in_ascii = False
     window: list[int] = []  # value counts of up to 4 data lines
+    _degraded: list[bool] = []  # M10: per-line recombination-degraded flags
     # E-41: hoist the mnemonic-header match set + all-string clause once
     # (only when a LASFile is available).  The header-skip applies ONLY
     # while the window is empty — the first line(s) of the section, the
@@ -616,7 +618,21 @@ def _detect_actual_wrap(
             continue
 
         # Data line found — split using DLM-aware split (shared utility).
-        values = _split_data_line(stripped, delimiter)
+        # F-074: pass ``expected=curve_count`` so the gate sees the SAME
+        # column layout the fill loop sees.  Without it a thousands-grouped
+        # COMMA row ("1,234.5,2,345.6,3,456.7") counts as 2N raw tokens, and
+        # when 2N is a multiple of curve_count the R-1 flowing rule below
+        # fires and routes a perfectly valid WRAP=NO file to _read_wrapped.
+        # warn=False: this window scan is speculative (up to 4 lines) and the
+        # reading path re-splits the same lines, so the recombination
+        # diagnostic must be emitted there, not here.
+        # M10: the traced splitter also reports whether recombination merged
+        # fragments on this row — such a row's count is a tokenizer artifact
+        # (it can shrink below curve_count and read as a depth line), so the
+        # shared detector must see the flag.
+        values, _recombined = _split_data_line_traced(
+            stripped, delimiter, expected=curve_count, warn=False
+        )
 
         # F-M20: When curve_count is 1, wrapped and non-wrapped modes are
         # equivalent — every line holds exactly one value regardless of
@@ -626,6 +642,7 @@ def _detect_actual_wrap(
             return False
 
         window.append(len(values))
+        _degraded.append(_recombined)
         if len(window) >= 4:
             break
 
@@ -634,6 +651,7 @@ def _detect_actual_wrap(
         curve_count,
         declared_wrap,
         empty_window_default=True,
+        recombination_degraded=_degraded,
     )
 
 
@@ -722,6 +740,36 @@ def _deduplicate_curves(las_file: LASFile, _stacklevel: int = 2) -> None:
     las_file.curves_order = new_order
 
 
+def _split_bracket_mnemonic(name: str) -> tuple[str, str]:
+    """Split a bracket array mnemonic into ``(stem, "[n]")``.
+
+    ``"NMR[1]"`` → ``("NMR", "[1]")``.  A non-bracket mnemonic is returned
+    unchanged with an empty suffix (``"GR"`` → ``("GR", "")``).
+
+    F-075/F-077: array elements carry their index IN the mnemonic, so a
+    dedup suffix appended to the whole name (``"NMR[1]_2"``) breaks the
+    model's mnemonic grammar (``^[\\w\\-]+(\\[\\d+\\])?$``, models.py:80)
+    — the rename then raised a bare ValueError out of
+    ``read_las_file_as_object``.  The suffix belongs on the STEM
+    (``"NMR_2[1]"``), which is grammar-legal for both forms.
+    """
+    if name.endswith("]"):
+        open_idx = name.rfind("[")
+        if open_idx > 0 and name[open_idx + 1 : -1].isdigit():
+            return name[:open_idx], name[open_idx:]
+    return name, ""
+
+
+def _suffixed_curve_name(base_name: str, suffix: int) -> str:
+    """Build a dedup name that stays inside the mnemonic grammar.
+
+    ``("GR", 2)`` → ``"GR_2"``; ``("NMR[1]", 2)`` → ``"NMR_2[1]"`` (never
+    ``"NMR[1]_2"`` — see :func:`_split_bracket_mnemonic`).
+    """
+    stem, index_suffix = _split_bracket_mnemonic(base_name)
+    return f"{stem}_{suffix}{index_suffix}"
+
+
 def _resolve_unique_curve_name(
     base_name: str,
     start_suffix: int,
@@ -732,6 +780,10 @@ def _resolve_unique_curve_name(
     F-M19: Extracted helper for the deduplication collision-resolution
     algorithm shared across parser.py, data_reader.py, and dev_reader.py.
 
+    F-075/F-077: the suffix goes on the mnemonic STEM, so a bracket array
+    element ``NMR[1]`` becomes ``NMR_2[1]`` (a name the model accepts)
+    instead of ``NMR[1]_2`` (rejected by ``CurveDefinition``).
+
     Args:
         base_name: The original curve mnemonic.
         start_suffix: Starting integer for the suffix (e.g. 2 for first
@@ -740,14 +792,14 @@ def _resolve_unique_curve_name(
             detection against previously-generated _N suffixes).
 
     Returns:
-        A unique name of the form ``f"{base_name}_{N}"`` that does not
+        A unique name of the form ``f"{stem}_{N}{index}"`` that does not
         collide with any name in *output_names*.
     """
     suffix = start_suffix
-    new_name = f"{base_name}_{suffix}"
+    new_name = _suffixed_curve_name(base_name, suffix)
     while new_name in output_names:
         suffix += 1
-        new_name = f"{base_name}_{suffix}"
+        new_name = _suffixed_curve_name(base_name, suffix)
     return new_name
 
 
@@ -756,10 +808,15 @@ def _suffix_from_name(name: str, base_name: str) -> int:
 
     Given ``name = "DEPT_3"`` and ``base_name = "DEPT"``, returns 3.
     Used to keep the ``seen`` counter in sync with the actual suffix
-    assigned by :func:`_resolve_unique_curve_name`.
+    assigned by :func:`_resolve_unique_curve_name`.  Bracket mnemonics
+    keep their index suffix after the ``_N`` part (``"NMR_2[1]"`` with
+    ``base_name = "NMR[1]"`` → 2).
     """
+    stem, index_suffix = _split_bracket_mnemonic(base_name)
+    start = len(stem) + 1
+    end = len(name) - len(index_suffix) if index_suffix else len(name)
     try:
-        return int(name[len(base_name) + 1 :])
+        return int(name[start:end])
     except (ValueError, IndexError):
         return 0
 
@@ -791,7 +848,21 @@ def _rename_duplicate_curve(
     if idx < len(las_file.curves):
         if not las_file.curves[idx].original_mnemonic:
             las_file.curves[idx].original_mnemonic = name
-        las_file.curves[idx].mnemonic = new_name
+        # P-11 (F-075/F-077): the reader boundary may only raise
+        # LASParseError (reader.py maps LASParseError; a bare ValueError
+        # escapes read_las_file).  CurveDefinition.__setattr__ validates the
+        # mnemonic grammar and raises ValueError, so map it here — the same
+        # wrapper the LAS 3.0 data path installs around its dedup call
+        # (_las30_data.process_ascii_data).  The rename SOURCE is now
+        # grammar-legal (_suffixed_curve_name keeps bracket indices intact),
+        # so this wrapper is the boundary contract, not the primary fix.
+        try:
+            las_file.curves[idx].mnemonic = new_name
+        except ValueError as exc:
+            raise LASParseError(
+                f"Curve deduplication failed: cannot rename duplicate mnemonic "
+                f"'{name}' to '{new_name}': {exc}"
+            ) from exc
 
 
 def _declared_mnemonic_set(
@@ -943,6 +1014,35 @@ def _read_normal(
     # mnemonics) once per read — building it per data row would make the
     # hot loop O(rows x curves) for set construction.
     _mnemonic_declared = _mnemonic_header_declared(las_file)
+    # F-214 (mapping half): a ~C definition line the parser had to DROP still
+    # owns a data column.  The parser records its position in the ~C list
+    # (``LASParser._dropped_curve_positions`` → published as this attribute,
+    # version-gated to the 1.2/2.0 path).  When a row carries one value per
+    # ORIGINAL definition, mapping it onto the surviving curves by position
+    # assigned every later column to the wrong mnemonic (probed: the CALIPER
+    # column was read as GR and GR's own values were discarded).
+    # ``_drop_column_map`` lists the value indices that belong to surviving
+    # curves, so the dropped column is skipped and no placeholder curve is
+    # fabricated (the M9 contract, tests/test_regression.py:6538-6579, pins
+    # that a dropped definition must not inflate the curve count).  Rows whose
+    # value count matches the SURVIVING curve count keep the pre-fix
+    # behaviour.
+    _dropped_positions = tuple(
+        _p
+        for _p in (getattr(las_file, "_dropped_curve_positions", ()) or ())
+        if isinstance(_p, int)
+    )
+    _drop_column_map: list[int] | None = None
+    _drop_expected_columns = 0
+    if _dropped_positions:
+        _drop_expected_columns = curve_count + len(_dropped_positions)
+        if all(0 <= _p < _drop_expected_columns for _p in _dropped_positions):
+            _drop_column_map = [
+                _col
+                for _col in range(_drop_expected_columns)
+                if _col not in _dropped_positions
+            ]
+    _drop_skip_warned = False
     # DR-05: Count string-curve values stored.  MAX_TOTAL_ELEMENTS accounts
     # numpy allocation at ~8 B/element, but each Python str object costs
     # ~50-100 B — a crafted file can pass the element guard and still
@@ -1026,6 +1126,25 @@ def _read_normal(
         # recombine thousands-separated fragments ("1,234.5") with a loud
         # warning instead of silently mis-assigning columns.
         values = _split_data_line(stripped, delimiter, expected=curve_count)
+
+        if _drop_column_map is not None and len(values) == _drop_expected_columns:
+            # F-214 (mapping half): the row carries one value per ORIGINAL ~C
+            # definition, and this ~C section dropped at least one.  Skip the
+            # dropped definition's own column so the surviving curves keep
+            # their values instead of inheriting the next column's.
+            if not _drop_skip_warned:
+                warnings.warn(
+                    f"Data section: a ~C (curve definition) line was dropped "
+                    f"earlier, so column {sorted(_dropped_positions)} of the "
+                    f"{_drop_expected_columns}-column rows is skipped and the "
+                    f"surviving curves keep their own values.  Without this the "
+                    f"values after the dropped definition would be read under "
+                    f"the previous curve's mnemonic.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                _drop_skip_warned = True
+            values = [values[_col] for _col in _drop_column_map]
 
         # M-37: Skip a standalone mnemonic header row (e.g. "~A\nDEPT GR\n"
         # before the numeric rows).  LAS 2.0 places mnemonics on the ~A

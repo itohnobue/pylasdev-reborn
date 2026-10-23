@@ -22,6 +22,7 @@ import warnings
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from pylasdev import (
     LASFile,
@@ -131,7 +132,15 @@ class TestLas20VsLas30Parity:
 
     def test_las20_vs_las30_data_formats_agree(self, tmp_path: Path) -> None:
         """The LAS 3.0 writer emits the same numeric data even with format
-        specifiers on the curve definitions (F/E formats stay numeric)."""
+        specifiers on the curve definitions (F/E formats stay numeric).
+
+        HARDEN (test-register row, M3): ``_assert_parity`` compares
+        ``data_format`` only when BOTH sides declare one, and a parsed LAS 2.0
+        curve has ``data_format=None`` — so the cross-version comparison
+        could not see a 3.0 writer that collapsed {E} to {F} (the M3
+        mutation).  The 3.0 side's declared formats are therefore asserted
+        directly here.
+        """
         las20 = LASFile()
         las20.version = VersionSection(vers="2.0", wrap="NO", dlm="SPACE")
         _build_well(las20)
@@ -157,6 +166,10 @@ class TestLas20VsLas30Parity:
         p20 = _write_and_parse(las20, tmp_path, "fmt20")
         p30 = _write_and_parse(las30, tmp_path, "fmt30")
 
+        # The 3.0 side must round-trip the DECLARED format specifiers.
+        formats = {curve["mnemonic"]: curve.get("data_format") for curve in p30["curves"]}
+        assert formats == {"DEPT": "F", "DT": "E"}, formats
+
         _assert_parity(p20, p30, "formats-agree")
 
 
@@ -176,3 +189,125 @@ class TestLas12VsLas20Parity:
         p20 = _write_and_parse(las20, tmp_path, "parity20b")
 
         _assert_parity(p12, p20, "LAS1.2-vs-LAS2.0")
+
+
+# ---------------------------------------------------------------------------
+# F-5 / G-E: wrap + case dimensions, and a falsifiability control for the
+# parity helper itself (test-register HARDEN + ADD-GAP rows).
+# ---------------------------------------------------------------------------
+
+
+def _run_parity(las: LASFile, tmp_path: Path, name: str) -> dict:
+    return _write_and_parse(las, tmp_path, name)
+
+
+class TestParityDimensionCoverage:
+    """G-E / HARDEN: the parity guard must not be a WRAP=NO-uppercase-only claim."""
+
+    def test_case_variant_mnemonics_parity(self, tmp_path: Path) -> None:
+        """Lowercase mnemonics on one side must parse to the same uppercase names.
+
+        The 2.0 model declares ``dept``/``dt``/``rhob``; the reader uppercases,
+        so parity with the uppercase 3.0 model holds — and a reader that
+        stopped normalizing case would fail here.
+        """
+        las20 = LASFile()
+        las20.version = VersionSection(vers="2.0", wrap="NO", dlm="SPACE")
+        _build_numeric_well(las20, ["DEPT", "DT", "RHOB"])
+        for curve in las20.curves:
+            curve.mnemonic = curve.mnemonic.lower()
+        las20.curves_order = [name.lower() for name in las20.curves_order]
+        las20.logs = {key.lower(): value for key, value in las20.logs.items()}
+
+        las30 = LASFile()
+        las30.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        _build_numeric_well(las30, ["DEPT", "DT", "RHOB"])
+
+        p20 = _run_parity(las20, tmp_path, "case20")
+        p30 = _run_parity(las30, tmp_path, "case30")
+        assert p20["curves_order"] == ["DEPT", "DT", "RHOB"], p20["curves_order"]
+        _assert_parity(p20, p30, "case-variant")
+
+    def test_declared_wrap_yes_parity(self, tmp_path: Path) -> None:
+        """A LAS 2.0 model declaring WRAP=YES still agrees with LAS 3.0.
+
+        The writer emits the unwrapped form and overrides the header to
+        WRAP=NO (documented writer behaviour, F-01), so both versions parse
+        to the same logical well and both report WRAP=NO.  This pins the
+        wrap-override liveness on the reader/writer boundary: a writer that
+        emitted WRAP=YES while writing unwrapped data would drift here.
+        """
+        las20 = LASFile()
+        las20.version = VersionSection(vers="2.0", wrap="YES", dlm="SPACE")
+        _build_numeric_well(las20, ["DEPT", "DT", "RHOB"])
+
+        las30 = LASFile()
+        las30.version = VersionSection(vers="3.0", wrap="NO", dlm="COMMA")
+        _build_numeric_well(las30, ["DEPT", "DT", "RHOB"])
+
+        p20 = _run_parity(las20, tmp_path, "wrap20")
+        p30 = _run_parity(las30, tmp_path, "wrap30")
+        assert p20["version"]["WRAP"] == "NO", p20["version"]
+        assert p30["version"]["WRAP"] == "NO", p30["version"]
+        _assert_parity(p20, p30, "declared-wrap-yes")
+
+
+class TestParityHarnessFalsifiability:
+    """G-C: _assert_parity must FAIL on each contract dimension it claims.
+
+    Every cross-version test in this module relies on this helper.  A helper
+    with an unreachable or weakened dimension makes the whole harness
+    decorative, so each dimension gets a negative control: mutate one field of
+    a synthetic pair and require an AssertionError.
+    """
+
+    @staticmethod
+    def _baseline() -> dict:
+        return {
+            "curves_order": ["DEPT", "DT"],
+            "well": {"STRT": "100.0", "STOP": "200.0", "NULL": "-999.25"},
+            "logs": {"DEPT": np.array([100.0, 101.0]), "DT": np.array([50.0, 51.0])},
+            "curves": [
+                {"mnemonic": "DEPT", "unit": "M", "description": "DEPTH", "data_format": "F"},
+                {"mnemonic": "DT", "unit": "US/M", "description": "SONIC", "data_format": "F"},
+            ],
+        }
+
+    def test_identical_dicts_pass(self) -> None:
+        _assert_parity(self._baseline(), self._baseline(), "control")
+
+    def test_curves_order_drift_fails(self) -> None:
+        second = self._baseline()
+        second["curves_order"] = ["DT", "DEPT"]
+        with pytest.raises(AssertionError, match="curves_order drift"):
+            _assert_parity(self._baseline(), second, "order")
+
+    def test_well_drift_fails(self) -> None:
+        second = self._baseline()
+        second["well"]["STOP"] = "250.0"
+        with pytest.raises(AssertionError, match="well drift"):
+            _assert_parity(self._baseline(), second, "well")
+
+    def test_data_drift_fails(self) -> None:
+        second = self._baseline()
+        second["logs"]["DT"] = np.array([50.0, 99.0])
+        with pytest.raises(AssertionError):
+            _assert_parity(self._baseline(), second, "data")
+
+    def test_unit_drift_fails(self) -> None:
+        second = self._baseline()
+        second["curves"][1]["unit"] = "OHMM"
+        with pytest.raises(AssertionError, match="unit drift"):
+            _assert_parity(self._baseline(), second, "unit")
+
+    def test_description_drift_fails(self) -> None:
+        second = self._baseline()
+        second["curves"][1]["description"] = "OTHER"
+        with pytest.raises(AssertionError, match="description drift"):
+            _assert_parity(self._baseline(), second, "description")
+
+    def test_data_format_drift_fails_when_both_declare(self) -> None:
+        second = self._baseline()
+        second["curves"][1]["data_format"] = "E"
+        with pytest.raises(AssertionError, match="data_format drift"):
+            _assert_parity(self._baseline(), second, "format")

@@ -7,50 +7,28 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from pylasdev.mnem_base import MNEM_BASE, resolve_mnemonic
+from pylasdev.mnem_base import MNEM_BASE, build_mnemonic_lookup, resolve_mnemonic
 
-
-def _build_uppercased_first_wins(
-    mnem_base: dict[str, str],
-) -> dict[str, str]:
-    """Build uppercased mnemonic dict using sorted first-wins semantics.
-
-    Matches the parser's algorithm at parser.py:298-315:
-    1. Sort by (not isupper, key) — canonical uppercase entries come first.
-    2. First-wins on key.upper() — later entries for the same key are ignored.
-    3. Resolve chains via resolve_mnemonic to reach terminal canonical names.
-
-    Dict comprehension {k.upper(): v for ...} uses last-wins semantics
-    and produces different results for 84 BK/LL/Cyrillic entries (F-M26).
-    """
-    # Step 1: sort uppercase-first, then alphabetically
-    sorted_items = sorted(
-        mnem_base.items(),
-        key=lambda item: (not item[0].isupper(), item[0]),
-    )
-    # Step 2: first-wins by uppercased key
-    raw_upper: dict[str, str] = {}
-    for k, v in sorted_items:
-        key = k.upper()
-        if key not in raw_upper:
-            raw_upper[key] = v
-    # Step 3: resolve chains to terminal canonical names
-    return {k: resolve_mnemonic(raw_upper, k) for k in raw_upper}
+# HARDEN (test-register rows for TestResolveMnemonic / TestCyrillicRsResistivity):
+# the file used to build its own copy of the uppercased first-wins lookup,
+# so a regression in the PRODUCTION builder never failed these tests.  All
+# real-MNEM_BASE assertions now use build_mnemonic_lookup (mnem_base.py:2072),
+# the function the parser (parser.py:1191) and models (models.py:6522) use.
 
 
 class TestMnemBase:
     """Tests for the mnemonic alias database."""
 
-    def test_mnem_base_is_dict(self) -> None:
-        """Test that MNEM_BASE is a dict."""
+    def test_mnem_base_shape_and_content(self) -> None:
+        """MNEM_BASE is a non-empty dict of str -> str.
+
+        MERGE (test-register row): the former test_mnem_base_is_dict,
+        test_mnem_base_not_empty and test_mnem_base_values_are_strings each
+        asserted one shape property of the same literal dict; they are one
+        test now, keeping every assertion.
+        """
         assert isinstance(MNEM_BASE, dict)
-
-    def test_mnem_base_not_empty(self) -> None:
-        """Test that MNEM_BASE has entries."""
         assert len(MNEM_BASE) > 100
-
-    def test_mnem_base_values_are_strings(self) -> None:
-        """Test that all values are strings."""
         for key, value in MNEM_BASE.items():
             assert isinstance(key, str), f"Key {key!r} is not a string"
             assert isinstance(value, str), f"Value for {key!r} is not a string"
@@ -61,16 +39,22 @@ class TestMnemBase:
         assert MNEM_BASE.get("AKDT") == "DT"
 
     def test_mnem_base_used_in_reader(self) -> None:
-        """Test that mnem_base can be used with read_las_file."""
-        from pathlib import Path
+        """Test that mnem_base can be used with read_las_file.
 
+        HARDEN (test-register DISPUTED-DELETE, resolved KEEP + HARDEN): the
+        old assertion ``assert "logs" in data`` cannot fail for a parseable
+        file.  The end-to-end contract this test names is that the reader
+        applies the base, so the exact normalized curve order and the index
+        values are asserted.
+        """
         from pylasdev import read_las_file
 
         test_data = Path(__file__).parent.parent / "test_data"
         # Use a LAS 2.0 file — LAS 3.0 disallows ~Other sections
         las_file = test_data / "sample_2.0.las"
         data = read_las_file(las_file, mnem_base=MNEM_BASE)
-        assert "logs" in data
+        assert data["curves_order"] == ["DEPT", "DT", "GGK", "KP", "SFLU", "SFLA", "ILM", "ILD"]
+        np.testing.assert_allclose(data["logs"]["DEPT"][:3], [1670.0, 1669.875, 1669.75])
 
     # --- T12/G-15: MNEM_BASE reader integration end-to-end ---
     def test_mnem_base_normalizes_curve_names(self, tmp_path: Path) -> None:
@@ -163,11 +147,15 @@ class TestResolveMnemonic:
     """
 
     def test_cycle_detection(self) -> None:
-        """Cycle A→B→A returns current value when cycle detected."""
+        """Cycle A→B→A returns the current value when the cycle is detected.
+
+        HARDEN (test-register row): ``result in ("A", "B")`` accepted either
+        exit, so it could not detect a change in the cycle policy.  The
+        documented behaviour (nodes.py: resolve_mnemonic "returns current when
+        next is in seen") makes the exact terminal value B.
+        """
         mnem_base = {"A": "B", "B": "A"}
-        result = resolve_mnemonic(mnem_base, "A")
-        # Cycle detected: returns current when next is in seen
-        assert result in ("A", "B")
+        assert resolve_mnemonic(mnem_base, "A") == "B"
 
     def test_self_loop_cycle_detection(self) -> None:
         """Self-loop: A→A returns A."""
@@ -176,26 +164,37 @@ class TestResolveMnemonic:
         assert result == "A"
 
     def test_max_depth_limit(self) -> None:
-        """Long chain exceeding max_depth returns the current value."""
-        # Build a chain of max_depth+5 steps: 0→1→2→...→(max_depth+5)
+        """Long chain exceeding max_depth stops at the depth-limited node.
+
+        HARDEN (test-register row): ``result in mnem_base.values() or
+        result == "0"`` accepted almost any string.  Chain 0→1→…→15 with
+        max_depth=10 walks exactly 10 hops and returns "10".
+        """
         chain_len = 15  # > default max_depth of 10
         mnem_base = {str(i): str(i + 1) for i in range(chain_len)}
-        result = resolve_mnemonic(mnem_base, "0", max_depth=10)
-        # max_depth exhausted at the 10th hop, returns whatever current is
-        assert result in mnem_base.values() or result == "0"
+        assert resolve_mnemonic(mnem_base, "0", max_depth=10) == "10"
 
     def test_resolve_with_real_mnem_base_single_hop(self) -> None:
-        """Use real MNEM_BASE to verify single-hop resolution works."""
-        uppered = _build_uppercased_first_wins(MNEM_BASE)
-        # AK → DT (single hop, works in uppercased dict)
-        result = resolve_mnemonic(uppered, "AK")
-        assert result == "DT"
+        """Use the real MNEM_BASE lookup to verify single-hop resolution.
 
-    def test_resolve_three_hop_real_chain(self) -> None:
-        """Real chain from MNEM_BASE: GZ3R1 → OGZ (resolved single-hop in uppercased)."""
-        uppered = _build_uppercased_first_wins(MNEM_BASE)
-        result = resolve_mnemonic(uppered, "GZ3R1")
-        assert result == "OGZ"
+        HARDEN (test-register row): the oracle is now the PRODUCTION
+        build_mnemonic_lookup rather than a test-local reimplementation
+        (a regression in the builder could not fail the old test).
+        """
+        lookup = build_mnemonic_lookup(MNEM_BASE)
+        assert lookup["AK"] == "DT"
+
+    def test_resolve_real_chain_terminates_at_ogz(self) -> None:
+        """Real base: GZ3R1 resolves to the terminal canonical name OGZ.
+
+        HARDEN (test-register row): the old name claimed a "three hop" chain
+        while the docstring described a single hop (the production builder
+        resolves chains eagerly, so no multi-hop chain survives in its
+        output — probed: 0 entries of build_mnemonic_lookup resolve to
+        another key).  The name and docstring now state what is pinned.
+        """
+        lookup = build_mnemonic_lookup(MNEM_BASE)
+        assert lookup["GZ3R1"] == "OGZ"
 
     def test_custom_max_depth(self) -> None:
         """Custom max_depth limits chain walking."""
@@ -233,11 +232,14 @@ class TestResolveMnemonic:
         to collide with Agk1→GRO via the uppercased first-wins algorithm,
         silently mapping AGK to GRO.  After the fix, AGK/Agk/aGK all route
         to the GK family.
+
+        HARDEN (test-register row): the lookup comes from the PRODUCTION
+        build_mnemonic_lookup, so a regression in the builder fails this pin.
         """
-        uppered = _build_uppercased_first_wins(MNEM_BASE)
-        assert resolve_mnemonic(uppered, "AGK") == "GK", "AGK must resolve to GK, not GRO"
-        assert resolve_mnemonic(uppered, "Agk") == "GK", "Agk must resolve to GK, not GRO"
-        assert resolve_mnemonic(uppered, "aGK") == "GK", "aGK must resolve to GK, not GRO"
+        lookup = build_mnemonic_lookup(MNEM_BASE)
+        assert resolve_mnemonic(lookup, "AGK") == "GK", "AGK must resolve to GK, not GRO"
+        assert resolve_mnemonic(lookup, "Agk") == "GK", "Agk must resolve to GK, not GRO"
+        assert resolve_mnemonic(lookup, "aGK") == "GK", "aGK must resolve to GK, not GRO"
 
     # --- F-H-005: BK collision fix ---
 
@@ -247,10 +249,12 @@ class TestResolveMnemonic:
         Before the fix, the first-wins collision between Cyrillic БК→BK and
         the canonical BK→BFV caused lowercase 'bk' lookups to resolve
         incorrectly.  After the fix, both casing variants resolve to BFV.
+
+        HARDEN (test-register row): production build_mnemonic_lookup oracle.
         """
-        uppered = _build_uppercased_first_wins(MNEM_BASE)
-        assert resolve_mnemonic(uppered, "BK") == "BFV", "BK must resolve to BFV"
-        assert resolve_mnemonic(uppered, "bk") == "BFV", "bk must resolve to BFV"
+        lookup = build_mnemonic_lookup(MNEM_BASE)
+        assert resolve_mnemonic(lookup, "BK") == "BFV", "BK must resolve to BFV"
+        assert resolve_mnemonic(lookup, "bk") == "BFV", "bk must resolve to BFV"
 
 
 class TestMnemBaseDualLaterologCollision:
@@ -320,10 +324,20 @@ class TestCyrillicRsResistivity:
     """  # noqa: RUF002
 
     def test_all_cyrillic_r_keys_follow_r_family(self) -> None:
-        uppered = _build_uppercased_first_wins(MNEM_BASE)
-        for key in uppered:
-            if key.startswith("Р"):  # noqa: RUF001
-                assert uppered[key].startswith("R"), (
-                    f"Cyrillic Р-* key {key!r} resolves to {uppered[key]!r}, "  # noqa: RUF001
-                    "breaking the R-*→R-* pattern"
-                )
+        """Every Cyrillic R-family key resolves to an R-prefixed canonical name.
+
+        HARDEN (test-register row): the sweep now iterates the PRODUCTION
+        lookup (a builder regression fails it) and asserts the sweep is not
+        vacuous — a base that lost its Cyrillic entries would otherwise pass
+        with zero iterations.
+        """
+        lookup = build_mnemonic_lookup(MNEM_BASE)
+        cyrillic_r_keys = [key for key in lookup if key.startswith("Р")]  # noqa: RUF001
+        assert len(cyrillic_r_keys) >= 10, (
+            f"expected the Cyrillic R family in the production lookup, got {cyrillic_r_keys}"
+        )
+        for key in cyrillic_r_keys:
+            assert lookup[key].startswith("R"), (
+                f"Cyrillic Р-* key {key!r} resolves to {lookup[key]!r}, "  # noqa: RUF001
+                "breaking the R-*→R-* pattern"
+            )

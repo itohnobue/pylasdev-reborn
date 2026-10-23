@@ -5,6 +5,23 @@ All notable changes to pylasdev will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] — 2026-10-24
+
+### Fixed
+
+Full production audit (436 verified findings):
+
+- **LAS 3.0 conformance**: normative format grammar and array-spacing/date-time forms; `[n]`-indexed definition/parameter sections; quoted string data; blank-index diagnostics
+- **Data integrity**: silent NULL/encoding/control-character corruption; wrap misdetection; thousands-separator recombination; `{I}` int64 bounds
+- **Writer**: atomic write preserves mode/identity and fsyncs; CRLF for LAS 1.2/2.0; index precision; `original_mnemonic` validation; NULL-sentinel collision warning
+- **DEV**: DUG/Petrel layouts, `sep=` preamble, locale number forms, datum-alias disclosure, TVD tolerance
+- **Models**: guard-placement parity across construction/mutation/validate/serialisation; row-count and DEV column invariants; int64 representability
+- **Encoding**: chardet label canonicalisation; UTF-8 false-positive fix; correct foreign-codec retention; linear scan
+
+### Tests
+
+Suite revised to the precise/valuable/not-overgrown standard: stale pins re-baselined to the corrected contracts, regression pins added for every landed fix, wall-clock assertions replaced with deterministic work counters, redundant/vacuous tests removed, high-value gaps added. 2,471 passed, 1 skipped, 6 xfailed.
+
 ## [2.0.7] — 2026-08-09
 
 ### Test Suite Optimization

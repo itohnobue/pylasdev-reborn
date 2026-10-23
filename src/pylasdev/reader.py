@@ -13,6 +13,7 @@ import warnings
 from pathlib import Path
 from typing import Any
 
+from ._sanitize import normalize_nbsp_family
 from .data_reader import read_ascii_data
 from .encoding import read_with_encoding
 from .exceptions import LASParseError, LASReadError
@@ -21,20 +22,93 @@ from .parser import LASParser
 
 logger = logging.getLogger(__name__)
 
-# F-32 + G-17 + F-I2-M04 + F-I2-M05: Control characters that appear in file
-# content and must be stripped before splitlines() to prevent section-header
-# injection and silent data corruption.  The writer's _CONTROL_CHARS_RE strips
-# these; this makes the read path symmetric.
-# Characters: \x00-\x08, \x0B (VT), \x0C (FF), \x0E-\x1F (FS/GS/RS/etc.),
-# \x7F (DEL), \x85 (NEL), \u2028 (LINE SEPARATOR), \u2029 (PARAGRAPH SEPARATOR).
-# F-001: Also include the 13 Unicode whitespace characters that the writer's
-# _CONTROL_CHARS_RE strips (\u00A0, \u2000-\u200A, \u202F, \u205F, \u3000)
-# so the write→read roundtrip is symmetric.
-_SPLITLINES_CHARS_RE = re.compile(
-    r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85"
+# F-32 + G-17 + F-I2-M04 + F-I2-M05 + F-225 + F-231 (unit U6) + LD-08:
+# characters in file content that must be neutralized before splitlines() to
+# prevent section-header injection and silent data corruption.  The pre-fix
+# code used ONE class for two different intents and substituted a space for
+# both, so a character inside a numeric token split the token silently:
+# '10\x0000.0' parsed as 10.0 / 0.0 and '1\xa0000.5' as 1.0 / 0.0, with at
+# best a generic "extra columns" warning.  The policy is now:
+#   * the non-breaking space family (NBSP U+00A0, THIN SPACE U+2009, NARROW
+#     NBSP U+202F) is normalized by _sanitize.normalize_nbsp_family with the
+#     ONE rule every entry point shares (LD-08): a family character INSIDE
+#     one numeric token — a token-leading 1-3 digit group, then groups of
+#     exactly three digits ('1\xa0000.5' -> '1000.5') — is DELETED — a space
+#     would split one value into two columns and shift every later value on
+#     the row (F-225); every other occurrence becomes a SPACE — deleting it
+#     would fuse two genuinely separate values ('1.0\xa02.0' -> '1.02.0',
+#     F-231).  The delete side is position-scoped precisely because a blanket
+#     "delete between two digits" fused values, and it additionally requires
+#     the 1-3 digit token-leading left group so a genuine column separator is
+#     never fused ('1000\xa0500.0' is 1000 and 500.0 — M9);
+#   * every character str.splitlines() treats as a line break beyond LF/CR
+#     (VT, FF, FS/GS/RS, NEL, LINE/PARAGRAPH SEPARATOR) becomes a SPACE — a
+#     fake line boundary must never forge a section header;
+#   * every other Unicode space the writer's _UNICODE_WS_RE normalizes
+#     (U+2000-U+200A other than U+2009, U+205F, U+3000) becomes a SPACE —
+#     deleting them would concatenate adjacent tokens (F-05:
+#     'ABC\xa0DEF' -> 'ABCDEF');
+#   * every other C0 control (including NUL) and DEL is DELETED, mirroring
+#     the writer's _CONTROL_CHARS_RE, and a counted UserWarning names the
+#     affected line — a padding character is not a delimiter, so it must not
+#     split a token, and it must not vanish silently either (F-231).
+# Tab (\x09) is preserved: it is legitimate LAS whitespace.
+# The space substitution for non-numeric text is silent: NBSP is not a
+# control character, and tests/test_regression.py:94-116 pins NBSP-as-space
+# for non-numeric text (F-001).  A DELETION — an NBSP-used-as-padding inside
+# one numeric token — is NOT silent: normalize_nbsp_family counts it and
+# names the fused token (M9(b)).  The NBSP family members stay listed in
+# _SPACE_CHARS_RE as a fallback; normalize_nbsp_family runs first, so they
+# are already gone by the time this class is applied.
+_SPACE_CHARS_RE = re.compile(
+    r"[\x0B\x0C\x1C-\x1E\x85"
     r"\u2028\u2029"
     r"\u00A0\u2000-\u200A\u202F\u205F\u3000]"
 )
+_DELETE_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0E-\x1B\x1F\x7F]")
+
+# Line boundaries under str.splitlines() semantics, used only to report the
+# 1-based line of the first deleted control character.
+_LINE_BREAK_RE = re.compile(r"\r\n|[\n\r\x0B\x0C\x1C\x1D\x1E\x85\u2028\u2029]")
+
+
+def _sanitize_control_chars(content: str, file_path: Path) -> str:
+    """Apply the control-character policy to raw file content.
+
+    Returns the content with the non-breaking space family normalized by the
+    shared rule (thousands grouping separator deleted, every other family
+    character one space), line-break characters and Unicode spaces replaced
+    by spaces, and non-line-break C0 controls / DEL deleted.  Two counted
+    UserWarnings report the destructive steps: the NBSP-family deletion names
+    the fused token(s) (M9(b)), and the control-character deletion reports
+    its count, first code point and first affected line — so a padding
+    character inside a token is never silent corruption (F-225/F-231).
+    """
+    # LD-08: ONE NBSP-family rule, shared with the writer, parser and DEV
+    # reader — a separator INSIDE one numeric token is deleted, everything
+    # else becomes a space.  M9(b): the deletion is counted and the fused
+    # token is named, so a value the normalizer joined is never silent.
+    content = normalize_nbsp_family(content, warn_context=str(file_path), stacklevel=3)
+    content = _SPACE_CHARS_RE.sub(" ", content)
+    first_control = _DELETE_CONTROL_CHARS_RE.search(content)
+    if first_control is None:
+        return content
+    first_char = first_control.group()
+    # The space substitution above is 1:1, and the NBSP-family rule only
+    # deletes a grouping separator (a digit-adjacent character, never a
+    # line-break character), so the line number is accurate.
+    first_line = len(_LINE_BREAK_RE.findall(content[: first_control.start()])) + 1
+    content, n_deleted = _DELETE_CONTROL_CHARS_RE.subn("", content)
+    warnings.warn(
+        f"Removed {n_deleted} control character(s) from {file_path} before "
+        f"parsing (first: U+{ord(first_char):04X} at line {first_line}). "
+        "Control characters that are not line breaks are deleted — the LAS "
+        "writer deletes the same character class — so a padding character "
+        "can never split a value into two columns. Verify the file is not "
+        "corrupt.",
+        stacklevel=3,
+    )
+    return content
 
 
 def read_las_file(
@@ -82,6 +156,12 @@ def read_las_file(
 
     Warns:
         UserWarning: If LAS version is > 3.0 (unsupported but attempted).
+        UserWarning: If a non-breaking space used as thousands padding was
+            removed from inside a numeric token (counted, naming the fused
+            token) — see M9/F-225.
+        UserWarning: If control characters that are not line breaks were
+            removed from the file content (counted, with the first
+            affected line) — see F-225/F-231.
 
     Example:
         >>> data = read_las_file("sample.las")
@@ -140,6 +220,12 @@ def read_las_file_as_object(
 
     Warns:
         UserWarning: If LAS version is > 3.0 (unsupported but attempted).
+        UserWarning: If a non-breaking space used as thousands padding was
+            removed from inside a numeric token (counted, naming the fused
+            token) — see M9/F-225.
+        UserWarning: If control characters that are not line breaks were
+            removed from the file content (counted, with the first
+            affected line) — see F-225/F-231.
     """
     file_path = Path(file_path)
 
@@ -170,9 +256,11 @@ def read_las_file_as_object(
     # PERF-01: Split content once, pass lines list to both parser and
     # data_reader to eliminate redundant content.splitlines() calls
     # (double splitlines doubles peak memory for large files).
-    # F-32 + G-17: Sanitize splitlines() line-break characters BEFORE
-    # splitting to prevent section-header injection.
-    lines = _SPLITLINES_CHARS_RE.sub(" ", content).splitlines()
+    # F-32 + G-17 + F-225/F-231 (unit U6) + LD-08: normalize the NBSP family
+    # (and sanitize line-break characters) BEFORE splitting (section-header
+    # injection), and delete the remaining control characters (a padding
+    # char must not split a token); see _sanitize_control_chars.
+    lines = _sanitize_control_chars(content, file_path).splitlines()
     parser.source_file = str(file_path)
     # F-047: Thread the desanitize parameter through to header parsing.
     # data_reader sets this flag before processing data, but header

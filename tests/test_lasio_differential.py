@@ -37,6 +37,7 @@ cleanly when lasio is absent.
 
 from __future__ import annotations
 
+import functools
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
@@ -100,8 +101,16 @@ _EMPTY_DATA_FILE = "sample_3.0.las"
 _LASIO_UNREADABLE_FILE = "sample_las3.0_spec.las"
 
 
+@functools.cache
 def _load_pair(test_data_dir: Path, name: str) -> tuple[dict, object]:
-    """Parse one file with pylasdev and lasio; return (pdict, lasfile)."""
+    """Parse one file with pylasdev and lasio; return (pdict, lasfile).
+
+    Module-level cache (the TEST stage runtime rule: several test classes
+    re-parse the same 13-file corpus, four times over).  The returned objects
+    are SHARED between tests and must therefore be treated as READ-ONLY —
+    every test here only reads them, and a test that needs to mutate a dict
+    must copy it first (see TestComparisonComparatorControls).
+    """
     path = test_data_dir / name
     with _suppress_warnings():
         p = read_las_file(path)
@@ -172,6 +181,10 @@ class TestFullDataContract:
         if not p["logs"]:
             pytest.fail(f"pylasdev read no logs for {fname} (expected data)")
         mismatches, total = _compare_data(p, las)
+        # HARDEN (test-register row, F-1): a zero-cell comparison would pass
+        # vacuously, so require a non-empty comparison AND assert the
+        # comparator is falsifiable (see TestComparisonComparatorControls).
+        assert total > 0, f"{fname}: comparator saw 0 cells — the assertion would be vacuous"
         assert mismatches == 0, f"{fname}: {mismatches}/{total} data cells differ from lasio"
 
     @pytest.mark.parametrize("fname", _FULL_COMPARE_FILES)
@@ -186,6 +199,12 @@ class TestFullDataContract:
     @pytest.mark.parametrize("fname", _FULL_COMPARE_FILES)
     def test_well_fields_agree(self, test_data_dir: Path, fname: str) -> None:
         p, las = _load_pair(test_data_dir, fname)
+        # HARDEN (test-register row): `_compare_well` skips a field whose
+        # lasio value is None, so a file where lasio stores every field as
+        # None would compare 0 fields and pass.  Require that the comparison
+        # actually covered fields.
+        compared = sum(1 for key in p["well"] if las.well[key].value is not None)
+        assert compared > 0, f"{fname}: every well field was skipped — vacuous comparison"
         nbad = _compare_well(p, las)
         assert nbad == 0, f"{fname}: {nbad} well field(s) differ from lasio"
 
@@ -337,7 +356,13 @@ class TestDocumentedDivergences:
             lasio.read(str(f))
 
     def test_duplicate_mnemonic_suffixes_differ(self, tmp_path: Path) -> None:
-        """Duplicate mnemonics: lasio colon suffix; pylasdev underscore suffix."""
+        """Duplicate mnemonics: lasio colon suffix; pylasdev underscore suffix.
+
+        HARDEN (test-register row): the old assertion was inequality only
+        (``set(p) != set(las)``), which passes for ANY divergence including a
+        pylasdev-side rename regression.  Both suffix schemes are now pinned
+        exactly.
+        """
         content = (
             "~VERSION INFORMATION\n"
             " VERS.   2.0  : CWLS LOG ASCII STANDARD\n"
@@ -360,13 +385,9 @@ class TestDocumentedDivergences:
         with _suppress_warnings():
             p = read_las_file(f)
         las = lasio.read(str(f))
-        # Both rename duplicates; schemes differ by design.
-        assert len(p["curves_order"]) == 3
-        assert len(las.keys()) == 3
-        assert set(p["curves_order"]) != set(las.keys()), (
-            f"expected divergent suffix schemes, got pylasdev {p['curves_order']} "
-            f"lasio {list(las.keys())}"
-        )
+        # Both rename duplicates; the schemes differ by design (documented).
+        assert p["curves_order"] == ["DEPT", "GR", "GR_2"], p["curves_order"]
+        assert list(las.keys()) == ["DEPT", "GR:1", "GR:2"], list(las.keys())
 
 
 class TestSpecialFiles:
@@ -374,17 +395,28 @@ class TestSpecialFiles:
 
     def test_encoding_divergent_file_data_matches(self, test_data_dir: Path) -> None:
         """1475IBK3.las: lasio misdetects cp866 as cp1006 (mojibake text),
-        but the DATA still matches under the null-mapping formula."""
+        but the DATA still matches under the null-mapping formula.
+
+        HARDEN (test-register row, F-1): require a non-empty comparison.
+        """
         p, las = _load_pair(test_data_dir, _ENCODING_DIVERGENT_FILE)
         # curve count and data shapes agree
         assert len(p["curves_order"]) == len(las.keys())
         mismatches, total = _compare_data(p, las)
+        assert total > 0, "comparator saw 0 cells — the assertion would be vacuous"
         assert mismatches == 0, f"{mismatches}/{total} cells differ from lasio"
 
     def test_encoding_divergent_file_curve_names_differ(self, test_data_dir: Path) -> None:
         """Documented: lasio's mojibake curve names differ from pylasdev's
-        correctly-decoded Cyrillic names on 1475IBK3.las."""
+        correctly-decoded Cyrillic names on 1475IBK3.las.
+
+        HARDEN (test-register row): inequality alone would accept a
+        pylasdev-side decoding regression, so pylasdev's exact decoded names
+        are pinned; the lasio side stays a divergence assertion because its
+        mojibake text depends on the installed chardet version.
+        """
         p, las = _load_pair(test_data_dir, _ENCODING_DIVERGENT_FILE)
+        assert p["curves_order"] == ["DEPT", "БК", "ИКП", "БКЛ"], p["curves_order"]
         assert p["curves_order"] != list(las.keys()), (
             "expected divergence on this encoding-misdetected file"
         )
@@ -392,16 +424,47 @@ class TestSpecialFiles:
     def test_duplicate_mnemonic_file_data_matches(self, test_data_dir: Path) -> None:
         """4ALS.las: duplicate IK mnemonic + 0xFF byte in SP curve make the
         KEY SETS diverge (documented), but the DATA still matches under the
-        null-mapping formula."""
+        null-mapping formula.
+
+        HARDEN (test-register row, F-1): require a non-empty comparison.
+        """
         p, las = _load_pair(test_data_dir, _DIVERGENT_KEYS_FILE)
         assert len(p["curves_order"]) == len(las.keys())
         mismatches, total = _compare_data(p, las)
+        assert total > 0, "comparator saw 0 cells — the assertion would be vacuous"
         assert mismatches == 0, f"{mismatches}/{total} cells differ from lasio"
 
     def test_duplicate_mnemonic_file_keys_differ(self, test_data_dir: Path) -> None:
         """Documented: 4ALS.las keys diverge (IK_2 vs IK:1/IK:2 suffix
-        scheme; SP\xff decoded to different codepoints)."""
+        scheme; the SP\\xff byte decoded to different codepoints).
+
+        HARDEN (test-register row): the pylasdev key list is pinned exactly
+        (the IK_2 suffix and the SP + U+0178 decode), so a pylasdev-side
+        rename regression fails; the lasio side asserts its colon scheme.
+        """
         p, las = _load_pair(test_data_dir, _DIVERGENT_KEYS_FILE)
+        assert p["curves_order"] == [
+            "DEPT",
+            "BK",
+            "CALI",
+            "DS",
+            "DT",
+            "GGK",
+            "GGKS",
+            "GK",
+            "GZ3",
+            "GZ4",
+            "IK",
+            "IK_2",
+            "NGK",
+            "NKT",
+            "PZ",
+            "SP",
+            "SPŸ",
+        ], p["curves_order"]
+        assert "IK:1" in las.keys() and "IK:2" in las.keys(), (
+            f"expected lasio's colon suffix scheme, got {list(las.keys())}"
+        )
         assert p["curves_order"] != list(las.keys()), (
             "expected divergence on duplicate-mnemonic + 0xFF-byte file"
         )
@@ -422,3 +485,36 @@ class TestSpecialFiles:
         assert "DEPT" in p["curves_order"]
         with pytest.raises(lasio.exceptions.LASHeaderError):
             lasio.read(str(f))
+
+
+class TestComparisonComparatorControls:
+    """F-1 (test-register HARDEN): the data comparator must be falsifiable.
+
+    `_compare_data` is the harness's own oracle adapter: it maps pylasdev's
+    raw NULL sentinel onto lasio's NaN convention.  If that formula were
+    widened (for example an `equal_nan=True` isclose alone, or a comparison
+    that treated null-filled cells as always equal), every
+    `test_data_agrees` row would pass while comparing nothing.  This
+    negative control mutates ONE cell of the pylasdev side and requires the
+    comparator to report it.
+    """
+
+    def test_compare_data_reports_a_corrupted_cell(self, test_data_dir: Path) -> None:
+        p, las = _load_pair(test_data_dir, "sample.las")
+        mismatches, total = _compare_data(p, las)
+        assert total > 0
+        assert mismatches == 0, f"baseline must agree, got {mismatches}/{total}"
+
+        corrupted = dict(p)
+        corrupted["logs"] = dict(p["logs"])
+        target = p["curves_order"][1] if len(p["curves_order"]) > 1 else p["curves_order"][0]
+        perturbed = np.array(p["logs"][target], dtype=float, copy=True)
+        perturbed[0] = perturbed[0] + 1.0
+        corrupted["logs"][target] = perturbed
+
+        bad_mismatches, bad_total = _compare_data(corrupted, las)
+        assert bad_total == total, "cell count must not change with the perturbation"
+        assert bad_mismatches >= 1, (
+            f"comparator missed a +1.0 perturbation of {target!r} — it cannot "
+            "falsify a real data drift"
+        )

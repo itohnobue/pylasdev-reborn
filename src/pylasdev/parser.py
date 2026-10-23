@@ -46,6 +46,14 @@ from ._las30_data import (
 from ._parser_state import _ParserState
 from ._section_transition import _SectionTransitionHandler
 from ._version_spec import _LASVersionSpec
+
+# M12: the EXT-03 dedup installs the deduped curve list through the writer's
+# in-place container helper so the model's own CurveDefinition objects (and the
+# ``las.curves[i] is section.section_curves[j]`` identity) survive the dedup.
+# Position matters: _writer_base imports ``data_reader`` and ``models`` at
+# module level, so it must come after the ``data_reader`` /
+# ``_data_section_reader`` pair imported above (II-10b's partial-module chain).
+from ._writer_base import _restore_live_container
 from .data_reader import (
     _parse_float_with_d_notation,
 )
@@ -58,7 +66,6 @@ from .models import (
     LASFile,
     ParameterEntry,
     ParameterZone,
-    _GuardedList,
 )
 
 logger = logging.getLogger(__name__)
@@ -202,30 +209,143 @@ _DEFERRED_PIPE_SCOPE = -3
 _KNOWN_CURVE_FORMATS: frozenset[str] = frozenset({"F", "E", "D", "S", "A", "I"})
 # PARS-01: The S/A branch previously used `[SA]\w*`, which over-accepted
 # ANY word starting with S or A (e.g. {API}, {SAND}, {SLATE}) as a valid
-# LAS data format.  Only the single-letter codes S and A — optionally with
-# semicolon-separated suffix groups (e.g. "S;LITH") — are legitimate LAS
-# format specifiers.  `[SA](?:;[\w.]+)*` accepts "S", "A", "S;LITH",
-# "A;X" and rejects "API"/"SAND"/"SLATE".
-_FORMAT_SPEC_RE = re.compile(r"^(?:[FEDI](?:\d+(?:\.\d+)?(?:[ED][+-]?\d+)?)?|[SA](?:;[\w.]+)*)$")
+# LAS data format.  `[SA](?:;[\w.]+)*` narrowed it to the single-letter
+# codes S and A plus semicolon suffix groups and rejected the word forms.
+#
+# F-180: that narrowing went too far — it also rejected the STANDARD's own
+# width and combined forms, so a conforming `{S32}`/`{S80}`/`{AS}`/
+# `{AF10.4}` curve had its data_format cleared and every value replaced by
+# the null sentinel.  Release 3.00 "Data Formats" defines:
+#   * a total-length width on F/I/S/E ({Fx.y}, {Ix}, {Sx}, {E0.00E+00});
+#   * the `A` array flag FIRST, with a regular format immediately after it
+#     ({AS}, {AF10.4}, {AS32}) — "The A must always be the first character";
+#   * an optional `;`-delimited spacing list after the A/format part
+#     ({A;0ms}, {AF10.4;5ms}, {AF10.4;5ms;10ft}).
+# The grammar below accepts exactly those while keeping PARS-01's block
+# direction closed: it still rejects the word-like description tokens
+# ({API}, {SAND}, {SLATE}, {DENSITY}, {DEG}, {DD-MM-YYYY}).  The non-numeric
+# classes (date/time letter patterns, the Deg/Min/Sec symbol form) are NOT
+# part of this regex — they are recognised separately by
+# _DATE_TIME_FORMAT_RE / _DMS_FORMAT_RE and routed to the string channel
+# (F-186), not cleared.
+_FORMAT_SPEC_RE = re.compile(
+    r"^(?:"
+    r"[FEDI](?:\d+(?:\.\d+)?(?:[ED][+-]?\d+)?)?"
+    r"|A(?:[FEDI](?:\d+(?:\.\d+)?(?:[ED][+-]?\d+)?)?|S\d*)?(?:;[\w.]+)*"
+    r"|S\d*(?:;[\w.]+)*"
+    r")$"
+)
 
-# F-32 + G-17 + F-I2-M04 + F-I2-M05: Control characters that appear in file
-# content and must be stripped before splitlines() to prevent section-header
-# injection and silent data corruption.  The writer's _CONTROL_CHARS_RE strips
-# these; this makes the read path symmetric.
-# F-I2-M04: Added \x00 (null byte) — previously bypassed SECTION_PATTERN,
-#   routing ~\x00VERSION to _other_lines and corrupting float parsing.
-# F-I2-M05: Added remaining control characters (\x00-\x08, \x0E-\x1F, \x7F)
-#   that the writer strips but the parser/reader previously passed through.
-# Characters: \x00-\x08, \x0B (VT), \x0C (FF), \x0E-\x1F (FS/GS/RS/etc.),
-# \x7F (DEL), \x85 (NEL), \u2028 (LINE SEPARATOR), \u2029 (PARAGRAPH SEPARATOR).
-# F-001: Also include the 13 Unicode whitespace characters that the writer's
-# _CONTROL_CHARS_RE strips (\u00A0, \u2000-\u200A, \u202F, \u205F, \u3000)
-# so the write→read roundtrip is symmetric.
+# F-180/F-186: LAS 3.0 date/time format letter patterns — Release 3.00
+# "Data Formats": upper-case D/M/Y (`D`, `DD`, `M`, `MM`, `MMM`, `MMMM`,
+# `YYYY` — the only acceptable year form) joined by '-' or '/', and lower-case
+# h/m time patterns joined by ':' (`hh`, `hh:mm`, `hh:mm:ss`).  Matching is
+# case-insensitive because _extract_curve_format upper-cases the captured
+# token before classification.  These are DATA FORMATS per the standard — a
+# date channel is a string channel here (F-186), never a cleared/nulled
+# numeric one.
+_DATE_TIME_FORMAT_RE = re.compile(
+    r"^(?:"
+    r"(?:[DM]{1,4}|YYYY)(?:[-/](?:[DM]{1,4}|YYYY)){1,2}"
+    r"|h{2}(?::m{2}(?::s{2})?)?"
+    r")$",
+    re.IGNORECASE,
+)
+
+# F-180: the Deg/Min/Sec data format is the three symbols together
+# ("{° '\"}" — "All three must be used").  FORMAT_SPEC_PATTERN requires a
+# leading letter, so it never captures this token; a dedicated trailing-form
+# check classifies the channel as string like the date/time patterns.
+_DMS_FORMAT_RE = re.compile(r"\{\s*°\s*'\s*\"\s*\}\s*$")
+
+
+def _is_date_time_data_format(data_format: str) -> bool:
+    """True when *data_format* is a LAS 3.0 date/time letter pattern.
+
+    F-186: such a token IS a data format per the standard ("Ver 3.0 allows
+    six format types; Floating point, Integer, Exponential, String, Date and
+    Time, Deg/min/sec"), so it must not be reported as invalid and must not
+    leave the channel routed through the numeric path (every date token then
+    fails float() and the whole column becomes the null sentinel).
+    """
+    return bool(_DATE_TIME_FORMAT_RE.match(data_format))
+
+
+# F-186: a date/time token that FORMAT_SPEC_PATTERN cannot capture because it
+# contains the ':' time delimiter ({hh:mm:ss}, {DD/MM/YYYY hh:mm}) — the
+# pattern's format body excludes ':' (a mid-token colon would be read as the
+# array-offset separator).  The combined date+time form is the ONE place the
+# standard allows an embedded space.
+# M5: the token must END the description — the same trailing-position rule
+# F-216 applies to the {S}/{A}/{F} family (the writer appends the real data
+# format at the END of the description, so a mid-description brace token is
+# USER TEXT).  The anchor has _DMS_FORMAT_RE's shape; the fallback that uses
+# this pattern therefore cannot fire on user text.
+_DATE_TIME_TOKEN_RE = re.compile(
+    r"\{("
+    r"(?:[DM]{1,4}|YYYY)(?:[-/](?:[DM]{1,4}|YYYY)){1,2}"
+    r"(?:\s+h{2}(?::m{2}(?::s{2})?)?)?"
+    r"|h{2}(?::m{2}(?::s{2})?)?"
+    r")\}\s*$",
+    re.IGNORECASE,
+)
+
+
+def _has_date_time_token(description: str) -> bool:
+    """True when *description* ENDS with a date/time format token (F-186).
+
+    M5: the position rule is F-216's — only a token that terminates the
+    description is the channel's format.  A mid-description token is user
+    text (the writer appends the real format at the END), so it must not
+    move a numeric column into the string container.
+    """
+    return bool(_DATE_TIME_TOKEN_RE.search(description))
+
+
+# F-32 + G-17 + F-I2-M04 + F-I2-M05 + LD-08: characters that must be
+# neutralised before splitlines() to prevent section-header injection and
+# silent data corruption, plus the symmetric read side of the writer's
+# character handling.
+#
+# F-182 POLICY (one class table, applied on every parser path):
+#   * line / paragraph separators — VT, FF, FS, GS, RS, NEL, U+2028,
+#     U+2029 — and the Unicode spaces are REPLACED WITH A SPACE (they are
+#     whitespace/line separators; a space keeps the surrounding tokens
+#     distinct).  FS/GS/RS are in this class because Python's
+#     str.splitlines() treats them as line boundaries; deleting them would
+#     fuse "101.0\x1c51.0" into one token "101.051.0" (a different silent
+#     corruption — pinned by tests/test_parser.py:test_mid_line_splitline_char_no_column_shift).
+#   * the non-breaking space family (NBSP U+00A0, THIN SPACE U+2009, NARROW
+#     NBSP U+202F) is normalized FIRST by _sanitize.normalize_nbsp_family,
+#     the ONE rule every entry point shares (LD-08): the three-digit
+#     thousands grouping shape is DELETED ('1\xa0000.5' -> '1000.5' — a
+#     space would split one value into two columns, F-225) and every other
+#     occurrence becomes a SPACE ('1.0\xa02.0' -> '1.0 2.0' — deleting it
+#     would fuse two separate values, F-231).  The family members remain
+#     listed in _SPLITLINES_CHARS_RE as a fallback (they are already gone
+#     when the helper ran).
+#   * every OTHER C0 control (NUL \x00 through \x08, \x0E-\x1B, \x1F) and
+#     DEL (\x7F) is DELETED, never space-substituted: substituting a space
+#     inside "10\x0000.0" produced the bogus value "10 00.0" — one token
+#     silently split into two (F-182).  Deletion is counted and reported
+#     through the warnings API by _delete_control_chars.
+#   * TAB (\x09) is preserved (valid LAS whitespace).
+# LF (\x0A) and CR (\x0D) are line terminators: splitlines() consumes them,
+# so they are not space-substituted here (that would merge lines).
+#
+# F-I2-M04: \x00 is in the DELETE class — previously it bypassed
+#   SECTION_PATTERN, routing ~\x00VERSION to _other_lines.
+# F-001: also includes the Unicode whitespace characters the writer's
+# _UNICODE_WS_RE maps to a space, so the write→read roundtrip is symmetric.
 _SPLITLINES_CHARS_RE = re.compile(
-    r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x85"
+    r"[\x0B\x0C\x1C\x1D\x1E\x85"
     r"\u2028\u2029"
     r"\u00A0\u2000-\u200A\u202F\u205F\u3000]"
 )
+# F-182: control characters DELETED from a line (never space-substituted).
+# DEL (\x7F) belongs here, not in the space class — it is a non-printing
+# control, not a separator.
+_CONTROL_DELETE_RE = re.compile(r"[\x00-\x08\x0E-\x1B\x1F\x7F]")
 
 # Section header: line starting with ~, followed by section keyword and trailing content.
 # Captures the full section word (e.g., "VERSION", "Core_Definition", "Core[1]")
@@ -547,6 +667,49 @@ def _is_indexed_data_section(section_word: str) -> bool:
     return base in _INDEXED_DATA_TYPES
 
 
+def _strip_section_index(section_word: str) -> str:
+    """Return *section_word* without a trailing LAS 3.0 ``[n]`` array index.
+
+    F-185: Release 3.00 suffixes the REPEATING section titles with the
+    array-index brackets ("each section title must be suffixed with the
+    array index brackets, [], containing a sequential number"), so
+    ``~Log_Definition[2]`` and ``~Log_Parameter[2]`` are spec-legal.  The
+    bracket is part of SECTION_PATTERN's word, so every suffix test
+    (``_DEFINITION``, ``_PARAMETER``) must dispatch on the base word while
+    the RAW word stays the section's identity (definition-range keys, pipe
+    targets).  A non-numeric or unbalanced bracket is left untouched.
+    """
+    if not section_word.endswith("]"):
+        return section_word
+    bracket_idx = section_word.find("[")
+    if bracket_idx < 0:
+        return section_word
+    if not section_word[bracket_idx + 1 : -1].isdigit():
+        return section_word
+    return section_word[:bracket_idx]
+
+
+def _looks_like_data_values(text: str) -> bool:
+    """True when *text* is a non-empty run of numeric data values.
+
+    F-183: used to decide whether a ``~``-leading line inside an open data
+    section is a DATA ROW rather than a section header.  A header carries a
+    word, an annotation or a pipe; a data row carries values.  Only
+    unambiguous evidence counts — every whitespace/comma/semicolon-separated
+    token must parse as a number (the null sentinel included), so a header's
+    text ("CURVE INFORMATION", "| Log_Definition") never qualifies.
+    """
+    tokens = [t for t in re.split(r"[\s,;]+", text.strip()) if t]
+    if not tokens:
+        return False
+    for token in tokens:
+        try:
+            float(token)
+        except ValueError:
+            return False
+    return True
+
+
 # N-06: Date/time VALUE patterns for the LAS 1.2 auto-mode CWLS/lasio
 # well-field heuristic (branch-3).  A multi-word PRE-colon side that
 # matches one of these (e.g. "2026-07-19 12:34", "1:30 PM",
@@ -575,6 +738,62 @@ def _looks_like_datetime_value(text: str) -> bool:
     return any(p.search(text) for p in _DATETIME_VALUE_PATTERNS)
 
 
+def _looks_like_well_value(text: str) -> bool:
+    """True when *text* is shaped like a well-field VALUE (F-054).
+
+    The LAS 1.2 auto-mode CWLS/lasio heuristic decides which side of the
+    colon is the value by "the side that carries digits".  That test is
+    symmetric in the two strings, so a CWLS DESCRIPTION token that happens
+    to carry a digit (``LOC. Zone1 : ACME`` — the layout the library's own
+    LAS 1.2 writer emits, ``_writer_las12.py:170-176``) was read as the
+    value and the pair was inverted with no diagnostic.
+
+    This predicate supplies the second, independent signal the heuristic
+    needs: a real value parses as a number (Fortran D-notation included),
+    looks like a date/time shape, or is a digit-dominant code such as a UWI
+    ("10006170502W500" — the lasio-written shape P-01 pins).  A description
+    word such as ``Zone1`` is none of those: one digit in five characters is
+    prose, not a value, and reading it as the value is what inverted the
+    library's own CWLS output.
+    """
+    try:
+        _parse_float_with_d_notation(text)
+    except (ValueError, OverflowError):
+        if _looks_like_datetime_value(text):
+            return True
+        _digits = sum(1 for _c in text if _c.isdigit())
+        return _digits >= 3 and _digits * 2 >= len(text)
+    return True
+
+
+def _row_carries_leading_data_value(text: str) -> bool:
+    """True when *text* starts with a numeric data VALUE.
+
+    F-195 (residual half): used to decide whether a ``~``-leading line
+    inside an open data section was a DATA ROW even though it is consumed
+    as a section header.  On the parser-owned LAS 3.0 path an ALL-numeric
+    row is already kept as data by ``_is_tilde_data_row`` (F-183), so what
+    reaches the diagnostic there is the MIXED row ("~A 1001.0 SAND").  On a
+    KNOWN 1.2/2.0 file the parser deliberately leaves data reading to the
+    reader (P-16), so the all-numeric shape ("~ASCII 1001.0", the reported
+    example) is still consumed as a header and its value lost — that is
+    the shape this predicate must also catch.
+
+    A genuine section header starts with a WORD ("~C CURVE INFORMATION",
+    "~Core_Data | Core_Definition"), so requiring a LEADING numeric token
+    keeps ordinary headers out; the caller additionally requires that no
+    pipe annotation is present.
+    """
+    tokens = [t for t in re.split(r"[\s,;]+", text.strip()) if t]
+    if not tokens:
+        return False
+    try:
+        float(tokens[0])
+    except ValueError:
+        return False
+    return True
+
+
 def _well_entry_uses_las12_conventions(vers: str) -> bool:
     """Whether well entries should use the LAS 1.2 CWLS/lasio conventions.
 
@@ -583,12 +802,19 @@ def _well_entry_uses_las12_conventions(vers: str) -> bool:
     colon, no swap).  NON-NUMERIC VERS (e.g. ``"CWLS LOG ASCII
     STANDARD"`` — documented as common in LAS 1.2 files, reader.py:210-
     215) → True: a non-numeric VERS cannot prove the file is 2.0+, and
-    the well-section layout heuristics (auto-mode) are harmless on
-    canonical layouts — running the swap there only re-affirms the
-    canonical reading (M-11).  Previously the swap decision depended
-    solely on numeric-VERS ``is_las12``, so a non-numeric VERS skipped
-    the swap entirely and DATE/LOC/COMP were stored
-    value/description-inverted with zero warnings.
+    the well-section layout heuristics (auto-mode) are the only reading
+    available.  M-11: previously the swap decision depended solely on
+    numeric-VERS ``is_las12``, so a non-numeric VERS skipped the swap
+    entirely and DATE/LOC/COMP were stored value/description-inverted with
+    zero warnings.
+
+    The heuristics are NOT "harmless on canonical layouts" (the claim this
+    docstring made until F-054): a canonical LAS 2.0-layout entry whose
+    DESCRIPTION token carries a digit and no space ("ACME : Zone1") still
+    trips the branch-1 digit test and is read inverted.  What F-054 fixes
+    is the reported direction — an ambiguous pair is now read as the spec
+    (CWLS) layout with a warning instead of being guessed silently, and a
+    digit-bearing CWLS DESCRIPTION token is no longer mistaken for a value.
     """
     spec = _LASVersionSpec(vers)
     if spec.is_las12:
@@ -701,10 +927,18 @@ def _validate_data_section_column_counts(data_sections: Sequence[Any]) -> None:
 def _validate_curve_data_format(data_format: str, mnemonic: str, line_no: int = 0) -> None:
     """Validate a curve data_format against known LAS format specifiers.
 
-    Accepts single-letter codes (F, E, D, S, A) and extended Fortran-style
-    format specifiers (e.g., "F8.3", "E10.2", "E0.00E+00").  Rejects
-    non-numeric templates such as "DEG", "DD/MM/YYYY" which are metadata
-    strings, not LAS data format specifiers.
+    Accepts single-letter codes (F, E, D, S, A), extended Fortran-style
+    format specifiers (e.g., "F8.3", "E10.2", "E0.00E+00"), the LAS 3.0
+    width/bracket forms (``S32``, ``AS``, ``AF10.4``, ``A;0ms``) and the
+    LAS 3.0 date/time letter patterns (``DD/MM/YYYY``, ``hh:mm:ss``).
+    Rejects word-like description templates such as "DEG", "DENSITY",
+    "API" which are metadata strings, not LAS data format specifiers.
+
+    F-186: date/time patterns ARE data formats per Release 3.00 ("six
+    format types … Date and Time"), so they are accepted here instead of
+    being reported as invalid and cleared — which routed the channel
+    through the numeric path and replaced every value with the null
+    sentinel.
 
     Args:
         data_format: The format specifier string (already uppercased).
@@ -713,17 +947,19 @@ def _validate_curve_data_format(data_format: str, mnemonic: str, line_no: int = 
 
     Raises:
         LASParseError: If the format specifier is not a recognised single-letter
-            code or valid extended format.
+            code, valid extended format, or date/time letter pattern.
     """
     if not data_format:
         return
     if data_format in _KNOWN_CURVE_FORMATS or _FORMAT_SPEC_RE.match(data_format):
         return
+    if _is_date_time_data_format(data_format):
+        return
     prefix = f"Line {line_no}: " if line_no else ""
     raise LASParseError(
         f"{prefix}curve '{mnemonic}' has unsupported format "
         f"specifier '{{{data_format}}}'. Non-numeric format types "
-        f"(e.g., {{DEG}}, date templates) are not valid LAS "
+        f"(e.g., {{DEG}}, {{DENSITY}}) are not valid LAS "
         f"data format specifiers. "
         f"Valid values: {', '.join(sorted(_VALID_DATA_FORMATS))}"
     )
@@ -778,6 +1014,13 @@ def _dedup_simulated_names(names: list[str]) -> set[str]:
     duplicate of ``name`` becomes ``name_2`` (``seen[name]`` starts at 1,
     first collision increments to 2), later duplicates ``name_3``…, with
     collision re-check against the output set.
+
+    NEW-FROM-FIX (D2 report): the suffix is built by the SHARED
+    ``data_reader._suffixed_curve_name`` — the same builder
+    ``_deduplicate_curves`` and the 1.2/2.0 reader now use — so a bracket
+    array element stays grammar-legal: ``NMR[1]`` → ``NMR_2[1]``, never
+    ``NMR[1]_2``.  A duplicated bracket name therefore lands in the match
+    set under the name the dedup pass will actually produce.
     """
     seen: dict[str, int] = {}
     out: set[str] = set()
@@ -786,18 +1029,18 @@ def _dedup_simulated_names(names: list[str]) -> set[str]:
         if name in seen:
             seen[name] += 1
             suffix = seen[name]
-            new_name = f"{name}_{suffix}"
+            new_name = _data_reader._suffixed_curve_name(name, suffix)
             while new_name in out:
                 suffix += 1
-                new_name = f"{name}_{suffix}"
+                new_name = _data_reader._suffixed_curve_name(name, suffix)
             seen[name] = suffix
             result.append(new_name)
         elif name in out:
             suffix = 2
-            new_name = f"{name}_{suffix}"
+            new_name = _data_reader._suffixed_curve_name(name, suffix)
             while new_name in out:
                 suffix += 1
-                new_name = f"{name}_{suffix}"
+                new_name = _data_reader._suffixed_curve_name(name, suffix)
             seen[name] = suffix
             result.append(new_name)
         else:
@@ -822,7 +1065,10 @@ def _enhanced_expected_mnemonic_set(section_curves: list[CurveDefinition]) -> se
       identical plain-mnemonic A-format curves (``array_info is None``)
       is renamed to ``{BASE}[1]``..``{BASE}[n]`` by
       ``_build_spec_form_array_info`` (``_las30_data.py:426-455``) when
-      the data is numeric — add those bracketed names too.
+      the data is numeric — add those bracketed names too.  F-187: the
+      function's E-22 SINGLE-element branch (a lone plain A-format curve
+      carrying the preserved ``{A:N}`` marker) produces ``{BASE}[1]`` and
+      is simulated as well.
 
     Extra names are harmless by construction: in all-string sections the
     F-19 exclusion makes them inert, and in sections with >=1 numeric
@@ -862,6 +1108,24 @@ def _enhanced_expected_mnemonic_set(section_curves: list[CurveDefinition]) -> se
                 for pos in range(1, run + 1):
                     synthesized[i + pos - 1] = f"{base}[{pos}]"
                     expected.add(f"{base}[{pos}]")
+            elif _SPEC_FORM_ARRAY_RE.search(c.description or ""):
+                # F-187 (E-22 single-element twin): a LONE plain-mnemonic
+                # A-format curve carrying the preserved {A:N}/{A;} spec-form
+                # marker is synthesized as a one-element array
+                # (``{BASE}[1]``) by the single-element branch of
+                # ``_build_spec_form_array_info`` — the same mechanism as
+                # the multi-element run above.  Without the simulated name a
+                # header row written in POST-synthesis names
+                # ("DEPT AMP[1]") is not in the match set, so it is consumed
+                # as data: phantom null row + column shift (probed:
+                # DEPT=[-999.25, 1000.0, 1001.0] instead of [1000.0, 1001.0]).
+                # The E-22 branch also requires the group's DATA to be
+                # numeric, which cannot be known at accumulation time; the
+                # extra name is inert on a non-numeric group for the reason
+                # documented above (membership only fixes false negatives).
+                base = c.mnemonic.upper()
+                synthesized[i] = f"{base}[1]"
+                expected.add(f"{base}[1]")
             i = j + 1
         else:
             i += 1
@@ -940,6 +1204,41 @@ class LASParser:
         # so a directly-following units row can also be skipped on the
         # first data line only.  Same monkeypatch-safe pattern as above.
         self._skipped_mnemonic_header = False
+        # F-206: the RAW version string when VERS was digit-leading but
+        # unparseable ("1,2", "1 2", "12", "1.2x") and therefore defaulted
+        # to "2.0".  `las_file.version.vers` must stay "2.0" (pinned by
+        # tests/test_parser.py TestS8PXM03VERSNormalization and the F-005
+        # contract), but the WELL-SECTION convention decision must not use
+        # the fabricated 2.0: the raw value still carries the file's real
+        # version family, so the well path passes it to
+        # _well_entry_uses_las12_conventions exactly like the non-numeric
+        # VERS fallback (M-11) does.  None when no such default happened.
+        # Init here (not only in _reset) so tests that monkeypatch _reset()
+        # still get the attribute.
+        self._vers_unparsed: str | None = None
+        # F-183: count of `~`-leading rows that were consumed as a section
+        # header and dropped while a data section was open (delimiter-joined
+        # first data value).  Drives the counted warnings-API diagnostic so
+        # a discarded row is never silent.  Init here (not only in _reset)
+        # so tests that monkeypatch _reset() still get the attribute.
+        self._discarded_data_rows = 0
+        # F-214: count of definition lines (~W/~C/~P) that did not match the
+        # section grammar and were dropped.  A dropped ~C line undeclares a
+        # curve, so the SURVIVING definitions are mapped to the data columns
+        # by position and every later column lands under the wrong mnemonic;
+        # the drop used to be logger-only (invisible to the warnings API).
+        # Init here for the same monkeypatch-safe reason as above.
+        self._dropped_definition_lines = 0
+        # F-214 (mapping half): the COLUMN POSITION of every dropped ~C line
+        # inside the current ~C list.  A dropped definition is not a curve, so
+        # the reader maps data columns to the SURVIVING definitions by
+        # position — a drop in the middle shifted every later column onto the
+        # wrong mnemonic (probed: the CALIPER column read as GR).  Recording
+        # the position lets the reader skip exactly that column instead of
+        # fabricating a placeholder curve, which the M9 contract forbids
+        # (tests/test_regression.py:6538-6579 pins that a dropped definition
+        # must not inflate the curve count / header-skip arithmetic).
+        self._dropped_curve_positions: list[int] = []
         # M-02..M-05 (version_pending, ACCEPTED pre-fix audit): pre-~V
         # curve/definition and parameter sections are buffered RAW and
         # re-classified once the version is known (_resolve_version_pending
@@ -960,6 +1259,14 @@ class LASParser:
         self._line_no = 0  # F-049: Track current line number for error messages
         # M-04: reset the units-row position gate per file.
         self._skipped_mnemonic_header = False
+        # F-206: reset the unparseable-VERS memory per file.
+        self._vers_unparsed = None
+        # F-183: reset the discarded-data-row counter per file.
+        self._discarded_data_rows = 0
+        # F-214: reset the dropped-definition-line counter per file.
+        self._dropped_definition_lines = 0
+        # F-214 (mapping half): reset the recorded drop positions per file.
+        self._dropped_curve_positions = []
         # M-36: N-I-30 mnem_base resolution-collision tracking for curve
         # names — reset per file.  Keeps the ORIGINAL mnemonic for a curve
         # whose raw name resolves to a canonical already taken by another
@@ -1055,6 +1362,46 @@ class LASParser:
         """Public accessor for pre-scanned data line count."""
         return self._state.data_line_count
 
+    def _delete_control_chars(self, lines: list[str]) -> list[str]:
+        """F-182: delete true control characters from each line, counted.
+
+        A control character is DELETED, never replaced with a space: a space
+        substitution inside a value silently splits one token into two
+        (``STRT.M 10\\x0000.0`` was stored as ``"10 00.0"``).  The removal is
+        reported through the warnings API — counted, naming the affected
+        lines — because the parsed content then differs from the source file
+        and a caller filtering the warnings API must be able to see it.
+        Line/paragraph separators and the Unicode spaces are NOT handled
+        here: the non-breaking space family is normalized by
+        ``_sanitize.normalize_nbsp_family`` (LD-08) and everything else in
+        the space class is mapped to a space by ``_SPLITLINES_CHARS_RE``
+        before this runs.
+        """
+        cleaned: list[str] = []
+        affected: list[int] = []
+        removed = 0
+        for _idx, _line in enumerate(lines, 1):
+            if _CONTROL_DELETE_RE.search(_line):
+                _stripped = _CONTROL_DELETE_RE.sub("", _line)
+                removed += len(_line) - len(_stripped)
+                affected.append(_idx)
+                cleaned.append(_stripped)
+            else:
+                cleaned.append(_line)
+        if removed:
+            _shown = ", ".join(str(_n) for _n in affected[:10])
+            _more = "" if len(affected) <= 10 else f" (+{len(affected) - 10} more)"
+            warnings.warn(
+                f"Removed {removed} control character(s) from "
+                f"{len(affected)} line(s) (lines {_shown}{_more}). Control "
+                f"characters are deleted rather than replaced with a space so "
+                f"one value token is never split into two; the parsed content "
+                f"differs from the source file at those positions.",
+                UserWarning,
+                stacklevel=3,
+            )
+        return cleaned
+
     def parse(self, content: str, lines: list[str] | None = None) -> LASFile:
         """Parse LAS file content string.
 
@@ -1082,7 +1429,26 @@ class LASParser:
         # Pass 2 (_finalize_pre_scan), when the model is final, using the
         # reader's own classification primitives.
         if lines is None:
-            lines = _SPLITLINES_CHARS_RE.sub(" ", content).splitlines()
+            # LD-08: the shared NBSP-family rule runs BEFORE the space class
+            # (the class would otherwise turn a thousands separator into a
+            # space and split the numeric token).
+            # M9(b): the helper owns the rule; the call site passes
+            # warn_context so a thousands-separator deletion is counted and
+            # names where it happened instead of being silent (the DEV
+            # reader already does this).  stacklevel=3 points the warning at
+            # the caller of parse(), not at this frame.
+            content = _sanitize_mod.normalize_nbsp_family(
+                content,
+                warn_context="the LAS content passed to LASParser.parse",
+                stacklevel=3,
+            )
+            content = _SPLITLINES_CHARS_RE.sub(" ", content)
+            lines = content.splitlines()
+            # F-182: delete (never space-substitute) true control characters.
+            # Guarded on a single content-level scan so a clean file pays one
+            # regex pass, not one per line.
+            if _CONTROL_DELETE_RE.search(content):
+                lines = self._delete_control_chars(lines)
         else:
             # I2-XPD-01: When lines are provided externally (e.g., from
             # reader.py's PERF-01 optimization), apply _SPLITLINES_CHARS_RE
@@ -1091,7 +1457,24 @@ class LASParser:
             # was already applied by the caller, but per-line cleaning
             # ensures defense-in-depth against stale or unsanitized
             # externally-supplied line lists.
-            lines = [_SPLITLINES_CHARS_RE.sub(" ", ln) for ln in lines]
+            # LD-08: the NBSP-family rule is idempotent, so applying it here
+            # again on already-normalized lines changes nothing; it keeps a
+            # stale line list from a direct caller on the same policy.
+            # M9(b): same loudness contract as the content path above.
+            lines = [
+                _SPLITLINES_CHARS_RE.sub(
+                    " ",
+                    _sanitize_mod.normalize_nbsp_family(
+                        ln,
+                        warn_context="the LAS line list passed to LASParser.parse",
+                        stacklevel=3,
+                    ),
+                )
+                for ln in lines
+            ]
+            # F-182: same control-character deletion as the content path.
+            if any(_CONTROL_DELETE_RE.search(ln) for ln in lines):
+                lines = self._delete_control_chars(lines)
         self._pre_scan(lines)
 
         for line_no, line in enumerate(lines, 1):
@@ -1261,23 +1644,44 @@ class LASParser:
         is_las12_or_later = _LASVersionSpec(self.las_file.version.vers).is_las12_or_later
         if is_las12_or_later and self._state.version_found:
             # F-25: Use version-specific mandatory well fields from
-            # _LASVersionSpec.  M-11: LAS 2.0 requires the lascheck
-            # 10-field set (STRT, STOP, STEP, NULL, COMP, WELL, FLD, LOC,
-            # SRVC, DATE); LAS 1.2 and 3.0 require STRT, STOP, STEP, NULL
-            # (I2-07 — the lascheck 10-field set is a 2.0-era requirement;
-            # lascheck itself documents "supports checking against LAS 2.0
-            # standard only", so applying it to 1.2 produced 6 spurious
-            # warnings on minimal-but-valid 1.2 files).  UWI is optional
-            # (present but not required) — it previously caused
-            # false-positive "missing: UWI" warnings on common files.  We
-            # warn but do NOT raise an error.
+            # _LASVersionSpec.  LAS 1.2 and 3.0 require STRT, STOP, STEP,
+            # NULL (I2-07 — the lascheck 10-field set is a 2.0-era
+            # requirement; lascheck itself documents "supports checking
+            # against LAS 2.0 standard only", so applying it to 1.2
+            # produced 6 spurious warnings on minimal-but-valid 1.2
+            # files).  LAS 2.0 uses the CWLS twelve-slot rule (F-024,
+            # below), which carries the lascheck names plus the two
+            # alternative-spelling slots.  M-11: UWI is not a
+            # FLAT requirement — it produced false-positive "missing: UWI"
+            # warnings on common files; F-024 replaced the flat tuple with
+            # the CWLS slot list, where the "UWI|API" slot is satisfied by
+            # either spelling (see the F-024 paragraph below for the
+            # neither-spelling case).  We warn but do NOT raise an error.
+            #
+            # F-024: validate the CWLS GROUP-aware rule instead of the flat
+            # legacy list.  The CWLS Well Information section has twelve
+            # slots, two of which accept alternative spellings
+            # ("UWI|API", "PROV|CNTY|STAT|CTRY"); the flat tuple cannot
+            # express them, so the PROV family was enforced nowhere and a
+            # LAS 2.0 file with no province/county/state/country field drew
+            # no diagnostic at all.  A slot is satisfied by ANY member, so
+            # the M-11 "UWI is optional" decision is QUALIFIED rather than
+            # dropped: a file carrying UWI or API satisfies the slot, and a
+            # file carrying neither now warns like the rest of the CWLS set
+            # (the M-11 no-UWI-warn rule is superseded for LAS 2.0 by this
+            # CWLS slot; M11/ADV-6 — the 1.2-only test
+            # tests/test_reader.py:3618-3669 cannot witness the 2.0 group).
             _version_spec = _LASVersionSpec(self.las_file.version.vers)
-            _mandatory_fields = list(_version_spec.mandatory_well_fields)
-            for field in _mandatory_fields:
-                if field not in self.las_file.well.entries:
+            for _field_group in _version_spec.mandatory_well_field_groups:
+                if not any(_f in self.las_file.well.entries for _f in _field_group):
+                    _missing_label = (
+                        _field_group[0]
+                        if len(_field_group) == 1
+                        else " or ".join(_field_group)
+                    )
                     warnings.warn(
                         f"LAS {self.las_file.version.vers} file missing "
-                        f"mandatory well field: {field}",
+                        f"mandatory well field: {_missing_label}",
                         stacklevel=2,
                     )
 
@@ -1449,21 +1853,22 @@ class LASParser:
                 if _i < len(self.las_file.curves):
                     _dedup_curves.append(self.las_file.curves[_i])
             if len(_dedup_order) != len(self.las_file.curves_order):
-                self.las_file.curves_order = _dedup_order
-                # F-29: LASFile.__setattr__ re-wraps logs/string_data/
-                # curves_order but NOT curves (models.py:3006-3057), so a
-                # plain-list assignment here permanently strips the
-                # _GuardedList mutation guard installed by __post_init__
-                # (models.py:3506-3510).  Post-parse
-                # las_file.curves.append("bad") would silently succeed and
-                # the writer would fail later with a confusing AttributeError.
-                # Re-wrap through _GuardedList (mirroring _WriterMutationGuard.
-                # _rewrap_guards) so the mutation guard survives the dedup.
-                self.las_file.curves = _GuardedList(
-                    _dedup_curves,
-                    _container_name="LASFile.curves",
-                    _expected_type=CurveDefinition,
-                )
+                # M12: install the deduped lists IN PLACE on the live
+                # containers (see _restore_live_container) — never
+                # ``self.las_file.curves = ...``.  That branch deep-copies
+                # the list (F-158), replacing every CurveDefinition with a
+                # copy and severing the documented
+                # ``las.curves[i] is section.section_curves[j]`` identity the
+                # LAS 3.0 pipeline depends on: a post-parse
+                # ``las.curves[0].unit = ...`` then never reached the written
+                # file (proven on test_data/sample_las3.0_spec.las, 44/45
+                # shared before the F-158 fix, 0/45 after).
+                # F-29: the in-place install keeps the SAME _GuardedList
+                # object installed by LASFile.__post_init__, so the mutation
+                # guard still rejects ``las.curves.append("bad")`` after the
+                # dedup (a plain-list assignment would have stripped it).
+                _restore_live_container(self.las_file, "curves_order", _dedup_order)
+                _restore_live_container(self.las_file, "curves", _dedup_curves)
         elif not self.las_file.version.is_las30 or not self.las_file.data_sections:
             # F-30: Dedupe duplicate curve mnemonics during DIRECT parse for
             # LAS 1.2/2.0.  _parse_curve appends every ~C line with no
@@ -1493,6 +1898,15 @@ class LASParser:
             # curve name").  The rename-based dedup is version-agnostic and
             # produces the from_dict-compatible IK → IK_2 shape.
             _data_reader._deduplicate_curves(self.las_file, _stacklevel=3)
+
+        # F-214 (mapping half): hand the ~C drop positions to the data reader.
+        # A dropped definition owns a data COLUMN that has no curve; recording
+        # where it sat lets the reader skip exactly that column when the row
+        # carries one value per original definition (the otherwise-mis-mapped
+        # middle-drop case).  Version-gated to the 1.2/2.0 reader path, which
+        # is the only consumer; the LAS 3.0 per-section mapping is untouched.
+        if self._dropped_curve_positions and not self.las_file.version.is_las30:
+            self.las_file._dropped_curve_positions = tuple(self._dropped_curve_positions)
 
         return self.las_file
 
@@ -1731,6 +2145,61 @@ class LASParser:
             # reader's current_line == 0 gate.
             break
 
+    def _is_tilde_data_row(self, section_word: str, section_rest: str) -> bool:
+        """True when a ``~``-leading line inside an OPEN data section is a data row.
+
+        Three shapes qualify (M-05 + F-183):
+
+        1. M-05 (pre-existing): the word is not a recognized section type and
+           the line carries trailing content ("~FOO 12.0 52.0"), or the word
+           names a KNOWN curve mnemonic of the current scope (a string value
+           that happens to start with "~<mnemonic>").
+        2. F-183 (a): ``SECTION_PATTERN``'s ``\\S*`` swallowed a
+           delimiter-joined first value, leaving ``section_rest`` empty so
+           shape 1 could never fire — "~FOO,60" / "~A,1001.0,55.0" under
+           ``DLM=COMMA``.  The text after the first delimiter must be a run
+           of numbers, so an unrecognized-but-real header ("~MY_SECTION, X")
+           is unaffected.
+        3. F-183 (b): a RECOGNIZED section word whose remainder is a run of
+           numbers ("~A 1001.0 55.0") — a genuine header carries a word, an
+           annotation or a pipe, never bare values.  Without this the row was
+           consumed as a section header: its values vanished and a phantom
+           DataSection was named after them, with no warning at all.
+        """
+        if section_rest and (
+            not _is_recognized_section_word(section_word)
+            or section_word
+            in self._mnemonic_scope_cache_entry(
+                self._state.section_curve_start_idx,
+                self._state.section_curve_end_idx,
+            )[0]
+        ):
+            return True
+        for _delim in (",", ";"):
+            if _delim in section_word:
+                _head, _, _tail = section_word.partition(_delim)
+                if _head and _looks_like_data_values(_tail):
+                    return True
+        return bool(section_rest) and _looks_like_data_values(section_rest)
+
+    @staticmethod
+    def _is_lost_row_header(section_word: str) -> bool:
+        """True when *section_word* is a delimiter-joined DATA row lost as a header.
+
+        F-183's discarded-row shape: a RECOGNIZED section word immediately
+        followed by a data delimiter ("~A,60", "~C,SAND") — the row's own
+        values were swallowed by ``SECTION_PATTERN`` and the line was consumed
+        as a section header, so those values are not parsed.  A genuinely
+        unknown header ("~MY_SECTION") and an ordinary annotation
+        ("~C CURVE INFORMATION") do not qualify, so neither produces a
+        discard warning.
+        """
+        for _delim in (",", ";"):
+            if _delim in section_word:
+                _head = section_word.partition(_delim)[0]
+                return bool(_head) and _is_recognized_section_word(_head)
+        return False
+
     def _parse_line(self, line: str) -> None:
         """Route a single line to the appropriate section handler."""
         # F-I2-M06: Guard against absurdly long lines before any regex
@@ -1750,6 +2219,15 @@ class LASParser:
         if section_match:
             section_word = section_match.group(1).upper()
             section_rest = section_match.group(2).strip()
+            # F-185: LAS 3.0 suffixes the REPEATING section titles with the
+            # [n] array index (~Log_Definition[2], ~Log_Parameter[2]), and
+            # SECTION_PATTERN captures the bracket as part of the word — so
+            # every suffix-based recogniser must dispatch on the BASE word
+            # while section IDENTITY (definition-range keys, pipe targets,
+            # section labels) keeps the raw bracketed word (the pipe target
+            # of "~Log_Data[2] | Log_Definition[2]" is the raw word too, so
+            # the lookup keys still match).
+            _base_word = _strip_section_index(section_word)
 
             # M-05: a data row whose first token is `~`+letter (e.g.
             # "~FOO 12.0 52.0" — a string value that starts with a tilde)
@@ -1766,16 +2244,8 @@ class LASParser:
             # routing to other_lines for standalone words ("~CUSTOMSECT").
             if (
                 self._state.current_section == "A"
-                and section_rest
                 and (self.las_file.version.is_las30 or not self._state.version_found)
-                and (
-                    not _is_recognized_section_word(section_word)
-                    or section_word
-                    in self._mnemonic_scope_cache_entry(
-                        self._state.section_curve_start_idx,
-                        self._state.section_curve_end_idx,
-                    )[0]
-                )
+                and self._is_tilde_data_row(section_word, section_rest)
             ):
                 self._parse_ascii_data(line)
                 return
@@ -1786,14 +2256,67 @@ class LASParser:
             pipe_idx = section_rest.find("|")
             if pipe_idx >= 0:
                 # Split section name at pipe; pipe target follows.
-                pipe_target = section_rest[pipe_idx + 1 :].strip()
+                # F-196: the association operand is TILDE-TOLERANT.  Release
+                # 3.00's normative sentence says the matching Column
+                # Definition section title is named "without the ~ tilde",
+                # but the same document's p.17 example writes
+                # "~Log_Data | ~Log_Definition", and the key space this
+                # operand is looked up in is tilde-free by construction
+                # (SECTION_PATTERN captures the word AFTER the tilde).  The
+                # operand was consumed verbatim, so the tilde form never
+                # resolved: the section's scope reset to ALL curves and its
+                # values were attributed to the wrong mnemonics (probed:
+                # CORE_NUM values stored under GR + a phantom DEPT_2).
+                # Normalise ONE extraction site — all three consumers
+                # (_section_pipe_targets, _deferred_pipe_targets,
+                # _validate_cross_section_consistency) read this value.
+                pipe_target = section_rest[pipe_idx + 1 :].strip().lstrip("~").strip()
                 section_rest = section_rest[:pipe_idx].strip()
             elif "|" in section_word:
-                # Edge case: no space before pipe (e.g., "~Core|Definition")
+                # Edge case: no space before pipe (e.g., "~Core|Definition").
+                # F-196: same tilde tolerance for the no-space/no-space
+                # spelling ("~Core_Data|~Core_Definition").
                 pipe_idx_w = section_word.find("|")
-                pipe_target = (section_word[pipe_idx_w + 1 :] + " " + section_rest).strip()
+                pipe_target = (
+                    section_word[pipe_idx_w + 1 :] + " " + section_rest
+                ).strip().lstrip("~").strip()
                 section_word = section_word[:pipe_idx_w].strip()
                 section_rest = ""
+
+            # F-195 (residual after the F-183 data-row guard above): a row
+            # whose first token is a RECOGNISED section word but whose first
+            # VALUE is numeric ("~A 1001.0 SAND", and on a known 1.2/2.0 file
+            # also "~ASCII 1001.0") is consumed as a SECTION HEADER — the
+            # row's values are dropped and the remnant names the new section,
+            # with no diagnostic anywhere.  An all-numeric row on the
+            # parser-owned LAS 3.0 path is already kept as data
+            # (_is_tilde_data_row, F-183); this covers the shapes that guard
+            # cannot accept without also accepting genuine headers.  The
+            # dispatch itself is left alone (recognised words must still open
+            # sections, and the 1.2/2.0 data path is the reader's), so the
+            # loss is made visible instead of silent, counted with the same
+            # counter as the F-183 discard diagnostic.
+            if (
+                self._state.current_section == "A"
+                and pipe_target is None
+                and section_rest
+                and _is_recognized_section_word(section_word)
+                and _row_carries_leading_data_value(section_rest)
+            ):
+                self._discarded_data_rows += 1
+                warnings.warn(
+                    f"Line {self._line_no}: '~{section_word} {section_rest}' "
+                    f"inside the open data section was consumed as a SECTION "
+                    f"HEADER, so the row's data values are NOT parsed — the "
+                    f"first value ({section_rest.split()[0]!r}) is lost and the "
+                    f"remaining text names the new section "
+                    f"({self._discarded_data_rows} discarded data row(s) in "
+                    f"this file).  A data row shaped like this is kept only on "
+                    f"the LAS 3.0 data path, and only when every value after "
+                    f"the section word is numeric.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
             # Capture previous section's state BEFORE classification runs.
             # The handler snapshots all transition-relevant state and saves
@@ -1825,7 +2348,7 @@ class LASParser:
                 section_name = section_rest or ""
                 # G-02: Regular ~C or ~CURVE section — no definition name.
                 self._state.current_definition_name = None
-            elif re.search(r"_DEFINITION(_\d+)?$", section_word) and (
+            elif re.search(r"_DEFINITION(_\d+)?$", _base_word) and (
                 # N-08: ~{Name}_DEFINITION is a LAS 3.0 structured section.
                 # On a KNOWN non-3.0 file it is a CUSTOMER section per the
                 # LAS 2.0 spec (between ~V and ~A) — routing it to the curve
@@ -1833,6 +2356,9 @@ class LASParser:
                 # fabricated columns on read).  When the version is not yet
                 # known (pre-~V) the 3.0-capable dispatch is kept — the
                 # deferral machinery owns those sections.
+                # F-185: the suffix test runs on the BASE word so the
+                # spec's [n] index form dispatches here; the RAW word stays
+                # the section identity (current_definition_name below).
                 self.las_file.version.is_las30 or not self._state.version_found
             ):
                 if not self._state.version_found:
@@ -1874,13 +2400,15 @@ class LASParser:
                     # by consecutive _Definition sections).
                     self._state.current_definition_name = section_word.upper()
             elif (
-                section_word in {"P", "PARAMETER", "PARAMETERS"}
-                or section_word.endswith("_PARAMETER")
-                or section_word.endswith("_PARAMETERS")
+                _base_word in {"P", "PARAMETER", "PARAMETERS"}
+                or _base_word.endswith("_PARAMETER")
+                or _base_word.endswith("_PARAMETERS")
             ):
                 # F-M-01: LAS 3.0 typed parameter sections (e.g.,
                 # ~Core_Parameter, ~Drilling_Parameter) route to the
                 # parameter parser like standard ~P/~Parameter sections.
+                # F-185: the suffix test runs on the BASE word so
+                # ~Log_Parameter[2] dispatches here.
                 if not self._state.version_found:
                     # M-05 (version_pending): a ~P/~X_PARAMETER section parsed
                     # BEFORE ~V committed the optimistic 3.0 interpretation
@@ -1923,8 +2451,11 @@ class LASParser:
                 # drops the lines).  When the version is not yet known
                 # (pre-~V) the 3.0-capable dispatch is kept — the deferral
                 # machinery owns those sections.
+                # F-185: the _DATA suffix test runs on the BASE word so an
+                # indexed/user-defined data section (~Custom_Data[2]) is not
+                # mistaken for an unknown section.
                 or (
-                    section_word.endswith("_DATA")
+                    _base_word.endswith("_DATA")
                     and (self.las_file.version.is_las30 or not self._state.version_found)
                 )
                 or _is_indexed_data_section(section_word)
@@ -2054,7 +2585,25 @@ class LASParser:
                     def_prefix = (
                         self._state.current_data_section_type.replace("_DATA", "") + "_DEFINITION"
                     )
-                    if def_prefix in self._state.definition_curve_ranges:
+                    # F-185: an INDEXED data section without a pipe binds to
+                    # the _Definition of the SAME index first
+                    # (~Log_Data[2] → ~Log_Definition[2]), because the
+                    # definition-range keys keep the raw bracketed word.
+                    # Without this the spec's own two-definition shape (no
+                    # pipe) fell through to __MAIN__/all-curves and its
+                    # columns were bound to the wrong curves.
+                    _index_suffix = ""
+                    _bracket_idx = section_word.find("[")
+                    if _bracket_idx >= 0:
+                        _index_suffix = section_word[_bracket_idx:]
+                    _indexed_prefix = f"{def_prefix}{_index_suffix}"
+                    if _indexed_prefix != def_prefix and (
+                        _indexed_prefix in self._state.definition_curve_ranges
+                    ):
+                        start, end = self._state.definition_curve_ranges[_indexed_prefix]
+                        self._state.section_curve_start_idx = start
+                        self._state.section_curve_end_idx = end
+                    elif def_prefix in self._state.definition_curve_ranges:
                         start, end = self._state.definition_curve_ranges[def_prefix]
                         self._state.section_curve_start_idx = start
                         self._state.section_curve_end_idx = end
@@ -2088,8 +2637,8 @@ class LASParser:
                 # curves).  Warn through the warnings API — logger-only
                 # notices were invisible to warnings.catch_warnings.
                 if (
-                    section_word.endswith("_DATA")
-                    or re.search(r"_DEFINITION(_\d+)?$", section_word)
+                    _base_word.endswith("_DATA")
+                    or re.search(r"_DEFINITION(_\d+)?$", _base_word)
                 ):
                     warnings.warn(
                         f"~{section_word} is a LAS 3.0 structured section "
@@ -2097,7 +2646,32 @@ class LASParser:
                         f"'{self.las_file.version.vers}'.  Treating it as "
                         f"a customer section: content is preserved in the "
                         f"'other' field instead of being "
-                        f"{'discarded' if section_word.endswith('_DATA') else 'parsed as curve definitions'}.",
+                        f"{'discarded' if _base_word.endswith('_DATA') else 'parsed as curve definitions'}.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                # F-183: a `~`-leading DATA row that reaches this branch while
+                # a data section is open was consumed as a section header and
+                # is lost (its delimiter-joined values become the section
+                # name, or the row vanishes entirely).  The logger notice below
+                # is invisible to warnings.catch_warnings — the library's
+                # documented diagnostic channel — so report it there, COUNTED,
+                # instead of leaving the loss silent.  Only the delimiter-joined
+                # shape below qualifies: an ordinary customer-section header
+                # ("~MY_SECTION, notes") or a bare "~C" boundary must not
+                # produce a discard warning.
+                if self._state.current_section == "A" and self._is_lost_row_header(
+                    section_word
+                ):
+                    self._discarded_data_rows += 1
+                    warnings.warn(
+                        f"Line {self._line_no}: '~{section_word}' inside the "
+                        f"open data section was consumed as a section header, "
+                        f"so the row's data values are NOT parsed "
+                        f"({self._discarded_data_rows} discarded data row(s) "
+                        f"in this file).  A data row whose first value starts "
+                        f"with '~' is preserved only when its remaining values "
+                        f"are numeric.",
                         UserWarning,
                         stacklevel=2,
                     )
@@ -2661,8 +3235,23 @@ class LASParser:
                 # intended fallback.
                 self.las_file.version.vers = vers_normalized
             else:
+                # F-206: a DIGIT-LEADING but unparseable VERS ("1,2", "1 2",
+                # "12", "1.2x") — the catch-all defaulted the version to
+                # "2.0", which then made the well path apply the LAS 2.0
+                # layout to a file whose real version family is 1.x: every
+                # non-mandatory ~W entry came back value/description
+                # INVERTED (COMP='COMPANY', LOC='LOCATION' — the CWLS label
+                # stored as the value).  Record the RAW value so the well
+                # path can infer the conventions from it (the sibling
+                # non-numeric-VERS fallback, M-11), and say so in the
+                # warning — the default stays visible instead of silent.
+                if vers_normalized:
+                    self._vers_unparsed = vers_normalized
                 warnings.warn(
-                    f"Unknown VERS value '{value}'. Expected 1.2, 2.0, or 3.0. Defaulting to 2.0.",
+                    f"Unknown VERS value '{value}'. Expected 1.2, 2.0, or 3.0. "
+                    f"Defaulting to 2.0. The ~WELL section is read with the "
+                    f"conventions of the value's version family ('{vers_normalized}'), "
+                    f"not the defaulted 2.0 layout.",
                     UserWarning,
                     stacklevel=2,
                 )
@@ -2814,7 +3403,21 @@ class LASParser:
                 _curve.data_format = _df
                 _curve.description = _desc
                 if _curve.array_info is not None:
-                    _curve.array_info.time_offset = _off
+                    # F-208/P-11: ArrayElementInfo.__setattr__ re-validates
+                    # leaf fields and raises a BARE ValueError (e.g. a
+                    # negative {A:-5} time_offset).  Every other
+                    # construction site normalizes to LASParseError; this
+                    # pending-record fixup did not, so the exception type of
+                    # the same malformed file depended on ~C/~V ORDER
+                    # (probed: ~V first → LASParseError, ~C first → bare
+                    # ValueError escaping parse()).
+                    try:
+                        _curve.array_info.time_offset = _off
+                    except ValueError as exc:
+                        raise LASParseError(
+                            f"Line {self._line_no}: invalid array element info "
+                            f"for curve '{_curve.mnemonic}': {exc}"
+                        ) from exc
         pending = self._pending_version_sections
         if not pending:
             return
@@ -3205,16 +3808,48 @@ class LASParser:
                         actual_value = description
                         self.las_file.well.descriptions[mnemonic] = value
                     elif value_has_digits and not desc_has_digits and not value_has_spaces:
-                        # Pre-colon looks like data (has digits, no spaces)
-                        # = lasio format with value before colon.
-                        # P-01: The value is the PRE-colon text in this
-                        # layout — previously the code stored post-colon
-                        # text as the value, silently inverting
-                        # value/description for lasio-style files
-                        # (e.g. "DATE. 15/01/2001 : LOG DATE" → value
-                        # must be "15/01/2001", not "LOG DATE").
-                        actual_value = value
-                        self.las_file.well.descriptions[mnemonic] = description
+                        # Pre-colon text carries digits and no spaces —
+                        # data-like.  P-01: in the lasio layout the PRE-colon
+                        # text is the VALUE (e.g. "DATE. 15/01/2001 : LOG
+                        # DATE" → value "15/01/2001", not "LOG DATE").
+                        #
+                        # F-054: "carries a digit" alone is NOT evidence — a
+                        # CWLS description token can carry digits too
+                        # ("LOC. Zone1 : ACME", the LAS 1.2 writer's own
+                        # DESC : VALUE layout).  Because the digit test is
+                        # symmetric in the two strings, that shape assigned
+                        # the DESCRIPTION to the value, so the default
+                        # well_format="auto" read of the library's own output
+                        # inverted value/description silently, while
+                        # well_format="cwls" read it correctly.  Require a
+                        # second, independent signal before taking the lasio
+                        # reading: the post-colon side has to look like a
+                        # human description (it contains a space), or the
+                        # pre-colon side has to be shaped like a value.
+                        if desc_has_spaces or _looks_like_well_value(value):
+                            actual_value = value
+                            self.las_file.well.descriptions[mnemonic] = description
+                        else:
+                            # Two single-token sides and the digit-bearing one
+                            # is not value-shaped → the spec (CWLS) reading:
+                            # pre-colon = DESCRIPTION, post-colon = VALUE.
+                            # Warn: this is a guess on an ambiguous pair, and
+                            # pre-fix the heuristic guessed the other way
+                            # with no diagnostic at all.
+                            actual_value = description
+                            self.las_file.well.descriptions[mnemonic] = value
+                            warnings.warn(
+                                f"Auto-mode well field '{mnemonic}': both sides "
+                                f"are single tokens ({value!r} : {description!r}) "
+                                f"and the pre-colon side is neither numeric nor a "
+                                f"date/time VALUE, so it is read as the CWLS "
+                                f"DESCRIPTION and the post-colon text as the "
+                                f"VALUE.  Pass well_format='cwls' or "
+                                f"well_format='lasio' when the file is known to "
+                                f"use a specific convention.",
+                                UserWarning,
+                                stacklevel=2,
+                            )
                     elif value_has_spaces and not desc_has_spaces:
                         # Multi-word pre-colon, single-word post-colon.
                         # N-06: this is ONLY a CWLS "multi-word description
@@ -3309,6 +3944,47 @@ class LASParser:
         if unit is not None:
             self.las_file.well.units[mnemonic] = unit
 
+    def _requeue_deferred_group(
+        self,
+        requeued_lines: list[tuple[str, str, int, str, int, int | None]],
+        section_type: str,
+        section_name: str,
+        section_idx: int,
+        raw_lines: list[str],
+        curve_start: int,
+        curve_end: int | None,
+    ) -> None:
+        """Re-queue one deferred data group for a LATER replay pass.
+
+        All three unresolvable-scope branches of ``_replay_deferred_well``
+        (the ``| CURVE`` sentinel, the forward ``| X_Definition`` sentinel
+        and the bare unbounded section) move the group's tuples into the
+        next pass instead of resolving a scope that may still appear.
+
+        F-213: the group keeps its STORED ``section_idx`` — its DataSection
+        name is derived from it (``Section_{idx}`` for an unnamed section) —
+        so the index MUST be reserved against the live counter here.
+        Without the reservation the next section flushed in the same pass
+        takes the same index, and the model ends up with two identically
+        named DataSections ("duplicate data section name 'Section_0'" — a
+        ``validate()`` issue raised on a file that previously parsed
+        cleanly).
+        """
+        self._state.current_data_section_idx = max(
+            self._state.current_data_section_idx, section_idx + 1
+        )
+        for _ln in raw_lines:
+            requeued_lines.append(
+                (
+                    section_type,
+                    section_name,
+                    section_idx,
+                    _ln,
+                    curve_start,
+                    curve_end,
+                )
+            )
+
     def _replay_deferred_well(self, final: bool = False) -> None:
         """Re-process well entries (and data lines) that were parsed before ~V was known.
 
@@ -3331,7 +4007,14 @@ class LASParser:
             # M-11: the CWLS/lasio swap decision must not depend solely on
             # numeric-VERS is_las12 — a non-numeric VERS ("CWLS LOG ASCII
             # STANDARD") still gets the LAS 1.2 conventions.
-            is_las12 = _well_entry_uses_las12_conventions(self.las_file.version.vers)
+            # F-206: when VERS was DEFAULTED to "2.0" from an unparseable
+            # digit-leading value, decide from the raw value's version family
+            # instead of the fabricated 2.0 (same M-11 fallback, same
+            # helper — a corrupted "2.0x"/"3.0x" still gets 2.0/3.0
+            # conventions).
+            is_las12 = _well_entry_uses_las12_conventions(
+                self._vers_unparsed or self.las_file.version.vers
+            )
             for entry in self._state.deferred_well_entries:
                 self._store_well_entry(
                     mnemonic=entry["mnemonic"],
@@ -3459,17 +4142,15 @@ class LASParser:
                                 and "__MAIN__" not in self._state.definition_curve_ranges
                                 and "__MAIN_ALL__" not in self._state.definition_curve_ranges
                             ):
-                                for _ln in raw_lines:
-                                    requeued_lines.append(
-                                        (
-                                            section_type,
-                                            _section_name,
-                                            section_idx,
-                                            _ln,
-                                            curve_start,
-                                            curve_end,
-                                        )
-                                    )
+                                self._requeue_deferred_group(
+                                    requeued_lines,
+                                    section_type,
+                                    _section_name,
+                                    section_idx,
+                                    raw_lines,
+                                    curve_start,
+                                    curve_end,
+                                )
                                 continue
                             curve_start, curve_end = self._resolve_main_curve_scope()
                         elif curve_end == _DEFERRED_PIPE_SCOPE:
@@ -3480,7 +4161,35 @@ class LASParser:
                                 curve_start, curve_end = self._state.definition_curve_ranges[
                                     _pipe_target
                                 ]
+                            elif not final and _pipe_target:
+                                # F-213: the two SIBLING branches above re-queue
+                                # while the higher-priority scope may still
+                                # appear; this one fell straight through to the
+                                # MAIN scope.  A mid-parse flush (a post-~V
+                                # data section appearing before the trailing
+                                # ~C/~Definition block) therefore bound a
+                                # forward "| X_Definition" group to __MAIN__
+                                # for good, storing its values under the main
+                                # ~C mnemonics (probed: CORE values under GR).
+                                # Re-queue while the TARGET is still absent.
+                                # The guard keys on the pipe target, NOT on
+                                # __MAIN__'s presence: in the failing layout
+                                # __MAIN__ IS already recorded, so the sibling
+                                # guard shape cannot work here.
+                                self._requeue_deferred_group(
+                                    requeued_lines,
+                                    section_type,
+                                    _section_name,
+                                    section_idx,
+                                    raw_lines,
+                                    curve_start,
+                                    curve_end,
+                                )
+                                continue
                             else:
+                                # final=True (or a sentinel with no recorded
+                                # target — nothing to wait for): fall back to
+                                # the main scope, i.e. the pre-fix outcome.
                                 curve_start, curve_end = self._resolve_main_curve_scope()
                         elif curve_end is None:
                             _def_prefix = (section_type or "LOG_DATA").replace(
@@ -3511,17 +4220,15 @@ class LASParser:
                                 # _replay_deferred_well(final=True)) resolves
                                 # it against the complete curve list once the
                                 # trailing ~C range is recorded.
-                                for _ln in raw_lines:
-                                    requeued_lines.append(
-                                        (
-                                            section_type,
-                                            _section_name,
-                                            section_idx,
-                                            _ln,
-                                            curve_start,
-                                            curve_end,
-                                        )
-                                    )
+                                self._requeue_deferred_group(
+                                    requeued_lines,
+                                    section_type,
+                                    _section_name,
+                                    section_idx,
+                                    raw_lines,
+                                    curve_start,
+                                    curve_end,
+                                )
                                 continue
                             else:
                                 curve_start, curve_end = self._resolve_main_curve_scope()
@@ -3756,6 +4463,21 @@ class LASParser:
                 self.source_file or "<unknown>",
                 line.strip()[:120],
             )
+            # F-214: the drop is metadata loss only (well entries carry no
+            # data column), but it was logger-only — invisible to the
+            # warnings API that is this library's diagnostic channel, and
+            # uncounted.  Report it there too, counted, keeping the logger
+            # record (pinned by tests/test_regression.py M10).
+            self._dropped_definition_lines += 1
+            warnings.warn(
+                f"Line {self._line_no}: non-matching ~W (well information) line "
+                f"was DROPPED: {line.strip()[:80]!r}. The well entry it declares "
+                f"is missing from the result "
+                f"({self._dropped_definition_lines} dropped definition line(s) "
+                f"in this file).",
+                UserWarning,
+                stacklevel=2,
+            )
             return
 
         # F-I2-M14: Apply mnemonic base normalization to well entries,
@@ -3789,7 +4511,14 @@ class LASParser:
         # M-11: the CWLS/lasio swap decision must not depend solely on
         # numeric-VERS is_las12 — a non-numeric VERS ("CWLS LOG ASCII
         # STANDARD") still gets the LAS 1.2 conventions.
-        is_las12 = _well_entry_uses_las12_conventions(self.las_file.version.vers)
+        # F-206: an unparseable digit-leading VERS ("1,2", "12", "1.2x") is
+        # DEFAULTED to "2.0" on the model, so deciding from
+        # version.vers alone applied the LAS 2.0 layout to a 1.x file and
+        # inverted every non-mandatory entry (COMP='COMPANY').  Decide from
+        # the raw value's version family via the same M-11 helper.
+        is_las12 = _well_entry_uses_las12_conventions(
+            self._vers_unparsed or self.las_file.version.vers
+        )
 
         # F-P06: When ~W appears before ~V, the version defaults to "2.0" and
         # is_las12 is False, skipping the LAS 1.2 convention swap.  Buffer raw
@@ -3934,6 +4663,40 @@ class LASParser:
                 "Non-matching ~C line in %s: %s",
                 self.source_file or "<unknown>",
                 line.strip()[:120],
+            )
+            # F-214: a dropped curve DEFINITION is not metadata-only.  The
+            # ~C section's columns are mapped to the surviving definitions
+            # BY POSITION, so a drop in the middle of the list used to shift
+            # every later column one place left: the values of the dropped
+            # curve were read under the NEXT curve's mnemonic (probed: a
+            # caliper column silently became GR, GR's own values discarded).
+            # Make the loss visible AND record WHERE the definition was
+            # dropped, so the reader can skip exactly that column instead of
+            # mis-mapping the survivors (the positions are published on the
+            # model by parse() and consumed by data_reader._read_normal).  The
+            # drop itself is unchanged: a multi-word mnemonic ("HOLE DIA")
+            # cannot be represented by the model grammar (M9/test_regression
+            # pre-scan contract), and no placeholder curve is fabricated.
+            self._dropped_definition_lines += 1
+            _drop_pos = len(self.las_file.curves)
+            # Consecutive dropped lines occupy consecutive ORIGINAL columns, so
+            # the recorded positions must stay strictly increasing.
+            while any(_p >= _drop_pos for _p in self._dropped_curve_positions):
+                _drop_pos += 1
+            self._dropped_curve_positions.append(_drop_pos)
+            warnings.warn(
+                f"Line {self._line_no}: non-matching ~C (curve definition) line "
+                f"was DROPPED: {line.strip()[:80]!r}. The curve it declares is "
+                f"NOT in the result.  When the data rows carry one value per "
+                f"original definition, this column is skipped and the surviving "
+                f"curves keep their own values; when the row has the surviving "
+                f"column count, the columns are mapped BY POSITION and a "
+                f"definition dropped before the last one shifts every later "
+                f"column onto the wrong mnemonic "
+                f"({self._dropped_definition_lines} dropped definition line(s) "
+                f"in this file).",
+                UserWarning,
+                stacklevel=2,
             )
             return
 
@@ -4091,11 +4854,35 @@ class LASParser:
         CURRENT version state (``_state.version_found`` /
         ``las_file.version.is_las30``).
         """
-        # F-M18: Use findall() to capture ALL format specifiers.  The old
-        # search() only found the first, but sub() removed them all —
-        # creating an asymmetry where extra format specifiers were silently
-        # discarded without warning.
-        format_matches = FORMAT_SPEC_PATTERN.findall(description)
+        # F-M18: findall() captured ALL format specifiers so the strip pass
+        # could see them (search()-only found the first while sub() removed
+        # them all).
+        # N-005: a format specifier ALWAYS contains '}'.  Skipping the scan
+        # when the description has none preserves every possible match and
+        # removes the brace-dense near-miss cost of the bounded pattern
+        # (measured 1.2-1.3 ms/kchar on '{A{A{A…' text with no closing brace,
+        # 41x end-to-end on a 50k-char description; see below for the
+        # end-to-end numbers).
+        # F-216: only the TRAILING token is the channel's format.  The
+        # stripper (_keep_non_format, N-09) already declares a
+        # mid-description brace token USER TEXT; the extractor used the last
+        # match ANYWHERE in the description, so the same token was
+        # simultaneously "user text" and "the authoritative format" — a
+        # numeric column declared "Gamma {S} ray" became a string channel
+        # and "Echo {A:5} ray" was renamed GR[1] with a fabricated 5 ms
+        # offset, both with zero warnings.  Filtering the candidates to
+        # matches that END the description makes the two rules agree: the
+        # writer appends the real data_format at the END (N-I-18), so
+        # writer-produced files are unaffected.
+        format_matches = (
+            [
+                (m.group("format"), m.group("offset"))
+                for m in FORMAT_SPEC_PATTERN.finditer(description)
+                if m.end() == len(description)
+            ]
+            if "}" in description
+            else []
+        )
         # N-15: the M-35 filter applies ONLY when the version is KNOWN to
         # be non-3.0 (version_found).  When ~C is parsed BEFORE ~V the
         # version is still the default "2.0" — filtering then dropped
@@ -4117,6 +4904,32 @@ class LASParser:
             format_matches = [m for m in format_matches if m[0].upper() in ("I", "S", "A")]
         data_format = ""
         array_time_offset: float | None = None
+        # M5: the date/time and Deg/Min/Sec ⇒ string fallbacks below belong to
+        # the same format-token family the extraction above governs, so they
+        # obey the same two rules:
+        #   * position (F-216) — the token must END the description.  A
+        #     mid-description brace token is USER TEXT (N-09's
+        #     _keep_non_format declares it so); routing a numeric column to
+        #     string_data on user text is exactly the misclassification F-216
+        #     fixed for {S}/{A}/{F}.
+        #   * version (M-35) — the date/time and DMS spellings are LAS 3.0
+        #     data formats.  On a KNOWN 1.2/2.0 file the same text is plain
+        #     description text (models._normalize_curve_data_format models the
+        #     same rule through ``date_time_is_string=False``), so it must
+        #     stay numeric.
+        # The ``not version_found`` arm keeps a ~C-before-~V file
+        # order-independent: such curves are deferred (M-04) and
+        # _resolve_version_pending re-runs this function with the real
+        # version, so the optimistic arm's result never reaches the model
+        # unreconciled.
+        _date_time_is_string = self.las_file.version.is_las30 or not self._state.version_found
+        # F-180: the Deg/Min/Sec data format is the three symbols together
+        # ("{° '\"}" — "All three must be used").  FORMAT_SPEC_PATTERN requires
+        # a leading letter, so this token never enters format_matches; detect
+        # it separately.  Its values are degree/minute/second text, not
+        # numbers, so the channel routes to the string channel exactly like a
+        # date/time pattern, and the token stays in the description.
+        _dms_format = _date_time_is_string and bool(_DMS_FORMAT_RE.search(description))
         if format_matches:
             # N-I-18: Prefer the TRAILING (last) format specifier.  The
             # writer appends the curve's real data_format at the END of the
@@ -4133,35 +4946,44 @@ class LASParser:
             # comparisons (string_curves at L1485, _KNOWN_CURVE_FORMATS at L1498,
             # and array-time-offset check at L1172) work regardless of input case.
             data_format = first_fmt.upper()
-            # Normalize extended Fortran-style format specifiers (e.g., F8.3,
-            # E10.2, E0.00E+00, D0.00E+00) to single-letter codes (F, E, D)
-            # for roundtrip compatibility.  from_dict's _VALID_DATA_FORMATS
-            # only accepts single-letter codes; storing the extended form
-            # would cause parse→to_dict→from_dict ValueError (F-H01).
-            # F-REV-01: Validate the full format string BEFORE truncation
-            # so that non-format brace text (e.g. {Density}) is caught
-            # by _FORMAT_SPEC_RE rather than silently normalizing to a
-            # valid single-letter code (DENSITY → D).
-            # I2-XWP-02: Multi-character patterns that do NOT match
-            # _FORMAT_SPEC_RE (e.g., {DD/MM/YYYY}, {DEG}) are metadata
-            # templates and pass through unchanged — same behavior
-            # as the parameter path (line ~2077).
-            try:
-                _validate_curve_data_format(data_format, raw_mnemonic, line_no=self._line_no)
-            except LASParseError:
-                # Not a valid data format — clear it so CurveDefinition
-                # __post_init__ does not reject the multi-char string.
-                # The non-format text is preserved in the description
-                # via _keep_non_format below.
-                warnings.warn(
-                    f"Invalid data format '{data_format}' in curve "
-                    f"'{raw_mnemonic}' — clearing to empty string",
-                    UserWarning,
-                    stacklevel=2,
-                )
-                data_format = ""
-            if len(data_format) > 1:
-                data_format = data_format[0]
+            if _is_date_time_data_format(first_fmt):
+                # F-186: a date/time letter pattern IS a LAS 3.0 data format
+                # ("Ver 3.0 allows six formats types; Floating point, Integer,
+                # Exponential, String, Date and Time, Deg/min/sec").  It is a
+                # NON-NUMERIC channel, so route it to the string channel: the
+                # date tokens then survive in string_data instead of failing
+                # float() and being replaced by the null sentinel.  The
+                # template stays in the description (_keep_non_format keeps
+                # it), so write→read is stable.
+                data_format = "S"
+            else:
+                # Normalize extended Fortran-style format specifiers (e.g., F8.3,
+                # E10.2, E0.00E+00, D0.00E+00) to single-letter codes (F, E, D)
+                # for roundtrip compatibility.  from_dict's _VALID_DATA_FORMATS
+                # only accepts single-letter codes; storing the extended form
+                # would cause parse→to_dict→from_dict ValueError (F-H01).
+                # F-REV-01: Validate the full format string BEFORE truncation
+                # so that non-format brace text (e.g. {Density}) is caught
+                # by _FORMAT_SPEC_RE rather than silently normalizing to a
+                # valid single-letter code (DENSITY → D).
+                # F-180: the LAS 3.0 width/bracket/spacing forms
+                # ({S32}, {AS}, {AF10.4}, {A;0ms}) now pass this validation
+                # instead of being cleared to "" (which nulled the column).
+                # A token that still fails here is genuinely not a format
+                # ({DENSITY}, {GAMMA}); its data_format is cleared and the
+                # text is preserved in the description by _keep_non_format.
+                try:
+                    _validate_curve_data_format(data_format, raw_mnemonic, line_no=self._line_no)
+                except LASParseError:
+                    warnings.warn(
+                        f"Invalid data format '{data_format}' in curve "
+                        f"'{raw_mnemonic}' — clearing to empty string",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    data_format = ""
+                if len(data_format) > 1:
+                    data_format = data_format[0]
             if data_format == "A" and first_offset:
                 try:
                     array_time_offset = float(first_offset)
@@ -4178,20 +5000,14 @@ class LASParser:
                         f"{array_time_offset} in curve description "
                         f"'{description}'"
                     )
-            if len(format_matches) > 1:
-                # N-I-18: The trailing (writer-appended) format is the
-                # authoritative one; earlier brace tokens are treated as
-                # user description text / non-authoritative formats.
-                extra_formats = [f[0] for f in format_matches[:-1]]
-                logger.warning(
-                    "Multiple format specifiers found in curve '%s' "
-                    "description: %s. Only the trailing (%s) is used; "
-                    "earlier specifiers %s are discarded.",
-                    raw_mnemonic,
-                    [f[0] for f in format_matches],
-                    data_format,
-                    extra_formats,
-                )
+            # F-216/N-I-18: the former "Multiple format specifiers" warning
+            # lived here.  Its failure mode — earlier specifiers silently
+            # discarded by the strip pass while the extractor used the last
+            # one — cannot recur: a non-trailing token is USER TEXT now
+            # (F-216's trailing-only candidate filter, and N-09's
+            # _keep_non_format gate), so it is neither extracted as a format
+            # nor stripped from the description.  At most ONE match can end
+            # the description, so there is no second specifier to report.
 
             # F-REV-01: Only strip validated format specifiers from
             # description.  FORMAT_SPEC_PATTERN.sub("") blindly strips
@@ -4214,6 +5030,21 @@ class LASParser:
                 if m.end() != len(description):
                     return m.group(0)  # N-09: mid-description token = user text
                 fmt = m.group("format").upper()
+                # F-186: a date/time letter pattern is the channel's format
+                # metadata, but CurveDefinition.data_format carries "S" for
+                # that channel (string routing — see _extract_curve_format),
+                # so the template itself must stay in the description.  The
+                # writer re-emits the description, so the roundtrip is stable.
+                if _is_date_time_data_format(m.group("format")):
+                    return m.group(0)
+                # F-180: the normative `;`-spacing form ({A;0ms},
+                # {AF10.4;5ms}) carries the array spacing.  The parser-side
+                # grammar accepts the token (F-180) but the spacing ITSELF is
+                # extracted by _las30_data._SPEC_FORM_ARRAY_RE (D2 / F-007),
+                # so the token must survive here — stripping it would delete
+                # the only copy of the spacing from the description.
+                if ";" in fmt:
+                    return m.group(0)
                 # N-15: M-35's keep-token branch applies ONLY when the
                 # version is KNOWN to be non-3.0.  Pre-~V (version not yet
                 # parsed) the token is stripped like a 3.0 format so the
@@ -4258,6 +5089,17 @@ class LASParser:
 
             description = FORMAT_SPEC_PATTERN.sub(_keep_non_format, description).strip()
 
+        if _dms_format and not data_format:
+            # F-180: Deg/Min/Sec channel → string routing (see _dms_format).
+            data_format = "S"
+        if not data_format and _date_time_is_string and _has_date_time_token(description):
+            # F-186: a date/time token FORMAT_SPEC_PATTERN could not capture
+            # (the ':'-bearing time forms, {hh:mm:ss}) still makes this a
+            # date/time channel — string routing, template preserved.
+            # M5: TRAILING token only (F-216's position rule) and LAS 3.0
+            # only (M-35's version rule) — see _date_time_is_string above.
+            data_format = "S"
+
         # N-09: reverse the writer's brace escape
         # (_escape_braces_for_las_value — applied on every version so
         # the {I} marker path is symmetric).  The writer's OWN appended
@@ -4294,6 +5136,20 @@ class LASParser:
                 "Non-matching ~P line in %s: %s",
                 self.source_file or "<unknown>",
                 line.strip()[:120],
+            )
+            # F-214 (third instance of one root cause): a dropped parameter
+            # definition is metadata loss only, but it was logger-only —
+            # invisible to the warnings API and uncounted.  Report it there
+            # too, counted, keeping the logger record.
+            self._dropped_definition_lines += 1
+            warnings.warn(
+                f"Line {self._line_no}: non-matching ~P (parameter) line was "
+                f"DROPPED: {line.strip()[:80]!r}. The parameter it declares is "
+                f"missing from the result "
+                f"({self._dropped_definition_lines} dropped definition line(s) "
+                f"in this file).",
+                UserWarning,
+                stacklevel=2,
             )
             return
 
@@ -4334,7 +5190,32 @@ class LASParser:
         # (forward-compatible — assignment works before and after the
         # field is added to the dataclass).
         param_data_format = ""
-        param_format_matches = FORMAT_SPEC_PATTERN.findall(description)
+        # N-005: same '}'-fast-path as the curve path — a specifier always
+        # contains '}', so a brace-free description needs no scan (the
+        # bounded pattern's near-miss cost on '{A{A{A…' runs is 1.2-1.3
+        # ms/kchar of description).
+        # F-216 (parameter twin): only the TRAILING token is the channel's
+        # format — a mid-description brace token is user text (N-09's
+        # _keep_non_format_param already declares it so; the extractor
+        # previously disagreed and took the last match ANYWHERE).  The
+        # anchor is the writer's format position: at the END of the
+        # description, or immediately before the zone association the
+        # writer emits AFTER it (``desc  {fmt} | Zone[1]``) — the same zone
+        # gate the zone extraction below uses, so the two cannot diverge.
+        _param_fmt_anchor = len(description)
+        if self.las_file.version.is_las30 or not self._state.version_found:
+            _zone_for_anchor = ZONE_ASSOC_PATTERN.search(description)
+            if _zone_for_anchor is not None:
+                _param_fmt_anchor = len(description[: _zone_for_anchor.start()].rstrip())
+        param_format_matches = (
+            [
+                (m.group("format"), m.group("offset"))
+                for m in FORMAT_SPEC_PATTERN.finditer(description)
+                if m.end() == _param_fmt_anchor
+            ]
+            if "}" in description
+            else []
+        )
         # N-16: the M-35 filter applies ONLY when the version is KNOWN to
         # be non-3.0 (version_found).  When ~P is parsed BEFORE ~V the
         # version is still the default "2.0" — emptying the matches then
@@ -4353,38 +5234,37 @@ class LASParser:
             # text and must be preserved.
             param_format_matches = []
         if param_format_matches:
-            # M-03: Prefer the TRAILING (last) format specifier, matching
-            # the curve path (N-I-18 in _parse_curve).  The writer appends
-            # the parameter's real data_format at the END of the
-            # description (``desc  {fmt}``), so for writer-produced files
-            # the trailing match is authoritative.  The previous
-            # ``[0]`` (FIRST) mis-extracted a brace token from user text
-            # (e.g. "Mud type {S} in hole" + real format E → data_format
-            # 'S') and silently replaced the real format on roundtrip.
+            # F-216 (parameter twin): see the candidate filter above — at
+            # most one match can end the writer's format position, so the
+            # former "Multiple format specifiers" warning has no state left
+            # to report: a non-trailing token is USER TEXT now, neither
+            # extracted as a format nor stripped from the description.
             param_data_format = param_format_matches[-1][0].upper()
-            if len(param_format_matches) > 1:
-                extra_formats = [f[0] for f in param_format_matches[:-1]]
-                logger.warning(
-                    "Multiple format specifiers found in parameter '%s' "
-                    "description: %s. Only the trailing (%s) is used; "
-                    "extra specifiers %s are discarded.",
-                    raw_mnemonic,
-                    [f[0] for f in param_format_matches],
-                    param_data_format,
-                    extra_formats,
-                )
             # F-101: Validate single-character parameter data_format codes at
             # parse time — mirroring from_dict's check at models.py:107.
             if param_data_format:
+                if _is_date_time_data_format(param_format_matches[-1][0]):
+                    # F-186 (parameter twin): a date/time letter pattern IS a
+                    # LAS 3.0 data format ("six format types … Date and
+                    # Time"), so it must not be reported as unrecognized or
+                    # cleared with a spurious warning.  ParameterEntry has no
+                    # field that can carry the template, so it stays in the
+                    # description (where _keep_non_format_param preserves it)
+                    # and data_format stays empty — the pre-fix net outcome,
+                    # minus the false diagnostic.
+                    param_data_format = ""
                 # I2-XWP-02: Truncate extended Fortran-style format
                 # specifiers (F8.3, E10.2, D0.00E+00) to single-letter
                 # codes for roundtrip compatibility with from_dict's
                 # _VALID_DATA_FORMATS.  This matches the curve path's
                 # behavior (line ~1861).  Multi-character patterns that
-                # do NOT match _FORMAT_SPEC_RE (e.g., {DD/MM/YYYY},
-                # {DEG}) are metadata templates and pass through
-                # unchanged — same as the existing documented behavior.
-                if len(param_data_format) > 1:
+                # do NOT match _FORMAT_SPEC_RE (e.g., {DENSITY}) are
+                # metadata templates: the warning below fires and the token
+                # is preserved in the description by
+                # _keep_non_format_param (F-180: the earlier wording here
+                # claimed they "pass through unchanged", which was false for
+                # data_format — it is cleared).
+                elif len(param_data_format) > 1:
                     try:
                         _validate_curve_data_format(
                             param_data_format,
@@ -4448,6 +5328,12 @@ class LASParser:
                 # time is the writer's appended token, not a zone suffix.
                 if m.end() != len(description):
                     return m.group(0)  # N-09: mid-description token = user text
+                # F-186 (parameter twin): a date/time letter pattern is the
+                # channel's format metadata but ParameterEntry cannot carry
+                # it — keep the template in the description so the
+                # write→read roundtrip is stable.
+                if _is_date_time_data_format(m.group("format")):
+                    return m.group(0)
                 # N-16: M-35's keep-token branch applies ONLY when the
                 # version is KNOWN to be non-3.0.  Pre-~V (version not yet
                 # parsed) the token is stripped like a 3.0 format so the
@@ -4562,6 +5448,11 @@ class LASParser:
         # Derive section_type by stripping the _PARAMETER/_PARAMETERS suffix.
         _section_type: str | None = None
         _sect_name = (self._state.current_section_name or "").upper()
+        # F-185: strip a LAS 3.0 [n] array-index suffix before deriving the
+        # section type — ~Log_Parameter[2] must yield section_type "LOG"
+        # (the writer reconstructs "~Log_Parameter" from it; keeping the
+        # index would emit "~LOG_PARAMETER[2]_Parameter").
+        _sect_name = _strip_section_index(_sect_name)
         if _sect_name.endswith("_PARAMETER"):
             _section_type = _sect_name[: -len("_PARAMETER")]
         elif _sect_name.endswith("_PARAMETERS"):
@@ -5013,7 +5904,26 @@ class LASParser:
             # deferral.  Re-queueing in the no-deferred-lines case makes the
             # non-deferred path behave like the deferred path: the data is
             # buffered and attached once curves parse.
-            if not self.las_file.curves:
+            # N-001 (F-213 twin): the same deferral must also engage when the
+            # section's OWN pipe target is a forward "| X_Definition" that is
+            # not parsed yet — even though curves already exist.  Deferral was
+            # gated on `not curves` only, so a SPEC-ORDERED file
+            # (`~V ~C ~Core_Data | Core_Definition … ~Core_Definition`) flushed
+            # the section immediately with the scope the classifier stored when
+            # the target was unknown ((0, None) → "Unrecognized pipe target" →
+            # main scope) and nothing re-resolved it when the definition
+            # arrived: the values landed under the main ~C mnemonics (probed:
+            # CORE values under GR, CORE_NUM null-filled) with only a
+            # logger-level notice.  The existing PARS-06 sentinel + replay
+            # machinery below carries it from here.
+            # The bare-~A / `| CURVE` paths are untouched: a section without a
+            # pipe target, or naming the main curve block, is not deferred.
+            _unresolved_pipe_target = bool(
+                self._current_pipe_target
+                and self._current_pipe_target not in {"CURVE", "C"}
+                and self._current_pipe_target not in self._state.definition_curve_ranges
+            )
+            if not self.las_file.curves or _unresolved_pipe_target:
                 if (
                     len(self._state.deferred_ascii_data_lines) + len(data_lines)
                     > _data_reader.MAX_DATA_LINES
@@ -5196,18 +6106,34 @@ class LASParser:
 
             for _seq_idx, label in enumerate(self._state.section_sequence):
                 section_word = label.split(":")[0]
+                # F-185: dispatch on the BASE word — the label carries the raw
+                # bracketed word for an indexed section (~Log_Definition[2]),
+                # whose suffix tests would otherwise all miss and misclassify
+                # it (the definition would be counted as a data/unknown
+                # section, breaking the ordering diagnostics).  The
+                # definition-identity checks below keep using the raw word
+                # wherever the raw range key is required.
+                _cw_base_word = _strip_section_index(section_word)
                 is_data = (
                     section_word in _DATA_SECTION_WORDS
-                    or section_word.endswith("_DATA")
+                    or _cw_base_word.endswith("_DATA")
                     or _is_indexed_data_section(section_word)
                 )
-                is_curve = section_word in {"C", "CURVE"} or section_word.endswith("_DEFINITION")
+                is_curve = section_word in {"C", "CURVE"} or _cw_base_word.endswith(
+                    "_DEFINITION"
+                )
                 # F-004: Identify parameter sections (both LAS 1.2/2.0 ~P
                 # and LAS 3.0 type-prefixed ~Core_Parameter etc.)
+                # F-185: the suffix tests run on the BASE word so an indexed
+                # ~Log_Parameter[2] is recognised; the bare-keyword set stays
+                # exactly {"P"} (a bare "~PARAMETER INFORMATION" title is not
+                # a typed parameter section — widening it fires spurious
+                # "parameter section after definition" warnings on valid
+                # files; pinned by test_sample_las3_spec_no_spurious_warnings).
                 is_param = (
-                    section_word == "P"
-                    or section_word.endswith("_PARAMETER")
-                    or section_word.endswith("_PARAMETERS")
+                    _cw_base_word == "P"
+                    or _cw_base_word.endswith("_PARAMETER")
+                    or _cw_base_word.endswith("_PARAMETERS")
                 )
 
                 if is_data:
@@ -5309,8 +6235,11 @@ class LASParser:
 
                 if is_curve:
                     # Mark this definition type as seen.
-                    if section_word.endswith("_DEFINITION"):
-                        _defs_seen.add(section_word)
+                    if _cw_base_word.endswith("_DEFINITION"):
+                        # F-185: index-stripped so the type key matches the
+                        # value derived from a data/parameter section
+                        # (LOG_DEFINITION, not LOG_DEFINITION[2]).
+                        _defs_seen.add(_cw_base_word)
                     else:
                         # ~C or ~CURVE — covers all global definitions.
                         _defs_seen.add("__MAIN__")
@@ -5322,10 +6251,12 @@ class LASParser:
                 if is_param:
                     # Derive the expected definition type for this parameter
                     # section (e.g., CORE_PARAMETER → CORE_DEFINITION).
-                    if section_word.endswith("_PARAMETERS"):
-                        _def_type = section_word.replace("_PARAMETERS", "_DEFINITION")
-                    elif section_word.endswith("_PARAMETER"):
-                        _def_type = section_word.replace("_PARAMETER", "_DEFINITION")
+                    # F-185: derived from the BASE word so an indexed
+                    # ~Log_Parameter[2] maps to LOG_DEFINITION.
+                    if _cw_base_word.endswith("_PARAMETERS"):
+                        _def_type = _cw_base_word.replace("_PARAMETERS", "_DEFINITION")
+                    elif _cw_base_word.endswith("_PARAMETER"):
+                        _def_type = _cw_base_word.replace("_PARAMETER", "_DEFINITION")
                     else:
                         # ~P — global parameter section, covers all
                         _def_type = "__MAIN__"

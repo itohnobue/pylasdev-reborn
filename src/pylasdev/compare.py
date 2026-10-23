@@ -53,25 +53,48 @@ def _scalars_equal(a: Any, b: Any) -> bool:
         return False
 
 
-def _reduce_structured_mask(mask: np.ndarray) -> np.ndarray:
-    """Reduce a structured (V-kind) boolean mask to a plain boolean mask.
+def _masks_equal(mask1: np.ndarray, mask2: np.ndarray) -> bool:
+    """Compare two masks structurally, field by field for structured masks.
 
-    Structured MaskedArrays carry a structured mask — one boolean per
-    field — which ``~`` and ``np.array_equal`` cannot operate on
-    (H-02: an uncaught TypeError escaped ``compare_las_dicts``).  A
-    position is treated as masked when ANY of its fields is masked,
-    matching the mask contract's single boolean-per-position model
-    (numpy itself broadcasts a plain mask to every field, so a masked
-    position is an all-fields-masked position).  Plain boolean masks
-    pass through unchanged.
+    A structured (V-kind) mask carries one boolean per field, so a
+    position masked in one field but not in another is a *different* mask
+    pattern.  Comparing folded (any-field-masked) projections — the
+    pre-fix behaviour — erased that difference and made two arrays with
+    different mask patterns compare EQUAL (F-065).  Masks with different
+    structure (structured vs plain, or two different structured dtypes)
+    are never equal.
     """
-    if mask.dtype.kind != "V":
-        return mask
-    reduced: np.ndarray | None = None
+    if mask1.dtype.kind == "V" or mask2.dtype.kind == "V":
+        if mask1.dtype != mask2.dtype:
+            return False
+    try:
+        return bool(np.array_equal(mask1, mask2))
+    except (TypeError, ValueError):
+        return False
+
+
+def _fill_structured_mask(data: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Return ``data`` with each field's masked positions set to its zero value.
+
+    Structured masks are per FIELD: one position can be masked in one field
+    and carry real data in another.  Filling each field's masked positions
+    with that field's zero value (in both operands, once ``_masks_equal``
+    has established identical mask patterns) makes every masked position
+    compare equal while every unmasked position still compares on its own
+    value — the per-field mask contract.  Collapsing the mask to "the
+    whole row is masked" hid differences in fields that were unmasked in
+    *both* operands and reported them EQUAL (F-065: 99.0 vs 3.0).
+    """
+    filled = None
     for name in mask.dtype.names or ():
-        field = mask[name]
-        reduced = field if reduced is None else reduced | field
-    return mask if reduced is None else reduced
+        field_mask = mask[name]
+        if not field_mask.any():
+            continue
+        if filled is None:
+            filled = np.array(data, copy=True)
+        zero = np.zeros((1,), dtype=filled[name].dtype)[0]
+        filled[name] = np.where(field_mask, zero, filled[name])
+    return data if filled is None else filled
 
 
 def _unwrap_masks(
@@ -88,31 +111,37 @@ def _unwrap_masks(
     differ: a position masked in one operand but not the other is a
     structural mismatch, not a value comparison.
 
-    Structured (V-kind) masks are reduced to a plain boolean mask by
-    ``_reduce_structured_mask`` before any mask arithmetic, so ``~``
-    and ``np.array_equal`` never see a structured operand (H-02).
+    Masks are compared structurally by ``_masks_equal`` — field by field
+    for structured (V-kind) masks — so a per-field mask difference is a
+    mask mismatch and never compares EQUAL (F-065).
+
+    Structured masks are applied per FIELD by ``_fill_structured_mask``,
+    so their ``keep`` is None: the masked positions of each field are
+    filled in both operands, and a position masked in one field still
+    compares the data of every field unmasked in both.
     """
-    mask1 = (
-        _reduce_structured_mask(np.ma.getmaskarray(arr1))
-        if isinstance(arr1, np.ma.MaskedArray)
-        else None
-    )
-    mask2 = (
-        _reduce_structured_mask(np.ma.getmaskarray(arr2))
-        if isinstance(arr2, np.ma.MaskedArray)
-        else None
-    )
+    mask1 = np.ma.getmaskarray(arr1) if isinstance(arr1, np.ma.MaskedArray) else None
+    mask2 = np.ma.getmaskarray(arr2) if isinstance(arr2, np.ma.MaskedArray) else None
     if mask1 is not None:
         arr1 = np.ma.getdata(arr1)
     if mask2 is not None:
         arr2 = np.ma.getdata(arr2)
     if mask1 is None and mask2 is None:
         return arr1, arr2, None
-    m1 = mask1 if mask1 is not None else np.zeros(arr2.shape, dtype=bool)
-    m2 = mask2 if mask2 is not None else np.zeros(arr1.shape, dtype=bool)
-    if not np.array_equal(m1, m2):
+    if mask1 is None:
+        assert mask2 is not None  # both None returned above
+        mask1 = np.zeros(mask2.shape, dtype=mask2.dtype)
+    elif mask2 is None:
+        mask2 = np.zeros(mask1.shape, dtype=mask1.dtype)
+    if not _masks_equal(mask1, mask2):
         return None
-    return arr1, arr2, ~m1
+    if mask1.dtype.kind == "V":
+        return (
+            _fill_structured_mask(arr1, mask1),
+            _fill_structured_mask(arr2, mask2),
+            None,
+        )
+    return arr1, arr2, ~mask1
 
 
 def _allclose_symmetric(
@@ -235,12 +264,12 @@ def _compare_arrays(
         try:
             unwrapped = _unwrap_masks(arr1, arr2)
         except (ValueError, TypeError):
-            # H-02: a V-kind mask that _reduce_structured_mask cannot
-            # normalize (e.g. a field-less structured dtype) would
-            # otherwise raise here.  Fall back to the pre-fix v2.0.4
-            # semantics — np.array_equal strips masks internally, so
-            # masked positions compare by raw data — a crash-free
-            # verdict, never a raise escaping the public API.
+            # H-02: a V-kind mask that _unwrap_masks cannot normalize
+            # (e.g. a field-less structured dtype) would otherwise raise
+            # here.  Fall back to the pre-fix v2.0.4 semantics —
+            # np.array_equal strips masks internally, so masked positions
+            # compare by raw data — a crash-free verdict, never a raise
+            # escaping the public API.
             unwrapped = arr1, arr2, None
         if unwrapped is None:
             logger.warning("Array mask mismatch at '%s'", label)
@@ -251,7 +280,24 @@ def _compare_arrays(
             arr2 = arr2[keep]
             if arr1.size == 0:
                 return True
-        if not np.array_equal(arr1, arr2):
+        try:
+            equal = np.array_equal(arr1, arr2)
+        except (TypeError, ValueError):
+            # F-068: np.array_equal raises on incomparable dtype pairs —
+            # structured vs non-void, two structured dtypes with no common
+            # type, and object arrays whose elements are ndarrays
+            # (ambiguous truth value).  The H-02 contract above is that a
+            # crash-free verdict never escapes ``compare_las_dicts``, whose
+            # documented return is bool; the guard covered the mask unwrap
+            # but not the comparison it protects.
+            logger.warning(
+                "Array values mismatch at '%s' (incomparable dtypes): %s vs %s",
+                label,
+                arr1.dtype,
+                arr2.dtype,
+            )
+            return False
+        if not equal:
             logger.warning("Array values mismatch at '%s'", label)
             return False
     else:

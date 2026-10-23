@@ -281,7 +281,7 @@ class _SectionTransitionHandler:
         # M-25: lazy import of the parser's keyword tables (same pattern as
         # MAX_SECTION_SEQUENCE below — _section_transition is imported by
         # parser at module load, so a module-level import would be circular).
-        from .parser import _DATA_SECTION_WORDS, _is_indexed_data_section
+        from .parser import _DATA_SECTION_WORDS, _is_indexed_data_section, _strip_section_index
 
         # F1: Track per-section curve boundaries for LAS 3.0.
         # When entering ~C (including _Definition sections), mark the
@@ -296,8 +296,21 @@ class _SectionTransitionHandler:
         # preserve the section_word (e.g., CORE_PARAMETERS) for type
         # derivation in _parse_parameter_entry.  section_name may be
         # annotation text, not the type identifier.
+        # M6 (F-185 twin): the [n] array-index suffix is part of
+        # SECTION_PATTERN's word, so the RAW word of a spec-legal
+        # ~Log_Parameter[2] never satisfies endswith("_PARAMETER") — and with
+        # an annotation the raw word is then replaced by the annotation text
+        # (_current_section_name = "Parameter Information"), leaving
+        # _parse_parameter_entry's F-185 strip nothing to strip:
+        # section_type became None and the writer re-emitted
+        # ~PARAMETER INFORMATION instead of ~LOG_Parameter.  Dispatch on the
+        # BASE word like the parser's own suffix tests (parser.py:2222,
+        # :5447, :6108); the RAW word stays current_section_name because it
+        # is the section's identity for definition-range/pipe lookups, and
+        # _parse_parameter_entry does its own strip.
+        _parameter_word = _strip_section_index(section_word)
         if section_type == "P" and (
-            section_word.endswith("_PARAMETER") or section_word.endswith("_PARAMETERS")
+            _parameter_word.endswith("_PARAMETER") or _parameter_word.endswith("_PARAMETERS")
         ):
             p._state.current_section_name = section_word
         elif section_type == "A" and section_word in {"A", "ASCII"}:

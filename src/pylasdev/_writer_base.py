@@ -36,14 +36,16 @@ from ._sanitize import (
     _sanitize_las_value as _sanitize_las_value,
 )
 from ._version_spec import _LASVersionSpec
-from .data_reader import _get_null_value, _get_well_entry_ci
+from .data_reader import _get_null_value, _get_well_entry_ci, _parse_float_with_d_notation
 from .exceptions import LASDataError, LASWriteError, PylasdevError
 from .models import (
     _MNEMONIC_PATTERN,
+    MAX_FIELD_LENGTH,
     CurveDefinition,
     LASFile,
     ParameterEntry,
     _case_key,
+    _container_row_count_issues,
     _GuardedDict,
     _GuardedList,
 )
@@ -159,8 +161,69 @@ def _section_type_to_prefix(section_type: str) -> str:
     return "A"
 
 
+def _validate_emitted_curve_name(mnemonic: object, owner: str) -> None:
+    """F-026: refuse an emitted curve identity the parser cannot read back.
+
+    ``_format_curve_line`` emits ``curve.original_mnemonic`` as the curve
+    identity when it differs from ``curve.mnemonic`` (M-59), but
+    ``CurveDefinition`` validates only ``mnemonic`` (models.py:2160) — an
+    ``original_mnemonic`` holding a space, a dot, a pipe or a non-str value
+    reaches the ``~C`` line verbatim, the parser's ``~C`` grammar
+    (``_MNEMONIC_LINE_RE``, parser.py:372) cannot match the line, and the
+    curve AND its whole data column are dropped on re-read with ZERO
+    write-side warnings (ADV-07 probes 1-3).  A value longer than
+    ``MAX_FIELD_LENGTH`` writes a file the library's own reader rejects
+    (probe 4: ``LASParseError: field 'mnemonic' length … exceeds``).
+
+    The same hole exists on the other emitted-identity axis: a
+    ``curves_order`` entry (also a plain, only-type-checked model field)
+    with no curve definition is written verbatim into the ``~A`` column
+    header (see ``_header_name``), where an embedded space produces a
+    header the parser cannot tokenize.
+
+    The test is applied to the EMITTED bytes (the sanitized name): the
+    sanitizer is what decides which characters actually land in the file,
+    so a name it repairs is representable and must not be refused
+    (got-20260809134750 — gates must test the sanitized value, not the raw
+    input).  Reject here rather than emit a corrupt file, mirroring the
+    well-key guard (``_write_well_section``: "Reject here rather than emit
+    metadata that cannot survive a roundtrip").
+
+    The model-side guard on the field itself is a separate finding (F-143,
+    models.py); this is the writer half, so a model built around that guard
+    (unpickle, ``object.__setattr__``) still cannot write a corrupt file.
+    """
+    if not isinstance(mnemonic, str):
+        raise LASWriteError(
+            f"Curve {owner!r}: the emitted curve name must be a string, got "
+            f"{type(mnemonic).__name__} ({mnemonic!r}).  It is written as the "
+            f"~C/~A curve name, which the parser cannot represent."
+        )
+    emitted = _sanitize_las_value(mnemonic)
+    if len(emitted) > MAX_FIELD_LENGTH or not _MNEMONIC_PATTERN.fullmatch(emitted):
+        raise LASWriteError(
+            f"Curve {owner!r}: emitted curve name {emitted!r} "
+            f"cannot roundtrip — the LAS parser's ~C grammar requires "
+            f"{_MNEMONIC_PATTERN.pattern!r} (and at most "
+            f"{MAX_FIELD_LENGTH} characters).  The writer would emit a ~C "
+            f"line the parser cannot match, silently dropping the curve and "
+            f"its whole data column on re-read.  Correct the curve's "
+            f"original_mnemonic (or mnemonic) — or the curves_order entry "
+            f"with no curve definition — so the emitted name matches the "
+            f"parser grammar."
+        )
+
+
 def _emitted_mnemonic(curve: CurveDefinition, is_las30: bool = True) -> str:
     """The mnemonic as written to the ~C / Definition line.
+
+    This is the ONE resolution site for the emitted curve identity: every
+    consumer (``_format_curve_line``, ``_emission_plan``,
+    ``_dedup_by_emitted_mnemonic``, ``_warn_for``, the legacy ``~A``
+    ``_header_name`` and the LAS 3.0 identity/signature helpers) calls it,
+    so the emitted name cannot drift between emission, dedup and the
+    ``~A`` header (F-026: three inline copies of the preference had to be
+    kept in sync by hand).
 
     Mirrors the emission logic in ``_format_curve_line``:
     - M-59 (F-16): when ``curve.original_mnemonic`` is set and differs
@@ -187,12 +250,18 @@ def _emitted_mnemonic(curve: CurveDefinition, is_las30: bool = True) -> str:
     lines, structurally invalid, silently written.  ``is_las30`` defaults
     to True so the LAS 3.0 call sites (which DO emit the bracket) are
     unchanged.
+
+    F-026: the resolved name is validated here (``_validate_emitted_curve_name``)
+    so every consumer of the emitted identity — emission, dedup, plan, the
+    ``~A`` header — refuses a name the parser cannot read back, instead of
+    writing a ~C line that silently drops the curve and its data column.
     """
     mnemonic = (
         curve.original_mnemonic
         if curve.original_mnemonic and curve.original_mnemonic != curve.mnemonic
         else curve.mnemonic
     )
+    _validate_emitted_curve_name(mnemonic, curve.mnemonic)
     if curve.array_info is not None and "[" not in mnemonic and is_las30:
         mnemonic = f"{mnemonic}[{curve.array_info.index}]"
     return mnemonic
@@ -359,14 +428,14 @@ def _format_curve_line(
     # {S}-marker membership below tests the EMITTED name (II-7: a curve
     # BFV with original_mnemonic='LLD' emits 'LLD', and the marker
     # decision must match what is actually written).
+    # F-026: the resolution goes through ``_emitted_mnemonic`` (no inline
+    # copy) so the ~C emitter, the ~A header and the dedup/plan keys all
+    # agree AND the emitted name is validated once — see
+    # ``_validate_emitted_curve_name``.
     _emit_mnem = (
         mnemonic_override
         if mnemonic_override is not None
-        else (
-            curve.original_mnemonic
-            if curve.original_mnemonic and curve.original_mnemonic != curve.mnemonic
-            else curve.mnemonic
-        )
+        else _emitted_mnemonic(curve, is_las30)
     )
 
     # N2b-1/II-7: the {S} membership must test the EMITTED mnemonic
@@ -676,6 +745,115 @@ def _lookup_data_array(
     return None, False
 
 
+# F-032/F-034: the library's default data precision.  It is applied to EVERY
+# column including the index (depth) column, but the index must never be
+# rounded — CWLS LAS 2.0 §5.4 requires STRT to equal the first ~A index value
+# and states "Rounding of depth values is not acceptable".  With `.8g`,
+# 1234567.891 is emitted as '1234567.9' (0.009 m/row) and three distinct
+# depths collapse to one token, with zero diagnostics (ADV-26 probes).
+# An EXPLICIT user precision is the user's documented choice (pinned by
+# tests/test_writer.py::test_write_custom_precision) and is left untouched.
+_DEFAULT_DATA_PRECISION: str = ".8g"
+
+
+def _warn_inexact_index(
+    curve_name: str,
+    token: str,
+    value: float,
+    precision: str,
+) -> bool:
+    """F-032/F-034: warn (once per block) when the emitted index cannot be read back.
+
+    ``_format_index_value`` repairs the DEFAULT precision, so this fires only
+    for an explicitly requested precision (or a non-float64 scalar) that
+    rounds the index — the remaining silent-loss path.  CWLS LAS 2.0 §5.4
+    forbids rounding depth values, and a rounded index can make two distinct
+    samples share one depth (ADV-26 probe: three depths, one emitted token).
+    Returns True when it warned.
+    """
+    try:
+        exact = float(token) == float(value)
+    except ValueError:
+        return False
+    if exact:
+        return False
+    import warnings
+
+    warnings.warn(
+        f"Index curve {curve_name!r}: the emitted depth {token!r} does not "
+        f"read back as the model value {float(value)!r} (precision "
+        f"{precision!r}).  CWLS LAS 2.0 §5.4 forbids rounding depth values — "
+        f"distinct depths can collapse into one depth row on re-read.  Use "
+        f"the default precision to keep the index exact.",
+        UserWarning,
+        stacklevel=4,
+    )
+    return True
+
+
+def _format_index_value(value: float, precision: str, null_value: float | None) -> str:
+    """Format an INDEX-column value, preserving it exactly at the default precision.
+
+    F-032/F-034 (one root cause, one formatting decision): the index column
+    is formatted with the same generic precision as the data columns, so the
+    library's own default silently rounds depths.  When the caller did not
+    choose a precision (``precision == _DEFAULT_DATA_PRECISION``) and the
+    default token does not parse back to the model value, the shortest exact
+    decimal for the value (``repr``, which round-trips by construction) is
+    emitted instead.  A value routed to the null sentinel is NOT rewritten —
+    that routing is deliberate (F-036 only adds the missing diagnostic) — and
+    non-float64 scalars (float32 inputs) keep the existing formatting so their
+    emitted bytes do not change.
+    """
+    token = _format_number(value, precision, null_value)
+    if precision != _DEFAULT_DATA_PRECISION or not isinstance(value, float):
+        return token
+    if null_value is not None and value == null_value:
+        return token
+    try:
+        if float(token) == value:
+            return token
+    except ValueError:
+        return token
+    exact = repr(float(value))
+    if "e" in exact.lower():
+        exact = _format_fixed_precision(float(value), ".17g")
+    return exact
+
+
+def _warn_null_collision(
+    curve_name: str,
+    value: float,
+    null_value: float,
+    *,
+    already_warned: bool,
+) -> bool:
+    """F-036: warn (once per emitted block) that a REAL value equals the NULL sentinel.
+
+    ``_format_number`` routes any value numerically equal to the declared
+    NULL to the sentinel — the format has no other encoding, so the routing
+    itself is unavoidable.  What was missing is the signal: the same bytes
+    are a measurement to pylasdev and "no data" to a conforming reader
+    (ADV-26 probe: lasio reads NaN where pylasdev reads 0.0, with zero write
+    warnings).  Returns the new "already warned" state.
+    """
+    if already_warned:
+        return True
+    import warnings
+
+    warnings.warn(
+        f"Curve {curve_name!r}: value {value!r} equals the declared NULL "
+        f"value {null_value!r}; it is emitted as the null sentinel and "
+        f"conforming readers (e.g. lasio) will read it as NO-DATA, while "
+        f"pylasdev reads it back as the real value.  The format cannot "
+        f"represent the distinction — declare a NULL value that no real "
+        f"measurement can take.",
+        UserWarning,
+        stacklevel=4,
+    )
+    return True
+
+
 def _format_data_rows(
     curve_names: list[str],
     data: dict[str, NDArray[np.float64]],
@@ -718,9 +896,11 @@ def _format_data_rows(
     warned_delim_str = False
     warned_empty_str = False
     warned_tilde_str = False
+    warned_null_collision = False
+    warned_index_precision = False
     for i in range(num_rows):
         row_values: list[str] = []
-        for arr, is_string in curve_arrays:
+        for _col, (arr, is_string) in enumerate(curve_arrays):
             if arr is None or i >= len(arr):
                 if is_string:
                     # M-78: a short (ragged) string curve was padded with
@@ -908,7 +1088,29 @@ def _format_data_rows(
                 if not math.isfinite(val):
                     row_values.append(_format_number(null_value, precision, null_value))
                 else:
-                    row_values.append(_format_number(val, precision, null_value))
+                    # F-036: a real value equal to the declared NULL is
+                    # emitted as the sentinel — no alternative encoding
+                    # exists — so report the collision once (the cross-reader
+                    # divergence is otherwise silent).
+                    if null_value is not None and val == null_value:
+                        warned_null_collision = _warn_null_collision(
+                            curve_names[_col],
+                            val,
+                            null_value,
+                            already_warned=warned_null_collision,
+                        )
+                    # F-032/F-034: the index column (position 0) keeps its
+                    # exact value at the default precision; every other
+                    # column keeps the caller's formatting.
+                    if _col == 0:
+                        _index_token = _format_index_value(val, precision, null_value)
+                        if not warned_index_precision:
+                            warned_index_precision = _warn_inexact_index(
+                                curve_names[_col], _index_token, val, precision
+                            )
+                        row_values.append(_index_token)
+                    else:
+                        row_values.append(_format_number(val, precision, null_value))
         line = delimiter.join(row_values)
         # M-29: the M-78 empty-value guard above covers SPACE only.  For
         # COMMA/TAB an entirely-empty (or whitespace-only) row — a
@@ -1136,6 +1338,65 @@ def _warn_long_header_lines(lines: list[str], max_length: int) -> None:
                 warned = True
 
 
+# ── Live-container installs ─────────────────────────────────────────────
+#
+# ``LASFile.__setattr__`` deep-copies a wholesale ``curves``/``parameters``
+# assignment ON PURPOSE (F-158: ``las.curves = [cd]`` followed by
+# ``cd.unit = ...`` must not mutate the model through the shared element).
+# An INTERNAL reassignment is not a caller assignment — the writers' pre-write
+# snapshots and the parser's EXT-03 dedup hand back objects the model already
+# owns — so routing one through ``__setattr__`` replaced every
+# ``CurveDefinition`` with a deep copy.  That (a) severed the documented
+# ``las.curves[i] is section.section_curves[j]`` identity the LAS 3.0 pipeline
+# depends on, making ``parse -> mutate las.curves[0].unit -> write`` emit the
+# OLD value with ``validate() == []``, and (b) re-ran the container
+# validators, so a restore raised a bare ``ValueError`` while the write's own
+# ``LASWriteError`` was in flight (M12, L24).
+
+
+def _restore_live_container(las_file: Any, name: str, snapshot: Any) -> None:
+    """Install *snapshot* into the model's LIVE *name* container in place.
+
+    Used for every INTERNAL reassignment of a model container (the writers'
+    save/restore blocks and the parser's EXT-03 dedup): the live
+    ``_GuardedDict``/``_GuardedList`` object is kept and refilled through the
+    C-level ``clear``/``extend``/``update`` methods, then re-installed with
+    ``object.__setattr__``.  Consequences, all three required:
+
+    * the elements keep their identity — the objects in *snapshot* are the
+      ones the model owned, so ``las.curves[i] is
+      section.section_curves[j]`` survives the write and a post-write
+      mutation of ``las.curves`` reaches the next emitted file (M12);
+    * the mutation guard is not stripped (the same ``_GuardedList`` object is
+      the attribute after the call), so F-29's guarantee survives;
+    * the element/row-count validators are NOT re-entered — a restore inside a
+      ``finally`` cannot raise while the write's ``LASWriteError`` is in
+      flight (L24; the same reason ``_WriterMutationGuard._restore_container``
+      uses the C-level methods, F-123).
+
+    Caller assignments (``las.curves = [...]`` with caller-owned objects) MUST
+    keep going through ``LASFile.__setattr__`` so F-158's deep copy still
+    applies.  Only use this where the snapshot came from the model itself.
+
+    A ``None`` snapshot (a documented-valid state for directly-constructed
+    files) is installed as ``None``; a live container whose type does not
+    match the snapshot is replaced outright — the writer's
+    ``_WriterMutationGuard`` re-wraps such a container afterwards.
+    """
+    live = getattr(las_file, name, None)
+    if isinstance(live, list) and isinstance(snapshot, list):
+        list.clear(live)
+        list.extend(live, snapshot)
+        object.__setattr__(las_file, name, live)
+        return
+    if isinstance(live, dict) and isinstance(snapshot, dict):
+        dict.clear(live)
+        dict.update(live, snapshot)
+        object.__setattr__(las_file, name, live)
+        return
+    object.__setattr__(las_file, name, snapshot)
+
+
 # ── _WriterMutationGuard ────────────────────────────────────────────────
 
 
@@ -1151,10 +1412,13 @@ class _WriterMutationGuard:
     mutated by an aborted write.
 
     The version-specific writers' ``finally`` blocks restore the data
-    containers from plain ``dict``/``list`` snapshots, which permanently
-    strips the ``_GuardedDict``/``_GuardedList`` mutation guards.  This
-    guard re-wraps the containers so invalid mutations are still caught
-    after a write (success or failure).
+    containers from plain ``dict``/``list`` snapshots.  That restore is
+    in-place (``_restore_live_container``, M12): the live
+    ``_GuardedDict``/``_GuardedList`` objects are refilled, so the mutation
+    guards survive, the ``CurveDefinition`` objects keep their identity, and
+    no validator re-runs.  This guard still re-wraps as a safety net for any
+    container a writer replaced outright (or a bypassed construction), so
+    invalid mutations are still caught after a write (success or failure).
     """
 
     def __init__(
@@ -1191,48 +1455,115 @@ class _WriterMutationGuard:
             list(las_file.curves_order) if las_file.curves_order is not None else None
         )
         self._saved_curves = list(las_file.curves) if las_file.curves is not None else None
+        # F-123: keep the LIVE container objects as well as their contents.
+        # The failure-path restore writes the snapshot back into these objects
+        # through the C-level dict/list API, which neither re-validates the
+        # contents nor replaces the ``_GuardedDict``/``_GuardedList`` wrapper.
+        # Re-assigning the snapshot instead runs ``LASFile.__setattr__`` →
+        # ``_GuardedDict.__init__``, whose row-count validation REJECTS an
+        # internally inconsistent snapshot (an in-place ``ndarray.resize``
+        # mutates a stored column without passing any container guard) and
+        # raises ValueError *while the write's own LASWriteError is being
+        # handled* — masking the documented error with a bare ValueError.
+        self._live_containers: dict[str, Any] = {
+            "logs": las_file.logs,
+            "string_data": las_file.string_data,
+            "curves_order": las_file.curves_order,
+            "curves": las_file.curves,
+        }
 
     def __enter__(self) -> _WriterMutationGuard:
         return self
+
+    def _restore_container(self, name: str, snapshot: Any) -> None:
+        """Write *snapshot* back without re-validating it (F-123).
+
+        The pre-write contents are restored INTO the object the model held
+        before the write, using ``dict.clear``/``dict.update`` (or the list
+        equivalents) — the C-level methods, so the element and row-count
+        validators are not re-entered.  A ``None`` snapshot (a documented
+        valid state for directly-constructed files) is restored as ``None``.
+        """
+        las_file = self._las_file
+        if snapshot is None:
+            object.__setattr__(las_file, name, None)
+            return
+        live = self._live_containers.get(name)
+        if isinstance(live, dict) and isinstance(snapshot, dict):
+            dict.clear(live)
+            dict.update(live, snapshot)
+            object.__setattr__(las_file, name, live)
+            return
+        if isinstance(live, list) and isinstance(snapshot, list):
+            list.clear(live)
+            list.extend(live, snapshot)
+            object.__setattr__(las_file, name, live)
+            return
+        object.__setattr__(las_file, name, snapshot)
 
     def _restore_saved_state(self) -> None:
         """Restore the pre-write snapshot on the failure path."""
         las_file = self._las_file
         las_file.version.wrap = self._saved_wrap
         las_file.version.dlm = self._saved_dlm
-        las_file.logs = self._saved_logs
-        las_file.string_data = self._saved_string_data
-        las_file.curves_order = self._saved_curves_order
-        las_file.curves = self._saved_curves
+        self._restore_container("logs", self._saved_logs)
+        self._restore_container("string_data", self._saved_string_data)
+        self._restore_container("curves_order", self._saved_curves_order)
+        self._restore_container("curves", self._saved_curves)
 
-    def _rewrap_guards(self) -> None:
+    def _rewrap_guards(self, *, failure_in_flight: bool = False) -> None:
         """Re-wrap data containers in guarded dict/list after a write.
 
         W-06: the version-specific writers restore logs/string_data/
-        curves from plain dict/list snapshots in their ``finally`` blocks,
-        permanently stripping the mutation guards installed at LASFile
-        construction.  Re-install the guards so subsequent invalid
-        mutations are still rejected.  None containers (a valid state for
-        directly-constructed files) are left untouched.
+        curves from plain dict/list snapshots in their ``finally`` blocks.
+        The restore is in-place now (``_restore_live_container``), so the
+        guards normally survive; this re-wrap remains the safety net for a
+        container a writer replaced outright.  None containers (a valid
+        state for directly-constructed files) are left untouched.
+
+        L24: on the failure path this runs while the write's own
+        ``LASWriteError`` is in flight.  Wrapping a container whose stored
+        contents are ALREADY inconsistent re-raises the row-count
+        ``ValueError`` from the ``_GuardedDict`` constructor, which would
+        replace the documented ``LASWriteError`` with a bare ``ValueError``
+        (probed with a model whose column lengths were bypassed to
+        ``[3, 4]``).  *failure_in_flight* keeps the re-wrap from masking the
+        primary error: a container that cannot be re-wrapped is left exactly
+        as the failure-path restore installed it — the caller's pre-write
+        state, which was unguarded before the write too, so nothing is made
+        worse.  On the SUCCESS path the error still propagates (there is no
+        in-flight exception to mask), so the validation is not weakened.
         """
         las_file = self._las_file
-        if las_file.logs is not None and not isinstance(las_file.logs, _GuardedDict):
-            las_file.logs = _GuardedDict(las_file.logs, _container_name="LASFile.logs")
-        if las_file.string_data is not None and not isinstance(las_file.string_data, _GuardedDict):
-            las_file.string_data = _GuardedDict(
-                las_file.string_data, _container_name="LASFile.string_data"
-            )
-        if las_file.curves is not None and not isinstance(las_file.curves, _GuardedList):
-            las_file.curves = _GuardedList(
-                las_file.curves,
-                _container_name="LASFile.curves",
-                _expected_type=CurveDefinition,
-            )
+        try:
+            if las_file.logs is not None and not isinstance(las_file.logs, _GuardedDict):
+                las_file.logs = _GuardedDict(las_file.logs, _container_name="LASFile.logs")
+            if las_file.string_data is not None and not isinstance(las_file.string_data, _GuardedDict):
+                las_file.string_data = _GuardedDict(
+                    las_file.string_data, _container_name="LASFile.string_data"
+                )
+            if las_file.curves is not None and not isinstance(las_file.curves, _GuardedList):
+                # M12: ``object.__setattr__``, not ``las_file.curves = ...``
+                # — the latter deep-copies every CurveDefinition (F-158) and
+                # would sever ``las.curves[i] is section.section_curves[j]``.
+                object.__setattr__(
+                    las_file,
+                    "curves",
+                    _GuardedList(
+                        las_file.curves,
+                        _container_name="LASFile.curves",
+                        _expected_type=CurveDefinition,
+                    ),
+                )
+        except (TypeError, ValueError):
+            if not failure_in_flight:
+                raise
 
     def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
         import warnings
 
-        if exc_type is not None:
+        _failure_in_flight = exc_type is not None
+        if _failure_in_flight:
             # W-07: failure path — restore the saved state so the caller's
             # model is not left partially mutated by the failed write.
             self._restore_saved_state()
@@ -1247,8 +1578,10 @@ class _WriterMutationGuard:
                 pass
 
         # W-06: re-install mutation guards stripped by the writers' finally
-        # blocks (runs on both success and failure paths).
-        self._rewrap_guards()
+        # blocks (runs on both success and failure paths).  L24: the
+        # re-wrap must not raise while the write's LASWriteError is in
+        # flight — see the method docstring.
+        self._rewrap_guards(failure_in_flight=_failure_in_flight)
 
         return False  # type: ignore[return-value]
 
@@ -1277,8 +1610,29 @@ class _WriterBase:
 
         for issue in self._las_file.validate(complete=True):
             warnings.warn(issue, stacklevel=2)
+        # L24/M12: refuse an internally inconsistent data container BEFORE
+        # emitting.  The version writers' container restore is in-place now
+        # (``_restore_live_container``) and deliberately does not re-run the
+        # row-count validator — a restore must never raise while the write's
+        # own error is in flight.  That validator was previously the only
+        # thing refusing this state, which is reachable without any container
+        # guard (F-123: an in-place ``ndarray.resize`` or a C-level
+        # ``dict.__setitem__``), so removing it must NOT turn the documented
+        # hard failure into a null-padded write.  Raise the same refusal here
+        # — before emission, with the issue text instead of an incidental
+        # restore exception.
+        _row_count_issues = _container_row_count_issues(
+            self._las_file.logs, "LASFile: 'logs'"
+        ) + _container_row_count_issues(
+            self._las_file.string_data, "LASFile: 'string_data'"
+        )
+        if _row_count_issues:
+            raise LASWriteError(" ".join(_row_count_issues))
         if self._spec.is_las30:
             self._warn_string_curves_without_s_marker()
+        # F-044: the ~W STRT/STOP/STEP fields are emitted verbatim and were
+        # never compared with the index the same write emits.
+        self._warn_strt_stop_step_mismatch()
 
         # PF-22 (I2-13 completion): the legacy ~A data pass emits its
         # columns from the LIVE curves_order while ~C historically emitted
@@ -1295,12 +1649,21 @@ class _WriterBase:
         # override) agrees with the data rows at write time.  The model is
         # restored afterwards — the write does not silently reorder the
         # user's curves list.
-        _original_curves = self._las_file.curves
+        # M12: the emission-time reassignment installs the reordered list IN
+        # PLACE on the live container, so the CurveDefinition objects keep
+        # their identity (``las.curves[i] is section.section_curves[j]``).
+        # ``_original_curves`` is therefore a CONTENT snapshot, captured
+        # before the reorder — the live object's contents are what gets
+        # reordered, so keeping a reference to it would lose the original
+        # order.
+        _original_curves: list[CurveDefinition] | None = (
+            list(self._las_file.curves) if self._las_file.curves is not None else None
+        )
         _reordered_curves: list[CurveDefinition] | None = None
         if not self._spec.is_las30 or not self._las_file.data_sections:
             _reordered_curves = self._curves_in_live_order()
             if _reordered_curves is not None:
-                self._las_file.curves = _reordered_curves
+                _restore_live_container(self._las_file, "curves", _reordered_curves)
 
         try:
             lines: list[str] = []
@@ -1322,10 +1685,190 @@ class _WriterBase:
             if header_limit is not None:
                 _warn_long_header_lines(lines, header_limit)
             lines.extend(self._write_ascii_sections())
-            return "\n".join(lines) + "\n"
+            _terminator = self._line_terminator()
+            return _terminator.join(lines) + _terminator
         finally:
             if _reordered_curves is not None:
-                self._las_file.curves = _original_curves
+                # M12/L24: in-place restore of the pre-write CONTENT snapshot
+                # — never ``self._las_file.curves = ...`` (that branch
+                # deep-copies, severing section_curves identity, and
+                # re-validates while an error may be in flight).
+                _restore_live_container(self._las_file, "curves", _original_curves)
+
+    # ── Output conventions ──────────────────────────────────────────
+
+    def _line_terminator(self) -> str:
+        """The emitted line terminator for this version (F-042).
+
+        CWLS LAS 2.0 (2009) §3.0: "Line termination will consist of ASCII 13
+        ASCII 10 (CR LF) except for the last line." — so LAS 1.2/2.0 output
+        must use CR LF on EVERY platform, not the platform's convention.
+        LAS 3.0 Appendix IV ("Termination Issues") rules an LF-only file on a
+        UNIX platform a valid LAS 3.0 file, so 3.0 follows the platform
+        convention (CR LF on Windows, LF elsewhere).
+
+        ``write_las_file`` opens the file with ``newline=""``, which disables
+        the platform's newline translation — the bytes chosen here are exactly
+        what reaches disk on every platform.
+        """
+        if self._spec.is_las30 and os.linesep == "\n":
+            return "\n"
+        return "\r\n"
+
+    def _warn_strt_stop_step_mismatch(self) -> None:
+        """F-044: report a ~W index description that contradicts the data (once).
+
+        The writer orders the mandatory well keys and emits the model's
+        STRT/STOP/STEP verbatim; nothing ever compares them with the emitted
+        index, so a model whose header says ``STRT 0.0 / STOP 2.0 / STEP 1.0``
+        while the index runs ``0 / 5 / 10`` writes a file that violates the
+        Well Information rule (STRT = first ~A value, STOP = last, STEP their
+        difference — CWLS LAS 2.0 §5.4; the LAS 1.2/3.0 Well Information
+        sections define the same three fields) with zero diagnostics
+        (ADV-26 probe).
+
+        The fix REPORTS rather than reconciles: rewriting the header would
+        silently alter model metadata the caller set, and the model cannot
+        perform this check at all (``WellSection.validate`` has no data
+        access by design).  A single warning names every diverging field.
+
+        Two shapes are NOT contradictions (M13, L10):
+
+        * A declared ``STEP 0`` is the variable-step encoding — the header
+          itself states that no single step describes the grid — so it cannot
+          contradict a non-uniform index (M13).  A *uniform* grid declared
+          ``STEP 0`` still can, and still reports.
+        * A cell holding the NULL sentinel is a missing sample, not an index
+          value (L10): the emission path writes the sentinel for every
+          non-finite cell, so such cells are excluded from the STRT/STOP and
+          step comparisons instead of being read as depths.
+
+        Skipped when there is no emitted index (no ``curves_order``, no data
+        array, a string index, fewer than two rows, or a non-finite endpoint)
+        — no comparison is possible there — when every cell is the NULL
+        sentinel (no depth to compare), and a missing mandatory field is
+        left to ``validate()``, which already reports it.
+        """
+        las = self._las_file
+        order = las.curves_order
+        if not order:
+            return
+        index_arr, is_string = _lookup_data_array(
+            order[0], las.logs or {}, las.string_data or {}
+        )
+        if index_arr is None or is_string:
+            return
+        if isinstance(index_arr, np.ndarray) and index_arr.ndim == 0:
+            return
+        try:
+            values = [float(v) for v in np.asarray(index_arr, dtype=float).ravel()]
+        except (TypeError, ValueError):
+            return
+        if len(values) < 2:
+            return
+
+        declared: dict[str, float | None] = {}
+        for _key in ("STRT", "STOP", "STEP"):
+            try:
+                declared[_key] = float(_get_well_entry_ci(las.well, _key, ""))
+            except (TypeError, ValueError):
+                declared[_key] = None
+        if all(v is None for v in declared.values()):
+            return
+
+        if not (math.isfinite(values[0]) and math.isfinite(values[-1])):
+            return
+
+        # L10: a cell holding the NULL sentinel is a missing sample, not an
+        # index value.  The emission path writes the sentinel for every
+        # non-finite cell (``_format_number``) and for a real value equal to
+        # it (F-036), so neither is comparable as a depth: doing so reported a
+        # sentinel tail as a STOP divergence and a sentinel cell as a step,
+        # turning a uniform grid into a false NON-UNIFORM report
+        # (``sample_las3.0_spec.las``).  Resolve the sentinel the way the
+        # emission path does, but without ``_get_null_value``'s fallback
+        # warning (that path already reports an unparsable NULL when it
+        # emits) and without its raise (this diagnostic must not move the
+        # write's exception point).
+        try:
+            null_value: float | None = _parse_float_with_d_notation(
+                _get_well_entry_ci(las.well, "NULL", "-999.25")
+            )
+        except (TypeError, ValueError, AttributeError, OverflowError):
+            null_value = None
+        if null_value is not None and not math.isfinite(null_value):
+            null_value = None
+
+        def _is_depth(value: float) -> bool:
+            return math.isfinite(value) and (null_value is None or value != null_value)
+
+        depths = [_v for _v in values if _is_depth(_v)]
+        if not depths:
+            return
+        first, last = depths[0], depths[-1]
+
+        def _differs(declared_value: float | None, actual: float) -> bool:
+            return declared_value is not None and not math.isclose(
+                declared_value, actual, rel_tol=1e-9, abs_tol=1e-12
+            )
+
+        problems: list[str] = []
+        if _differs(declared["STRT"], first):
+            problems.append(f"STRT {declared['STRT']!r} but the first index value is {first!r}")
+        if _differs(declared["STOP"], last):
+            problems.append(f"STOP {declared['STOP']!r} but the last index value is {last!r}")
+        # Steps come from consecutive entries of the EMITTED column, not from
+        # the filtered depth list, so a sentinel between two depths cannot
+        # fabricate a step out of the gap (L10).
+        steps = {
+            round(values[_i + 1] - values[_i], 12)
+            for _i in range(len(values) - 1)
+            if _is_depth(values[_i]) and _is_depth(values[_i + 1])
+        }
+        # M13: a declared STEP 0 is the variable-step encoding — the header
+        # itself states that no single step describes the grid — so a
+        # non-uniform index cannot contradict it.  A uniform grid declared
+        # STEP 0 still contradicts the header (a fixed step is required there)
+        # and still reports through the branch below.
+        _variable_step = declared["STEP"] is not None and declared["STEP"] == 0.0
+        if len(steps) > 1:
+            if not _variable_step:
+                problems.append(
+                    f"a NON-UNIFORM index grid ({len(steps)} distinct steps) that no "
+                    f"single STEP value ({declared['STEP']!r}) can describe"
+                )
+        elif steps:
+            _actual_step = next(iter(steps))
+            if _differs(declared["STEP"], _actual_step):
+                problems.append(
+                    f"STEP {declared['STEP']!r} but the actual index step is "
+                    f"{_actual_step!r}"
+                )
+        if not problems:
+            return
+        import warnings
+
+        if self._spec.is_las20:
+            _rule = (
+                "CWLS LAS 2.0 §5.4 requires STRT/STOP to equal the first/last "
+                "~A index value and STEP its actual difference"
+            )
+        else:
+            _rule = (
+                f"The CWLS LAS {self._spec.vers} Well Information section defines "
+                "STRT/STOP as the first/last index value and STEP as the "
+                "increment between index values"
+            )
+
+        warnings.warn(
+            f"The ~W header does not describe the emitted index column "
+            f"{order[0]!r}: " + "; ".join(problems) + f".  {_rule}, so the "
+            "written file's header contradicts its data for any reader that "
+            "trusts the header.  The header is emitted unchanged — correct "
+            "the well entries before writing.",
+            UserWarning,
+            stacklevel=3,
+        )
 
     # ── Section writers (overridable) ───────────────────────────────
 
@@ -1678,11 +2221,11 @@ class _WriterBase:
             # keyed 'BFV' emits 'LLD' markerless — testing curve.mnemonic
             # ('BFV') here would falsely conclude "no loss" and suppress
             # the warning exactly when the values are destroyed.
-            _emit_name = (
-                curve.original_mnemonic
-                if curve.original_mnemonic and curve.original_mnemonic != curve.mnemonic
-                else curve.mnemonic
-            )
+            # F-026: resolved through the ONE helper (no inline copy);
+            # is_las30=False matches ``_format_curve_line``'s membership
+            # test, which evaluates the name BEFORE the [N] bracket is
+            # appended for LAS 3.0 array curves.
+            _emit_name = _emitted_mnemonic(curve, is_las30=False)
             # M-35: the {S}-forcing membership in _format_curve_line
             # tests BOTH the emitted name and the curve's storage
             # mnemonic (the string_mnemonics sets are built from the
@@ -1839,7 +2382,12 @@ class _WriterBase:
             if not self._las_file.curves_order and _ds.curves_order:
                 self._las_file.curves_order = list(_ds.curves_order)
             if not self._las_file.curves and _ds.section_curves:
-                self._las_file.curves = list(_ds.section_curves)
+                # M12: internal install — in place, so the section's own
+                # CurveDefinition objects keep their identity (the
+                # ``curves = ...`` branch would deep-copy them).
+                _restore_live_container(
+                    self._las_file, "curves", list(_ds.section_curves)
+                )
 
             if (
                 self._las_file.curves_order
@@ -1983,11 +2531,21 @@ class _WriterBase:
 
             def _header_name(name: str) -> str:
                 c = _by_mnem.get(name) or _by_mnem.get(name.upper())
-                candidate = (
-                    c.original_mnemonic
-                    if c is not None and c.original_mnemonic and c.original_mnemonic != c.mnemonic
-                    else (c.mnemonic if c is not None else name)
-                )
+                # F-026: the ~A column name is the same emitted identity the
+                # ~C block writes, resolved through the ONE helper (no
+                # inline copy) — and therefore validated.  is_las30=False
+                # keeps the legacy ~A header free of the [N] bracket, which
+                # the legacy emitter never wrote.  A curves_order entry with
+                # NO definition is emitted from the raw entry (there is no
+                # curve to consult), so it is validated directly — an
+                # embedded space otherwise writes a ~A header the parser
+                # cannot tokenize (NEW-FROM-FIX of the same F-026 class; the
+                # LAS 3.0 section path drops such an entry instead).
+                if c is not None:
+                    candidate = _emitted_mnemonic(c, is_las30=False)
+                else:
+                    _validate_emitted_curve_name(name, name)
+                    candidate = name
                 if candidate in _header_seen and c is not None:
                     candidate = c.mnemonic
                 _header_seen.add(candidate)
@@ -2098,6 +2656,47 @@ class _WriterBase:
                     stacklevel=3,
                 )
 
+            # F-046: the REVERSE direction.  Only the count divergence above
+            # was handled; a ~C block that declares FEWER curves than ~A emits
+            # data columns went through silently, and the reader discards the
+            # undeclared columns ("Extra columns are discarded").  Trigger
+            # (ADV-27 probes 1-4): ``las.curves = []`` (or a truncated list)
+            # with a populated ``curves_order`` and data — the emitted file
+            # has an EMPTY ~C section beside ``~A DEPT`` and re-reads with
+            # ``logs {}``: every value is gone.  The LAS 3.0 data_sections
+            # path already refuses the equivalent state
+            # (_writer_las30.py:1039), so the legacy/top-level path must too.
+            # Liveness: a curves_order entry that carries NO data keeps
+            # writing (null-padded, with the E-32 warning above) — nothing is
+            # discarded there, so it must not raise.
+            if len(_c_emitted) < len(_header_names):
+                _emitted_upper = {m.upper() for m in _c_emitted}
+                _lost_columns: list[str] = []
+                for _name in _header_names:
+                    if _name.upper() in _emitted_upper:
+                        continue
+                    _orphan_arr, _ = _lookup_data_array(
+                        _name, self._las_file.logs or {}, self._las_file.string_data or {}
+                    )
+                    if _orphan_arr is None:
+                        continue
+                    if isinstance(_orphan_arr, np.ndarray) and _orphan_arr.ndim == 0:
+                        _lost_columns.append(_name)
+                    elif len(_orphan_arr) > 0:
+                        _lost_columns.append(_name)
+                if _lost_columns:
+                    raise LASWriteError(
+                        f"~C declares only {len(_c_emitted)} curve(s) but ~A "
+                        f"would emit {len(_header_names)} data column(s) from "
+                        f"curves_order, and column(s) {sorted(_lost_columns)} "
+                        f"carry data with no curve definition.  The LAS "
+                        f"1.2/2.0 single-block format cannot represent an "
+                        f"undeclared column: on re-read the reader discards "
+                        f"it and the values are lost.  Restore the missing "
+                        f"curve definition(s) (or remove the columns from "
+                        f"curves_order and the data containers)."
+                    )
+
             header_line = "~A  " + "  ".join(_sanitize_las_value(n) for n in _header_names)
             # N-I-16: The ~A column-header line is appended AFTER the
             # header-section length check in `write()` (which runs before
@@ -2135,6 +2734,58 @@ class _WriterBase:
 
 
 # ── Public API: write_las_file ──────────────────────────────────────────
+
+
+def _default_new_file_mode() -> int:
+    """Mode a plain ``open(path, "w")`` would give a newly created file.
+
+    F-049: ``tempfile.mkstemp`` always creates its file 0600, and that
+    mode survived ``os.replace`` — so every atomically written file was
+    owner-only where a truncating ``open()`` would have produced the
+    umask-derived 0644.  ``os.umask`` has no getter, so the value is read
+    with the set-and-restore idiom (the same one pip and setuptools use);
+    the window is two adjacent syscalls and the restored value is what
+    every other caller sees.
+    """
+    current_umask = os.umask(0o022)
+    os.umask(current_umask)
+    return 0o666 & ~current_umask
+
+
+def _apply_file_mode(fd: int, path: str, mode: int) -> None:
+    """Give the temp file at ``fd``/``path`` the destination's ``mode``.
+
+    ``os.fchmod`` is POSIX-only; on Windows the file is not inherited by
+    anyone until the replace, so a path-based ``os.chmod`` is equivalent.
+    """
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, mode)
+    else:  # pragma: no cover - Windows
+        os.chmod(path, mode)
+
+
+def _fsync_directory(dir_path: str) -> None:
+    """Best-effort fsync of a directory entry after an atomic replace.
+
+    F-049: without it a crash can leave the rename undurable even though
+    the file's own contents were fsynced.  The rename has ALREADY landed
+    when this runs, so a failure here cannot be reported as a write
+    failure (the file exists with the right contents): Windows cannot
+    open a directory at all, and some network/FUSE filesystems reject
+    ``fsync`` on a directory.  Both are swallowed deliberately.
+    """
+    if os.name == "nt":  # pragma: no cover - Windows
+        return
+    try:
+        dir_fd = os.open(dir_path, os.O_RDONLY)
+    except OSError:  # pragma: no cover - platform/filesystem dependent
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:  # pragma: no cover - platform/filesystem dependent
+        pass
+    finally:
+        os.close(dir_fd)
 
 
 def write_las_file(
@@ -2238,12 +2889,44 @@ def write_las_file(
             raise LASWriteError(f"Failed to generate LAS file content: {e}") from e
 
         try:
-            target_dir = str(file_path.parent)
-            fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=".tmp_", suffix=file_path.name)
+            # F-049: the atomic replace must preserve the DESTINATION's
+            # identity and permissions.  The pre-fix path had three
+            # defects, all from treating the destination as a path rather
+            # than as a file with attributes:
+            #   1. the 0600 mode mkstemp gives its temp file survived the
+            #      replace, so EVERY written file came out owner-only
+            #      (instead of the umask-derived 0644 a plain open() gives)
+            #      and a pre-existing 0444 target was silently rewritten
+            #      AND turned writable;
+            #   2. a symlinked target was replaced by a regular file,
+            #      destroying the link instead of writing through it;
+            #   3. neither the data nor the directory entry was flushed, so
+            #      a crash could leave a truncated or an unrenamed file.
+            # Resolve only the final path (write THROUGH a symlink and keep
+            # the link itself), carry the target's own mode — umask-derived
+            # when the file does not exist yet — and fsync the data before
+            # the replace and the directory after it.
+            target_path = Path(os.path.realpath(file_path))
+            target_dir = str(target_path.parent)
             try:
+                existing_mode: int | None = os.stat(target_path).st_mode & 0o7777
+            except FileNotFoundError:
+                existing_mode = None
+            fd, tmp_path = tempfile.mkstemp(
+                dir=target_dir, prefix=".tmp_", suffix=target_path.name
+            )
+            try:
+                _apply_file_mode(
+                    fd,
+                    tmp_path,
+                    existing_mode if existing_mode is not None else _default_new_file_mode(),
+                )
                 with os.fdopen(fd, "w", encoding=encoding, newline="") as f:
                     f.write(content)
-                os.replace(tmp_path, file_path)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, target_path)
+                _fsync_directory(target_dir)
             except Exception:
                 try:
                     os.unlink(tmp_path)

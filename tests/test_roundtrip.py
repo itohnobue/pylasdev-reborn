@@ -23,7 +23,12 @@ class TestRoundTrip:
     """Tests for read-write-read consistency."""
 
     def test_roundtrip_from_dict(self, sample_las_data: dict, tmp_path: Path) -> None:
-        """Test that writing from dict and reading back preserves data."""
+        """Test that writing from dict and reading back preserves data.
+
+        HARDEN (test-register row): the fixture's ``parameters`` (BHT/BS), its
+        well fields and its curve metadata were written but never asserted —
+        a writer that dropped the whole ~P section left this test green.
+        """
         temp_file = tmp_path / "roundtrip.las"
         write_las_file(temp_file, sample_las_data)
         roundtrip = read_las_file(temp_file)
@@ -37,6 +42,33 @@ class TestRoundTrip:
                 sample_las_data["logs"][curve],
                 roundtrip["logs"][curve],
                 decimal=6,
+            )
+
+        # Parameter values survive (the fixture carries BHT/BS).
+        for mnemonic, value in sample_las_data["parameters"].items():
+            assert mnemonic in roundtrip["parameters"], (
+                f"parameter {mnemonic!r} missing after roundtrip"
+            )
+            assert roundtrip["parameters"][mnemonic] == value, (
+                f"parameter {mnemonic!r} changed: {value!r} -> "
+                f"{roundtrip['parameters'][mnemonic]!r}"
+            )
+
+        # Well fields survive with their exact values.
+        for key, value in sample_las_data["well"].items():
+            assert roundtrip["well"].get(key) == value, (
+                f"well field {key!r} changed: {value!r} -> {roundtrip['well'].get(key)!r}"
+            )
+
+        # Curve metadata survives (unit + description per curve).
+        for expected, actual in zip(sample_las_data["curves"], roundtrip["curves"], strict=True):
+            assert actual["mnemonic"] == expected["mnemonic"]
+            assert actual["unit"] == expected["unit"], (
+                f"unit drift for {expected['mnemonic']!r}: "
+                f"{expected['unit']!r} -> {actual['unit']!r}"
+            )
+            assert actual["description"] == expected["description"], (
+                f"description drift for {expected['mnemonic']!r}"
             )
 
     def test_roundtrip_all_files(self, all_las_files: list[Path], tmp_path: Path) -> None:
@@ -106,17 +138,43 @@ class TestRoundTrip:
                         )
 
             # Verify string_data entries preserved (LAS 3.0 {S} format curves)
+            # HARDEN (test-register row): compare the KEY SET, not just the
+            # original's keys — the one-direction loop could not see a key the
+            # roundtrip ADDED (a writer that moved a numeric column into
+            # string_data stayed green).
             orig_string_data = original.get("string_data", {})
             rt_string_data = roundtrip.get("string_data", {})
+            assert set(rt_string_data) == set(orig_string_data), (
+                f"string_data key-set drift in {las_path.name}: "
+                f"{sorted(rt_string_data)} vs {sorted(orig_string_data)}"
+            )
             for key in orig_string_data:
-                assert key in rt_string_data, (
-                    f"string_data key {key} missing in roundtrip for {las_path.name}"
-                )
                 np.testing.assert_array_equal(
                     orig_string_data[key],
                     rt_string_data[key],
                     err_msg=f"string_data mismatch for {key} in {las_path.name}",
                 )
+
+            # HARDEN (test-register row, AC-9 corpus contract): the well
+            # section, the parameter values and the per-curve metadata were
+            # outside the contract — a writer that dropped ~P entirely (M1)
+            # left this corpus gate green.  All three are exact comparisons:
+            # the 18 bundled fixtures roundtrip them unchanged.
+            assert roundtrip["well"] == original["well"], (
+                f"well drift in {las_path.name}: "
+                f"{[(k, original['well'].get(k), roundtrip['well'].get(k)) for k in sorted(set(original['well']) | set(roundtrip['well'])) if original['well'].get(k) != roundtrip['well'].get(k)]}"
+            )
+            assert roundtrip.get("parameters", {}) == original.get("parameters", {}), (
+                f"parameter value drift in {las_path.name}"
+            )
+            assert len(roundtrip.get("parameter_details", [])) == len(
+                original.get("parameter_details", [])
+            ), f"parameter count drift in {las_path.name}"
+            assert [
+                (c["mnemonic"], c.get("unit"), c.get("description")) for c in roundtrip["curves"]
+            ] == [
+                (c["mnemonic"], c.get("unit"), c.get("description")) for c in original["curves"]
+            ], f"curve metadata drift in {las_path.name}"
 
             # Verify data_sections count preserved (LAS 3.0 multi-section files)
             orig_sections = original.get("data_sections", [])
@@ -265,10 +323,13 @@ class TestRoundTrip:
             "Expected standard ~P section for global parameters"
         )
 
-        # Roundtrip: re-read and verify section_type preserved
+        # Roundtrip: re-read and verify section_type AND payload preserved
+        # HARDEN (test-register row): the old assertions were a `>= 2` count
+        # plus section_type only, so a writer that dropped the parameter
+        # VALUE/UNIT/DESCRIPTION stayed green.  The exact payload is pinned.
         data = read_las_file(temp_file)
         param_details = data.get("parameter_details", [])
-        assert len(param_details) >= 2, f"Expected at least 2 parameters, got {len(param_details)}"
+        assert len(param_details) == 2, f"Expected exactly 2 parameters, got {len(param_details)}"
 
         # Find BHT (section_type should be None → not in output or default)
         bht_params = [p for p in param_details if p.get("mnemonic") == "BHT"]
@@ -277,6 +338,9 @@ class TestRoundTrip:
         assert bht_params[0].get("section_type") in (None, ""), (
             f"BHT should not have section_type, got: {bht_params[0].get('section_type')!r}"
         )
+        assert bht_params[0].get("unit") == "DEGC"
+        assert bht_params[0].get("value") == "35.5"
+        assert bht_params[0].get("description") == "Bottom Hole Temperature"
 
         # Find MATR (section_type should be 'CORE')
         matr_params = [p for p in param_details if p.get("mnemonic") == "MATR"]
@@ -284,6 +348,8 @@ class TestRoundTrip:
         assert matr_params[0].get("section_type") == "CORE", (
             f"MATR section_type should be 'CORE', got: {matr_params[0].get('section_type')!r}"
         )
+        assert matr_params[0].get("value") == "SAND"
+        assert matr_params[0].get("description") == "Neutron Matrix"
 
     def test_per_section_parameter_multiple_section_types(self, tmp_path: Path) -> None:
         """F-053/IF-011: Multiple section types each get their own

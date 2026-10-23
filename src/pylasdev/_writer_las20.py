@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ._writer_base import (
+    _restore_live_container,
     _sanitize_las_value,
     _WriterBase,
 )
@@ -79,10 +80,15 @@ class _Las20Writer(_WriterBase):
         try:
             lines.extend(self._write_ascii_legacy(delimiter, check_line_limit))
         finally:
-            self._las_file.logs = _saved_logs
-            self._las_file.string_data = _saved_string_data
-            self._las_file.curves_order = _saved_curves_order
-            self._las_file.curves = _saved_curves
+            # M12/L24: restore IN PLACE (see _restore_live_container).  Never
+            # ``self._las_file.<container> = ...``: that branch deep-copies
+            # ``curves`` (severing section_curves identity) and re-runs the
+            # container validators, so a restore could raise while the
+            # write's own LASWriteError is in flight.
+            _restore_live_container(self._las_file, "logs", _saved_logs)
+            _restore_live_container(self._las_file, "string_data", _saved_string_data)
+            _restore_live_container(self._las_file, "curves_order", _saved_curves_order)
+            _restore_live_container(self._las_file, "curves", _saved_curves)
             self._las_file.version.dlm = _saved_dlm
 
         return lines
