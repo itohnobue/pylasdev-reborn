@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 from pylasdev import (
     CurveDefinition,
@@ -13,8 +13,10 @@ from pylasdev import (
     ParameterEntry,
     ParameterZone,
     VersionSection,
+    read_dev_file_as_object,
     read_las_file,
     read_las_file_as_object,
+    write_dev_file,
     write_las_file,
 )
 
@@ -454,18 +456,37 @@ class TestRoundTrip:
         assert restored.curves[1].description == "SONIC"
 
 
-class TestDEVRoundtripSkipped:
-    """DEV roundtrip tests — skipped until DEV writer is implemented.
+class TestDEVRoundtrip:
+    """DEV read → write → read roundtrip (F-T2-M04 / F-T3-M02).
 
-    F-T2-M04: No DEV writer exists.  ``write_dev_file`` is needed before
-    DEV roundtrip tests can be meaningful.
-    F-T3-M02: DEV roundtrip is untested as a result.
+    The placeholder that stood here was skipped because no DEV writer
+    existed; ``write_dev_file`` makes the cycle executable, so the same
+    properties it promised are now asserted: ``column_order`` and the DATA
+    survive, positionally, for every DEV fixture in ``test_data/``.
     """
 
-    @pytest.mark.skip(reason="F-T2-M04: DEV writer not implemented")
-    def test_dev_roundtrip_skipped(self) -> None:
-        """DEV read → write → read roundtrip — not yet testable."""
-        pass
+    def test_dev_roundtrip(self, tmp_path: Path, all_dev_files: list[Path]) -> None:
+        for dev_path in all_dev_files:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                original = read_dev_file_as_object(dev_path)
+            out = tmp_path / dev_path.name
+            write_dev_file(out, original)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                roundtrip = read_dev_file_as_object(out)
+
+            assert list(roundtrip.column_order) == list(original.column_order), (
+                f"column_order changed for {dev_path.name}"
+            )
+            for name in original.column_order:
+                before = original.columns[name]
+                after = roundtrip.columns[name]
+                assert len(after) == len(before), f"{dev_path.name}: {name} row count"
+                # The writer's `.8g` default keeps 8 SIGNIFICANT digits; the
+                # fixture carries 8 DECIMALS, so AZI/INC/DLS drift below 1e-6
+                # relative (test_dev_writer.py pins the exact per-token values).
+                np.testing.assert_allclose(after, before, rtol=1e-6, atol=0)
 
 
 # ──────────────────────────────────────────────────────────────

@@ -5,6 +5,12 @@ All notable changes to pylasdev will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] — 2026-10-24
+
+### Added
+
+- **DEV write support**: `write_dev_file()` serializes a `DevFile` (or legacy dict) to a simple DEV layout — one header line in `column_order` order, one row per station; NaN/Inf cells become `null_value` (`-999.25` by default, a null sentinel) with a per-column warning on a real-value collision; comment/banner lines are not preserved; an unemittable column name raises the new `DEVWriteError`
+
 ## [2.1.0] — 2026-10-24
 
 ### Fixed

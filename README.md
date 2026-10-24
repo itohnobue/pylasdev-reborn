@@ -11,7 +11,7 @@ It is "Reborn" because it was updated, fixed and refactored to work with modern 
 
 - Read and write LAS 1.2, 2.0, and 3.0 files
 - LAS 3.0 support: array notation, format specifiers, multiple data sections, string data
-- Read DEV (deviation survey) files
+- Read and write DEV (deviation survey) files
 - Automatic encoding detection with chardet (supports Cyrillic: cp1251, cp866)
 - Auto-detection of mislabeled WRAP headers (WRAP=YES with non-wrapped data)
 - Type-safe API with full type hints and dataclass models

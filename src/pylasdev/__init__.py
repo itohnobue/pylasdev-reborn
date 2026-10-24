@@ -7,6 +7,7 @@ Public API:
     write_las_file()           — Write LAS data to file
     read_dev_file()            — Read DEV deviation file, returns dict
     read_dev_file_as_object()  — Read DEV file, returns typed DevFile (new API)
+    write_dev_file()           — Write DEV deviation data to file
     compare_las_dicts()        — Compare two LAS data dictionaries
 
     # Data models
@@ -32,6 +33,7 @@ Public API:
     LASEncodingError           — File encoding cannot be determined or decoded
     LASDataError               — LAS data validation fails in from_dict
     DEVReadError               — DEV file cannot be read or parsed
+    DEVWriteError              — DEV file cannot be written
 """
 
 from importlib.metadata import PackageNotFoundError, version
@@ -43,8 +45,10 @@ except PackageNotFoundError:
 
 from .compare import compare_las_dicts
 from .dev_reader import read_dev_file, read_dev_file_as_object
+from .dev_writer import write_dev_file
 from .exceptions import (
     DEVReadError,
+    DEVWriteError,
     LASDataError,
     LASEncodingError,
     LASParseError,
@@ -73,6 +77,7 @@ __all__ = [
     "read_las_file",
     "write_las_file",
     "read_dev_file",
+    "write_dev_file",
     "compare_las_dicts",
     # New object API
     "read_las_file_as_object",
@@ -98,4 +103,5 @@ __all__ = [
     "LASEncodingError",
     "LASDataError",
     "DEVReadError",
+    "DEVWriteError",
 ]

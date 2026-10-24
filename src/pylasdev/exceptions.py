@@ -44,3 +44,7 @@ class LASDataError(PylasdevError, ValueError):
 
 class DEVReadError(PylasdevError):
     """Raised when a DEV file cannot be read or parsed."""
+
+
+class DEVWriteError(PylasdevError):
+    """Raised when a DEV file cannot be written."""

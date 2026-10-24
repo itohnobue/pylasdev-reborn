@@ -33,7 +33,7 @@ See the [README](README.md) for installation and a quick start.
 ## Basic API (dict-based)
 
 ```python
-from pylasdev import read_las_file, write_las_file, read_dev_file
+from pylasdev import read_las_file, write_las_file, read_dev_file, write_dev_file
 
 # Read a LAS file (returns dict for backward compatibility)
 # Use a real test file from the test_data/ directory (18 LAS files + 1 DEV file)
@@ -48,6 +48,10 @@ write_las_file("output.las", data)
 dev_data = read_dev_file("test_data/sample.dev")
 print(dev_data["MD"])   # Measured depth array
 print(dev_data["TVD"])  # True vertical depth array
+
+# Write DEV data (simple layout: one header line, one row per station)
+write_dev_file("output.dev", dev_data)
+print(read_dev_file("output.dev")["MD"])  # Re-read: same columns; MD exact, others at .8g
 ```
 
 ## Object-oriented API (new)
@@ -100,6 +104,7 @@ las2 = LASFile.from_dict(d)               # Create from dict
 | Function | Description |
 |----------|-------------|
 | `write_las_file(file_path, las_data, encoding="utf-8", precision=".8g")` | Write LAS data (dict or `LASFile`) to a `.las` file with configurable encoding and numeric precision |
+| `write_dev_file(file_path, dev_data, encoding="utf-8", precision=".8g", delimiter=" ", null_value=-999.25)` | Write DEV data (dict or `DevFile`) to a `.dev` file as a simple layout — one header line in `column_order` order, one row per station, space/tab/comma/semicolon delimiters; NaN/Inf cells are emitted as `null_value` (a real value that emits one of the reader's numeric null sentinels is warned per column and reads back as missing; any other `null_value` re-reads as that literal number); comment/banner lines are not preserved; a non-default `delimiter` must be passed again on read; an unemittable column name raises `DEVWriteError` |
 
 ### Comparison
 
@@ -234,6 +239,7 @@ All exceptions inherit from `PylasdevError`:
 | `LASEncodingError` | File encoding cannot be determined or decoded |
 | `LASWriteError` | LAS file cannot be written |
 | `DEVReadError` | DEV file cannot be read or parsed |
+| `DEVWriteError` | DEV file cannot be written |
 
 ## Common Use Cases
 
