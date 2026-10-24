@@ -96,15 +96,15 @@ las2 = LASFile.from_dict(d)               # Create from dict
 |----------|---------|-------------|
 | `read_las_file(file_path, mnem_base=None, encoding=None, max_file_size=None)` | `dict` | Read LAS 1.2/2.0/3.0 file, returns legacy dict format |
 | `read_las_file_as_object(file_path, mnem_base=None, encoding=None, max_file_size=None)` | `LASFile` | Read LAS file, returns typed `LASFile` dataclass |
-| `read_dev_file(file_path, encoding=None, max_file_size=None)` | `dict` | Read DEV deviation file, returns `{column: ndarray}` dict |
-| `read_dev_file_as_object(file_path, encoding=None, max_file_size=None)` | `DevFile` | Read DEV file, returns typed `DevFile` dataclass |
+| `read_dev_file(file_path, encoding=None, max_file_size=None, delimiter=None, normalize_aliases=True)` | `dict` | Read DEV deviation file, returns `{column: ndarray}` dict |
+| `read_dev_file_as_object(file_path, encoding=None, max_file_size=None, delimiter=None, normalize_aliases=True)` | `DevFile` | Read DEV file, returns typed `DevFile` dataclass |
 
 ### Write Functions
 
 | Function | Description |
 |----------|-------------|
 | `write_las_file(file_path, las_data, encoding="utf-8", precision=".8g")` | Write LAS data (dict or `LASFile`) to a `.las` file with configurable encoding and numeric precision |
-| `write_dev_file(file_path, dev_data, encoding="utf-8", precision=".8g", delimiter=" ", null_value=-999.25)` | Write DEV data (dict or `DevFile`) to a `.dev` file as a simple layout — one header line in `column_order` order, one row per station, space/tab/comma/semicolon delimiters; NaN/Inf cells are emitted as `null_value` (a real value that emits one of the reader's numeric null sentinels is warned per column and reads back as missing; any other `null_value` re-reads as that literal number); comment/banner lines are not preserved; a non-default `delimiter` must be passed again on read; an unemittable column name raises `DEVWriteError` |
+| `write_dev_file(file_path, dev_data, encoding="utf-8", precision=".8g", delimiter=" ", null_value=-999.25)` | Write DEV data (dict or `DevFile`) to a `.dev` file as a simple layout — one header line in `column_order` order, one row per station, space/tab/comma/semicolon delimiters; NaN/Inf cells are emitted as `null_value` (a real value that emits one of the reader's numeric null sentinels is warned per column and reads back as missing; any other `null_value` re-reads as that literal number); comment/banner lines are not preserved; a `delimiter` outside the reader's auto-detected set (space, tab, comma, semicolon) must be passed again on read; an unemittable column name raises `DEVWriteError` |
 
 ### Comparison
 
@@ -398,7 +398,7 @@ print('WRAP in file:', las.version.wrap)
 
 **Cause:** `-999.25` is the standard null value in the LAS format specification
 (CWLS convention). pylasdev does not automatically mask or replace null values
-— you must handle them in your own code.
+in LAS files — you must handle them in your own code.
 
 **Fix:** Mask null values after reading:
 
