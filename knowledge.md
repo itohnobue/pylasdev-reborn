@@ -1,5 +1,5 @@
 # Knowledge Base
-Last updated: 2026-10-24T03:55:32.907753
+Last updated: 2026-10-24T22:54:44.207674
 
 ## [got-20260630231738-c9b671]
 Category: gotcha
@@ -17,13 +17,19 @@ pylasdev-reborn DoS protection constants: MAX_DATA_SECTIONS=1000, MAX_CURVES=100
 
 ## [con-20260701005900-8cc26b]
 Category: reference
-Tags: dev-format, research, pylasdev, specification, las
-Changed: 2026-10-04T20:19:18.636195
+Tags: dev-format, research, pylasdev, specification, las, portability, external-consumers
+Changed: 2026-10-24T22:53:04.534281
 
 DEV format reference: (1) no single authoritative DEV standard - LAS 3.0 Inclinometry and
 Petrel .dev are closest; (2) two paradigms - MD/INC/AZI and MD/TVD/X/Y; (3) multiple delimiter
 conventions; (4) null sentinel = -999.25 in LAS, -999 common; (5) 5 calculation methods but NONE
 encoded in the file format; (6) structural comparison table with parsing implications for pylasdev.
+(7) emitted-token portability across third-party consumers: a single space is the only delimiter no
+documented consumer rejects (WinPICS states tab-delimited fields are not supported; PetroBench
+accepts space or tab — documentary); the LAS-family numeric grammar is fixed-point or integer, so no
+exponent, no nan/inf text, no thousands grouping and no leading plus; and -999 is a file TERMINATOR
+in the TNO dialect, never a cell null — the meanings are confirmed, the mechanism likely. Source:
+the DEV structural and lexical research reports behind the DEV writer.
 
 ## [got-20260717091300-1b2681]
 Category: gotcha
@@ -1477,4 +1483,88 @@ Tags: testing, determinism, oracle, performance, regression-pins, pylasdev
 Changed: 2026-10-24T03:55:30.430570
 
 Test oracles must be deterministic, and a stale pin is re-baselined by contract. (a) A wall-clock assertion measures the machine, not the code: it fails under coverage or a loaded host and says nothing about the defect class. Replace it with a proxy that still discriminates: a work counter emitted by the production path (rebuild count, values processed), a structural property of the compiled artifact (an unbounded repetition inside a start-anchored group is what makes per-start work unbounded — assert its absence plus exact parse content), or an allocation bound (tracemalloc peak of one rejecting call). Each proxy must fail on the pre-fix shape and pass post-fix — measure both. Evidence: a per-flush re-slice proxy asserted values_processed and rebuilds<=1 where the pre-fix slice yields ~45,000 rebuilds; the H-04 regex proxy is false for the old pattern and true for the shipped one; the F-22 resource proxy measured 1,654 bytes post-fix against 800,000 bytes pre-fix. A suite with zero clock reads (grep perf_counter/time.time over tests -> 0) can be pinned as a meta-test, so the class cannot return. (b) Re-baseline a stale pin by CONTRACT, not by convenience: change the expectation to the post-fix contract the authorising finding re-derived, keep the regression the test guards, add the fixture data the new rule requires rather than weakening the assertion, and retarget a deleted diagnostic to the conforming state while keeping the discrimination through a surviving check. A re-baseline that only updates an expected value, or drops the assertion, deletes the protection. Checklist: grep tests for perf_counter/time.time/monotonic/elapsed; name the authorising finding for every re-baselined node; run each re-baselined and new pin against the pre-fix tree and require failure there.
+
+## [pat-20261024225303-783700]
+Category: pattern
+Tags: pylasdev, documentation-truth, docstrings, warnings, diagnostics, condition-scope
+Changed: 2026-10-24T22:53:03.671445
+
+Prose must be true of the artifact it ships in. (a) An outcome claim states its enabling condition in the same sentence. An unconditional claim over a conditional behaviour is false on the other branch, and reading the code it describes does not reveal it: a writer docstring claimed a depth is never rounded (true only at the default precision — an explicitly requested precision rounds it), and a write warning claimed NaN cells re-read as declared missing data (true only when the null value is a member of the reader's numeric sentinel set; any other finite null re-reads as that literal number, a fabricated measurement). Generate the sentence in the branch that decides the outcome (dev_writer._emit_diagnostics builds the null prose that way), so text and predicate cannot drift. (b) Reusing a sibling path's diagnostic transfers the OBLIGATION, not the wording: _writer_base._warn_inexact_index asserts that CWLS LAS 2.0 section 5.4 forbids rounding depths — an LAS authority that does not govern a DEV file — and the DEV writer emits that message verbatim. When a contract names a shared helper, pass or wrap a format-true message instead of importing the helper's message into a second format. Checklist: for every docstring or warning sentence naming a read/write outcome, name its enabling condition in the same sentence and generate it from the deciding branch; for every reused diagnostic, test each clause against the consuming format's governing document. Related: got-20261024035530-16c7b3 (a comment falsified by the same diff).
+
+## [pat-20261024225303-0e5833]
+Category: pattern
+Tags: pylasdev, validation, consumer-contract, delimiter, control-characters, cross-module
+Changed: 2026-10-24T22:53:03.770607
+
+Validate a format-significant input against the CONSUMER's own predicate, imported from the consumer module — never a re-derived approximation such as a Unicode general category or a hand-written character list. The imported predicate is the exact set that decides the outcome; an approximation is wrong in both directions. Evidence: the DEV reader deletes exactly the characters matching _DEV_DELETE_CHARS_RE (dev_reader.py) before tokenising, so a file delimited by one of them fuses its header and every row into one all-NaN column; dev_writer._resolve_delimiter now rejects that imported class. A unicodedata.category(d) == 'Cc' test would have refused the tab — a supported, tested delimiter — and also refused 0x0B/0x0C/0x1C-0x1E, which the reader turns into spaces and re-reads cleanly: over- and under-rejection at once. The same pattern applies to the sentinel set and the alias normaliser, both imported by the writer rather than restated. Checklist: import the consumer's predicate/set/normaliser and test membership; pin both directions (the corrupting class is refused, the legitimate neighbours still round-trip); a rule re-expressed in the consumer's own words is a split brain waiting to drift.
+
+## [pat-20261024225303-0f9fd1]
+Category: pattern
+Tags: pylasdev, dev-writer, dev-reader, index-column, depth, precision, cross-module
+Changed: 2026-10-24T22:53:03.868196
+
+The index (depth) column is the column the CONSUMER resolves, not the column at position 0. The DEV reader resolves depth nominally — header tokens are upper-cased and matched against MD and its family (MDKB, MDSS, MDRKB, DEPTH, DPT, DEPT, MDMSL), with no positional fallback (dev_reader.py, the MD-family block) — so a writer that formats position 0 as the index protects the wrong column: with a permuted ['X','MD','TVD'] model the depth was formatted on the generic precision path and silently rounded (1234.56789 -> 1234.5679, zero warnings on either side) while the position-0 column exceeded the requested precision. Resolve the index with the reader's own normaliser (_normalize_dev_column(name) == 'MD'), fall back to position 0 only when no column qualifies, and format that column with _format_index_value (dev_writer._resolve_index_position). Exactness there is a default-precision repair, not a guarantee: at an explicitly requested precision the index follows the caller's precision, and any token that no longer reads back as the value is a WARNED condition (the LAS path's _warn_inexact_index obligation — one warning naming the column, the value and the emitted token), never a silent rounding and never an override of the caller's precision. Checklist: derive every special column from the consumer's own resolution rule; pin a permuted-order case whose values the default precision cannot round; pin the exact and warned directions separately.
+
+## [pat-20261024225303-6eb2e2]
+Category: pattern
+Tags: pylasdev, dev-writer, emission, header, delimiter, shape-invariant, roundtrip
+Changed: 2026-10-24T22:53:03.962566
+
+An emission-shape invariant is about the bytes on disk, so it applies to EVERY emitted line — the header is a line and carries the same one-token-per-column requirement as a data row. A row-only check cannot see a header split: a column name containing the active delimiter turns the header into phantom columns and shifts every value on every row, with no diagnostic (measured: 88 of 98 candidate delimiters corrupt when embedded in a name). Two mechanisms, both required: the name grammar is POSITIONAL — a name is refused when it contains the delimiter argument in effect (A|B refused under delimiter '|', accepted under the default space) — and one shared shape check runs on the header and on every row (dev_writer._check_line_shape, called for the header and inside the row loop). The grammar carries the user-facing message; the shape check is the emission backstop. Checklist: route every emitted line through one shape check instead of adding a near-identical second check per site; validate names against the delimiter actually in use, not a fixed separator set; pin the header case, a clean case that must keep writing, and that the refusal names the column and the reason rather than an internal error.
+
+## [got-20261024225304-2bbaca]
+Category: gotcha
+Tags: pylasdev, dev-writer, dev-reader, null-sentinel, membership, fabricated-data, warnings
+Changed: 2026-10-24T22:53:04.055056
+
+A reader's null sentinels are a CLOSED MEMBERSHIP SET: every outcome claim must branch on membership, and numeric proximity means nothing. dev_reader._DEV_NUMERIC_SENTINELS is exactly {-999.0, -999.25, -9999.0, -9999.25}; a finite null that is not a member is emitted verbatim and re-reads as that NUMBER, indistinguishable from a measurement (measured for -999.2500001, -999.26, -1000.0, -1234.5, 0.0, 1e30), while a member is read as missing data. The trap is that a non-member null looks like a sentinel to a human and to a proximity test, so a statement that a cell 'reads back as missing data' without the membership condition fabricates a guarantee the file does not carry. Keep ACCEPTING a non-sentinel finite null — a numeric fill the caller's own pipeline recognises is legitimate; the defect is the unqualified claim, not the acceptance. The collision gate must test the EMITTED TOKEN, not the source value: a value rounded onto a sentinel by the requested precision (TVDSS=-999.001 at '.2f' -> '-999.00') is read as missing exactly like an exact hit (dev_writer._build_dev_text). Checklist: branch every null/outcome sentence and diagnostic on membership in the sentinel set; warn on the emitted token; test a non-member null end-to-end (the warning does not say missing, and the re-read value is the number) plus a precision-rounded collision.
+
+## [got-20261024225304-9180c6]
+Category: gotcha
+Tags: pylasdev, dev-writer, dev-reader, thousands-separator, bare-integer, comma, token-syntax
+Changed: 2026-10-24T22:53:04.146559
+
+A token that is a bare integer is ambiguous to a comma-delimited reader: the reader's thousands-separator recombination and its DUG/headerless count heuristics both consume it. Rendering an integral float as '12' lets adjacent columns '12' and '345.6' recombine into '12345.6' (the other column becoming NaN), and lets a one-column file's first station be read as a column count with the header eaten. Emit every numeric token as a decimal number: append '.0' to any token matching ^[+-]?[0-9]+$, unconditionally and for every delimiter (dev_writer._BARE_INTEGER_RE, applied in _format_token). The reader-side gate (dev_reader._recombine_thousands_separators) is a separate contract — got-20260809134738-13fc48 records it; this is the producer-side rule that keeps the ambiguous token off the file in the first place. Checklist: grep every numeric emission path for an integral/float shortcut; pin a comma-delimited round-trip with integral values in adjacent columns and a one-column integral first station.
+
+## [pat-20261024225304-a24c6c]
+Category: pattern
+Tags: testing, verification, precision, allclose, tolerance, exact-equality, pylasdev
+Changed: 2026-10-24T22:53:04.238692
+
+A tolerance comparison cannot verify a precision contract — it hides exactly the defect it is meant to detect. A fidelity probe using np.allclose with default tolerances passed a documented 'same values' round-trip claim while about 4e-8 relative differences existed in the re-read data, because the tolerance absorbs the rounding the claim denied. Verify numeric round-trip claims with exact, NaN-aware equality per column (element equality, or np.array_equal(..., equal_nan=True) on the re-read values), and state the comparison's scope explicitly: index exact at the default precision, non-index columns at the emitted precision — the same fixture had 341/1490 cells differ at '.8g' and 0 at '.12g'/'.8f'. A probe must also be able to fail: a test that permutes columns but feeds values the default precision cannot round passes against both the broken and the fixed code. Checklist: grep verification code for allclose/assert_approx/isclose; replace it with exact equality where the claim is precision or identity; for every new pin, name the input that makes it fail pre-fix (falsifiability: pat-20260721180622-4f55ad).
+
+## [got-20261024225304-cf75af]
+Category: gotcha
+Tags: pylasdev, dev-reader, headerless, column-names, normalisation, roundtrip-identity
+Changed: 2026-10-24T22:53:04.342699
+
+'A read output is a normalisation fixed point' is a premise to CHECK per dialect, not a general truth. The DEV reader's headerless branch fabricates col_0, col_1, ... (dev_reader.py, the auto-generated-name branch) outside _normalize_dev_column, and every header token is upper-cased and alias-mapped on the next read — so a read->write->read cycle canonicalises those names (col_0 -> COL_0) and rewrites column_order while the values survive. An identity criterion built on the fixed-point premise therefore acquits a writer whose output does not round-trip for that dialect; the writer's correct behaviour is verbatim emission plus a rename warning naming both spellings and the normalize_aliases=False escape, and the limitation belongs in the criterion as a scope qualifier. Checklist: before relying on fixed-point identity, find where the consumer GENERATES names and whether that generator goes through its own normaliser; test the name-fabricating dialect explicitly; make the identity claim name the dialects it covers.
+
+## [got-20261024225304-94076d]
+Category: gotcha
+Tags: pylasdev, writer, format-helper, nan, inf, null-token, guard
+Changed: 2026-10-24T22:53:04.434172
+
+_writer_base._format_index_value repairs exactness by falling back to repr(value), so a non-finite input returns the TEXT 'nan'/'inf' rather than a numeric token. A missing index cell routed through it therefore hands the reader an alphabetic null token — the token class that promotes an all-missing row to column names. Every caller must gate on math.isfinite first and send non-finite cells through the shared null formatter (dev_writer._format_token does this; that isfinite gate is load-bearing, not defensive). Checklist: at every call site prove the value is finite before the call and route non-finite values to the null formatter; pin an all-missing index column and assert the emitted token is the numeric sentinel (not 'nan'/'inf') and the station/row is preserved.
+
+## [pat-20261024225328-0c580d]
+Category: pattern
+Tags: specification, acceptance-criteria, decidability, enumeration, verification, workflow
+Changed: 2026-10-24T22:53:28.972721
+
+An acceptance criterion must be decidable and satisfiable before any implementation is scored against it. Two failure shapes recur. (a) A clause that is vacuous under one reading and unsatisfiable under another adjudicates nothing: 'the index MUST be exact at the requested precision' is trivially true read as `token == format(value, precision)` and impossible read as 'the value survives a coarser precision', so it could not separate a conforming writer from a rounding one, and two verifiers read it in opposite directions. (b) A CLOSED enumeration that omits the case its own governing sentence requires acquits the code by enumeration: a column-name safety criterion listed every forbidden name shape except 'contains the active delimiter', so an enumerative reading found the writer conformant while a name containing the active delimiter silently shifted every value on re-read. Checklist when authoring or adjudicating a criterion: state the predicate so a conforming and a non-conforming implementation produce different verdicts; test it at its boundary (default vs explicitly requested precision, the delimiter actually in use); when it presents a closed set, cross-check the set against the governing sentence and add the missing member; and when the code conforms to a defective clause, correct the criterion first and then re-activate the code item — a conformant implementation of an undecidable clause is not a pass.
+
+## [got-20261024225444-d9b40a]
+Category: gotcha
+Tags: pylasdev, writer, sanitization, cross-format, delimiter, escape, roundtrip
+Changed: 2026-10-24T22:54:44.103406
+
+Do not reuse another format's sanitizer: a repair is correct only relative to the consuming grammar. The LAS write-side sanitizer replaces a Unicode space (the NBSP family) with an ASCII space — harmless in LAS text, but in a space-delimited DEV header the ASCII space IS the column delimiter, so the repair splits a column name into two and shifts every later column. The same holds for an escape family with no inverse on the consumer side: the LAS _#/_~ escapes have no DEV un-escape, so applying them there permanently changes the token. For DEV the implemented policy is refuse-over-repair — a name the grammar cannot represent (whitespace including Unicode spaces, control characters, the active delimiter) is rejected with a message, not rewritten (dev_writer._column_name_defect), and only the reader's delete class is removed where deletion preserves the name. Checklist: before importing a sanitizer/normaliser across formats, trace what its transform does to each character class under the CONSUMING delimiter and grammar; prefer refusal when a repair is ambiguous; an escape added on the write side needs an inverse on every read path or it reduces round-trip fidelity (see got-20260718223103-8ee17f, got-20260722035628-b50c61).
+
+## [got-20261024225444-015742]
+Category: gotcha
+Tags: pylasdev, writer, metadata, fabrication, units, external-consumers
+Changed: 2026-10-24T22:54:44.197867
+
+Never fabricate metadata the model could not carry. A reader that drops banner/comment lines leaves the model with no carrier, so a writer that reconstructs a KB/units line from column names is inventing a statement the source never made — and the library's own reader ignores that line, so a round-trip test through it cannot see the fabrication while an external consumer that does read the units line can rescale every value (the units-factor class). The correct behaviour is to emit nothing and document the loss: no metadata parameter, no derived banner, no guessed unit or datum. This is a decided convention, not a gap to close later. Checklist: for every metadata element the reader drops, the writer states the loss in its docstring and emits nothing; never derive a unit/precision/datum statement from what happens to be in the data; verify metadata absence with a consumer other than this library's reader when the claim matters.
 
